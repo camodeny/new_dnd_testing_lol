@@ -66,8 +66,32 @@ def _frame(**overrides):
     return build_frame(**kwargs)
 
 
-def _probs(selected: str, selected_p: float, others: dict[str, float]) -> dict[str, float]:
-    return {selected: selected_p, **others}
+def _full(
+    selected: str, selected_p: float, runner: str, runner_p: float
+) -> dict[str, float]:
+    """Complete unit-sum distribution over the standard 5-candidate frame.
+
+    Remainder after the top two is spread over the other three candidates so
+    every policy call carries the full frame distribution.
+    """
+    all_ids = (
+        "flank",
+        "volley",
+        OPEN_ENDED_DM_CANDIDATE_ID,
+        CLARIFY_CANDIDATE_ID,
+        DEFER_CANDIDATE_ID,
+    )
+    assert selected in all_ids and runner in all_ids and selected != runner
+    rest = [c for c in all_ids if c not in (selected, runner)]
+    share = round((1.0 - selected_p - runner_p) / len(rest), 10)
+    assert share >= 0, "top-two probabilities exceed 1"
+    probs = {selected: selected_p, runner: runner_p}
+    for candidate_id in rest[:-1]:
+        probs[candidate_id] = share
+    # Last entry absorbs float residue so the map sums to exactly 1.
+    probs[rest[-1]] = round(1.0 - sum(probs.values()), 10)
+    assert abs(sum(probs.values()) - 1.0) < 1e-9
+    return probs
 
 
 def test_legal_selection_resolves_and_round_trips_through_runtime():
@@ -114,7 +138,7 @@ def test_open_ended_dm_escape_defers_instead_of_executing():
     verdict = evaluate_execution(
         frame,
         OPEN_ENDED_DM_CANDIDATE_ID,
-        _probs(OPEN_ENDED_DM_CANDIDATE_ID, 0.9, {"flank": 0.05, "volley": 0.05}),
+        _full(OPEN_ENDED_DM_CANDIDATE_ID, 0.9, "flank", 0.05),
         0.95,
         verified=True,
     )
@@ -190,7 +214,7 @@ def test_rebuild_requires_fresh_candidates():
 def test_near_tie_policy_defers_per_decision_class():
     frame = _frame()
     verdict = evaluate_execution(
-        frame, "flank", {"flank": 0.47, "volley": 0.44}, 0.9, verified=True
+        frame, "flank", _full("flank", 0.47, "volley", 0.44), 0.9, verified=True
     )
     # skirmish_action near-tie margin is 0.10; 0.03 is a near-tie whose
     # configured behavior is primer_advisory, never direct execution.
@@ -212,14 +236,14 @@ def test_near_tie_policy_defers_per_decision_class():
     register_policy(strict)
     strict_frame = _frame(decision_class="custom_strict")
     verdict = evaluate_execution(
-        strict_frame, "flank", {"flank": 0.55, "volley": 0.40}, 0.9,
+        strict_frame, "flank", _full("flank", 0.55, "volley", 0.40), 0.9,
         verified=True, policy=strict,
     )
     assert verdict.directive == "escalate"
 
     # Same numbers under the aggressive skirmish class clear direct execution.
     verdict = evaluate_execution(
-        frame, "flank", {"flank": 0.55, "volley": 0.40}, 0.9, verified=True
+        frame, "flank", _full("flank", 0.55, "volley", 0.40), 0.9, verified=True
     )
     assert verdict.directive == "direct_execute"
 
@@ -227,7 +251,7 @@ def test_near_tie_policy_defers_per_decision_class():
 def test_aggressive_reversible_direct_execution():
     frame = _frame()
     verdict = evaluate_execution(
-        frame, "flank", {"flank": 0.8, "volley": 0.1}, 0.85, verified=True
+        frame, "flank", _full("flank", 0.8, "volley", 0.1), 0.85, verified=True
     )
     assert verdict.directive == "direct_execute"
     trace = policy_trace(frame, verdict)
@@ -264,7 +288,16 @@ def test_higher_risk_and_failed_verification_escalate():
     # Even a confident high-risk pick escalates: confidence is evidence,
     # never authorization.
     verdict = evaluate_execution(
-        risky_frame, "burn_bridge", {"burn_bridge": 0.95}, 0.95,
+        risky_frame,
+        "burn_bridge",
+        {
+            "burn_bridge": 0.95,
+            "parley": 0.02,
+            OPEN_ENDED_DM_CANDIDATE_ID: 0.01,
+            CLARIFY_CANDIDATE_ID: 0.01,
+            DEFER_CANDIDATE_ID: 0.01,
+        },
+        0.95,
         verified=True, policy=policy,
     )
     assert verdict.directive == "escalate"
@@ -273,7 +306,7 @@ def test_higher_risk_and_failed_verification_escalate():
     # Failed deterministic verification escalates even a safe confident pick.
     frame = _frame()
     verdict = evaluate_execution(
-        frame, "flank", {"flank": 0.9, "volley": 0.05}, 0.95, verified=False
+        frame, "flank", _full("flank", 0.9, "volley", 0.05), 0.95, verified=False
     )
     assert verdict.directive == "escalate"
     assert "verification" in verdict.reason
@@ -300,7 +333,17 @@ def test_higher_risk_and_failed_verification_escalate():
         )
     )
     verdict = evaluate_execution(
-        irreversible, "shatter", {"shatter": 0.9}, 0.9, verified=True
+        irreversible,
+        "shatter",
+        {
+            "shatter": 0.9,
+            "probe": 0.05,
+            OPEN_ENDED_DM_CANDIDATE_ID: 0.02,
+            CLARIFY_CANDIDATE_ID: 0.02,
+            DEFER_CANDIDATE_ID: 0.01,
+        },
+        0.9,
+        verified=True
     )
     assert verdict.directive == "primer_advisory"
 
@@ -369,7 +412,46 @@ def test_non_boolean_verification_cannot_authorize_execution():
     for bad in ("false", 1, 0, None, [], object()):
         with pytest.raises(DecisionError) as exc_info:
             evaluate_execution(
-                frame, "flank", {"flank": 0.9}, 0.95, verified=bad
+                frame, "flank", _full("flank", 0.9, "volley", 0.05), 0.95, verified=bad
+            )
+        assert exc_info.value.kind == "malformed"
+
+
+def test_partial_or_contradictory_distribution_cannot_execute():
+    """Sliced, extra-key, non-unit, or self-contradicting maps fail closed."""
+    frame = _frame()
+    bad_maps = [
+        # Missing the three escape candidates: margin looks wider than it is.
+        {"flank": 0.8, "volley": 0.2},
+        # Extra key outside the frame.
+        {**_full("flank", 0.8, "volley", 0.1), "invented": 0.0},
+        # Unit-sum violated (sums to 0.9).
+        {"flank": 0.8, "volley": 0.1, OPEN_ENDED_DM_CANDIDATE_ID: 0.0,
+         CLARIFY_CANDIDATE_ID: 0.0, DEFER_CANDIDATE_ID: 0.0},
+        # Selection contradicts the distribution maximum.
+        _full("volley", 0.8, "flank", 0.1),
+    ]
+    for probs, selected in [
+        (bad_maps[0], "flank"),
+        (bad_maps[1], "flank"),
+        (bad_maps[2], "flank"),
+        (bad_maps[3], "flank"),
+    ]:
+        with pytest.raises(DecisionError) as exc_info:
+            evaluate_execution(frame, selected, probs, 0.95, verified=True)
+        assert exc_info.value.kind == "malformed"
+
+
+def test_malformed_current_revision_fails_closed():
+    """Floats, booleans, empties, and None are never 'current'."""
+    frame = _frame()
+    for bad in (7.0, True, False, "", "   ", None, 7.5, ["7"]):
+        with pytest.raises(DecisionError) as exc_info:
+            is_stale(frame, bad)
+        assert exc_info.value.kind == "malformed"
+        with pytest.raises(DecisionError) as exc_info:
+            revalidate_for_execution(
+                frame, "flank", bad, legal_ids={"flank"}
             )
         assert exc_info.value.kind == "malformed"
 

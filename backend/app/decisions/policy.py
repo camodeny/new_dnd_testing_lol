@@ -197,14 +197,49 @@ def _checked_unit(value: float | None, *, what: str) -> float:
 
 
 def alternative_margin(probabilities: dict[str, float], selected_id: str) -> float:
-    """Top-1 minus top-2 probability; 1.0 when the frame holds one rival-less pick."""
-    top = _checked_unit(probabilities.get(selected_id, 0.0), what="selected probability")
-    runner_up = 0.0
-    for candidate_id, value in probabilities.items():
-        if candidate_id == selected_id:
-            continue
-        runner_up = max(runner_up, _checked_unit(value, what="alternative probability"))
+    """Top-1 minus top-2 probability over an already-validated distribution."""
+    top = probabilities[selected_id]
+    runner_up = max(
+        (value for candidate_id, value in probabilities.items() if candidate_id != selected_id),
+        default=0.0,
+    )
     return max(0.0, top - runner_up)
+
+
+# Same invariants as the adapter boundary: a choice distribution covers
+# exactly the frame candidates and sums to 1 within 2-decimal rounding plus
+# epsilon. Anything looser lets a sliced map inflate the margin.
+DISTRIBUTION_SUM_TOLERANCE = 0.01
+_DISTRIBUTION_EPSILON = 1e-9
+
+
+def _checked_distribution(
+    frame: DecisionFrame, probabilities: object
+) -> dict[str, float]:
+    """Validate a complete unit-sum distribution over the frame candidates.
+
+    Raises malformed on missing/extra keys, non-probability values, maps
+    that do not sum to 1, or a selection contradicting the maximum.
+    """
+    expected = {c.id for c in frame.candidates}
+    if not isinstance(probabilities, dict) or set(probabilities) != expected:
+        raise DecisionError(
+            f"policy input distribution for question {frame.question_id!r} must "
+            f"cover exactly the frame candidates; got {sorted(probabilities) if isinstance(probabilities, dict) else probabilities!r}",
+            kind="malformed",
+        )
+    normalized = {
+        candidate_id: _checked_unit(value, what=f"probability for candidate {candidate_id!r}")
+        for candidate_id, value in probabilities.items()
+    }
+    total = sum(normalized.values())
+    if abs(total - 1.0) > DISTRIBUTION_SUM_TOLERANCE + _DISTRIBUTION_EPSILON:
+        raise DecisionError(
+            f"policy input distribution for question {frame.question_id!r} "
+            f"sums to {total!r}, not 1",
+            kind="malformed",
+        )
+    return normalized
 
 
 def evaluate_execution(
@@ -233,21 +268,31 @@ def evaluate_execution(
             kind="malformed",
         )
     candidate: CandidateRecord = resolve_candidate(frame, selected_id)
+    # The distribution is validated before any branch uses it — including the
+    # escape branch — so a sliced or non-unit map can never inflate a margin.
+    distribution = _checked_distribution(frame, probabilities)
+    if (
+        max(distribution.values()) - distribution[candidate.id]
+        > DISTRIBUTION_SUM_TOLERANCE + _DISTRIBUTION_EPSILON
+    ):
+        raise DecisionError(
+            f"policy input selection {candidate.id!r} contradicts its "
+            f"distribution for question {frame.question_id!r}",
+            kind="malformed",
+        )
     if is_escape_id(candidate.id):
         return PolicyVerdict(
             directive=ESCALATE,
             reason=f"escape candidate {candidate.id} defers to the open-ended AI DM path",
             decision_class=frame.decision_class,
             selected_id=candidate.id,
-            probability=_checked_unit(
-                probabilities.get(candidate.id, 0.0), what="selected probability"
-            ),
+            probability=distribution[candidate.id],
             confidence=_checked_unit(confidence, what="confidence"),
-            margin=alternative_margin(probabilities, candidate.id),
+            margin=alternative_margin(distribution, candidate.id),
         )
-    probability = _checked_unit(probabilities.get(candidate.id, 0.0), what="selected probability")
+    probability = distribution[candidate.id]
     confidence_value = _checked_unit(confidence, what="confidence")
-    margin = alternative_margin(probabilities, candidate.id)
+    margin = alternative_margin(distribution, candidate.id)
 
     # Truthiness is not verification: a truthy non-boolean such as "false"
     # must never read as a passed deterministic check.

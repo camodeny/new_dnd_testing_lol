@@ -339,14 +339,36 @@ def resolve_candidate(frame: DecisionFrame, selected_id: str) -> CandidateRecord
     )
 
 
+def _checked_revision(value: str | int, *, what: str) -> str | int:
+    """Validate a revision value with the same shape as frame revisions.
+
+    Raw equality would accept ``7.0 == 7`` or ``True == 1`` as current; a
+    malformed authoritative revision must fail closed instead.
+    """
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise DecisionError(
+            f"{what} revision {value!r} must be a non-empty string or integer",
+            kind="malformed",
+        )
+    if isinstance(value, str) and not value.strip():
+        raise DecisionError(
+            f"{what} revision must be a non-empty string or integer",
+            kind="malformed",
+        )
+    return value
+
+
 def is_stale(frame: DecisionFrame, current_revision: str | int) -> bool:
     """Whether the frame was enumerated against an older revision."""
-    return frame.state_revision != current_revision
+    return frame.state_revision != _checked_revision(
+        current_revision, what="current"
+    )
 
 
 def assert_fresh(frame: DecisionFrame, current_revision: str | int) -> None:
     """Raise :exc:`DecisionError` (stale) when the frame revision moved on."""
-    if is_stale(frame, current_revision):
+    checked = _checked_revision(current_revision, what="current")
+    if frame.state_revision != checked:
         raise DecisionError(
             f"decision frame {frame.frame_id!r} is stale: enumerated at "
             f"revision {frame.state_revision!r}, current is {current_revision!r}",
