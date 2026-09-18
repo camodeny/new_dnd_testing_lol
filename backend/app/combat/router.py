@@ -173,15 +173,21 @@ def read_turn_order(campaign_id: str, encounter_id: str, request: Request, db: S
         ordered = get_turn_order(db, encounter.id)
     except EncounterNotReadyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    order = []
+    for p in ordered:
+        # Same participant redaction as encounter_view(): another PC's
+        # roll_request_id stays with its controller (or the owner).
+        privileged = is_owner or str(p.controller_user_id or "") == str(profile.id)
+        item = p.to_dict(include_private=privileged)
+        if not privileged:
+            item.pop("roll_request_id", None)
+        order.append(item)
     return {
         "encounter_id": str(encounter.id),
         "status": encounter.status,
         "round": encounter.round,
         "active_participant_id": str(encounter.active_participant_id) if encounter.active_participant_id else None,
-        "order": [
-            p.to_dict(include_private=is_owner or str(p.controller_user_id or "") == str(profile.id))
-            for p in ordered
-        ],
+        "order": order,
     }
 
 

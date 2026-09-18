@@ -1304,6 +1304,61 @@ def test_encounter_sweep_executes_relay_published_rows_once():
         set_realtime_publisher(previous)
 
 
+def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
+    """Turn-order matches encounter_view: another PC's roll_request_id stays
+    with its controller (or the owner)."""
+    from fastapi.testclient import TestClient
+
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, _ = _start(db, ctx, [
+            {"character_id": str(ctx["owner_pc"])},
+            {"character_id": str(ctx["player_pc"])},
+        ])
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        player_p = _pc_participant(db, encounter.id, ctx["player_pc"])
+        _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+        _fulfill(db, encounter.id, player_p, ctx["player"], 9)
+        db.commit()
+        encounter_id = str(encounter.id)
+        campaign_id = str(ctx["campaign_id"])
+        owner_id, player_id = str(ctx["owner"]), str(ctx["player"])
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        as_player = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order",
+            headers={"x-test-user": player_id},
+        )
+        assert as_player.status_code == 200, as_player.text
+        by_controller = {
+            p["controller_user_id"]: p for p in as_player.json()["order"]
+        }
+        assert by_controller[player_id]["roll_request_id"]
+        assert "roll_request_id" not in by_controller[owner_id]
+        as_owner = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order",
+            headers={"x-test-user": owner_id},
+        )
+        assert as_owner.status_code == 200, as_owner.text
+        assert all("roll_request_id" in p for p in as_owner.json()["order"])
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_encounter_sweep_retries_failed_execution_after_relay():
     """Transient worker failure → relay pre-emption → due retry still swept."""
     from datetime import datetime, timedelta, timezone
