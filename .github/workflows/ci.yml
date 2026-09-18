@@ -49,6 +49,8 @@ jobs:
       POSTGRES_URL_NON_POOLING: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       FAULT_TEST_DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       NODE_ENV: "test"
+      # Issue #374: E2E scenario failure artifacts land here for CI upload.
+      E2E_DIAGNOSTICS_DIR: /tmp/e2e-diagnostics
 
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +78,7 @@ jobs:
           name: backend-test-logs
           path: |
             /tmp/pytest-backend.log
+            /tmp/e2e-diagnostics/
           if-no-files-found: ignore
           retention-days: 7
 
