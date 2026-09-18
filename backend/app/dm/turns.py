@@ -1242,6 +1242,49 @@ def commit_turn(
                     )
         except Exception as e:
             logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
+    # Link encounters started by this attempt to the authoritative turn event
+    # (issue #230): the turn commit IS the start's fictional mutation, so the
+    # encounter rides this event with no separate revision bump. The
+    # encounter.started projection is enqueued atomically in the same
+    # transaction; direct realtime delivery happens post-commit below.
+    linked_encounter_ids: list[uuid.UUID] = []
+    try:
+        from models.combat import Encounter as _Encounter
+
+        _started = db.execute(
+            select(_Encounter).where(
+                _Encounter.campaign_id == turn.campaign_id,
+                _Encounter.source_attempt_id == attempt.id,
+                _Encounter.created_event_id.is_(None),
+            )
+        ).scalars().all()
+        for _enc in _started:
+            _enc.created_event_id = event.id
+            linked_encounter_ids.append(_enc.id)
+        db.flush()
+        if _started:
+            from app.outbox.service import enqueue_outbox as _enqueue_outbox
+
+            for _enc in _started:
+                _enqueue_outbox(
+                    db,
+                    event_type="encounter.started",
+                    payload={
+                        "encounter_id": str(_enc.id),
+                        "campaign_id": str(turn.campaign_id),
+                        "thread_id": _enc.thread_id,
+                        "participant_count": int(_enc.participant_count or 0),
+                        "start_source": _enc.start_source,
+                    },
+                    aggregate_type="encounter",
+                    aggregate_id=_enc.id,
+                    campaign_id=turn.campaign_id,
+                    operation_id=f"encounter:{_enc.id}:started",
+                    commit=False,
+                )
+            db.flush()
+    except Exception as e:
+        logger.warning("dm_turn failed to link encounter start event turn_id=%s error=%s", turn.id, e)
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
@@ -1285,6 +1328,18 @@ def commit_turn(
     db.refresh(attempt)
     db.refresh(campaign_after)
     db.refresh(event)
+
+    if commit and linked_encounter_ids:
+        try:
+            from app.realtime.service import publish_encounter_started as _publish_started
+            from models.combat import Encounter as _EncounterPub
+
+            for _eid in linked_encounter_ids:
+                _row = db.get(_EncounterPub, _eid)
+                if _row is not None:
+                    _publish_started(db, _row)
+        except Exception as e:
+            logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "

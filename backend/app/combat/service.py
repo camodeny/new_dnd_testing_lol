@@ -293,7 +293,7 @@ def _validate_scene(db: Session, campaign_id: uuid.UUID, scene: dict | None) -> 
     }
 
 
-def _load_source_turn(db: Session, campaign_id: uuid.UUID, turn_id: Any, attempt_id: Any) -> DmTurn:
+def _load_source_turn(db: Session, campaign_id: uuid.UUID, turn_id: Any, attempt_id: Any) -> tuple[DmTurn, DmTurnAttempt]:
     try:
         turn_uuid = uuid.UUID(str(turn_id))
         attempt_uuid = uuid.UUID(str(attempt_id))
@@ -305,9 +305,11 @@ def _load_source_turn(db: Session, campaign_id: uuid.UUID, turn_id: Any, attempt
         raise EncounterError("source turn not found in this campaign")
     if attempt.turn_id != turn.id:
         raise EncounterError("source attempt does not belong to the source turn")
-    if turn.current_attempt_id is None:
-        raise EncounterError("source turn has no current attempt to scope initiative requests")
-    return turn
+    # Provenance must be exact: a stale attempt from the same turn is
+    # rejected rather than silently rewritten to the current attempt.
+    if turn.current_attempt_id is None or str(turn.current_attempt_id) != str(attempt.id):
+        raise EncounterError("source_attempt_id must be the turn's current attempt")
+    return turn, attempt
 
 
 # ── Reads ───────────────────────────────────────────────────────────────────
@@ -481,6 +483,7 @@ def _build_encounter_rows(
     db: Session,
     campaign: Campaign,
     turn: DmTurn,
+    attempt_id: uuid.UUID,
     *,
     operation_id: str,
     scene: dict | None,
@@ -502,7 +505,7 @@ def _build_encounter_rows(
         map_ref=scene_parts["map_ref"],
         start_source=start_source,
         source_turn_id=turn.id,
-        source_attempt_id=turn.current_attempt_id,
+        source_attempt_id=attempt_id,
         operation_id=operation_id,
         participant_count=len(resolved),
         initiated_at=_now(),
@@ -535,7 +538,7 @@ def _build_encounter_rows(
                 campaign_id=campaign.id,
                 thread_id=turn.thread_id,
                 turn_id=turn.id,
-                attempt_id=turn.current_attempt_id,
+                attempt_id=attempt_id,
                 request_key=request_key,
                 requested_user_id=item["controller_user_id"],
                 character_id=item["character_id"],
@@ -689,7 +692,7 @@ def start_encounter(
     from app.campaigns.service import require_playable_campaign
 
     require_playable_campaign(campaign)
-    turn = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
+    turn, attempt = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
 
     prior = find_by_operation(db, campaign_id, operation_id)
     if prior is not None:
@@ -707,7 +710,7 @@ def start_encounter(
 
     def _mutate(locked: Campaign) -> None:
         holder["encounter"] = _build_encounter_rows(
-            db, locked, turn, operation_id=operation_id,
+            db, locked, turn, attempt.id, operation_id=operation_id,
             scene=scene, participants=participants or [], start_source=start_source,
         )
 
@@ -801,7 +804,7 @@ def start_encounter_inline(
     if active is not None:
         raise EncounterAlreadyActiveError(campaign.id, active.id)
     encounter = _build_encounter_rows(
-        db, campaign, turn, operation_id=operation_key,
+        db, campaign, turn, attempt.id, operation_id=operation_key,
         scene=args.get("scene") if isinstance(args, dict) else None,
         participants=(args.get("participants") if isinstance(args, dict) else None) or [],
         start_source="dm_effect",

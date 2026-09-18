@@ -207,14 +207,12 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
 
 def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, payload: dict) -> tuple[PlayerRollRequest, PlayerRollFulfillment, DmTurnAttempt | None]:
     started = time.monotonic()
-    req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
-    if req is None:
-        raise RollLifecycleError("Roll request not found")
-    # Issue #230 — encounter initiative reuses the durable #204 request /
-    # fulfillment records. Encounter-linked requests resume the encounter,
-    # never the source DM turn (which may already be committed).
+    # Canonical lock order for encounter initiative is encounter-first, so
+    # linkage is detected before taking any row lock; the encounter service
+    # then owns all locking. (Linking only ever happens at encounter start
+    # on fresh requests, so an unlinked request cannot become linked here.)
     linked = db.execute(
-        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == req.id).limit(1)
+        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == request_id).limit(1)
     ).scalars().first()
     if linked is not None:
         from app.combat.service import (
@@ -225,7 +223,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
 
         participant = db.get(EncounterParticipant, linked)
         try:
-            _, fulfillment, _, _, _ = fulfill_human_initiative(
+            req_row, fulfillment, _, _, _ = fulfill_human_initiative(
                 db, participant.encounter_id, participant.id, actor_id=actor_id, payload=payload,
                 # Flush-only: the outer idempotent command owns the commit so
                 # the record, mutation, and result commit atomically.
@@ -236,8 +234,11 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         except EncounterError as exc:
             raise RollLifecycleError(str(exc)) from exc
         logger.info("player_roll encounter_initiative fulfilled request_id=%s encounter_id=%s",
-                    req.id, participant.encounter_id)
-        return req, fulfillment, None
+                    req_row.id, participant.encounter_id)
+        return req_row, fulfillment, None
+    req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
+    if req is None:
+        raise RollLifecycleError("Roll request not found")
     from app.campaigns.service import require_playable_campaign
 
     require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
@@ -289,16 +290,18 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
 
 
 def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict | None) -> tuple[PlayerRollRequest, list[PlayerRollRequest], DmTurnAttempt | None]:
-    req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
-    if req is None:
-        raise RollLifecycleError("Roll request not found")
     # Issue #230 — encounter initiative requests are owned by the encounter
     # lifecycle; cancelling one would strand its participant in pending.
+    # Checked lock-free first: linkage never changes after creation, and the
+    # error path needs no row lock.
     encounter_linked = db.execute(
-        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == req.id).limit(1)
+        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == request_id).limit(1)
     ).scalars().first()
     if encounter_linked is not None:
         raise RollLifecycleError("encounter initiative requests cannot be cancelled; resolve them through the encounter")
+    req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
+    if req is None:
+        raise RollLifecycleError("Roll request not found")
     from app.campaigns.service import require_playable_campaign
 
     require_playable_campaign(_lock_campaign_row(db, req.campaign_id))

@@ -116,10 +116,11 @@ def _fixture():
     return fac, ctx
 
 
-def _start(db, ctx, participants, *, operation_id="op-enc-1", revision=0, scene=None):
+def _start(db, ctx, participants, *, operation_id="op-enc-1", revision=0, scene=None, attempt_id=None):
     return start_encounter(
         db, ctx["campaign_id"], operation_id=operation_id, expected_revision=revision,
-        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"], source_attempt_id=ctx["attempt_id"],
+        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+        source_attempt_id=attempt_id or ctx["attempt_id"],
         scene=scene or {"location_name": "Treeline"}, participants=participants,
     )
 
@@ -586,6 +587,99 @@ def test_dm_structured_effect_starts_encounter_inline():
         db.commit()
         assert get_active_encounter(db, ctx["campaign_id"]).id == encounter.id
         assert len(list_participants(db, encounter.id)) == 2
+
+
+def test_dm_effect_turn_commit_binds_start_provenance_and_outbox():
+    """Full turn commit with a staged start_encounter binds the turn event as
+    start provenance and enqueues the encounter.started projection."""
+    from datetime import datetime, timezone
+
+    from app.dm.contract import normalize_contract
+    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
+    from models.reliability import Outbox
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        turn = db.get(DmTurn, ctx["turn_id"])
+        attempt = db.get(DmTurnAttempt, ctx["attempt_id"])
+        contract = normalize_contract({
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond",
+            "reason": "combat begins",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{"text": "Goblins attack!", "claim_kind": "observation",
+                            "origin": "dm_adjudication"}],
+            }],
+            "staged_effects": [{
+                "id": "start-enc-1", "effect_type": "start_encounter",
+                "arguments": {
+                    "participants": [
+                        {"character_id": str(ctx["owner_pc"])},
+                        {"npc_entity_id": str(ctx["goblin_id"])},
+                    ],
+                    "scene": {"location_name": "Treeline"},
+                },
+            }],
+        })
+        stage_validated_attempt(db, attempt.id, contract)
+        stream = DMStream(
+            id=uuid.uuid4(), campaign_id=turn.campaign_id,
+            thread_id=uuid.UUID(str(turn.thread_id)),
+            turn_id=str(turn.id), attempt_id=str(attempt.id),
+            status="streaming", audience=turn.audience,
+        )
+        db.add(stream)
+        db.flush()
+        text = "Goblins burst from the treeline!"
+        db.add(DMStreamChunk(
+            id=uuid.uuid4(), stream_id=stream.id, sequence=0,
+            text=text, byte_length=len(text.encode()),
+        ))
+        stream.first_chunk_at = datetime.now(timezone.utc)
+        stream.chunk_count = 1
+        db.flush()
+        mark_streaming_started(db, turn.id, attempt.id, stream.id)
+        _, _, event = commit_turn_with_effects(db, turn.id, attempt.id)
+        encounter = get_active_encounter(db, ctx["campaign_id"])
+        assert encounter is not None
+        assert encounter.start_source == "dm_effect"
+        # The turn event is the start's provenance: bound, resolvable, surfaced.
+        assert encounter.created_event_id == event.id
+        view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
+        assert view["created_event_id"] == str(event.id)
+        assert view["created_event_sequence"] == event.sequence
+        started_rows = [
+            row for row in db.execute(
+                select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
+            ).scalars().all() if row.event_type == "encounter.started"
+        ]
+        assert len(started_rows) == 1
+        assert started_rows[0].operation_id == f"encounter:{encounter.id}:started"
+
+
+def test_stale_source_attempt_id_is_rejected_not_rewritten():
+    fac, ctx = _fixture()
+    with fac() as db:
+        # A second submission supersedes the fixture attempt: it is now stale.
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
+            character_id=ctx["owner_pc"], raw_content="I draw my blade!",
+            segments=[{"type": "ic", "text": "I draw my blade!"}],
+            thread_id=ctx["thread_id"],
+        )
+        db.commit()
+        turn, fresh_attempt = coordinate_turn(db, ctx["campaign_id"], ctx["thread_id"])
+        assert fresh_attempt.id != ctx["attempt_id"]
+        with pytest.raises(EncounterError, match="current attempt"):
+            _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}],
+                   operation_id="op-stale-attempt", attempt_id=ctx["attempt_id"])
+            db.rollback()
+        # The current attempt is accepted.
+        encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}],
+                              operation_id="op-fresh-attempt", attempt_id=fresh_attempt.id)
+        assert encounter.source_attempt_id == fresh_attempt.id
 
 
 def test_contract_rejects_ambiguous_participant_selection():
