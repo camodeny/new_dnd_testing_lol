@@ -1091,3 +1091,77 @@ def fulfill_human_initiative(
 
         publish_encounter_ready(db, encounter)
     return request, fulfillment, participant, encounter, event
+
+
+# ── Queue workers (durable realtime backstop) ─────────────────────────────
+
+
+def _handle_encounter_envelope(envelope, event_type: str, db: Session | None) -> dict:
+    """Shared worker body: resolve the encounter, emit its projection.
+
+    Best-effort by design — the direct post-commit publish is the latency
+    path; this durable outbox path only backstops crashes between commit and
+    publish. Stable event ids make redelivery idempotent, and authoritative
+    state never rolls back here.
+    """
+    from database import SessionLocal
+
+    own_session = False
+    if db is None:
+        db = SessionLocal()
+        own_session = True
+    try:
+        from app.realtime.service import publish_encounter_ready, publish_encounter_started
+
+        payload = envelope.payload or {}
+        encounter = None
+        encounter_id = payload.get("encounter_id")
+        if encounter_id:
+            try:
+                encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
+            except Exception:
+                encounter = None
+        if encounter is None:
+            # API-path started rows carry the start operation_id (the
+            # encounter id is allocated inside the mutation); resolve
+            # deterministically via the idempotent start lookup.
+            operation_id = payload.get("operation_id") or getattr(envelope, "operation_id", None)
+            campaign_ref = payload.get("campaign_id") or getattr(envelope, "campaign_id", None)
+            if operation_id and campaign_ref:
+                try:
+                    encounter = find_by_operation(
+                        db, uuid.UUID(str(campaign_ref)), str(operation_id)
+                    )
+                except Exception:
+                    encounter = None
+        if encounter is None:
+            logger.warning("encounter worker unresolved %s payload=%s", event_type, payload)
+            return {"ok": False, "reason": "unknown_encounter"}
+        if event_type == ENCOUNTER_STARTED_EVENT:
+            publish_encounter_started(db, encounter)
+        else:
+            publish_encounter_ready(db, encounter)
+        return {"ok": True, "encounter_id": str(encounter.id)}
+    finally:
+        if own_session:
+            db.close()
+
+
+def handle_encounter_started(envelope, db: Session | None = None) -> dict:
+    """Worker handler for ``encounter.started`` outbox jobs."""
+    return _handle_encounter_envelope(envelope, ENCOUNTER_STARTED_EVENT, db)
+
+
+def handle_encounter_ready(envelope, db: Session | None = None) -> dict:
+    """Worker handler for ``encounter.initiative_ready`` outbox jobs."""
+    return _handle_encounter_envelope(envelope, ENCOUNTER_READY_EVENT, db)
+
+
+def register_encounter_workers() -> None:
+    from app.queue.consumer import WORKER_HANDLERS
+
+    WORKER_HANDLERS[ENCOUNTER_STARTED_EVENT] = handle_encounter_started
+    WORKER_HANDLERS[ENCOUNTER_READY_EVENT] = handle_encounter_ready
+
+
+register_encounter_workers()

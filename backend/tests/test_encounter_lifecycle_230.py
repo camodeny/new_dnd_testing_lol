@@ -776,7 +776,6 @@ def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
 
 # ── realtime hooks ──────────────────────────────────────────────────────────
 
-
 def test_realtime_hooks_emit_stable_encounter_events():
     from app.realtime.service import (
         InMemoryRealtimePublisher,
@@ -1134,3 +1133,47 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
         }
     finally:
         app.dependency_overrides.clear()
+
+
+def test_encounter_outbox_workers_publish_lifecycle():
+    """Issue #230: encounter outbox rows resolve to registered workers that
+    re-emit the thread-channel projection (durable realtime backstop)."""
+    from app.outbox.service import envelope_for_outbox
+    from app.queue.consumer import WORKER_HANDLERS, resolve_worker_handler
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from models.reliability import Outbox
+
+    fac, ctx = _fixture()
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        with fac() as db:
+            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+            owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+            _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+            db.commit()
+            rows = list(db.execute(
+                select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
+            ).scalars().all())
+            by_type = {r.event_type: r for r in rows}
+            assert ENCOUNTER_STARTED_EVENT in by_type
+            assert ENCOUNTER_READY_EVENT in by_type
+            # Only the worker path under test may publish from here on.
+            recorder.clear()
+            for event_type in (ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT):
+                env = envelope_for_outbox(by_type[event_type])
+                assert resolve_worker_handler(env) is WORKER_HANDLERS[event_type]
+                result = WORKER_HANDLERS[event_type](env, db)
+                assert result == {"ok": True, "encounter_id": str(encounter.id)}
+            started = [p for p in recorder.published if p["event"] == "encounter.started"]
+            ready = [p for p in recorder.published if p["event"] == "encounter.initiative_ready"]
+            assert len(started) == 1 and len(ready) == 1
+            assert started[0]["payload"]["event_id"] == f"encounter:{encounter.id}:started"
+            assert ready[0]["payload"]["event_id"] == f"encounter:{encounter.id}:ready"
+    finally:
+        set_realtime_publisher(previous)

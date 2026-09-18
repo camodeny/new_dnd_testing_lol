@@ -37,6 +37,7 @@ from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
 import app.adventures.service  # noqa: F401 — registers the adventure.closing worker
+import app.combat.service  # noqa: F401 — registers the encounter lifecycle workers
 from models.campaigns import Campaign
 from models.campaigns import CampaignInvite
 from models.campaigns import CampaignMember
