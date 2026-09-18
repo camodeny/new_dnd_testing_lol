@@ -1330,6 +1330,7 @@ def create_campaign_invite(campaign_id: str, request: Request, db: Session = Dep
     import uuid as _uuid
 
     from app.campaigns.invites import (
+        code_fingerprint,
         invite_url,
         normalize_email,
         owner_invite_dict,
@@ -1379,8 +1380,8 @@ def create_campaign_invite(campaign_id: str, request: Request, db: Session = Dep
             db.commit()
             db.refresh(inv)
             logger.info(
-                "campaign invite created campaign_id=%s actor_id=%s code=%s has_email=%s",
-                cid, profile.id, code, bool(intended_email),
+                "campaign invite created campaign_id=%s actor_id=%s code_hash=%s has_email=%s",
+                cid, profile.id, code_fingerprint(code), bool(intended_email),
             )
             body = owner_invite_dict(inv)
             body["invite_url"] = invite_url(code)
@@ -1408,7 +1409,7 @@ def revoke_campaign_invite(
     from datetime import datetime as _datetime
     from datetime import timezone as _timezone
 
-    from app.campaigns.invites import invite_url, normalize_code, owner_invite_dict
+    from app.campaigns.invites import code_fingerprint, invite_url, normalize_code, owner_invite_dict
 
     profile = resolve_profile(request, db)
     try:
@@ -1452,17 +1453,21 @@ def revoke_campaign_invite(
             event_type="campaign.invite_revoked",
             operation_id=operation_id or idempotency_key,
             actor_id=profile.id,
-            targets={"invite_code": clean},
-            payload_builder=lambda: {
-                "invite_code": clean,
+            # Bearer codes never enter domain-event history (member-visible):
+            # correlate by invite id instead.
+            targets_builder=lambda: {
                 "invite_id": str(_mutate.result.id) if _mutate.result is not None else None,  # type: ignore[attr-defined]
+            },
+            payload_builder=lambda: {
+                "invite_id": str(_mutate.result.id) if _mutate.result is not None else None,  # type: ignore[attr-defined]
+                "invite_status": "revoked",
             },
             mutate=_mutate,
             commit=False,
         )
         logger.info(
-            "campaign invite revoked campaign_id=%s actor_id=%s code=%s revision=%s",
-            cid, profile.id, clean, campaign_after.revision,
+            "campaign invite revoked campaign_id=%s actor_id=%s code_hash=%s revision=%s",
+            cid, profile.id, code_fingerprint(clean), campaign_after.revision,
         )
         body = owner_invite_dict(_mutate.result)  # type: ignore[attr-defined]
         body["invite_url"] = invite_url(clean)
@@ -1476,7 +1481,7 @@ def revoke_campaign_invite(
             idempotency_key=idempotency_key,
             command_type="campaign.invite.revoke",
             scope_type="campaign_invite",
-            scope_id=f"{cid}:{clean}",
+            scope_id=f"{cid}:{code_fingerprint(clean)}",
             payload=payload,
             execute=_execute,
         )
@@ -1506,6 +1511,7 @@ def send_campaign_invite_email(
     from datetime import timezone as _timezone
 
     from app.campaigns.invites import (
+        code_fingerprint,
         invite_url,
         normalize_email,
         owner_invite_dict,
@@ -1549,13 +1555,13 @@ def send_campaign_invite_email(
     db.refresh(invite)
     if sent:
         logger.info(
-            "campaign invite email sent campaign_id=%s actor_id=%s code=%s",
-            cid, profile.id, invite.code,
+            "campaign invite email sent campaign_id=%s actor_id=%s code_hash=%s",
+            cid, profile.id, code_fingerprint(invite.code),
         )
     else:
         logger.warning(
-            "campaign invite email failed campaign_id=%s actor_id=%s code=%s error=%s",
-            cid, profile.id, invite.code, error,
+            "campaign invite email failed campaign_id=%s actor_id=%s code_hash=%s error=%s",
+            cid, profile.id, code_fingerprint(invite.code), error,
         )
     body = owner_invite_dict(invite)
     body["invite_url"] = invite_url(invite.code)
@@ -1883,6 +1889,7 @@ def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
     explain without leaking anything else.
     """
     from app.campaigns.invites import (
+        code_fingerprint,
         invite_usability,
         normalize_code,
         public_invite_dict,
@@ -1894,7 +1901,7 @@ def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail="Code required")
     inv = db.execute(select(CampaignInvite).where(CampaignInvite.code == clean)).scalars().first()
     if not inv:
-        logger.info("invite lookup miss code=%s", clean)
+        logger.info("invite lookup miss code_hash=%s", code_fingerprint(clean))
         raise HTTPException(status_code=404, detail="Invite not found")
     camp = db.get(Campaign, inv.campaign_id)
     if not camp:
@@ -1904,8 +1911,8 @@ def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
         select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == camp.id)
     ) or 0
     logger.info(
-        "invite lookup code=%s campaign_id=%s usable=%s reason=%s",
-        clean, camp.id, usable, reason or "-",
+        "invite lookup code_hash=%s campaign_id=%s usable=%s reason=%s",
+        code_fingerprint(clean), camp.id, usable, reason or "-",
     )
     if not usable:
         raise HTTPException(status_code=410, detail=f"Invite is {reason}")
@@ -1920,19 +1927,19 @@ def _accept_invite(db: Session, camp: Campaign, invite: CampaignInvite, profile)
     writing a duplicate row. Enforces revocation, expiry, lobby-only lock,
     and required-player capacity in domain order.
     """
-    from app.campaigns.invites import invite_usability
+    from app.campaigns.invites import code_fingerprint, invite_usability
 
     usable, reason = invite_usability(invite)
     if not usable:
         logger.warning(
-            "campaign invite accept rejected campaign_id=%s actor_id=%s code=%s reason=%s",
-            camp.id, profile.id, invite.code, reason,
+            "campaign invite accept rejected campaign_id=%s actor_id=%s code_hash=%s reason=%s",
+            camp.id, profile.id, code_fingerprint(invite.code), reason,
         )
         raise HTTPException(status_code=410, detail=f"Invite is {reason}")
     if is_campaign_member(db, camp.id, profile.id):
         logger.info(
-            "campaign invite duplicate accept campaign_id=%s actor_id=%s code=%s",
-            camp.id, profile.id, invite.code,
+            "campaign invite duplicate accept campaign_id=%s actor_id=%s code_hash=%s",
+            camp.id, profile.id, code_fingerprint(invite.code),
         )
         return {"ok": True, "campaign": camp.to_dict(), "idempotent": True, "duplicate": True}
     if camp.status != "lobby":
@@ -1958,8 +1965,8 @@ def _accept_invite(db: Session, camp: Campaign, invite: CampaignInvite, profile)
     invite.accepted_count = int(invite.accepted_count or 0) + 1
     db.commit()
     logger.info(
-        "campaign invite accepted campaign_id=%s actor_id=%s code=%s members=%s",
-        camp.id, profile.id, invite.code, int(member_count) + 1,
+        "campaign invite accepted campaign_id=%s actor_id=%s code_hash=%s members=%s",
+        camp.id, profile.id, code_fingerprint(invite.code), int(member_count) + 1,
     )
     return {"ok": True, "campaign": camp.to_dict(), "idempotent": False, "duplicate": False}
 
@@ -2004,7 +2011,9 @@ def accept_invite_by_code(payload: dict, request: Request, db: Session = Depends
         raise HTTPException(status_code=400, detail="Invite code required")
     inv = db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first()
     if not inv:
-        logger.info("invite accept miss code=%s", code)
+        from app.campaigns.invites import code_fingerprint as _accept_fp
+
+        logger.info("invite accept miss code_hash=%s", _accept_fp(code))
         raise HTTPException(status_code=404, detail="Invite not found")
     camp = db.execute(
         select(Campaign).where(Campaign.id == inv.campaign_id).with_for_update()

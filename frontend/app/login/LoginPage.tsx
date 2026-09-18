@@ -17,6 +17,23 @@ function safeNextPath(raw: string | null): string | null {
   return raw
 }
 
+export const PENDING_INVITE_KEY = 'pendingInviteCode'
+
+// Invite continuation derived from the rendered location (#242): AppShell
+// renders LoginPage directly at /invite/:code for signed-out recipients,
+// so there is no ?next= in that path — the pathname itself is the context.
+export function inviteContinuation(): { next: string; code: string } | null {
+  if (typeof window === 'undefined') return null
+  const fromParam = safeNextPath(new URLSearchParams(window.location.search).get('next'))
+  if (fromParam) {
+    const match = /^\/invite\/([A-Za-z0-9_-]{1,20})\/?$/.exec(fromParam)
+    return { next: fromParam, code: (match?.[1] ?? '').toUpperCase() || '' }
+  }
+  const match = /^\/invite\/([A-Za-z0-9_-]{1,20})\/?$/.exec(window.location.pathname)
+  if (!match) return null
+  return { next: `/invite/${match[1].toUpperCase()}`, code: match[1].toUpperCase() }
+}
+
 export default function LoginPage({ onLogin }: LoginPageProps) {
   const router = useRouter()
   const [isRegistering, setIsRegistering] = useState(false)
@@ -30,7 +47,15 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const authError = params.get('auth_error')
-    setInviteNext(safeNextPath(params.get('next')))
+    const continuation = inviteContinuation()
+    setInviteNext(continuation?.next ?? null)
+    // Persist the pending invite so a later auth-confirmation landing can
+    // resume it even if the redirect chain drops the path.
+    if (continuation?.code) {
+      try {
+        localStorage.setItem(PENDING_INVITE_KEY, continuation.code)
+      } catch { /* no-op */ }
+    }
     if (authError) {
       setError(authError)
       params.delete('auth_error')
@@ -47,11 +72,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     setLoading(true)
 
     // Invite-aware onboarding (#242): recipients parked here by
-    // /invite/:code continue to the same invite after signing in/up.
-    const next = safeNextPath(new URLSearchParams(window.location.search).get('next'))
+    // /invite/:code — or rendered here directly by AppShell — continue to
+    // the same invite after signing in/up.
+    const continuation = inviteContinuation()
     const continueAfterLogin = (user: User) => {
       onLogin(user)
-      if (next) router.push(next)
+      if (continuation?.next) router.push(continuation.next)
     }
 
     try {
@@ -65,7 +91,14 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           const { data, error } = await supabase.auth.signUp({
             email: emailVal,
             password,
-            options: { data: { username: username.trim() || emailVal.split('@')[0] } },
+            options: {
+              data: { username: username.trim() || emailVal.split('@')[0] },
+              // Confirmation emails return to the invite itself so a
+              // new-account signup never loses its table.
+              ...(continuation?.next
+                ? { emailRedirectTo: `${window.location.origin}${continuation.next}` }
+                : {}),
+            },
           })
           if (error) throw error
           // If email confirmation is on, user needs to confirm before signing in

@@ -49,6 +49,18 @@ def normalize_code(raw) -> str:
     return str(raw or "").strip().upper()
 
 
+def code_fingerprint(code: str) -> str:
+    """One-way short fingerprint for log correlation — issue #242.
+
+    Invite codes are bearer credentials, so they never appear verbatim in
+    logs; use this truncated SHA-256 hex where an unknown-code lookup (or a
+    lifecycle transition) needs correlation without the secret.
+    """
+    import hashlib
+
+    return hashlib.sha256(normalize_code(code).encode()).hexdigest()[:12]
+
+
 def normalize_email(raw) -> str | None:
     if raw is None:
         return None
@@ -268,21 +280,21 @@ def send_invite_email(*, to_email: str, campaign_name: str, code: str,
             _send_via_sendgrid(to_email=to_email, subject=subject, body=body, from_addr=from_addr)
         elif provider in ("log", "disabled", ""):
             logger.info(
-                "invite email skipped provider=%s to_hash=%s campaign=%s code=%s",
-                provider, _addr_hash(to_email), campaign_name, normalize_code(code),
+                "invite email skipped provider=%s to_hash=%s campaign=%s code_hash=%s",
+                provider, _addr_hash(to_email), campaign_name, code_fingerprint(code),
             )
             return False, f"email provider '{provider or 'log'}' does not send mail"
         else:
             return False, f"unknown email provider '{provider}'"
     except Exception as exc:  # noqa: BLE001 — delivery failure is data, not a crash
         logger.warning(
-            "invite email delivery failed provider=%s to_hash=%s code=%s error=%s",
-            provider, _addr_hash(to_email), normalize_code(code), type(exc).__name__,
+            "invite email delivery failed provider=%s to_hash=%s code_hash=%s error=%s",
+            provider, _addr_hash(to_email), code_fingerprint(code), type(exc).__name__,
         )
         return False, str(exc) or type(exc).__name__
     logger.info(
-        "invite email delivered provider=%s to_hash=%s code=%s",
-        provider, _addr_hash(to_email), normalize_code(code),
+        "invite email delivered provider=%s to_hash=%s code_hash=%s",
+        provider, _addr_hash(to_email), code_fingerprint(code),
     )
     return True, None
 
