@@ -1,7 +1,9 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
 import { supabase, isSupabaseConfigured } from '@/lib/supabase'
+import { inviteContinuation, storePendingInvite } from '@/lib/pendingInvite'
 import type { User } from '@/types'
 import './login.css'
 
@@ -9,7 +11,15 @@ interface LoginPageProps {
   onLogin: (user: User) => void
 }
 
+function safeNextPath(raw: string | null): string | null {
+  if (!raw) return null
+  // Only same-origin absolute paths continue — never open-redirect.
+  if (!raw.startsWith('/') || raw.startsWith('//')) return null
+  return raw
+}
+
 export default function LoginPage({ onLogin }: LoginPageProps) {
+  const router = useRouter()
   const [isRegistering, setIsRegistering] = useState(false)
   const [username, setUsername] = useState('')
   const [email, setEmail] = useState('')
@@ -17,9 +27,15 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const [error, setError] = useState('')
   const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
+  const [inviteNext, setInviteNext] = useState<string | null>(null)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const authError = params.get('auth_error')
+    const continuation = inviteContinuation()
+    setInviteNext(continuation?.next ?? null)
+    // Persist the pending invite so a later auth-confirmation landing can
+    // resume it even if the redirect chain drops the path.
+    if (continuation?.code) storePendingInvite(continuation.code)
     if (authError) {
       setError(authError)
       params.delete('auth_error')
@@ -35,6 +51,15 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     setSuccess('')
     setLoading(true)
 
+    // Invite-aware onboarding (#242): recipients parked here by
+    // /invite/:code — or rendered here directly by AppShell — continue to
+    // the same invite after signing in/up.
+    const continuation = inviteContinuation()
+    const continueAfterLogin = (user: User) => {
+      onLogin(user)
+      if (continuation?.next) router.push(continuation.next)
+    }
+
     try {
       if (isSupabaseConfigured()) {
         // Supabase Auth path — email is required for Supabase; username is stored in user_metadata
@@ -46,7 +71,14 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           const { data, error } = await supabase.auth.signUp({
             email: emailVal,
             password,
-            options: { data: { username: username.trim() || emailVal.split('@')[0] } },
+            options: {
+              data: { username: username.trim() || emailVal.split('@')[0] },
+              // Confirmation emails return to the invite itself so a
+              // new-account signup never loses its table.
+              ...(continuation?.next
+                ? { emailRedirectTo: `${window.location.origin}${continuation.next}` }
+                : {}),
+            },
           })
           if (error) throw error
           // If email confirmation is on, user needs to confirm before signing in
@@ -61,7 +93,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           const u = supaUser
             ? { id: supaUser.id as unknown as number, username: username.trim() || supaUser.email?.split('@')[0] || 'adventurer', email: supaUser.email ?? emailVal }
             : { id: 0 as unknown as number, username: username.trim(), email: emailVal }
-          onLogin(u as unknown as User)
+          continueAfterLogin(u as unknown as User)
         } else {
           const emailLogin = username.includes('@') ? username.trim() : email.trim() || username.trim()
           // Try email login; Supabase requires email
@@ -74,7 +106,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             localStorage.setItem('token', data.session.access_token)
           }
           const u = data.user!
-          onLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? u.email?.split('@')[0] ?? username, email: u.email ?? undefined } as unknown as User)
+          continueAfterLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? u.email?.split('@')[0] ?? username, email: u.email ?? undefined } as unknown as User)
         }
       } else {
         throw new Error('Authentication is not configured. Set the public Supabase URL and key.')
@@ -120,6 +152,11 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 ? 'Create an account and take your seat.'
                 : 'Sign in to return to your campaigns.'}
           </p>
+          {inviteNext?.startsWith('/invite/') && !success && (
+            <p className="login-subtitle" role="note" style={{ marginTop: 8 }}>
+              You&apos;re accepting a campaign invite — after signing in you&apos;ll continue straight to the lobby.
+            </p>
+          )}
 
           {success ? (
             <div className="success-message" role="status" aria-live="polite">

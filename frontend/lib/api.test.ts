@@ -135,14 +135,17 @@ describe('exported API surface', () => {
       'update',
     ])
     expect(Object.keys(api.campaignMembers).sort()).toEqual([
+      'acceptInvite',
       'createInvite',
-      'getInvite',
       'getLobby',
       'joinCampaign',
       'listCharacters',
+      'listInvites',
       'listMembers',
       'lookupInvite',
+      'revokeInvite',
       'selectCharacter',
+      'sendInviteEmail',
       'setReadiness',
     ])
     expect(Object.keys(api.gameplayThreads).sort()).toEqual([

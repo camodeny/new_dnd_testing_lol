@@ -183,7 +183,7 @@ export const campaignMembers = {
   listMembers: (campaignId: string | number) =>
     apiFetch<{ members: import('@/types').CampaignMember[] }>(`/campaigns/${campaignId}/members`),
   getLobby: (campaignId: string | number) =>
-    apiFetch<{ campaign: import('@/types').Campaign; members: import('@/types').CampaignMember[]; eligibility: import('@/types').LobbyEligibility; launch_locked: boolean }>(`/campaigns/${campaignId}/lobby`),
+    apiFetch<{ campaign: import('@/types').Campaign; members: import('@/types').CampaignMember[]; eligibility: import('@/types').LobbyEligibility; launch_locked: boolean; invites?: import('@/types').CampaignInvite[]; outstanding_invites?: number }>(`/campaigns/${campaignId}/lobby`),
   selectCharacter: (campaignId: string | number, expectedRevision: number, characterId: string, idempotencyKey: string) =>
     apiFetch(`/campaigns/${campaignId}/members/me/character`, {
       method: 'PUT',
@@ -196,12 +196,35 @@ export const campaignMembers = {
       body: JSON.stringify({ expected_revision: expectedRevision, ready }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
-  createInvite: (campaignId: string | number) =>
-    apiFetch<{ code: string }>(`/campaigns/${campaignId}/invites`, { method: 'POST' }),
-  getInvite: (campaignId: string | number) =>
-    apiFetch<{ code?: string }>(`/campaigns/${campaignId}/invites`),
+  // Lobby invitations — issue #242. Canonical multi-invite flow: owners
+  // create/list/revoke invites (each with its own code + shareable
+  // `/invite/:code` URL); recipients look up minimal safe metadata and
+  // accept idempotently; email delivery is optional with link/code fallback.
+  createInvite: (campaignId: string | number, options?: { intended_email?: string; recipient_label?: string; expires_in_hours?: number; expires_at?: string }) =>
+    apiFetch<{ code: string; invite_url: string; invite_url_path: string }>(`/campaigns/${campaignId}/invites`, {
+      method: 'POST',
+      body: JSON.stringify(options ?? {}),
+    }),
+  listInvites: (campaignId: string | number) =>
+    apiFetch<{ invites: import('@/types').CampaignInvite[] }>(`/campaigns/${campaignId}/invites`),
+  revokeInvite: (campaignId: string | number, code: string, expectedRevision: number, idempotencyKey: string) =>
+    apiFetch(`/campaigns/${campaignId}/invites/${encodeURIComponent(code)}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+  sendInviteEmail: (campaignId: string | number, code: string, email: string) =>
+    apiFetch(`/campaigns/${campaignId}/invites/${encodeURIComponent(code)}/email`, {
+      method: 'POST',
+      body: JSON.stringify({ to_email: email }),
+    }),
   lookupInvite: (code: string) =>
-    apiFetch<{ campaign: import('@/types').Campaign; campaign_id?: string }>(`/invites/lookup?code=${encodeURIComponent(code)}`),
+    apiFetch<import('@/types').InviteLookup>(`/invites/lookup?code=${encodeURIComponent(code)}`),
+  acceptInvite: (code: string) =>
+    apiFetch<{ ok: boolean; campaign_id: string; campaign: import('@/types').Campaign; duplicate?: boolean }>(`/invites/accept`, {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    }),
   joinCampaign: (campaignId: string | number, code: string) =>
     apiFetch(`/campaigns/${campaignId}/join`, {
       method: 'POST',

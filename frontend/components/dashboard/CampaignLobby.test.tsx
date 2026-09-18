@@ -8,7 +8,8 @@ import type { Campaign, User } from '@/types'
 
 vi.mock('@/lib/api', () => ({
   campaignMembers: {
-    getLobby: vi.fn(), listMembers: vi.fn(), getInvite: vi.fn(),
+    getLobby: vi.fn(), listMembers: vi.fn(), listInvites: vi.fn(), createInvite: vi.fn(),
+    revokeInvite: vi.fn(), sendInviteEmail: vi.fn(),
     setReadiness: vi.fn(), selectCharacter: vi.fn(),
   },
   campaigns: { transitionLifecycle: vi.fn() },
@@ -37,7 +38,7 @@ beforeEach(() => {
     eligibility: { eligible: remoteReady, blockers: remoteReady ? [] : ['Friend not ready'] },
     launch_locked: false,
   }))
-  vi.mocked(campaignMembers.getInvite).mockResolvedValue({ code: 'invite' })
+  vi.mocked(campaignMembers.listInvites).mockResolvedValue({ invites: [] })
   vi.mocked(characters.list).mockResolvedValue({ characters: [] })
   container = document.createElement('div')
   document.body.appendChild(container)
@@ -90,6 +91,32 @@ describe('authoritative lobby synchronization', () => {
     expect(container.textContent).toContain('Revision conflict')
     await act(async () => button('Mark ready').click())
     expect(campaignMembers.setReadiness).toHaveBeenLastCalledWith('campaign', 2, true, expect.any(String))
+  })
+
+  it('hides bearer invite links from non-owners', async () => {
+    vi.mocked(campaignMembers.getLobby).mockResolvedValueOnce({
+      campaign: { id: 'campaign', revision: 0 } as Campaign,
+      members: [
+        { user_id: 'owner', role: 'owner', username: 'Owner', is_ready: false },
+      ],
+      eligibility: { eligible: false, blockers: [] },
+      launch_locked: false,
+      invites: [
+        {
+          id: 'inv-1', campaign_id: 'campaign', status: 'active', usable: true,
+          recipient_label: 'Sam', intended_email_hint: 'f***@example.com',
+        },
+      ],
+      outstanding_invites: 1,
+    })
+    await act(async () => root.render(<CampaignLobby
+      campaign={{ id: 'campaign', name: 'Table', revision: 0 } as Campaign}
+      currentUser={{ id: 'friend' } as User} isOwner={false} onBegin={onBegin}
+    />))
+    // Outstanding invitee is visible; the bearer link never is.
+    expect(container.textContent).toContain('Sam')
+    expect(container.textContent).toContain('1 outstanding')
+    expect(container.textContent).not.toContain('/invite/')
   })
 
   it('keeps the lobby open when the lifecycle transition fails', async () => {

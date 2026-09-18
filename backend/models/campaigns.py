@@ -135,10 +135,41 @@ class CampaignMember(Base):
 
 
 class CampaignInvite(Base):
+    """Shareable lobby invitation — issue #242.
+
+    One row per invite (a campaign may have many outstanding invites). Each
+    row carries its own code/link, optional intended recipient metadata,
+    creator, lifecycle status, and optional expiry. Revocation is a status
+    flip (row preserved for observability), never a delete.
+
+    Status is ``active`` or ``revoked``; expiry is derived from
+    ``expires_at`` (no background sweeper — reads treat a past ``expires_at``
+    as expired). ``accepted_count`` counts successful membership creations
+    through this invite for observability; membership rows stay idempotent
+    per (campaign, user) regardless of retries.
+    """
+
     __tablename__ = "campaign_invites"
-    campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True)
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
     code: Mapped[str] = mapped_column(String(20), nullable=False, unique=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    intended_email: Mapped[str | None] = mapped_column(String(320), nullable=True)
+    recipient_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
+    accepted_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_delivery_status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    last_delivery_error: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    last_delivery_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
 
 class Adventure(Base):

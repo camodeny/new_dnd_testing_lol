@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import { campaigns as campaignsApi, campaignMembers } from '@/lib/api'
+import { recoverPendingInviteTarget } from '@/lib/pendingInvite'
 import LandingPage from '@/components/landing/LandingPage'
 import CampaignCard from '@/components/campaign/CampaignCard'
 import CampaignForm from '@/components/campaign/CampaignForm'
@@ -42,6 +43,17 @@ export default function HomePage() {
   const [campaignToDelete, setCampaignToDelete] = useState<Campaign | null>(null)
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+
+  useEffect(() => {
+    // Pending-invite recovery (#242): an email-confirmation redirect may
+    // land an authenticated recipient at / instead of /invite/:code — the
+    // stored code routes them back. Runs once per sign-in, never hijacks
+    // ordinary logins (no stored code → no-op).
+    if (user) {
+      const target = recoverPendingInviteTarget(window.location.pathname)
+      if (target) router.replace(target)
+    }
+  }, [user, router])
 
   useEffect(() => {
     if (!user) {
@@ -134,7 +146,9 @@ export default function HomePage() {
     try {
       const data = await campaignMembers.lookupInvite(clean)
       setActiveModal(null)
-      router.push(`/join/${(data as { campaign_id?: string }).campaign_id ?? ''}?code=${encodeURIComponent(clean.toUpperCase())}`)
+      // Canonical shareable flow (#242): the invite page re-verifies,
+      // preserves context across auth, and routes into the lobby.
+      router.push(`/invite/${encodeURIComponent((data as { code?: string }).code ?? clean.toUpperCase())}`)
     } catch (err) {
       setJoinError((err as Error).message || 'Failed to locate campaign. Check your code and try again.')
     } finally {

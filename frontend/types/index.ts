@@ -84,6 +84,43 @@ export interface LobbyEligibility {
   blockers: string[]
 }
 
+// Lobby invitations — issue #242. Owner list entries carry the full
+// record; lobby projections mask emails for non-owners; lookup returns
+// only the minimal safe pre-membership metadata.
+export interface CampaignInvite {
+  id?: string
+  campaign_id: string
+  // Bearer credential — present in owner views only; lobby projections for
+  // non-owners omit it (see lobby_invite_projection).
+  code?: string
+  invite_url?: string
+  invite_url_path?: string
+  status: 'active' | 'revoked'
+  usable?: boolean
+  intended_email?: string | null
+  intended_email_hint?: string | null
+  recipient_label?: string | null
+  expires_at?: string | null
+  revoked_at?: string | null
+  accepted_count?: number
+  last_delivery_status?: string | null
+  last_delivery_error?: string | null
+  created_at?: string | null
+}
+
+export interface InviteLookup {
+  code: string
+  campaign_id: string
+  campaign_name: string
+  campaign_status: string
+  required_players: number
+  member_count: number
+  seats_remaining: number
+  usable: boolean
+  unusable_reason?: string | null
+  expires_at?: string | null
+}
+
 export interface CampaignThreadMember {
   thread_id: string
   user_id: string
