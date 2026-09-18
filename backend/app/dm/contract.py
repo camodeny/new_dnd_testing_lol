@@ -280,6 +280,7 @@ STAGED_EFFECT_TYPES = (
     "assert_fact",
     "upsert_relation",
     "complete_adventure",
+    "start_encounter",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -361,12 +362,60 @@ class CompleteAdventureArgs(StrictModel):
     public_summary: str | None = Field(default=None, max_length=2000, description="Player-visible summary")
     idempotency_key: str | None = Field(default=None, max_length=128)
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs
+class EncounterParticipantSelector(StrictModel):
+    """One explicitly selected combatant — issue #230.
+
+    Exactly one of character_id (canonical PC) or npc_entity_id (canonical
+    NPC/monster world entity). The DM selects only fictionally relevant
+    participants; unlisted PCs are never auto-included. Stat resolution is
+    server-side (sheet mechanics for PCs, entity details for NPCs); the
+    optional NPC initiative_modifier override is a DM selection input, not a
+    human roll.
+    """
+    character_id: str | int | None = None
+    npc_entity_id: str | int | None = None
+    display_name: str | None = Field(default=None, max_length=160)
+    initiative_modifier: int | None = Field(default=None, ge=-20, le=20)
+
+    @model_validator(mode="after")
+    def _exactly_one_identity(self) -> "EncounterParticipantSelector":
+        if bool(self.character_id) == bool(self.npc_entity_id):
+            raise ValueError("participant must specify exactly one of character_id or npc_entity_id")
+        return self
+
+
+class StartEncounterArgs(StrictModel):
+    """DM-declared encounter start — issue #230.
+
+    Combat begins when the DM decides initiative is useful. Participants are
+    explicit; human PCs roll their own initiative via #204 records and
+    NPC/monster initiative rolls on the DM/runtime path.
+    """
+    participants: list[EncounterParticipantSelector] = Field(min_length=1, max_length=20)
+    scene: dict[str, Any] | None = Field(default=None, description="Optional scene/map links: location_entity_id, location_name, map_ref")
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("scene", mode="before")
+    @classmethod
+    def _validate_scene(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("scene must be an object")
+        allowed = {"location_entity_id", "location_name", "map_ref"}
+        for key in v:
+            if key not in allowed:
+                raise ValueError(f"scene key {key!r} is not supported (location_entity_id, location_name, map_ref)")
+        return v
+
+
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs
+
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -412,6 +461,8 @@ class StagedEffect(StrictModel):
                 UpsertRelationArgs.model_validate(args)
             elif t == "complete_adventure":
                 CompleteAdventureArgs.model_validate(args)
+            elif t == "start_encounter":
+                StartEncounterArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation

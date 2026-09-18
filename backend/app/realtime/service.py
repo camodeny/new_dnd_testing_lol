@@ -180,6 +180,43 @@ def build_revision_event(campaign: Campaign, *, thread_id: uuid.UUID | str | Non
     }
 
 
+def build_encounter_started_event(encounter, *, revision: int | None = None) -> dict[str, Any]:
+    """Projection for ``encounter.started`` — issue #230."""
+    return {
+        "type": "encounter.started",
+        "event_id": f"encounter:{encounter.id}:started",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "revision": int(revision) if revision is not None else None,
+        "participant_count": int(encounter.participant_count or 0),
+        "start_source": encounter.start_source,
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:started",
+    }
+
+
+def build_encounter_ready_event(encounter, *, revision: int | None = None) -> dict[str, Any]:
+    """Projection for ``encounter.initiative_ready`` — issue #230."""
+    return {
+        "type": "encounter.initiative_ready",
+        "event_id": f"encounter:{encounter.id}:ready",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "round": int(encounter.round or 1),
+        "revision": int(revision) if revision is not None else None,
+        "turn_order_ids": [str(pid) for pid in (encounter.turn_order_ids or [])],
+        "active_participant_id": str(encounter.active_participant_id) if encounter.active_participant_id else None,
+        "tie_resolution": encounter.tie_resolution,
+        "time_to_first_turn_ms": encounter.time_to_first_turn_ms,
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:ready",
+    }
+
+
 # ── publisher abstraction ───────────────────────────────────────────────────
 
 class RealtimePublisher:
@@ -386,6 +423,50 @@ def publish_revision(
     except Exception as exc:
         _inc("publish_failures")
         logger.warning("publish_revision failed campaign_id=%s error=%s", campaign.id, exc)
+        return False
+
+
+def _publish_encounter_event(db: Session, encounter, payload: dict[str, Any]) -> bool:
+    """Best-effort encounter projection to the source-turn thread channel.
+
+    Call AFTER db.commit() — failure leaves authoritative state intact.
+    Audience safety: payloads carry turn order + display names only; hidden
+    NPC stat breakdowns never enter realtime payloads (members converge via
+    the privacy-filtered snapshot).
+    """
+    try:
+        channel = live_table_channel(encounter.campaign_id, encounter.thread_id)
+        payload["channel"] = channel
+        return _publish_best_effort(channel, payload["type"], payload)
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning(
+            "publish_encounter failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc
+        )
+        return False
+
+
+def publish_encounter_started(db: Session, encounter) -> bool:
+    """Publish the encounter.started projection (best-effort, post-commit)."""
+    try:
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(db, encounter, build_encounter_started_event(encounter, revision=revision))
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_started failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
+        return False
+
+
+def publish_encounter_ready(db: Session, encounter) -> bool:
+    """Publish the encounter.initiative_ready projection (best-effort, post-commit)."""
+    try:
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(db, encounter, build_encounter_ready_event(encounter, revision=revision))
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_ready failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
 

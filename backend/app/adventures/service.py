@@ -113,6 +113,24 @@ def redact_private_effect_arguments(staged_effects: list | None) -> list:
             continue
         private = PRIVATE_EFFECT_ARGUMENTS.get(eff.get("effect_type"))
         args = eff.get("arguments")
+        # Issue #230: NPC initiative_modifier overrides are DM-only mechanics
+        # inputs. Persisted staged start_encounter effects must not leak them
+        # to non-owner members even though the encounter projection redacts.
+        if eff.get("effect_type") == "start_encounter" and isinstance(args, dict):
+            eff = dict(eff)
+            args = dict(args)
+            participants = args.get("participants")
+            if isinstance(participants, list):
+                args["participants"] = [
+                    {k: v for k, v in p.items() if k != "initiative_modifier"}
+                    if isinstance(p, dict) else p
+                    for p in participants
+                ]
+            if private:
+                args = {k: v for k, v in args.items() if k not in private}
+            eff["arguments"] = args
+            redacted.append(eff)
+            continue
         if not private or not isinstance(args, dict):
             redacted.append(eff)
             continue
