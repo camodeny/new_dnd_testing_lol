@@ -414,37 +414,6 @@ class WorldKnowledge(Base):
         }
 
 
-class WorldKnowledgeIdempotency(Base):
-    """Durable record of every idempotency key ever consumed by a knowledge
-    mutation — issue #211 follow-up.
-
-    One mutable WorldKnowledge row can only carry its latest key, so update
-    (re-assertion) keys are recorded here. Retries hit this ledger first and
-    return the current row without re-mutating, re-bumping the campaign
-    revision, or emitting a duplicate domain event.
-    """
-
-    __tablename__ = "world_knowledge_idempotency"
-    __table_args__ = (
-        UniqueConstraint(
-            "campaign_id", "idempotency_key",
-            name="uq_world_knowledge_idempotency_campaign_key",
-        ),
-        Index("ix_world_knowledge_idempotency_row", "campaign_id", "knowledge_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    campaign_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
-    )
-    knowledge_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("world_knowledge.id", ondelete="CASCADE"), nullable=False,
-    )
-    idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
-    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
-
 class WorldVisibilityGrant(Base):
     """Arbitrary-subset human disclosure grant — issue #211.
 

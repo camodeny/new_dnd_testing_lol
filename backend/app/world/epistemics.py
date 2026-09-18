@@ -53,7 +53,6 @@ from models.world import (
     WorldEntity,
     WorldFact,
     WorldKnowledge,
-    WorldKnowledgeIdempotency,
     WorldRelation,
     WorldVisibilityGrant,
 )
@@ -248,57 +247,22 @@ def _record_visibility(record: Any) -> str | None:
 def _find_knowledge_by_idempotency(
     db: Session, campaign_id: uuid.UUID, key: str | None
 ) -> WorldKnowledge | None:
+    """Single-key idempotency precheck on the live row (same pattern as #210).
+
+    Fresh-key re-assertion of the same (subject, target) is a legitimate
+    update (new revision + event); same-key retry returns the row without
+    re-mutating. Historical-key tracking lives in the central
+    command-idempotency boundary when callers need it — not in a
+    world-specific ledger.
+    """
     if not key:
         return None
-    direct = db.execute(
+    return db.execute(
         select(WorldKnowledge).where(
             WorldKnowledge.campaign_id == campaign_id,
             WorldKnowledge.idempotency_key == key,
         )
     ).scalars().first()
-    if direct is not None:
-        return direct
-    # Update-path keys live in the durable ledger: the live row only carries
-    # its latest key, so a retry of a superseded update key resolves here and
-    # returns the current row without re-mutating.
-    hist = db.execute(
-        select(WorldKnowledgeIdempotency).where(
-            WorldKnowledgeIdempotency.campaign_id == campaign_id,
-            WorldKnowledgeIdempotency.idempotency_key == key,
-        )
-    ).scalars().first()
-    if hist is None:
-        return None
-    row = db.get(WorldKnowledge, hist.knowledge_id)
-    if row is None or row.campaign_id != campaign_id:
-        return None
-    return row
-
-
-def _record_knowledge_idempotency(
-    db: Session, campaign_id: uuid.UUID, knowledge_id: uuid.UUID,
-    key: str | None, operation_id: str | None = None,
-) -> None:
-    """Remember that key K was consumed by knowledge row R (create or update).
-
-    Check-then-insert matches the existing precheck style; the unique
-    constraint on (campaign_id, idempotency_key) is the final arbiter.
-    """
-    if not key:
-        return
-    exists = db.execute(
-        select(WorldKnowledgeIdempotency.id).where(
-            WorldKnowledgeIdempotency.campaign_id == campaign_id,
-            WorldKnowledgeIdempotency.idempotency_key == key,
-        ).limit(1)
-    ).scalars().first()
-    if exists is not None:
-        return
-    db.add(WorldKnowledgeIdempotency(
-        id=uuid.uuid4(), campaign_id=campaign_id, knowledge_id=knowledge_id,
-        idempotency_key=key, operation_id=operation_id,
-    ))
-    db.flush()
 
 
 def _find_current_knowledge(
@@ -371,7 +335,9 @@ def assert_knowledge_inline(
             )
             return dup, False
     # Re-assertion path: validate the effective row first, then mutate — the
-    # truth tables are never written here by construction.
+    # truth tables are never written here by construction. All source
+    # references validate BEFORE any write so a failed assertion leaves both
+    # the prior knowledge row and the underlying truth untouched.
     current = _find_current_knowledge(db, campaign.id, subject.id, kind, tid)
     source = validate_acquisition_source(acquisition_source)
     prov = _normalize_mapping(provenance, field="provenance")
@@ -379,6 +345,11 @@ def assert_knowledge_inline(
         prov = {**prov, "acquisition_source": source}
     det = dict(details or {})
     op = (str(operation_id)[:128] if operation_id else None)
+    # Coerce explicitly supplied source refs up front (None = not supplied,
+    # leave the stored value alone on re-assertion).
+    new_source_turn = _coerce_optional_uuid(source_turn_id) if source_turn_id is not None else None
+    new_source_attempt = _coerce_optional_uuid(source_attempt_id) if source_attempt_id is not None else None
+    new_source_event = _coerce_optional_uuid(source_event_id) if source_event_id is not None else None
 
     if current is not None:
         current.subject_kind = skind
@@ -388,11 +359,16 @@ def assert_knowledge_inline(
         current.provenance = {**(current.provenance or {}), **prov}
         if details is not None:
             current.details = det
+        if source_turn_id is not None:
+            current.source_turn_id = new_source_turn
+        if source_attempt_id is not None:
+            current.source_attempt_id = new_source_attempt
+        if source_event_id is not None:
+            current.source_event_id = new_source_event
         if op:
             current.operation_id = op
         if key and not current.idempotency_key:
             current.idempotency_key = key
-        _record_knowledge_idempotency(db, campaign.id, current.id, key, op)
         db.flush()
         structured_log(
             logger, logging.INFO, "world_knowledge_updated",
@@ -411,14 +387,13 @@ def assert_knowledge_inline(
         target_entity_id=tid if kind == "entity" else None,
         knowledge_state=state, acquisition_source=source,
         visibility=vis, provenance=prov, details=det,
-        source_turn_id=_coerce_optional_uuid(source_turn_id),
-        source_attempt_id=_coerce_optional_uuid(source_attempt_id),
-        source_event_id=_coerce_optional_uuid(source_event_id),
+        source_turn_id=new_source_turn,
+        source_attempt_id=new_source_attempt,
+        source_event_id=new_source_event,
         operation_id=op, idempotency_key=key,
     )
     db.add(row)
     db.flush()
-    _record_knowledge_idempotency(db, campaign.id, row.id, key, op)
     structured_log(
         logger, logging.INFO, "world_knowledge_asserted",
         campaign_id=str(campaign.id), knowledge_id=str(row.id),

@@ -33,7 +33,7 @@ from app.world.knowledge import create_fact_authoritative, create_relation_autho
 from app.world.service import create_entity_authoritative  # noqa: E402
 from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
-from models.world import WorldKnowledge, WorldKnowledgeIdempotency, WorldVisibilityGrant  # noqa: E402
+from models.world import WorldKnowledge, WorldVisibilityGrant  # noqa: E402
 
 
 def _engine():
@@ -461,9 +461,9 @@ def test_hidden_subject_never_disclosed_through_projections():
     assert [k["subject_entity_id"] for k in owner_who["knowers"]] == [str(shade.id)]
 
 
-# ── Re-assertion retry is idempotent (no revision bump, no second event) ────
+# ── Re-assertion updates source provenance; same-key retry is idempotent ───
 
-def test_reassertion_retry_is_idempotent_without_second_event():
+def test_reassertion_updates_provenance_and_same_key_retry_is_idempotent():
     Fac, camp, owner, *_ = _setup()
     db = Fac()
     _, _, aria, _, _ = _entities(db, camp, 0)
@@ -472,39 +472,46 @@ def test_reassertion_retry_is_idempotent_without_second_event():
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-cellar-truth",
     )
+    turn_a, turn_b = uuid.uuid4(), uuid.uuid4()
     rev0 = int(db.get(Campaign, camp.id).revision)
     row_a, ev_a = assert_knowledge_authoritative(
         db, camp.id, rev0,
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="suspects", acquisition_source="heard_it",
-        visibility="campaign",
+        visibility="campaign", source_turn_id=turn_a,
         operation_id="op-k-a", idempotency_key="idem-key-a",
     )
     assert ev_a is not None
+    assert row_a.source_turn_id == turn_a
     rev1 = int(db.get(Campaign, camp.id).revision)
     assert rev1 == rev0 + 1
-    # Legitimate re-assertion of the same (subject, target) under a new key.
+    # Legitimate re-assertion of the same (subject, target) under a new key
+    # is an update: new state + new source provenance, new revision + event.
     row_b, ev_b = assert_knowledge_authoritative(
         db, camp.id, rev1,
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="saw_it",
-        visibility="campaign",
+        visibility="campaign", source_turn_id=turn_b,
         operation_id="op-k-b", idempotency_key="idem-key-b",
     )
     assert row_b.id == row_a.id and ev_b is not None
     assert row_b.knowledge_state == "knows"
+    assert row_b.source_turn_id == turn_b
     rev2 = int(db.get(Campaign, camp.id).revision)
     assert rev2 == rev1 + 1
-    # Retry of op-b: same row, no revision bump, no second event.
+    # Retry of the ORIGINAL key hits the live row directly: same row, no
+    # revision bump, no second event. (Fresh-key historical retry semantics
+    # belong to the central command-idempotency boundary, not a
+    # world-specific ledger — see #211 scope review.)
     row_r, ev_r = assert_knowledge_authoritative(
         db, camp.id, rev2,
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
-        knowledge_state="knows", acquisition_source="saw_it",
+        knowledge_state="suspects", acquisition_source="heard_it",
         visibility="campaign",
-        operation_id="op-k-b", idempotency_key="idem-key-b",
+        operation_id="op-k-a", idempotency_key="idem-key-a",
     )
     assert ev_r is None
     assert row_r.id == row_a.id
@@ -516,11 +523,3 @@ def test_reassertion_retry_is_idempotent_without_second_event():
         )
     ).scalars().all()
     assert len(events) == 2
-    # Both consumed keys stay durable history pointing at the same live row.
-    keys = db.execute(
-        select(WorldKnowledgeIdempotency).where(
-            WorldKnowledgeIdempotency.campaign_id == camp.id,
-        )
-    ).scalars().all()
-    assert {k.idempotency_key for k in keys} == {"idem-key-a", "idem-key-b"}
-    assert {k.knowledge_id for k in keys} == {row_a.id}
