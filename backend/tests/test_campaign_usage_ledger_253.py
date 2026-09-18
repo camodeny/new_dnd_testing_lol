@@ -259,7 +259,7 @@ def test_percentage_from_ledger_with_grace_and_byok():
     camp2, _ = _seed(db)
     assert get_capacity_summary(db, camp2)["percent_used"] == 0.0
     # Spent with no funding → surfaces as 100%, never div-by-zero.
-    run2 = _run(db, cost_usd=1.00)
+    run2 = _run(db, cost_usd=1.00, campaign_id=camp2)
     record_ai_spend_for_run(db, campaign_id=camp2, ai_run=run2)
     assert get_capacity_summary(db, camp2)["percent_used"] == 100.0
     # Public projection is aggregates only.
@@ -280,6 +280,7 @@ def test_ambiguous_cost_surfaced_and_gameplay_untouched():
     db.commit()
     name_before = db.get(Campaign, camp).name
     bad = _run(db, cost_usd=None, campaign_id=camp)  # succeeded primary, no cost
+    db.commit()  # durable before the excluded charge attempt
     with pytest.raises(AmbiguousCostError):
         record_ai_spend_for_run(db, campaign_id=camp, ai_run=bad)
     db.rollback()
@@ -330,3 +331,93 @@ def test_ledger_is_append_only_surface():
     assert not hasattr(ledger, "update_entry")
     assert not hasattr(ledger, "delete_entry")
     assert not hasattr(ledger, "adjust_entry_in_place")
+
+
+# ── 10. spend write boundary: no raw ai_spend, trace-attributed campaign ────
+
+def test_raw_ai_spend_rejected_and_cross_campaign_charge_refused():
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    other, _ = _seed(db)
+    # Raw ai_spend insertion bypasses run validation → rejected outright.
+    run = _run(db, cost_usd=1.00, campaign_id=camp)
+    db.commit()  # durable run + trace before the refused charge attempts
+    with pytest.raises(AccountingError):
+        record_entry(db, campaign_id=camp, entry_type="ai_spend", amount_cents=-100,
+                     idempotency_key="raw-spend", ai_run_id=run.id)
+    db.rollback()
+    # A run cannot be charged to a different campaign than its trace.
+    with pytest.raises(LedgerConflictError):
+        record_ai_spend_for_run(db, campaign_id=other, ai_run=run)
+    db.rollback()
+    # A run with no operation trace at all is equally unchargeable.
+    orphan = _run(db, cost_usd=1.00)
+    with pytest.raises(LedgerConflictError):
+        record_ai_spend_for_run(db, campaign_id=camp, ai_run=orphan)
+    db.rollback()
+    assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 0
+    # The correctly attributed charge still works.
+    entry = record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
+    assert entry.amount_cents == -100
+    db.close()
+
+
+# ── 11. uniqueness-conflict recovery keeps the session usable ───────────────
+
+def test_uniqueness_conflict_returns_matching_winner_without_poisoning_session():
+    from app.billing.ledger import _insert_entry
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    first = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+                         idempotency_key="race-1")
+    db.commit()
+    # Bypass the precheck to simulate a lost update race: the insert hits the
+    # unique constraint, the savepoint rolls back, and the matching winner is
+    # returned — the session must stay usable afterwards.
+    winner = _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+                           idempotency_key="race-1")
+    assert winner.id == first.id
+    assert db.query(CampaignUsageEntry).filter_by(idempotency_key="race-1").count() == 1
+    # Session usable: a fresh key still writes.
+    second = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=100,
+                          idempotency_key="race-2")
+    assert second.id != first.id
+    # Same key, conflicting payload → surfaced, never silent replay.
+    with pytest.raises(LedgerConflictError):
+        _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=999,
+                      idempotency_key="race-1")
+    db.rollback()
+    db.close()
+
+
+# ── 12. contributor + zero-cost idempotency strictness ──────────────────────
+
+def test_contributor_mismatch_and_zero_cost_collision_are_conflicts():
+    factory = _factory()
+    db = factory()
+    camp, users = _seed(db, members=2)
+    record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=300,
+                 idempotency_key="contrib-1", contributor_user_id=users[0])
+    db.commit()
+    # Same key, same amount, different contributor → conflict, not replay.
+    with pytest.raises(LedgerConflictError):
+        record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=300,
+                     idempotency_key="contrib-1", contributor_user_id=users[1])
+    db.rollback()
+    # Zero-cost spend colliding with an existing non-spend key → conflict.
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+                 idempotency_key="ai_spend:zero-run")
+    db.commit()
+    free = _run(db, cost_usd=0.0, campaign_id=camp)
+    db.commit()  # durable run + trace before the refused charge attempt
+    with pytest.raises(LedgerConflictError):
+        record_ai_spend_for_run(db, campaign_id=camp, ai_run=free,
+                                idempotency_key="ai_spend:zero-run")
+    db.rollback()
+    # Genuine zero-cost marker under its own key still records exactly once.
+    marker = record_ai_spend_for_run(db, campaign_id=camp, ai_run=free)
+    assert marker.amount_cents == 0
+    assert record_ai_spend_for_run(db, campaign_id=camp, ai_run=free).id == marker.id
+    db.close()

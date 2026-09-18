@@ -8,8 +8,18 @@ Deterministic accounting authority (code-owned, never delegated to a model):
   raises :class:`NonBillableRunError` and writes nothing.
 - Each primary billable run maps to exactly one ``ai_spend`` entry
   (``ai_run_id`` unique). Reprocessing returns the existing row.
+- Spend writes go only through :func:`record_ai_spend_for_run`, which
+  verifies the run is primary/billable/succeeded AND that the run's
+  operation trace attributes it to the charged campaign. Raw
+  :func:`record_entry` rejects ``ai_spend`` so callers cannot bypass
+  those invariants.
 - Retries with the same ``(campaign_id, idempotency_key)`` return the
-  existing row — failed writes are recoverable by retrying idempotently.
+  existing row only when the full accounting payload (type, amount, run,
+  contributor) matches — else :class:`LedgerConflictError`.
+- Failed writes are recoverable by retrying idempotently: inserts run
+  inside a savepoint, so a uniqueness conflict rolls back to the
+  savepoint and re-reads the winner instead of poisoning the caller's
+  session.
 - Ambiguous cost (a succeeded primary run with ``cost_usd is None``)
   raises :class:`AmbiguousCostError`: surfaced, never silently zero,
   never double-charged.
@@ -106,6 +116,89 @@ def _idempotent_get(db: Session, campaign_id, idempotency_key: str) -> CampaignU
     )
 
 
+def _payload_matches(
+    existing: CampaignUsageEntry, *, entry_type: str, amount_cents: int,
+    ai_run_id=None, contributor_user_id=None,
+) -> bool:
+    """One strict matcher for idempotency replay: every persisted field that
+    defines a retry-equivalent accounting event must agree. Attribution or
+    amount differences are conflicts, never silent replays."""
+    existing_run = str(existing.ai_run_id) if existing.ai_run_id else None
+    wanted_run = str(ai_run_id) if ai_run_id else None
+    existing_contrib = str(existing.contributor_user_id) if existing.contributor_user_id else None
+    wanted_contrib = str(contributor_user_id) if contributor_user_id else None
+    return (
+        existing.entry_type == entry_type
+        and existing.amount_cents == amount_cents
+        and existing_run == wanted_run
+        and existing_contrib == wanted_contrib
+    )
+
+
+def _insert_entry(
+    db: Session,
+    *,
+    campaign_id,
+    entry_type: str,
+    amount_cents: int,
+    idempotency_key: str,
+    contributor_user_id=None,
+    ai_run_id=None,
+    note: str | None = None,
+    entry_metadata: dict | None = None,
+) -> CampaignUsageEntry:
+    """Insert one ledger line inside a savepoint (flush, no commit).
+
+    On a uniqueness conflict the savepoint rolls back — leaving the
+    caller-owned session usable — then the winner is re-read and returned
+    only when its full payload matches; otherwise
+    :class:`LedgerConflictError`.
+    """
+    entry = CampaignUsageEntry(
+        campaign_id=campaign_id,
+        entry_type=entry_type,
+        amount_cents=amount_cents,
+        ai_run_id=ai_run_id,
+        contributor_user_id=contributor_user_id,
+        idempotency_key=idempotency_key,
+        note=note,
+        entry_metadata=entry_metadata,
+    )
+    try:
+        with db.begin_nested():
+            db.add(entry)
+            db.flush()
+    except IntegrityError as exc:
+        # Savepoint rolled back; the session is usable for the re-read.
+        winner = _idempotent_get(db, campaign_id, idempotency_key)
+        if winner is not None:
+            if not _payload_matches(
+                winner, entry_type=entry_type, amount_cents=amount_cents,
+                ai_run_id=ai_run_id, contributor_user_id=contributor_user_id,
+            ):
+                raise LedgerConflictError(
+                    f"idempotency_key {idempotency_key!r} already used with different payload"
+                ) from exc
+            return winner
+        if ai_run_id is not None:
+            # Key lookup missed but the run was charged under another key
+            # (exactly-once race): return it only on full payload agreement.
+            by_run = db.scalar(
+                select(CampaignUsageEntry).where(CampaignUsageEntry.ai_run_id == ai_run_id)
+            )
+            if by_run is not None:
+                if not _payload_matches(
+                    by_run, entry_type=entry_type, amount_cents=amount_cents,
+                    ai_run_id=ai_run_id, contributor_user_id=contributor_user_id,
+                ):
+                    raise LedgerConflictError(
+                        f"run {ai_run_id} already charged with different payload"
+                    ) from exc
+                return by_run
+        raise LedgerConflictError(f"ledger write conflict: {exc}") from exc
+    return entry
+
+
 def record_entry(
     db: Session,
     *,
@@ -118,60 +211,46 @@ def record_entry(
     note: str | None = None,
     entry_metadata: dict | None = None,
 ) -> CampaignUsageEntry:
-    """Append one ledger line (flush, no commit). Idempotent on retry.
+    """Append one non-spend ledger line (flush, no commit). Idempotent on retry.
 
     A retry with the same ``(campaign_id, idempotency_key)`` returns the
-    existing row when type/amount/run match, else raises
-    :class:`LedgerConflictError` so ambiguity surfaces instead of
-    double-posting.
+    existing row when the full payload (type/amount/run/contributor)
+    matches, else raises :class:`LedgerConflictError` so ambiguity surfaces
+    instead of double-posting.
+
+    ``ai_spend`` is rejected here: spend writes must go through
+    :func:`record_ai_spend_for_run`, which enforces the
+    primary/billable/succeeded + operation-trace invariants.
     """
     if not idempotency_key or not str(idempotency_key).strip():
         raise AccountingError("idempotency_key is required")
+    if entry_type == ENTRY_TYPE_AI_SPEND:
+        raise AccountingError("ai_spend must go through record_ai_spend_for_run")
     _validate_amount(entry_type, amount_cents)
-    if entry_type == ENTRY_TYPE_AI_SPEND and ai_run_id is None:
-        raise AccountingError("ai_spend requires ai_run_id")
-    if entry_type != ENTRY_TYPE_AI_SPEND and ai_run_id is not None:
+    if ai_run_id is not None:
         raise AccountingError(f"{entry_type} must not carry ai_run_id")
 
     existing = _idempotent_get(db, campaign_id, idempotency_key)
     if existing is not None:
-        existing_run = str(existing.ai_run_id) if existing.ai_run_id else None
-        wanted_run = str(ai_run_id) if ai_run_id else None
-        if (
-            existing.entry_type != entry_type
-            or existing.amount_cents != amount_cents
-            or existing_run != wanted_run
+        if not _payload_matches(
+            existing, entry_type=entry_type, amount_cents=amount_cents,
+            ai_run_id=None, contributor_user_id=contributor_user_id,
         ):
             raise LedgerConflictError(
                 f"idempotency_key {idempotency_key!r} already used with different payload"
             )
         return existing
 
-    entry = CampaignUsageEntry(
+    return _insert_entry(
+        db,
         campaign_id=campaign_id,
         entry_type=entry_type,
         amount_cents=amount_cents,
-        ai_run_id=ai_run_id,
-        contributor_user_id=contributor_user_id,
         idempotency_key=idempotency_key,
+        contributor_user_id=contributor_user_id,
         note=note,
         entry_metadata=entry_metadata,
     )
-    db.add(entry)
-    try:
-        db.flush()
-    except IntegrityError as exc:
-        # Caller owns the transaction; just re-read the winner below.
-        # Concurrent or retried insert: return the winner when it matches.
-        winner = _idempotent_get(db, campaign_id, idempotency_key)
-        if winner is not None:
-            return winner
-        if ai_run_id is not None:
-            by_run = db.scalar(select(CampaignUsageEntry).where(CampaignUsageEntry.ai_run_id == ai_run_id))
-            if by_run is not None:
-                return by_run
-        raise LedgerConflictError(f"ledger write conflict: {exc}") from exc
-    return entry
 
 
 def record_ai_spend_for_run(
@@ -186,8 +265,11 @@ def record_ai_spend_for_run(
 
     Returns the existing entry when this run was already charged (no
     double-charge). Raises :class:`NonBillableRunError` for recovery /
-    non-billable runs (excluded, writes nothing) and
-    :class:`AmbiguousCostError` when the run's cost is missing.
+    non-billable runs (excluded, writes nothing),
+    :class:`AmbiguousCostError` when the run's cost is missing, and
+    :class:`LedgerConflictError` when the run's operation trace does not
+    attribute it to ``campaign_id`` — a run can never be charged to a
+    different campaign than its trace (fail closed, writes nothing).
     """
     if ai_run.classification != "primary" or not ai_run.billable:
         raise NonBillableRunError(
@@ -196,6 +278,11 @@ def record_ai_spend_for_run(
     if ai_run.status not in {"succeeded"}:
         raise AmbiguousCostError(
             f"run {ai_run.id} status={ai_run.status!r}: only succeeded primary runs are chargeable"
+        )
+    trace = db.get(OperationTrace, ai_run.trace_id) if ai_run.trace_id else None
+    if trace is None or trace.campaign_id is None or str(trace.campaign_id) != str(campaign_id):
+        raise LedgerConflictError(
+            f"run {ai_run.id} is not attributable to campaign {campaign_id}: refusing to charge"
         )
     # Exactly-once: a run already charged returns its entry.
     charged = db.scalar(select(CampaignUsageEntry).where(CampaignUsageEntry.ai_run_id == ai_run.id))
@@ -208,33 +295,29 @@ def record_ai_spend_for_run(
         cents = 0
     # Zero-cost marker: ai_spend normally negative; allow 0 only here.
     key = idempotency_key or f"ai_spend:{ai_run.id}"
+    metadata = {"cost_usd": ai_run.cost_usd}
     if cents == 0:
         existing = _idempotent_get(db, campaign_id, key)
         if existing is not None:
+            if not _payload_matches(
+                existing, entry_type=ENTRY_TYPE_AI_SPEND, amount_cents=0,
+                ai_run_id=ai_run.id, contributor_user_id=None,
+            ):
+                raise LedgerConflictError(
+                    f"idempotency_key {key!r} already used with different payload"
+                )
             return existing
-        entry = CampaignUsageEntry(
+        return _insert_entry(
+            db,
             campaign_id=campaign_id,
             entry_type=ENTRY_TYPE_AI_SPEND,
             amount_cents=0,
-            ai_run_id=ai_run.id,
-            contributor_user_id=None,
             idempotency_key=key,
+            ai_run_id=ai_run.id,
             note=note,
-            entry_metadata={"cost_usd": ai_run.cost_usd},
+            entry_metadata=metadata,
         )
-        db.add(entry)
-        try:
-            db.flush()
-        except IntegrityError:
-            charged = db.scalar(select(CampaignUsageEntry).where(CampaignUsageEntry.ai_run_id == ai_run.id))
-            if charged is not None:
-                return charged
-            winner = _idempotent_get(db, campaign_id, key)
-            if winner is not None:
-                return winner
-            raise
-        return entry
-    return record_entry(
+    return _insert_entry(
         db,
         campaign_id=campaign_id,
         entry_type=ENTRY_TYPE_AI_SPEND,
@@ -242,7 +325,7 @@ def record_ai_spend_for_run(
         idempotency_key=key,
         ai_run_id=ai_run.id,
         note=note,
-        entry_metadata={"cost_usd": ai_run.cost_usd},
+        entry_metadata=metadata,
     )
 
 

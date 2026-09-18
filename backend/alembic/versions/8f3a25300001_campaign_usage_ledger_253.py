@@ -46,12 +46,11 @@ def upgrade() -> None:
     op.create_index("ix_usage_entries_campaign_type", "campaign_usage_entries", ["campaign_id", "entry_type"])
     op.create_index("ix_usage_entries_contributor", "campaign_usage_entries",
                     ["campaign_id", "contributor_user_id"])
-    op.create_index("ix_usage_entries_ai_run_id", "campaign_usage_entries", ["ai_run_id"],
-                    unique=True)
+    # No separate unique index on ai_run_id: the uq_usage_entries_ai_run
+    # constraint above already carries its own backing unique index.
 
 
 def downgrade() -> None:
-    op.drop_index("ix_usage_entries_ai_run_id", table_name="campaign_usage_entries")
     op.drop_index("ix_usage_entries_contributor", table_name="campaign_usage_entries")
     op.drop_index("ix_usage_entries_campaign_type", table_name="campaign_usage_entries")
     op.drop_index("ix_usage_entries_campaign", table_name="campaign_usage_entries")
