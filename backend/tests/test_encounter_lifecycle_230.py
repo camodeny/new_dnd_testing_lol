@@ -55,17 +55,19 @@ def _seed_world(db, *, second_pc=True, npc=True):
     owner = uuid.uuid4()
     player = uuid.uuid4()
     campaign_id = uuid.uuid4()
+    owner_pc = uuid.uuid4()
+    player_pc = uuid.uuid4()
+    absent_pc = uuid.uuid4()
     db.add_all([
         Profile(id=owner, email="owner@example.com"),
         Profile(id=player, email="player@example.com"),
         Campaign(id=campaign_id, owner_id=owner, name="Encounter Table", revision=0),
-        CampaignMember(campaign_id=campaign_id, user_id=owner, role="owner"),
-        CampaignMember(campaign_id=campaign_id, user_id=player, role="player"),
+        CampaignMember(campaign_id=campaign_id, user_id=owner, role="owner",
+                       selected_character_id=owner_pc),
+        CampaignMember(campaign_id=campaign_id, user_id=player, role="player",
+                       selected_character_id=player_pc),
     ])
     db.flush()
-    owner_pc = uuid.uuid4()
-    player_pc = uuid.uuid4()
-    absent_pc = uuid.uuid4()
     db.add_all([
         Character(id=owner_pc, owner_id=owner, name="Owner Blade", system="dnd5e"),
         Character(id=player_pc, owner_id=player, name="Player Bow", system="dnd5e"),
@@ -466,6 +468,33 @@ def test_npc_reroll_replay_is_idempotent_but_conflicts_rejected():
         assert replay_p.initiative_total == first_p.initiative_total == 17
         with pytest.raises(EncounterError, match="already recorded"):
             roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=3)
+        # Malformed replay input stays inside the validation contract (422),
+        # never escaping as an uncaught ValueError (500).
+        with pytest.raises(EncounterError, match="between 1 and 20"):
+            roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20="not-a-number")
+
+
+def test_off_roster_and_terminal_pcs_are_rejected():
+    from models.campaigns import CampaignPcLifecycle
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        # absent_pc belongs to a member but is not selected: off-roster.
+        with pytest.raises(EncounterError, match="active roster"):
+            _start(db, ctx, [{"character_id": str(ctx["absent_pc"])}],
+                   operation_id="op-off-roster")
+            db.rollback()
+        # A selected PC with a terminal lifecycle cannot join combat.
+        db.add(CampaignPcLifecycle(
+            campaign_id=ctx["campaign_id"], character_id=ctx["player_pc"],
+            user_id=ctx["player"], status="dead",
+        ))
+        db.commit()
+        with pytest.raises(EncounterError, match="is dead"):
+            _start(db, ctx, [{"character_id": str(ctx["player_pc"])}],
+                   operation_id="op-dead-pc")
+            db.rollback()
+        assert get_active_encounter(db, ctx["campaign_id"]) is None
 
 
 # ── reconnect / restart durability ──────────────────────────────────────────

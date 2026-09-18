@@ -222,6 +222,27 @@ def _validate_selection(db: Session, campaign_id: uuid.UUID, participants: list[
                 raise EncounterError(
                     f"participant {index} character owner is not a member of this campaign"
                 )
+            # Roster scoping (#266 canonical): the character must be on the
+            # campaign's active roster — selected by a member — so an owner
+            # cannot enroll a member's unrelated character. Terminal lifecycle
+            # states (dead/retired) can never join; a missing row means active.
+            from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
+
+            roster = db.execute(
+                select(CampaignMember).where(
+                    CampaignMember.campaign_id == campaign_id,
+                    CampaignMember.selected_character_id == character_id,
+                )
+            ).scalars().first()
+            if roster is None:
+                raise EncounterError(
+                    f"participant {index} character is not on this campaign's active roster"
+                )
+            lifecycle = get_lifecycle(db, campaign_id, character_id)
+            if lifecycle is not None and lifecycle.status in TERMINAL_PC_STATUSES:
+                raise EncounterError(
+                    f"participant {index} character is {lifecycle.status} and cannot join combat"
+                )
             modifier, dex_mod, source = _resolve_pc_stats(db, character_id)
             key = f"pc:{character_id}"
             if key in seen_keys:
@@ -561,6 +582,17 @@ def _build_encounter_rows(
     return encounter
 
 
+def _parse_d20(raw: Any) -> int:
+    """Bounded d20 parser shared by initial rolls and idempotent replays."""
+    try:
+        die = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise EncounterError("raw_d20 must be an integer between 1 and 20") from exc
+    if not 1 <= die <= 20:
+        raise EncounterError("raw_d20 must be between 1 and 20")
+    return die
+
+
 def _roll_npc_inline(participant: EncounterParticipant, *, raw_d20: int | None) -> EncounterParticipant:
     if participant.kind not in ("npc", "monster"):
         raise EncounterError("runtime rolls are for NPC/monster participants only; humans roll their own initiative")
@@ -568,12 +600,7 @@ def _roll_npc_inline(participant: EncounterParticipant, *, raw_d20: int | None) 
         return participant
     if raw_d20 is None:
         raw_d20 = secrets.randbelow(20) + 1
-    try:
-        die = int(raw_d20)
-    except (TypeError, ValueError) as exc:
-        raise EncounterError("raw_d20 must be an integer between 1 and 20") from exc
-    if not 1 <= die <= 20:
-        raise EncounterError("raw_d20 must be between 1 and 20")
+    die = _parse_d20(raw_d20)
     participant.raw_roll = die
     participant.initiative_total = die + int(participant.initiative_modifier)
     participant.roll_source = "dm_runtime"
@@ -845,7 +872,9 @@ def roll_npc_initiative(
     if participant.initiative_status == "fulfilled":
         # Idempotent replay: same die (or unspecified) returns current state;
         # a conflicting re-roll is rejected to protect recorded initiative.
-        if raw_d20 is None or int(raw_d20) == int(participant.raw_roll or -1):
+        # The replay value runs through the same bounded parser so malformed
+        # input stays inside the encounter validation contract (no 500s).
+        if raw_d20 is None or _parse_d20(raw_d20) == int(participant.raw_roll or -1):
             return participant, encounter, None
         raise EncounterError("initiative already recorded for this participant")
     _roll_npc_inline(participant, raw_d20=raw_d20)
