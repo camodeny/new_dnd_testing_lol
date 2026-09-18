@@ -497,6 +497,38 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
         return False
 
 
+#: Encounter lifecycle events inherit the source turn's thread. The generic
+#: campaign-member event feed must enforce the same thread boundary as
+#: ``can_view_encounter`` so private-thread combat metadata never leaks
+#: through ``/events`` history (issue #230 privacy).
+THREAD_SCOPED_EVENT_TYPES = frozenset({ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT})
+
+
+def encounter_event_visible_to(db: Session, event, viewer_id: uuid.UUID) -> bool:
+    """Whether a lifecycle domain event may appear in a member's event feed.
+
+    Non-thread-scoped types always pass (callers pre-filter those). Scoped
+    types require source-thread readability; missing/unparseable thread
+    discriminators fail closed.
+    """
+    if event.event_type not in THREAD_SCOPED_EVENT_TYPES:
+        return True
+    payload = getattr(event, "payload", None)
+    thread_ref = payload.get("thread_id") if isinstance(payload, dict) else None
+    if not thread_ref:
+        return False
+    from app.runtime.threads import can_read_thread, parse_thread_id
+
+    try:
+        thread_id = parse_thread_id(thread_ref)
+    except Exception:
+        return False
+    try:
+        return bool(can_read_thread(db, event.campaign_id, thread_id, viewer_id))
+    except Exception:
+        return False
+
+
 def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.UUID) -> dict | None:
     """Reconnect-safe encounter projection for the live-table snapshot."""
     campaign = db.get(Campaign, campaign_id)
@@ -695,6 +727,7 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         event_type=ENCOUNTER_READY_EVENT,
         payload={
             "encounter_id": str(encounter.id),
+            "thread_id": encounter.thread_id,
             "turn_order_ids": [str(pid) for pid in ordered_ids],
             "active_participant_id": str(ordered_ids[0]),
             "round": 1,

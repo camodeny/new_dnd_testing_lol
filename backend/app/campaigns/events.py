@@ -379,7 +379,14 @@ def list_campaign_events(
     limit: int = 100,
     offset: int = 0,
 ) -> list[CampaignDomainEvent]:
-    """Ordered history for a campaign (sequence asc)."""
+    """Ordered history for a campaign (sequence asc).
+
+    With ``viewer_id`` set this is the member-facing feed: public events,
+    the viewer's own actor events, and — for thread-scoped encounter
+    lifecycle events (issue #230) — only events from threads the viewer may
+    read. Callers without a viewer (provenance/audit internals) get the full
+    history.
+    """
     query = select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == campaign_id)
     if viewer_id is not None:
         query = query.where(
@@ -388,7 +395,7 @@ def list_campaign_events(
                 CampaignDomainEvent.actor_id == viewer_id,
             )
         )
-    return list(
+    rows = list(
         db.execute(
             query
             .order_by(CampaignDomainEvent.sequence.asc())
@@ -398,6 +405,17 @@ def list_campaign_events(
         .scalars()
         .all()
     )
+    if viewer_id is None:
+        return rows
+    # Thread-scoped encounter events inherit the source turn's thread; the
+    # generic public/actor rule would leak private-thread combat metadata.
+    from app.combat.service import THREAD_SCOPED_EVENT_TYPES, encounter_event_visible_to
+
+    return [
+        ev for ev in rows
+        if ev.event_type not in THREAD_SCOPED_EVENT_TYPES
+        or encounter_event_visible_to(db, ev, viewer_id)
+    ]
 
 
 def latest_domain_event(

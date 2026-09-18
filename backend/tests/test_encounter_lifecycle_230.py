@@ -1030,6 +1030,23 @@ def test_private_thread_encounter_hidden_from_non_members():
         assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
         visible = get_snapshot_encounter(db, ctx["campaign_id"], ctx["owner"])
         assert visible is not None and visible["id"] == str(encounter.id)
+        # Activating writes the ready event; neither lifecycle event may reach
+        # the non-thread member's campaign history feed.
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+        feed_outsider = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
+        assert all(
+            e.event_type not in (ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT)
+            for e in feed_outsider
+        )
+        feed_member = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
+        assert {ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT} <= {
+            e.event_type for e in feed_member
+        }
+        # Unscoped callers (provenance/audit) still see full history.
+        assert {ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT} <= {
+            e.event_type for e in list_campaign_events(db, ctx["campaign_id"])
+        }
 
 
 def test_private_thread_rejects_unreadable_controller():
@@ -1077,6 +1094,7 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
     monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.campaigns.router.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -1100,5 +1118,19 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
             f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order",
             headers=outsider_headers)
         assert order_outsider.status_code == 404
+        # Lifecycle history follows the same thread boundary.
+        events_outsider = client.get(
+            f"/api/campaigns/{campaign_id}/events", headers=outsider_headers)
+        assert events_outsider.status_code == 200
+        assert all(
+            e["event_type"] not in ("encounter.started", "encounter.initiative_ready")
+            for e in events_outsider.json()["events"]
+        )
+        events_member = client.get(
+            f"/api/campaigns/{campaign_id}/events", headers=member_headers)
+        assert events_member.status_code == 200
+        assert "encounter.started" in {
+            e["event_type"] for e in events_member.json()["events"]
+        }
     finally:
         app.dependency_overrides.clear()
