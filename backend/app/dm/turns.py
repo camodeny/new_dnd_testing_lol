@@ -1242,14 +1242,17 @@ def commit_turn(
                     )
         except Exception as e:
             logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
-    # Link encounters started by this attempt to the authoritative turn event
-    # (issue #230): the turn commit IS the start's fictional mutation, so the
-    # encounter rides this event with no separate revision bump. The
-    # encounter.started projection is enqueued atomically in the same
-    # transaction; direct realtime delivery happens post-commit below.
+    # Link encounters started by this attempt to an authoritative
+    # encounter.started lifecycle event (issue #230): the turn commit IS the
+    # start's fictional mutation, so each linked encounter gets its own
+    # domain event chained in the same outer transaction — one event per
+    # revision, preserving the sequence == revision invariant. The
+    # encounter.started projection is enqueued atomically alongside;
+    # direct realtime delivery happens post-commit below.
     linked_encounter_ids: list[uuid.UUID] = []
     try:
         from models.combat import Encounter as _Encounter
+        from models.campaigns import CampaignDomainEvent as _DomainEvent
 
         _started = db.execute(
             select(_Encounter).where(
@@ -1259,7 +1262,54 @@ def commit_turn(
             )
         ).scalars().all()
         for _enc in _started:
-            _enc.created_event_id = event.id
+            _lifecycle = db.execute(
+                select(_DomainEvent).where(
+                    _DomainEvent.campaign_id == turn.campaign_id,
+                    _DomainEvent.operation_id == _enc.operation_id,
+                    _DomainEvent.event_type == "encounter.started",
+                )
+            ).scalars().first()
+            if _lifecycle is None:
+                try:
+                    from app.campaigns.events import commit_campaign_mutation as _commit_mutation
+                    from app.combat.service import list_participants as _list_parts
+
+                    _campaign_now = db.get(Campaign, turn.campaign_id)
+                    _, _lifecycle = _commit_mutation(
+                        db,
+                        turn.campaign_id,
+                        expected_revision=int(_campaign_now.revision or 0),
+                        event_type="encounter.started",
+                        payload={
+                            "encounter_id": str(_enc.id),
+                            "thread_id": _enc.thread_id,
+                            "participant_count": int(_enc.participant_count or 0),
+                            "start_source": _enc.start_source,
+                            "source_turn_id": str(turn.id),
+                            "source_attempt_id": str(attempt.id),
+                            "participants": [
+                                {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
+                                for p in _list_parts(db, _enc.id)
+                            ],
+                        },
+                        operation_id=_enc.operation_id,
+                        actor_id=event.actor_id,
+                        provenance={
+                            "source": "dm_effect",
+                            "turn_event_id": str(event.id),
+                            "attempt_id": str(attempt.id),
+                        },
+                        commit=False,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "dm_turn failed to record encounter lifecycle event turn_id=%s encounter_id=%s error=%s",
+                        turn.id, _enc.id, e,
+                    )
+                    _lifecycle = None
+            # Fall back to the turn event only if the lifecycle row could not
+            # be recorded; readers resolve either shape.
+            _enc.created_event_id = _lifecycle.id if _lifecycle is not None else event.id
             linked_encounter_ids.append(_enc.id)
         db.flush()
         if _started:

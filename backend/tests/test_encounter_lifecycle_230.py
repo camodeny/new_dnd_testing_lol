@@ -620,8 +620,9 @@ def test_dm_structured_effect_starts_encounter_inline():
 
 
 def test_dm_effect_turn_commit_binds_start_provenance_and_outbox():
-    """Full turn commit with a staged start_encounter binds the turn event as
-    start provenance and enqueues the encounter.started projection."""
+    """Full turn commit with a staged start_encounter persists a distinct
+    encounter.started lifecycle event, binds it as start provenance, and
+    enqueues the encounter.started projection."""
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
@@ -675,11 +676,21 @@ def test_dm_effect_turn_commit_binds_start_provenance_and_outbox():
         encounter = get_active_encounter(db, ctx["campaign_id"])
         assert encounter is not None
         assert encounter.start_source == "dm_effect"
-        # The turn event is the start's provenance: bound, resolvable, surfaced.
-        assert encounter.created_event_id == event.id
+        # A distinct encounter.started lifecycle event exists in history and
+        # is the bound start provenance (turn linkage retained in provenance).
+        started_events = [
+            e for e in list_campaign_events(db, ctx["campaign_id"])
+            if e.event_type == ENCOUNTER_STARTED_EVENT
+        ]
+        assert len(started_events) == 1
+        lifecycle = started_events[0]
+        assert lifecycle.payload["encounter_id"] == str(encounter.id)
+        assert lifecycle.payload["thread_id"] == encounter.thread_id
+        assert lifecycle.provenance["turn_event_id"] == str(event.id)
+        assert encounter.created_event_id == lifecycle.id
         view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
-        assert view["created_event_id"] == str(event.id)
-        assert view["created_event_sequence"] == event.sequence
+        assert view["created_event_id"] == str(lifecycle.id)
+        assert view["created_event_sequence"] == lifecycle.sequence
         started_rows = [
             row for row in db.execute(
                 select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
@@ -1572,6 +1583,18 @@ def test_private_attempt_promotes_start_encounter():
         assert encounter is not None
         assert encounter.thread_id == str(thread.id)
         assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
+        # The structured start persists a thread-scoped lifecycle event: the
+        # thread member sees it in history, the outsider does not.
+        member_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
+        member_started = [e for e in member_feed if e.event_type == ENCOUNTER_STARTED_EVENT]
+        assert len(member_started) == 1
+        assert member_started[0].payload["encounter_id"] == str(encounter.id)
+        assert member_started[0].payload["thread_id"] == str(thread.id)
+        assert encounter.created_event_id == member_started[0].id
+        outsider_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
+        assert all(
+            e.event_type != ENCOUNTER_STARTED_EVENT for e in outsider_feed
+        )
 
 
 def test_member_event_page_fills_past_hidden_encounter_events():
