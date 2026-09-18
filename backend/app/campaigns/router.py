@@ -1531,12 +1531,12 @@ def send_campaign_invite_email(
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    # Serialize with lifecycle transitions and revocation (#242 review): the
-    # campaign row is the same lock create/revoke/accept take, and the
-    # transaction is retained through the send/outcome commit below, so a
-    # concurrent start or revoke cannot slip between the lobby/usability
-    # checks and the send. Provider calls are bounded (~10s timeouts), so
-    # the lock hold is short; SQLite ignores FOR UPDATE in tests.
+    # Serialize validation with lifecycle transitions and revocation (#242
+    # review): the campaign row is the same lock create/revoke/accept take.
+    # The lock is held only for validation + persisting the delivery intent;
+    # the Resend network call happens after commit so a slow provider cannot
+    # hold the campaign row. A stale email is harmless because acceptance
+    # revalidates the invite; delivery outcome is persisted afterwards.
     camp = db.execute(
         select(Campaign).where(Campaign.id == cid).with_for_update()
     ).scalars().first()
@@ -1560,12 +1560,23 @@ def send_campaign_invite_email(
         # fresh invite instead. Delivery state is untouched (nothing sent).
         raise HTTPException(status_code=410, detail=f"Invite is {unusable_reason}")
     inviter = db.get(Profile, profile.id)
+    campaign_name = camp.name
+    invite_id = invite.id
+    invite_code = invite.code
+    inviter_label = inviter.username if inviter else None
+    invite.intended_email = to_email
+    db.commit()
+    # Network I/O outside the campaign lock/transaction (see above).
     sent, error = send_invite_email(
         to_email=to_email,
-        campaign_name=camp.name,
-        code=invite.code,
-        inviter_label=inviter.username if inviter else None,
+        campaign_name=campaign_name,
+        code=invite_code,
+        inviter_label=inviter_label,
     )
+    # Short follow-up transaction: persist only the delivery outcome.
+    invite = db.get(CampaignInvite, invite_id)
+    if invite is None:  # pragma: no cover — row deleted mid-send
+        raise HTTPException(status_code=404, detail="Invite not found")
     invite.intended_email = to_email
     invite.last_delivery_status = "sent" if sent else "failed"
     invite.last_delivery_error = error

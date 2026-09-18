@@ -6,16 +6,12 @@ delivery, and observability helpers.
 
 Email delivery is env-driven (single canonical integration, stdlib only):
 
-- ``INVITE_EMAIL_PROVIDER``: ``log`` (default) | ``smtp`` | ``resend`` |
-  ``sendgrid``. ``log`` records the invite as deliverable-via-link and does
-  not send network mail; anything else requires its credentials.
+- ``RESEND_API_KEY`` set → send via Resend (production path).
+- Unset → safe local/dev fallback: no network mail, the invite stays usable
+  via link/code and sending is retryable.
+- ``INVITE_EMAIL_FROM``: sender address (fallback ``no-reply@example.com``).
 - ``INVITE_BASE_URL`` / ``PUBLIC_APP_URL``: origin used to build the
   shareable invite URL (``{origin}/invite/{CODE}``).
-- SMTP: ``SMTP_HOST``, ``SMTP_PORT`` (default 587), ``SMTP_USERNAME``,
-  ``SMTP_PASSWORD``, ``SMTP_FROM`` (fallback ``SMTP_USERNAME``),
-  ``SMTP_USE_TLS`` (default true).
-- Resend: ``RESEND_API_KEY``, ``INVITE_EMAIL_FROM``.
-- SendGrid: ``SENDGRID_API_KEY``, ``INVITE_EMAIL_FROM``.
 
 A delivery failure never invalidates the invite — the link/code stays usable
 and sending is retryable; the failure is recorded on the invite row
@@ -28,10 +24,8 @@ import json
 import logging
 import os
 import re
-import smtplib
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
 
 logger = logging.getLogger(__name__)
 
@@ -241,10 +235,6 @@ def invite_url(code: str) -> str:
     return f"{invite_base_url()}/invite/{normalize_code(code)}"
 
 
-def email_provider() -> str:
-    return str(os.environ.get("INVITE_EMAIL_PROVIDER") or "log").strip().lower()
-
-
 def render_invite_email(*, campaign_name: str, code: str, inviter_label: str | None = None) -> tuple[str, str]:
     link = invite_url(code)
     inviter = f" from {inviter_label}" if inviter_label else ""
@@ -261,45 +251,37 @@ def render_invite_email(*, campaign_name: str, code: str, inviter_label: str | N
 
 def send_invite_email(*, to_email: str, campaign_name: str, code: str,
                       inviter_label: str | None = None) -> tuple[bool, str | None]:
-    """Send one invite email via the configured provider.
+    """Send one invite email via Resend (stdlib-only HTTP).
 
-    Returns (sent, error). Never raises for provider failures — callers
-    record the outcome and keep the link/code usable.
+    Returns (sent, error). Never raises for delivery failures — callers
+    record the outcome and keep the link/code usable. Without
+    ``RESEND_API_KEY`` this is a safe local/dev no-send fallback.
     """
-    provider = email_provider()
     subject, body = render_invite_email(
         campaign_name=campaign_name, code=code, inviter_label=inviter_label
     )
-    from_addr = (
-        os.environ.get("INVITE_EMAIL_FROM")
-        or os.environ.get("SMTP_FROM")
-        or os.environ.get("SMTP_USERNAME")
-        or "no-reply@example.com"
-    )
+    from_addr = os.environ.get("INVITE_EMAIL_FROM") or "no-reply@example.com"
+    api_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not api_key:
+        logger.info(
+            "invite email skipped provider=resend to_hash=%s campaign=%s code_hash=%s",
+            _addr_hash(to_email), campaign_name, code_fingerprint(code),
+        )
+        return False, "email delivery is not configured (set RESEND_API_KEY)"
     try:
-        if provider == "smtp":
-            _send_via_smtp(to_email=to_email, subject=subject, body=body, from_addr=from_addr)
-        elif provider == "resend":
-            _send_via_resend(to_email=to_email, subject=subject, body=body, from_addr=from_addr)
-        elif provider == "sendgrid":
-            _send_via_sendgrid(to_email=to_email, subject=subject, body=body, from_addr=from_addr)
-        elif provider in ("log", "disabled", ""):
-            logger.info(
-                "invite email skipped provider=%s to_hash=%s campaign=%s code_hash=%s",
-                provider, _addr_hash(to_email), campaign_name, code_fingerprint(code),
-            )
-            return False, f"email provider '{provider or 'log'}' does not send mail"
-        else:
-            return False, f"unknown email provider '{provider}'"
+        _send_via_resend(
+            to_email=to_email, subject=subject, body=body,
+            from_addr=from_addr, api_key=api_key,
+        )
     except Exception as exc:  # noqa: BLE001 — delivery failure is data, not a crash
         logger.warning(
-            "invite email delivery failed provider=%s to_hash=%s code_hash=%s error=%s",
-            provider, _addr_hash(to_email), code_fingerprint(code), type(exc).__name__,
+            "invite email delivery failed provider=resend to_hash=%s code_hash=%s error=%s",
+            _addr_hash(to_email), code_fingerprint(code), type(exc).__name__,
         )
         return False, str(exc) or type(exc).__name__
     logger.info(
-        "invite email delivered provider=%s to_hash=%s code_hash=%s",
-        provider, _addr_hash(to_email), code_fingerprint(code),
+        "invite email delivered provider=resend to_hash=%s code_hash=%s",
+        _addr_hash(to_email), code_fingerprint(code),
     )
     return True, None
 
@@ -308,33 +290,6 @@ def _addr_hash(email: str) -> str:
     import hashlib
 
     return hashlib.sha256(email.strip().lower().encode()).hexdigest()[:12]
-
-
-def _send_via_smtp(*, to_email: str, subject: str, body: str, from_addr: str) -> None:
-    host = os.environ.get("SMTP_HOST", "").strip()
-    if not host:
-        raise RuntimeError("SMTP_HOST is not configured")
-    port = int(os.environ.get("SMTP_PORT") or "587")
-    username = os.environ.get("SMTP_USERNAME", "").strip() or None
-    password = os.environ.get("SMTP_PASSWORD", "") or None
-    use_tls = str(os.environ.get("SMTP_USE_TLS") or "true").strip().lower() in {"1", "true", "yes", "on"}
-    message = EmailMessage()
-    message["Subject"] = subject
-    message["From"] = from_addr
-    message["To"] = to_email
-    message.set_content(body)
-    timeout = float(os.environ.get("SMTP_TIMEOUT_SECONDS") or "10")
-    if use_tls:
-        with smtplib.SMTP(host, port, timeout=timeout) as client:
-            client.starttls()
-            if username:
-                client.login(username, password or "")
-            client.send_message(message)
-    else:
-        with smtplib.SMTP(host, port, timeout=timeout) as client:
-            if username:
-                client.login(username, password or "")
-            client.send_message(message)
 
 
 def _post_json(url: str, *, headers: dict, payload: dict) -> tuple[int, str]:
@@ -349,9 +304,9 @@ def _post_json(url: str, *, headers: dict, payload: dict) -> tuple[int, str]:
         raise RuntimeError(f"email API HTTP {exc.code}: {detail[:500]}") from exc
 
 
-def _send_via_resend(*, to_email: str, subject: str, body: str, from_addr: str) -> None:
-    api_key = os.environ.get("RESEND_API_KEY", "").strip()
-    if not api_key:
+def _send_via_resend(*, to_email: str, subject: str, body: str, from_addr: str,
+                     api_key: str) -> None:
+    if not api_key.strip():
         raise RuntimeError("RESEND_API_KEY is not configured")
     status, _ = _post_json(
         "https://api.resend.com/emails",
@@ -360,21 +315,3 @@ def _send_via_resend(*, to_email: str, subject: str, body: str, from_addr: str) 
     )
     if status >= 300:
         raise RuntimeError(f"resend HTTP {status}")
-
-
-def _send_via_sendgrid(*, to_email: str, subject: str, body: str, from_addr: str) -> None:
-    api_key = os.environ.get("SENDGRID_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("SENDGRID_API_KEY is not configured")
-    status, _ = _post_json(
-        "https://api.sendgrid.com/v3/mail/send",
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        payload={
-            "personalizations": [{"to": [{"email": to_email}]}],
-            "from": {"email": from_addr},
-            "subject": subject,
-            "content": [{"type": "text/plain", "value": body}],
-        },
-    )
-    if status >= 300:
-        raise RuntimeError(f"sendgrid HTTP {status}")
