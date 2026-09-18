@@ -1,4 +1,4 @@
-"""Bounded decision runtime — issue #380."""
+"""Bounded decision runtime — issues #380/#381."""
 
 from app.decisions.contracts import (
     ChoiceQuestion,
@@ -13,6 +13,39 @@ from app.decisions.contracts import (
     ScoreResult,
 )
 from app.decisions.errors import DecisionError
+from app.decisions.frames import (
+    CANDIDATE_SCHEMA_VERSION,
+    CLARIFY_CANDIDATE_ID,
+    DEFER_CANDIDATE_ID,
+    ESCAPE_CANDIDATE_IDS,
+    FRAME_SCHEMA_VERSION,
+    OPEN_ENDED_DM_CANDIDATE_ID,
+    CandidateRecord,
+    DecisionFrame,
+    assert_fresh,
+    build_frame,
+    enumerate_candidates,
+    escape_candidates,
+    frame_trace,
+    is_escape_id,
+    is_stale,
+    rebuild_frame,
+    resolve_candidate,
+    revalidate_for_execution,
+    to_decision_request,
+)
+from app.decisions.policy import (
+    DIRECT_EXECUTE,
+    ESCALATE,
+    POLICY_SCHEMA_VERSION,
+    PRIMER_ADVISORY,
+    DecisionClassPolicy,
+    PolicyVerdict,
+    evaluate_execution,
+    get_policy,
+    policy_trace,
+    register_policy,
+)
 from app.decisions.runtime import (
     DECISION_LOGICAL_OPERATION,
     DECISION_ROLE,
@@ -22,6 +55,20 @@ from app.decisions.runtime import (
 )
 
 __all__ = [
+    "CANDIDATE_SCHEMA_VERSION",
+    "FRAME_SCHEMA_VERSION",
+    "POLICY_SCHEMA_VERSION",
+    "CLARIFY_CANDIDATE_ID",
+    "DEFER_CANDIDATE_ID",
+    "OPEN_ENDED_DM_CANDIDATE_ID",
+    "ESCAPE_CANDIDATE_IDS",
+    "DIRECT_EXECUTE",
+    "PRIMER_ADVISORY",
+    "ESCALATE",
+    "CandidateRecord",
+    "DecisionFrame",
+    "DecisionClassPolicy",
+    "PolicyVerdict",
     "ChoiceQuestion",
     "ChoiceResult",
     "DecisionCandidate",
@@ -36,6 +83,21 @@ __all__ = [
     "NoulResult",
     "ScoreQuestion",
     "ScoreResult",
+    "assert_fresh",
+    "build_frame",
     "create_adapter",
+    "enumerate_candidates",
+    "escape_candidates",
+    "evaluate_execution",
+    "frame_trace",
+    "get_policy",
+    "is_escape_id",
+    "is_stale",
+    "policy_trace",
+    "rebuild_frame",
+    "register_policy",
+    "resolve_candidate",
+    "revalidate_for_execution",
+    "to_decision_request",
     "validate_request",
 ]
