@@ -292,6 +292,182 @@ class WorldFact(Base):
         }
 
 
+# ── Issue #211: epistemic knowledge + visibility grants ─────────────────────
+
+# Fictional epistemic stance of one knower toward one truth record. This never
+# changes objective truth (WorldFact.epistemic_state / WorldRelation state);
+# it only records what a character/NPC/party fictionally holds.
+KNOWLEDGE_STATES = frozenset({
+    "knows", "believes", "suspects", "claims", "does_not_know",
+})
+
+# Fictional knower kinds. Subjects are always canonical WorldEntity rows
+# (PCs included via entity_type="character"); human users never appear here.
+# Human access is governed separately by visibility + WorldVisibilityGrant.
+KNOWER_KINDS = frozenset({"character", "npc", "party", "group"})
+
+# Knowledge target kinds: objective truth records a knower can hold a stance
+# toward. Exactly one target FK is set per row.
+KNOWLEDGE_TARGET_KINDS = frozenset({"fact", "relation", "entity"})
+
+# Visibility-grant target kinds: any record whose human disclosure can be
+# scoped to an arbitrary authorized subset (includes knowledge rows, whose
+# disclosure is independent of the underlying truth record's disclosure).
+GRANT_TARGET_KINDS = frozenset({"fact", "relation", "entity", "knowledge"})
+
+# Denied-access reason codes (observability without leaking hidden content).
+ACCESS_DENIED_REASONS = frozenset({
+    "not_campaign_member",
+    "dm_only_requires_authority",
+    "private_requires_grant",
+    "record_not_found",
+    "ambiguous_visibility",
+    "knowledge_not_visible",
+    "target_not_visible",
+})
+
+
+class WorldKnowledge(Base):
+    """Per-knower epistemic record — issue #211.
+
+    Links one fictional subject (character/NPC/party/group as a canonical
+    WorldEntity) to one truth record (fact/relation/entity) with a fictional
+    stance (knows/believes/suspects/claims/does_not_know).
+
+    - Never mutates objective truth: writers only touch this table (+ events).
+    - Human disclosure of THIS row is governed by its own ``visibility`` plus
+      WorldVisibilityGrant rows; disclosure of the underlying truth record is
+      checked independently (never inferred from this row or vice versa).
+    - One current row per (subject, target): re-assertion updates the row in
+      place inside the caller's transaction; history lives in domain events.
+    - Fail-closed visibility: default ``dm_only``.
+    """
+
+    __tablename__ = "world_knowledge"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "idempotency_key",
+            name="uq_world_knowledge_campaign_idempotency",
+        ),
+        Index("ix_world_knowledge_campaign_subject", "campaign_id", "subject_entity_id"),
+        Index("ix_world_knowledge_campaign_fact", "campaign_id", "target_fact_id"),
+        Index("ix_world_knowledge_campaign_relation", "campaign_id", "target_relation_id"),
+        Index("ix_world_knowledge_campaign_tentity", "campaign_id", "target_entity_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    subject_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    subject_entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_entities.id", ondelete="CASCADE"), nullable=False,
+    )
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_fact_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_facts.id", ondelete="CASCADE"), nullable=True,
+    )
+    target_relation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_relations.id", ondelete="CASCADE"), nullable=True,
+    )
+    target_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_entities.id", ondelete="CASCADE"), nullable=True,
+    )
+    knowledge_state: Mapped[str] = mapped_column(String(16), nullable=False, default="believes", server_default="believes")
+    acquisition_source: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="dm_only", server_default="dm_only")
+    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    details: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    source_turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "subject_kind": self.subject_kind,
+            "subject_entity_id": str(self.subject_entity_id),
+            "target_kind": self.target_kind,
+            "target_fact_id": str(self.target_fact_id) if self.target_fact_id else None,
+            "target_relation_id": str(self.target_relation_id) if self.target_relation_id else None,
+            "target_entity_id": str(self.target_entity_id) if self.target_entity_id else None,
+            "knowledge_state": self.knowledge_state,
+            "acquisition_source": self.acquisition_source,
+            "visibility": self.visibility,
+            "provenance": self.provenance or {},
+            "details": self.details or {},
+            "source_turn_id": str(self.source_turn_id) if self.source_turn_id else None,
+            "source_attempt_id": str(self.source_attempt_id) if self.source_attempt_id else None,
+            "source_event_id": str(self.source_event_id) if self.source_event_id else None,
+            "operation_id": self.operation_id,
+            "idempotency_key": self.idempotency_key,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class WorldVisibilityGrant(Base):
+    """Arbitrary-subset human disclosure grant — issue #211.
+
+    ``visibility="private"`` records disclose to exactly the grantee set with
+    an active (unrevoked) row here — never to the campaign at large and never
+    to the owner implicitly. Revocation sets ``revoked_at`` (soft): future
+    reads deny while the row + its history stay durable provenance.
+    """
+
+    __tablename__ = "world_visibility_grants"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "idempotency_key",
+            name="uq_world_visibility_grants_campaign_idempotency",
+        ),
+        Index("ix_world_visibility_grants_target", "campaign_id", "target_kind", "target_id"),
+        Index("ix_world_visibility_grants_grantee", "campaign_id", "grantee_user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    target_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    target_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    grantee_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False,
+    )
+    granted_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True,
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "target_kind": self.target_kind,
+            "target_id": str(self.target_id),
+            "grantee_user_id": str(self.grantee_user_id),
+            "granted_by": str(self.granted_by) if self.granted_by else None,
+            "revoked_at": self.revoked_at.isoformat() if self.revoked_at else None,
+            "operation_id": self.operation_id,
+            "idempotency_key": self.idempotency_key,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class WorldFactEntityRef(Base):
     """Indexed join: which canonical entities a fact references.
 
