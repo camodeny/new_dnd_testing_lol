@@ -1242,6 +1242,80 @@ def commit_turn(
                     )
         except Exception as e:
             logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
+    # Stage encounter.started lifecycle semantics for encounters created by
+    # this attempt's start_encounter effect (issue #230). The turn commit IS
+    # the start's fictional mutation, so each linked encounter gets its own
+    # domain event + durable outbox hook chained in the same outer
+    # transaction (one event per revision, preserving the
+    # sequence == revision invariant). Fail-closed: any staging failure
+    # propagates and aborts the turn commit — a durable encounter without
+    # its lifecycle event must never commit. Direct realtime delivery
+    # happens post-commit below.
+    linked_encounter_ids: list[uuid.UUID] = []
+    from models.campaigns import CampaignDomainEvent as _DomainEvent
+    from models.combat import Encounter as _Encounter
+
+    _started = db.execute(
+        select(_Encounter).where(
+            _Encounter.campaign_id == turn.campaign_id,
+            _Encounter.source_attempt_id == attempt.id,
+            _Encounter.created_event_id.is_(None),
+        )
+    ).scalars().all()
+    if _started:
+        from app.campaigns.events import commit_campaign_mutation as _commit_mutation
+        from app.combat.service import (
+            ENCOUNTER_STARTED_EVENT as _ENCOUNTER_STARTED,
+            list_participants as _list_parts,
+        )
+
+        for _enc in _started:
+            _lifecycle = db.execute(
+                select(_DomainEvent).where(
+                    _DomainEvent.campaign_id == turn.campaign_id,
+                    _DomainEvent.operation_id == _enc.operation_id,
+                    _DomainEvent.event_type == _ENCOUNTER_STARTED,
+                )
+            ).scalars().first()
+            if _lifecycle is None:
+                _, _lifecycle = _commit_mutation(
+                    db,
+                    turn.campaign_id,
+                    expected_revision=int(campaign_after.revision or 0),
+                    event_type=_ENCOUNTER_STARTED,
+                    payload={
+                        "encounter_id": str(_enc.id),
+                        "thread_id": _enc.thread_id,
+                        "participant_count": int(_enc.participant_count or 0),
+                        "start_source": _enc.start_source,
+                        "source_turn_id": str(turn.id),
+                        "source_attempt_id": str(attempt.id),
+                        "participants": [
+                            {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
+                            for p in _list_parts(db, _enc.id)
+                        ],
+                    },
+                    operation_id=_enc.operation_id,
+                    actor_id=event.actor_id,
+                    provenance={
+                        "source": "dm_effect",
+                        "turn_event_id": str(event.id),
+                        "attempt_id": str(attempt.id),
+                    },
+                    outbox_event_type=_ENCOUNTER_STARTED,
+                    outbox_payload={
+                        "encounter_id": str(_enc.id),
+                        "campaign_id": str(turn.campaign_id),
+                        "thread_id": _enc.thread_id,
+                        "participant_count": int(_enc.participant_count or 0),
+                        "start_source": _enc.start_source,
+                    },
+                    outbox_operation_id=f"encounter:{_enc.id}:started",
+                    commit=False,
+                )
+            _enc.created_event_id = _lifecycle.id
+            linked_encounter_ids.append(_enc.id)
+        db.flush()
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
@@ -1285,6 +1359,22 @@ def commit_turn(
     db.refresh(attempt)
     db.refresh(campaign_after)
     db.refresh(event)
+
+    # Post-commit encounter-start realtime hook (issue #230). The durable
+    # outbox row staged above is the guaranteed delivery path; this direct
+    # publish is latency-only and best-effort — it never rolls back
+    # committed state.
+    if commit and linked_encounter_ids:
+        try:
+            from app.realtime.service import publish_encounter_started as _publish_started
+            from models.combat import Encounter as _EncounterPub
+
+            for _eid in linked_encounter_ids:
+                _row = db.get(_EncounterPub, _eid)
+                if _row is not None:
+                    _publish_started(db, _row)
+        except Exception as e:
+            logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "

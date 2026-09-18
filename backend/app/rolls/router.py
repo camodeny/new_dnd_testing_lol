@@ -1,4 +1,5 @@
 """HTTP transport for durable player-owned roll requests — issue #204."""
+import logging
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
@@ -16,6 +17,8 @@ from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, a
 from database import get_db
 from models.dm import DmTurn
 from models.dm import PlayerRollRequest
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -36,6 +39,29 @@ def _visible_turn(db: Session, campaign_id: uuid.UUID, turn_id: uuid.UUID, user_
     except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
         raise HTTPException(status_code=404, detail="Turn not found") from exc
     return turn
+
+
+def _publish_encounter_ready_post_commit(db: Session, result: dict) -> None:
+    """Best-effort ready publish for initiative fulfilled via generic rolls.
+
+    Mirrors the encounter router's post-commit pattern: the durable outbox row
+    (enqueued atomically with the mutation) is the guaranteed hook; this
+    direct publish is latency-only. Runs after the outer idempotency commit so
+    replays (stable event ids) stay idempotent.
+    """
+    ready = result.get("encounter_ready")
+    if not isinstance(ready, dict) or not ready.get("ready") or not ready.get("encounter_id"):
+        return
+    try:
+        from app.combat.service import get_encounter
+        from app.realtime.service import publish_encounter_ready
+
+        encounter = get_encounter(db, uuid.UUID(str(ready["encounter_id"])))
+        if encounter is None:
+            return
+        publish_encounter_ready(db, encounter)
+    except Exception:
+        logger.warning("generic roll fulfill post-commit ready publish skipped", exc_info=True)
 
 
 def _request_or_404(db: Session, campaign_id: uuid.UUID, request_id: uuid.UUID) -> PlayerRollRequest:
@@ -113,11 +139,12 @@ def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, 
 
     def execute():
         try:
-            req, fulfillment, resumed = fulfill_roll(db, request_id=rid, actor_id=profile.id, payload=payload)
+            req, fulfillment, resumed, encounter_ready = fulfill_roll(db, request_id=rid, actor_id=profile.id, payload=payload)
             return {
                 "roll_request": req.to_dict(),
                 "fulfillment": fulfillment.to_dict(include_private=True),
                 "resumed_attempt": resumed.to_dict() if resumed else None,
+                "encounter_ready": encounter_ready,
             }
         except RollAuthorizationError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -131,6 +158,7 @@ def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, 
         command_type="player_roll.fulfill", scope_type="roll_request", scope_id=rid,
         payload=payload, execute=execute,
     )
+    _publish_encounter_ready_post_commit(db, result)
     resumed = result.get("resumed_attempt")
     if resumed:
         from app.dm.recovery import execute_committed_attempt
