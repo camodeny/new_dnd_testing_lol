@@ -130,6 +130,29 @@ def filter_entities_for_viewer(
     return [e for e in entities if e.visibility not in RESTRICTED_VISIBILITIES]
 
 
+def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
+    """Authority-safe entity dict with DM-private NPC rules state redacted (#227).
+
+    Entity-level visibility still filters whole rows (see above); this
+    additionally redacts nested ``details`` rules-state sections for
+    campaign-visible NPCs carrying ``dm_private`` mutations. Code owns the
+    redaction via :func:`app.rules.state.project_npc_details_for_viewer` —
+    decision models never see a separate path.
+    """
+    data = entity.to_dict()
+    if is_authority:
+        return data
+    try:
+        from app.rules.state import project_npc_details_for_viewer as _project_details
+    except Exception:
+        return data
+    try:
+        data["details"] = _project_details(data.get("details"), False)
+    except Exception:
+        data["details"] = {}
+    return data
+
+
 # ── Typed reads ─────────────────────────────────────────────────────────────
 
 def get_entity(db: Session, entity_id: uuid.UUID) -> WorldEntity | None:
