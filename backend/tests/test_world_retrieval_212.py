@@ -670,3 +670,41 @@ def test_private_knowledge_internal_preserves_visibility_player_filters():
     assert player_view.packets == []
     assert player_view.denied >= 1
     assert player_view.denied_reasons.get("knowledge_not_visible") == 1
+
+
+# ── AI review round 2 regression ───────────────────────────────────────────
+
+def test_campaign_knowledge_of_hidden_target_stays_restricted_in_mediation():
+    from app.dm.evidence import evidence_results_to_records
+
+    Fac, cid, owner, player, _ = _setup()
+    db = Fac()
+    seed = _seed_graph(db, cid)  # seed["secret"] is a dm_only fact
+    campaign = db.get(Campaign, cid)
+    # Campaign-visible knowledge row pointing at a dm_only truth target.
+    assert_knowledge_inline(
+        db, campaign, subject_kind="character",
+        subject_entity_id=seed["a"].id, target_kind="fact",
+        target_fact_id=seed["secret"].id, knowledge_state="knows",
+        acquisition_source="overheard", visibility="campaign")
+    db.commit()
+    internal = query_character_knowledge(
+        db, cid, seed["a"].id, owner, dm_internal=True)
+    assert internal.visible == 1
+    # Packet visibility is the stricter of row and target: dm_only wins.
+    assert internal.packets[0].visibility == "dm_only"
+    assert "Asha hides" in str(internal.packets[0].content.get("target", {}))
+    # Through #203 mediation the evidence stays dm_only / adjudication-only.
+    audience = ContextAudience(campaign_id=str(cid), thread_id="main",
+                               audience="campaign", user_ids=[str(owner)])
+    requests = validate_evidence_requests([
+        {"id": "evk", "tool": "query_character_knowledge",
+         "query": str(seed["a"].id)},
+    ])
+    results, _trace = execute_evidence_round(
+        requests, audience, db=db, timeout_s=None)
+    assert results[0].status == "ok"
+    assert results[0].visibility == "dm_only"
+    records = evidence_results_to_records(results, audience)
+    # dm_only evidence is adjudication-only: never narration-eligible.
+    assert records[0].use == "adjudication_only"

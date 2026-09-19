@@ -1297,12 +1297,45 @@ def _knowledge_target_id_of_row(row: Any) -> tuple[str, str]:
     return kind, ""
 
 
+def _canonical_knowledge_visibility(value: Any) -> str:
+    """Canonical packet visibility: public/campaign/dm_only/private.
+
+    Unknown spellings fail closed to ``dm_only`` (adjudication-only, never
+    narration-eligible) rather than guessing broader disclosure.
+    """
+    s = str(value or "dm_only").strip()
+    aliases = {"party": "campaign", "party_known": "campaign", "dm_private": "dm_only"}
+    s = aliases.get(s, s)
+    if s in {"public", "campaign", "dm_only", "private"}:
+        return s
+    return "dm_only"
+
+
+_VISIBILITY_RESTRICTIVENESS = {"public": 0, "campaign": 1, "dm_only": 2, "private": 3}
+
+
+def _most_restrictive_visibility(first: Any, second: Any) -> str:
+    """Most restrictive of two visibility labels (fail closed on unknown)."""
+    a = _canonical_knowledge_visibility(first)
+    b = _canonical_knowledge_visibility(second)
+    if _VISIBILITY_RESTRICTIVENESS.get(b, 2) > _VISIBILITY_RESTRICTIVENESS.get(a, 2):
+        return b
+    return a
+
+
 def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> dict[str, Any]:
-    """Campaign-scoped internal entry: real visibility, target snapshot included."""
+    """Campaign-scoped internal entry: most-restrictive visibility, target snapshot.
+
+    The packet visibility is at least as restrictive as BOTH the knowledge
+    row and the embedded truth-target record, so a ``campaign``-visible
+    knowledge row pointing at a ``dm_only`` fact stays ``dm_only`` and can
+    never become narration-eligible through evidence mediation.
+    """
     from models.world import WorldEntity, WorldFact, WorldRelation
 
     kind, target_id = _knowledge_target_id_of_row(row)
     target: dict[str, Any] | None = None
+    target_visibility: Any = None
     try:
         record = None
         if kind == "fact" and getattr(row, "target_fact_id", None):
@@ -1313,8 +1346,12 @@ def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> 
             record = db.get(WorldEntity, row.target_entity_id)
         if record is not None and getattr(record, "campaign_id", None) == campaign_id:
             target = record.to_dict()
+            target_visibility = getattr(record, "visibility", None)
     except Exception:
         target = None
+        target_visibility = None
+    row_visibility = getattr(row, "visibility", "dm_only")
+    visibility = _most_restrictive_visibility(row_visibility, target_visibility or row_visibility)
     return {
         "knowledge_id": str(row.id),
         "subject_kind": getattr(row, "subject_kind", None),
@@ -1323,7 +1360,8 @@ def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> 
         "target_id": target_id,
         "knowledge_state": getattr(row, "knowledge_state", "believes"),
         "acquisition_source": getattr(row, "acquisition_source", None),
-        "visibility": str(getattr(row, "visibility", "dm_only") or "dm_only"),
+        "visibility": visibility,
+        "target_visibility": _canonical_knowledge_visibility(target_visibility or row_visibility),
         "target": target,
         "campaign_id": str(campaign_id),
     }
@@ -1332,11 +1370,12 @@ def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> 
 def _enrich_entries_with_row_visibility(
     db: Session, campaign_id: uuid.UUID, entries: list[dict[str, Any]]
 ) -> None:
-    """Attach the source knowledge row's real visibility to authorized entries.
+    """Attach the most-restrictive real visibility to authorized entries.
 
     Only called for entries a human projection already authorized, so no
-    hidden row is introduced — this merely preserves its visibility metadata
-    instead of erasing it to a hardcoded default.
+    hidden row is introduced — this preserves the stricter of the knowledge
+    row's and the embedded target's visibility instead of erasing it to a
+    hardcoded default.
     """
     from models.world import WorldKnowledge
 
@@ -1346,7 +1385,10 @@ def _enrich_entries_with_row_visibility(
         except Exception:
             row = None
         if row is not None and getattr(row, "campaign_id", None) == campaign_id:
-            entry["visibility"] = str(getattr(row, "visibility", "dm_only") or "dm_only")
+            row_vis = getattr(row, "visibility", "dm_only")
+            target = entry.get("target") if isinstance(entry.get("target"), dict) else None
+            target_vis = (target or {}).get("visibility", row_vis)
+            entry["visibility"] = _most_restrictive_visibility(row_vis, target_vis)
 
 
 def query_character_knowledge(
@@ -1589,6 +1631,29 @@ def query_who_knows(
         knowledge_state=knowledge_state, limit=limit_applied + 1)
     knowers = list(projection.get("knowers", []))[:limit_applied]
     _enrich_entries_with_row_visibility(db, campaign.id, knowers)
+    from models.world import WorldEntity as _WhoKnowsEntity
+    from models.world import WorldFact as _WhoKnowsFact
+    from models.world import WorldRelation as _WhoKnowsRelation
+
+    _target_record = None
+    try:
+        if kind == "fact":
+            _target_record = db.get(_WhoKnowsFact, tid)
+        elif kind == "relation":
+            _target_record = db.get(_WhoKnowsRelation, tid)
+        else:
+            _target_record = db.get(_WhoKnowsEntity, tid)
+    except Exception:
+        _target_record = None
+    _target_vis = (
+        getattr(_target_record, "visibility", "dm_only")
+        if _target_record is not None
+        and getattr(_target_record, "campaign_id", None) == campaign.id
+        else "dm_only"
+    )
+    for _knower in knowers:
+        _knower["visibility"] = _most_restrictive_visibility(
+            _knower.get("visibility", "dm_only"), _target_vis)
     packets = [
         _knowledge_packet(
             {"knowledge_id": k["knowledge_id"],
