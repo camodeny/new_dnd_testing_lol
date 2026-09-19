@@ -17,6 +17,25 @@ function newKey(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
+async function tryCopyText(text: string): Promise<boolean> {
+  try {
+    if (typeof navigator === 'undefined' || !navigator.clipboard?.writeText) return false
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// Owner invite lists arrive oldest-first (CampaignInvite.created_at.asc()),
+// so the newest usable code is the max by created_at with later positions
+// winning ties/missing timestamps.
+function newestUsableInvite(list: CampaignInvite[]): CampaignInvite | undefined {
+  const usable = list.filter((inv) => inv.usable !== false && inv.status === 'active' && inv.code)
+  if (usable.length === 0) return undefined
+  return usable.reduce((latest, inv) => ((inv.created_at ?? '') >= (latest.created_at ?? '') ? inv : latest))
+}
+
 export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin }: CampaignLobbyProps) {
   const [members, setMembers] = useState<CampaignMember[]>([])
   const [eligibility, setEligibility] = useState<LobbyEligibility | null>(null)
@@ -28,6 +47,9 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [inviteBusy, setInviteBusy] = useState(false)
   const [inviteError, setInviteError] = useState('')
   const [inviteNotice, setInviteNotice] = useState('')
+  // Owner-only fallback link shown as selectable text when the clipboard
+  // write fails (the copy-only UI otherwise leaves no way to share it).
+  const [manualLink, setManualLink] = useState<string | null>(null)
   // Render-safe origin for shareable links (#242 review): populated after
   // mount so server rendering/prerendering never touches `window`.
   const [origin, setOrigin] = useState('')
@@ -98,6 +120,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setInviteBusy(true)
     setInviteError('')
     setInviteNotice('')
+    setManualLink(null)
     try {
       const created = await membersApi.createInvite(campaign.id, { intended_email: email })
       const result = await membersApi.sendInviteEmail(campaign.id, created.code, email) as {
@@ -108,11 +131,17 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       if (result?.delivery?.sent) {
         setInviteNotice(`Invite sent to ${email}.`)
       } else {
-        // Email failure never invalidates the invite: copy the link so it
-        // can be shared manually instead.
+        // Email failure never invalidates the invite: try to copy the link
+        // so it can be shared manually; on clipboard failure surface the
+        // owner-only link as selectable text instead of claiming a copy.
         const link = origin ? `${origin}/invite/${created.code}` : `/invite/${created.code}`
-        await navigator.clipboard.writeText(link).catch(() => {})
-        setInviteNotice(`Couldn't email ${email} (${result?.delivery?.error ?? 'provider unavailable'}) — invite link copied, share it manually.`)
+        const copied = await tryCopyText(link)
+        if (copied) {
+          setInviteNotice(`Couldn't email ${email} (${result?.delivery?.error ?? 'provider unavailable'}) — invite link copied, share it manually.`)
+        } else {
+          setManualLink(link)
+          setInviteNotice(`Couldn't email ${email} (${result?.delivery?.error ?? 'provider unavailable'}) — copy the link below manually.`)
+        }
       }
     } catch (err) {
       setInviteError((err as Error).message)
@@ -125,6 +154,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setInviteBusy(true)
     setInviteError('')
     setInviteNotice('')
+    setManualLink(null)
     try {
       await membersApi.revokeInvite(campaign.id, code, revision, newKey())
       await Promise.all([refreshInvites(), refreshLobby()])
@@ -141,15 +171,24 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     if (inviteBusy) return
     setInviteBusy(true)
     setInviteError('')
+    setInviteNotice('')
+    setManualLink(null)
     try {
       // Reuse the latest active link; only mint a new code when none exists.
-      const usable = invites.find((inv) => inv.usable !== false && inv.status === 'active' && inv.code)
+      const usable = newestUsableInvite(invites)
       const code = usable?.code ?? (await membersApi.createInvite(campaign.id)).code
       const link = origin ? `${origin}/invite/${code}` : `/invite/${code}`
-      await navigator.clipboard.writeText(link).catch(() => {})
+      const copied = await tryCopyText(link)
       if (!usable) await Promise.all([refreshInvites(), refreshLobby()])
-      setLinkCopied(true)
-      setTimeout(() => setLinkCopied(false), 2000)
+      if (copied) {
+        setLinkCopied(true)
+        setTimeout(() => setLinkCopied(false), 2000)
+      } else {
+        // Clipboard unavailable/denied: surface the owner-only link as
+        // selectable text instead of reporting a copy that never happened.
+        setManualLink(link)
+        setInviteError(`Couldn't copy the invite link — copy it below manually: ${link}`)
+      }
     } catch (err) {
       setInviteError((err as Error).message)
     } finally {
@@ -353,6 +392,11 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                   </div>
                   {inviteError && <p className="lobby-invite-hint" role="alert">{inviteError}</p>}
                   {inviteNotice && <p className="lobby-invite-hint" role="status">{inviteNotice}</p>}
+                  {manualLink && (
+                    <p className="lobby-invite-hint" role="status" style={{ wordBreak: 'break-all' }}>
+                      Copy this link manually: <code>{manualLink}</code>
+                    </p>
+                  )}
                 </>
               ) : (
                 activeInvites.length === 0 && (

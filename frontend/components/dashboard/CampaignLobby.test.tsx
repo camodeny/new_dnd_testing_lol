@@ -139,3 +139,76 @@ describe('authoritative lobby synchronization', () => {
     expect(container.textContent).toContain('Party is no longer ready')
   })
 })
+
+describe('invite share-link copy', () => {
+  function stubClipboard(impl: (text: string) => Promise<void>) {
+    const writeText = vi.fn(impl)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    return writeText
+  }
+
+  function shareButton() {
+    const element = container.querySelector('button[aria-label="Copy a shareable invite link"]')
+    if (!element) throw new Error('Missing button: Copy a shareable invite link')
+    return element as HTMLButtonElement
+  }
+
+  async function flush() {
+    await act(async () => {})
+  }
+
+  it('reuses the newest active invite instead of the oldest', async () => {
+    vi.mocked(campaignMembers.listInvites).mockResolvedValue({
+      invites: [
+        { campaign_id: 'campaign', status: 'active', usable: true, code: 'old-code', created_at: '2026-01-01T00:00:00Z' },
+        { campaign_id: 'campaign', status: 'active', usable: true, code: 'new-code', created_at: '2026-09-01T00:00:00Z' },
+      ],
+    })
+    const writeText = stubClipboard(async () => {})
+    await renderLobby()
+    await flush()
+    await act(async () => { shareButton().click() })
+    expect(campaignMembers.createInvite).not.toHaveBeenCalled()
+    expect(writeText).toHaveBeenCalledOnce()
+    expect(writeText.mock.calls[0][0]).toContain('new-code')
+    expect(writeText.mock.calls[0][0]).not.toContain('old-code')
+    expect(container.textContent).toContain('Copied')
+  })
+
+  it('surfaces the link as selectable text when clipboard copy fails', async () => {
+    vi.mocked(campaignMembers.listInvites).mockResolvedValue({
+      invites: [
+        { campaign_id: 'campaign', status: 'active', usable: true, code: 'share-code', created_at: '2026-09-01T00:00:00Z' },
+      ],
+    })
+    stubClipboard(async () => { throw new Error('denied') })
+    await renderLobby()
+    await flush()
+    await act(async () => { shareButton().click() })
+    expect(container.textContent).not.toContain('Copied')
+    expect(container.textContent).toContain("Couldn't copy the invite link")
+    expect(container.textContent).toContain('Copy this link manually')
+    expect(container.textContent).toContain('share-code')
+  })
+
+  it('shows the manual link (not a false copy) when email fails and clipboard fails', async () => {
+    vi.mocked(campaignMembers.createInvite).mockResolvedValue({ code: 'email-code', invite_url: '', invite_url_path: '/invite/email-code' })
+    vi.mocked(campaignMembers.sendInviteEmail).mockResolvedValue({ delivery: { sent: false, error: 'boom' } })
+    stubClipboard(async () => { throw new Error('denied') })
+    await renderLobby()
+    await flush()
+    const input = container.querySelector('input[aria-label="Invitee email"]')
+    if (!input) throw new Error('Missing input: Invitee email')
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+      setter?.call(input, 'friend@example.com')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      input.dispatchEvent(new Event('change', { bubbles: true }))
+    })
+    await act(async () => { button('Send invite').click() })
+    expect(container.textContent).toContain('copy the link below manually')
+    expect(container.textContent).toContain('Copy this link manually')
+    expect(container.textContent).toContain('email-code')
+    expect(container.textContent).not.toContain('invite link copied')
+  })
+})
