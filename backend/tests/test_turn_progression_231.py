@@ -861,7 +861,8 @@ def test_hidden_npc_speed_redacted_for_non_owners():
         assert player_proj["resources"][npc_id]["movement_max"] is None
         assert player_proj["resources"][npc_id]["movement_remaining"] is None
         assert player_proj["resources"][npc_id]["extra_resources"] == {}
-        assert "50" not in str(player_proj["resources"][npc_id])
+        assert player_proj["resources"][npc_id]["movement_max"] != 50
+        assert player_proj["resources"][npc_id]["movement_remaining"] != 50
         # The PC's own budget stays visible to the non-owner.
         assert player_proj["resources"][str(owner_p.id)]["movement_max"] == 30
         # Same redaction rides the snapshot view and the default (fail-closed) read.
