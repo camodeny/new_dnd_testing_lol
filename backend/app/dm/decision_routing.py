@@ -123,7 +123,14 @@ _ensure_route_policy()
 
 @dataclass(frozen=True)
 class RouteSignals:
-    """Authoritative code-owned signals a route frame is built from."""
+    """Authoritative code-owned signals a route frame is built from.
+
+    ``complete`` is False when any authoritative read failed or coverage is
+    incomplete (e.g. submissions exist but no segments were read). An
+    incomplete signal set must escalate to the generative path — never
+    execute directly against a frame that may be missing player input or
+    pending player-owned rolls.
+    """
 
     state_revision: str | int
     submission_ids: tuple[str, ...]
@@ -131,6 +138,8 @@ class RouteSignals:
     ooc_only: bool = False
     pending_roll_count: int = 0
     pending_roll_labels: tuple[str, ...] = ()
+    complete: bool = True
+    signal_error: str | None = None
 
 
 @dataclass
@@ -384,6 +393,8 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
     submission_ids = tuple(str(s) for s in (attempt.submission_ids or []))
     segments: list[dict[str, str]] = []
     ooc_only = False
+    complete = True
+    signal_error: str | None = None
     try:
         from sqlalchemy import select
 
@@ -422,6 +433,8 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
         logger.warning("decision routing segment read failed: %s", exc)
         segments = []
         ooc_only = False
+        complete = False
+        signal_error = f"submission segment read failed: {exc}"
     pending_count = 0
     pending_labels: list[str] = []
     try:
@@ -444,6 +457,14 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
         pending_labels = [str(row.label or row.id) for row in pending_rows]
     except Exception as exc:
         logger.warning("decision routing pending-roll read failed: %s", exc)
+        complete = False
+        signal_error = f"pending roll read failed: {exc}"
+    if complete and submission_ids and not segments:
+        # Context assembly guarantees typed segments for every submission,
+        # so an empty read against a non-empty input set is incomplete
+        # coverage, not a genuine no-input attempt.
+        complete = False
+        signal_error = "no submission segments read for a non-empty input set"
     revision = getattr(attempt, "source_revision", 0)
     return RouteSignals(
         state_revision=revision,
@@ -452,6 +473,8 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
         ooc_only=ooc_only,
         pending_roll_count=pending_count,
         pending_roll_labels=tuple(pending_labels),
+        complete=complete,
+        signal_error=signal_error,
     )
 
 
@@ -667,6 +690,16 @@ def route_attempt(
     except Exception as exc:
         logger.warning("decision routing signal collection failed: %s", exc)
         return _escalate(f"signal collection failed: {exc}")
+    if not signals.complete:
+        # Incomplete coverage must escalate rather than guess: a degraded
+        # read could hide player input or a pending player-owned roll, and
+        # route_silent would otherwise resolve the attempt unseen.
+        return _escalate(
+            f"incomplete routing signals: {signals.signal_error}; "
+            "generative escape",
+            decision_skipped=True,
+            signal_error=signals.signal_error,
+        )
     try:
         frame = build_route_frame(signals)
     except DecisionError as exc:

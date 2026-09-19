@@ -426,3 +426,27 @@ def test_resumed_roll_evidence_escalates_without_decision_call(db):
     )
     assert calls == [1]
     assert result.mode == "silent"
+
+
+def test_degraded_signal_read_escalates_without_direct_execution():
+    from types import SimpleNamespace
+
+    adapter = FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID})
+    service = DecisionService(adapter)
+    stub_db = SimpleNamespace(
+        scalars=lambda *a, **k: (_ for _ in ()).throw(RuntimeError("db down")),
+        get=lambda model, _id: SimpleNamespace(revision=3),
+        refresh=lambda *a, **k: None,
+    )
+    attempt = SimpleNamespace(
+        id=uuid.uuid4(), campaign_id=uuid.uuid4(), submission_ids=["sub-1"],
+        source_revision=3, roll_evidence=[],
+    )
+    turn = SimpleNamespace(id=uuid.uuid4())
+    outcome = routing.route_attempt(
+        stub_db, attempt=attempt, turn=turn, decision_service=service
+    )
+    assert outcome.directive == "escalate"
+    assert outcome.contract is None
+    assert outcome.trace.get("decision_skipped") is True
+    assert adapter.calls == []
