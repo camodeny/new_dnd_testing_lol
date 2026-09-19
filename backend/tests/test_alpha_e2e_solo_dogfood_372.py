@@ -267,12 +267,15 @@ class Scenario:
         Provider-boundary failures (missing/misbehaving generative fixture)
         route through the generative-execution formatter so the artifact
         names ``generative_execution``; all other sweep failures stay
-        ``submission_execution``. Detection uses only the privacy-safe
-        error string (never payload bytes).
+        ``submission_execution``. Only whitelisted IDs/role/step cross into
+        the artifact — the raw provider error (which echoes player input
+        excerpts) is never persisted.
         """
         try:
             failed = outcome.get("failed") or []
-            first_error = str((failed[0] or {}).get("error", "") if failed else "")
+            first = dict(failed[0]) if failed else {}
+            first_error = str(first.get("error", ""))
+            attempt_id = first.get("attempt_id")
             lowered = first_error.lower()
             if "no fixture for this logical request" in lowered or (
                 "fake-provider" in lowered and "no fixture" in lowered
@@ -286,28 +289,64 @@ class Scenario:
                         role = match.group(1)
                 except Exception:
                     pass
-                return format_provider_failure(
-                    RuntimeError(first_error[:500]),
+                safe_error = RuntimeError(
+                    "generative provider has no fixture for this logical request "
+                    f"(role={role} step={stage})"
+                )
+                detail = format_provider_failure(
+                    safe_error,
                     role=role,
                     step=stage,
                 )
+                try:
+                    if attempt_id is not None:
+                        detail.setdefault("metadata", {})["attempt_id"] = str(
+                            attempt_id
+                        )
+                except Exception:
+                    pass
+                return detail
             return format_sweep_failure(outcome)
         except Exception:
             return {
                 "category": "submission_execution",
                 "stage": STAGE_SUBMISSION,
-                "detail": str(outcome)[:500],
+                "detail": "sweep failed",
                 "metadata": {},
             }
 
     def check_sweep(self, outcome: dict, stage: str):
         """Assert a production execute sweep has no failures (#374 detail)."""
         if outcome.get("failed"):
+            try:
+                # Record failed attempt IDs before the failure report so the
+                # artifact IDs include the boundary that actually broke.
+                for entry in outcome.get("failed") or []:
+                    aid = (entry or {}).get("attempt_id")
+                    if aid is not None and str(aid) not in self.ids["attempt_ids"]:
+                        self.ids["attempt_ids"].append(str(aid))
+            except Exception:
+                pass
             detail = self.sweep_failure_detail(outcome, stage)
+            try:
+                failed = outcome.get("failed") or []
+                attempt_ids = [
+                    str((entry or {}).get("attempt_id"))
+                    for entry in failed
+                    if (entry or {}).get("attempt_id") is not None
+                ]
+            except Exception:
+                attempt_ids = []
+            # Privacy-safe summary only: never persist the raw sweep
+            # error/outcome (provider errors echo player input excerpts).
+            message = (
+                f"sweep failed: {len(attempt_ids)} failed "
+                f"(attempts={attempt_ids} stage={stage})"
+            )
             return self.check(
                 False,
                 stage,
-                f"sweep failed: {outcome}",
+                message,
                 category=detail.get("category", "submission_execution"),
                 detail=detail,
             )
@@ -482,6 +521,17 @@ def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
     scn.check((body.get("dm_turn") or {}).get("id"), "start", "no opening turn")
     scn.check((body.get("dm_attempt") or {}).get("id"), "start", "no opening attempt")
     scn.ids["thread_id"] = body["thread_id"]
+    # Record coordinated IDs at creation so failure artifacts (which never
+    # reach the success-only await_committed_reply path) still carry them.
+    try:
+        turn_id = (body.get("dm_turn") or {}).get("id")
+        if turn_id is not None and str(turn_id) not in scn.ids["turn_ids"]:
+            scn.ids["turn_ids"].append(str(turn_id))
+        attempt_id = (body.get("dm_attempt") or {}).get("id")
+        if attempt_id is not None and str(attempt_id) not in scn.ids["attempt_ids"]:
+            scn.ids["attempt_ids"].append(str(attempt_id))
+    except Exception:
+        pass
     return body
 
 
@@ -498,6 +548,14 @@ def submit_player_turn(scn: Scenario, text: str, key: str, client=None) -> dict:
     body = r.json()
     scn.check((body.get("dm_turn") or {}).get("id"), "play", "no DM turn coordinated")
     scn.ids["submission_ids"].append(body["submission"]["id"])
+    # Record the coordinated turn ID at creation so failure artifacts carry
+    # it even when the commit assertions below are never reached.
+    try:
+        turn_id = (body.get("dm_turn") or {}).get("id")
+        if turn_id is not None and str(turn_id) not in scn.ids["turn_ids"]:
+            scn.ids["turn_ids"].append(str(turn_id))
+    except Exception:
+        pass
     return body
 
 
@@ -1067,7 +1125,9 @@ def test_missing_fixture_sweep_reports_generative_execution_artifact(
 
     #374 requires the generative-execution stage to be named when the
     provider boundary breaks; a generic ``submission`` report would send
-    investigators to the wrong pipeline stage.
+    investigators to the wrong pipeline stage. The artifact must stay
+    privacy-safe (no raw player input) while preserving the relevant
+    turn/attempt IDs.
     """
     monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
     _run_to_opening_reply(scn)
@@ -1075,10 +1135,16 @@ def test_missing_fixture_sweep_reports_generative_execution_artifact(
     phase0_provider._fixtures = [
         fixture for fixture in phase0_provider._fixtures if fixture.step != "play-1"
     ]
-    submitted = submit_player_turn(scn, FREEFORM_TURNS[0], "phase0-turn-1")
-    assert submitted["dm_turn"]["id"]
+    sentinel = "SENTINEL-PRIVATE-INPUT-9f3d58a2-must-never-reach-artifacts"
+    submitted = submit_player_turn(
+        scn, f"I press on carrying {sentinel}.", "phase0-turn-1"
+    )
+    submitted_turn_id = submitted["dm_turn"]["id"]
+    assert submitted_turn_id
     outcome = drain_dm_execution(scn, "play-1")
     assert outcome.get("failed"), "sweep unexpectedly succeeded without a fixture"
+    failed_attempt_id = (outcome["failed"][0] or {}).get("attempt_id")
+    assert failed_attempt_id
 
     with pytest.raises(AssertionError, match=r"\[374:generative_execution\]"):
         scn.check_sweep(outcome, "play-1")
@@ -1089,6 +1155,9 @@ def test_missing_fixture_sweep_reports_generative_execution_artifact(
     assert failure["category"] == "generative_execution"
     assert failure["detail"]["metadata"]["decision_role"] == "forward_dm"
     assert failure["detail"]["metadata"]["fixture_step"] == "play-1"
+    assert failure["detail"]["metadata"]["attempt_id"] == str(failed_attempt_id)
+    assert submitted_turn_id in failure["ids"]["turn_ids"]
+    assert str(failed_attempt_id) in failure["ids"]["attempt_ids"]
     assert scn.diag.timeline()[-1] == {
         "stage": "generative_execution",
         "status": "failed",
@@ -1101,6 +1170,14 @@ def test_missing_fixture_sweep_reports_generative_execution_artifact(
     saved = _json.load(open(artifacts[-1]))
     assert saved["first_failure"]["stage"] == "generative_execution"
     assert saved["first_failure"]["category"] == "generative_execution"
+    assert submitted_turn_id in saved["first_failure"]["ids"]["turn_ids"]
+    assert str(failed_attempt_id) in saved["first_failure"]["ids"]["attempt_ids"]
+    assert (
+        str(failed_attempt_id)
+        == saved["first_failure"]["detail"]["metadata"]["attempt_id"]
+    )
+    dumped = _json.dumps(saved)
+    assert sentinel not in dumped, "private player input leaked into CI artifact"
 
 
 def test_external_failure_bypassing_check_still_marks_stage_failed(
