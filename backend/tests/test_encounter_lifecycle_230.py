@@ -270,9 +270,12 @@ def test_human_and_npc_initiative_complete_to_active_with_order():
             str(owner_p.id): "human_app", str(player_p.id): "human_app", str(goblin_p.id): "dm_runtime",
         }
         assert "total_desc" in (encounter.tie_resolution or "")
-        # Both domain events exist in campaign order.
+        # Domain events exist in campaign order. Issue #231 opens turn 1
+        # atomically with readiness, appending encounter.turn_started.
+        from app.combat.service import TURN_STARTED_EVENT  # noqa: E402
+
         types = [e.event_type for e in list_campaign_events(db, ctx["campaign_id"])]
-        assert types == [ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT]
+        assert types == [ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT, TURN_STARTED_EVENT]
 
 
 def test_runtime_roll_refuses_human_pc_and_human_path_refuses_npc():
@@ -1024,13 +1027,15 @@ def test_private_thread_encounter_hidden_from_non_members():
         assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
         visible = get_snapshot_encounter(db, ctx["campaign_id"], ctx["owner"])
         assert visible is not None and visible["id"] == str(encounter.id)
-        # Activating writes the ready event; neither lifecycle event may reach
-        # the non-thread member's campaign history feed.
+        # Activating writes the ready + first-turn events; no lifecycle or
+        # turn event may reach the non-thread member's campaign history feed.
+        from app.combat.service import TURN_STARTED_EVENT  # noqa: E402
+
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
         _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
         feed_outsider = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
         assert all(
-            e.event_type not in (ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT)
+            e.event_type not in (ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT, TURN_STARTED_EVENT)
             for e in feed_outsider
         )
         feed_member = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])

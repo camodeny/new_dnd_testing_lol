@@ -54,12 +54,14 @@ def _publish_encounter_ready_post_commit(db: Session, result: dict) -> None:
         return
     try:
         from app.combat.service import get_encounter
-        from app.realtime.service import publish_encounter_ready
+        from app.realtime.service import publish_encounter_ready, publish_encounter_turn
 
         encounter = get_encounter(db, uuid.UUID(str(ready["encounter_id"])))
         if encounter is None:
             return
         publish_encounter_ready(db, encounter)
+        # Readiness opens turn 1 atomically (#231): project it too.
+        publish_encounter_turn(db, encounter, "started")
     except Exception:
         logger.warning("generic roll fulfill post-commit ready publish skipped", exc_info=True)
 
