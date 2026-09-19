@@ -741,6 +741,64 @@ def _record_routing_telemetry(
         logger.warning("decision routing telemetry dropped: %s", exc)
 
 
+def _record_superseded_telemetry(
+    db: Any,
+    *,
+    frame: DecisionFrame,
+    result: Any,
+    response: Any,
+    revision: str | int,
+    signals: RouteSignals,
+    error: Exception,
+    shadow: bool,
+    trace_id: str | None,
+    attempt: Any,
+    turn: Any,
+) -> None:
+    """Record an evaluated decision lost to attempt supersession (issue #383).
+
+    Best-effort and fail-soft: the authoritative escalation is unchanged.
+    The execution-policy outcome is derived from a pure re-evaluation probe
+    against the frame-time input set; the supersession failure is attached
+    as the deterministic revalidation result (``verified=False``). A probe
+    of its own that already failed revalidation keeps its own error.
+    """
+    try:
+        probe = decide_from_result(
+            frame,
+            result,
+            current_revision=revision,
+            frame_submission_ids=signals.submission_ids,
+            current_submission_ids=signals.submission_ids,
+        )
+    except Exception as probe_exc:
+        logger.warning("decision supersession telemetry probe dropped: %s", probe_exc)
+        return
+    trace = dict(probe.trace)
+    trace.update({"decision_path": OPEN_ENDED_GENERATIVE})
+    trace.setdefault("revalidation_error", str(error))
+    tele_outcome = RoutingOutcome(
+        directive=ESCALATE, selected_id=probe.selected_id, trace=trace,
+    )
+    if shadow:
+        mode = SHADOW
+    elif probe.directive == PRIMER_ADVISORY:
+        mode = PRIMER
+    else:
+        mode = ACTIVE
+    _record_routing_telemetry(
+        db,
+        frame=frame,
+        result=result,
+        response=response,
+        outcome=tele_outcome,
+        mode=mode,
+        trace_id=trace_id or getattr(response, "trace_id", None),
+        campaign_id=getattr(attempt, "campaign_id", None),
+        turn_id=getattr(turn, "id", None) or getattr(attempt, "turn_id", None),
+    )
+
+
 def route_attempt(
     db: Any,
     *,
@@ -831,6 +889,22 @@ def route_attempt(
                 "decision_path": OPEN_ENDED_GENERATIVE,
                 "revalidation_error": str(exc),
             }
+        )
+        # The bounded decision was already evaluated: record its policy
+        # outcome plus this deterministic revalidation failure (fail-soft)
+        # while the authoritative path escalates unchanged.
+        _record_superseded_telemetry(
+            db,
+            frame=frame,
+            result=result,
+            response=response,
+            revision=revision,
+            signals=signals,
+            error=exc,
+            shadow=shadow,
+            trace_id=trace_id,
+            attempt=attempt,
+            turn=turn,
         )
         return RoutingOutcome(directive=ESCALATE, trace=base)
     try:

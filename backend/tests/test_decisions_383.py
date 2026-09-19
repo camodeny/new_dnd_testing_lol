@@ -16,6 +16,9 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
+from models.campaigns import Campaign  # noqa: E402
+from models.dm import DmTurn, DmTurnAttempt  # noqa: E402
+from models.profiles import Profile  # noqa: E402
 from models.reliability import DecisionTelemetry  # noqa: E402
 
 from app.decisions import (  # noqa: E402
@@ -562,3 +565,55 @@ def test_routing_telemetry_persists_live_correlation_ids():
         assert row.operation_id == response.operation_id
         assert str(row.campaign_id) == str(campaign_id)
         assert str(row.turn_id) == str(turn_id)
+
+
+def test_superseded_attempt_still_records_policy_outcome_and_revalidation():
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy.orm import sessionmaker as _sessionmaker
+
+    engine = _create_engine("sqlite://")
+    Base.metadata.create_all(engine)
+    factory = _sessionmaker(bind=engine, expire_on_commit=False)
+    owner_id, camp_id, turn_id, attempt_id = (uuid.uuid4() for _ in range(4))
+    with factory() as db:
+        db.add(Profile(id=owner_id, email="owner@example.com"))
+        db.add(Campaign(id=camp_id, owner_id=owner_id, name="Table", revision=3))
+        db.add(DmTurn(
+            id=turn_id, campaign_id=camp_id, thread_id="thread-1",
+            source_revision=3, input_set_revision=0, submission_ids=[],
+            current_attempt_id=attempt_id,
+        ))
+        db.add(DmTurnAttempt(
+            id=attempt_id, turn_id=turn_id, attempt_number=1,
+            campaign_id=camp_id, thread_id="thread-1",
+            source_revision=3, input_set_revision=0, submission_ids=[],
+            # A newer submission superseded this attempt mid-decision.
+            status="superseded",
+        ))
+        db.commit()
+    service = DecisionService(
+        FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID})
+    )
+    with factory() as db:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        turn = db.get(DmTurn, turn_id)
+        outcome = routing.route_attempt(
+            db, attempt=attempt, turn=turn, decision_service=service,
+            trace_id="trace-superseded",
+        )
+        # Authoritative path escalates unchanged...
+        assert outcome.directive == "escalate"
+        assert outcome.contract is None
+        assert "revalidation_error" in outcome.trace
+    # ...while the evaluated decision is recorded with its policy outcome,
+    # failed revalidation, and correlation IDs.
+    with factory() as db:
+        row = db.query(DecisionTelemetry).one()
+        assert row.policy_directive == "direct_execute"
+        assert row.verified is False
+        assert "superseded" in (row.revalidation_error or "")
+        assert row.mode == ACTIVE
+        assert str(row.campaign_id) == str(camp_id)
+        assert str(row.turn_id) == str(turn_id)
+        assert row.trace_id == "trace-superseded"
+        assert row.selected_id == routing.ROUTE_SILENT_ID
