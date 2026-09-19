@@ -1407,10 +1407,23 @@ def build_damage_effect(
 def attack_domain_event(
     attack: AttackResolution, *, include_private: bool
 ) -> tuple[str, dict[str, Any], str]:
-    """(event_type, payload, visibility) triple for commit_campaign_mutation."""
+    """(event_type, payload, visibility) triple for commit_campaign_mutation.
+
+    A private (unredacted) payload always pairs with ``dm_private``
+    visibility — ``commit_campaign_mutation`` persists the supplied
+    visibility directly, so a private payload on a public event would
+    disclose hidden AC/dice. Shared visibility is only ever returned for
+    the redacted projection.
+    """
+    if include_private:
+        return (
+            ATTACK_RESOLVED_EVENT,
+            attack.to_event_payload(include_private=True),
+            "dm_private",
+        )
     return (
         ATTACK_RESOLVED_EVENT,
-        attack.to_event_payload(include_private=include_private),
+        attack.to_event_payload(include_private=False),
         "dm_private" if attack.ac_visibility == "hidden" else "public",
     )
 
@@ -1422,12 +1435,19 @@ def damage_domain_event(
     include_private: bool,
     visibility: str = "public",
 ) -> tuple[str, dict[str, Any], str]:
-    """(event_type, payload, visibility) triple for commit_campaign_mutation."""
+    """(event_type, payload, visibility) triple for commit_campaign_mutation.
+
+    A private (unredacted) payload always pairs with ``dm_private``
+    visibility, even if the caller passes a shared visibility — the private
+    payload carries exact HP snapshots, mitigation labels, and hidden dice.
+    Shared visibility is only ever returned for the redacted projection.
+    """
     payload = damage.to_event_payload(include_private=include_private)
     if hp_change is None:
         payload["hp_change"] = None
     elif include_private:
         payload["hp_change"] = hp_change.model_dump(mode="json")
+        return (DAMAGE_APPLIED_EVENT, payload, "dm_private")
     else:
         payload["hp_change"] = hp_change.public_projection()
     return (DAMAGE_APPLIED_EVENT, payload, visibility)

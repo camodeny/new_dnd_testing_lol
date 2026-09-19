@@ -1045,6 +1045,44 @@ def test_public_damage_event_hides_npc_mitigation_label():
     assert private_payload["mitigation"] == "resistance"
 
 
+def test_private_payloads_always_pair_with_private_visibility():
+    """Private event payloads can never ride on public visibility (#226)."""
+    attacker = pc_attacker(bonus=5)
+    defender = npc_defender(ac=15)
+    attack = resolve_attack_roll(
+        attacker=attacker,
+        defender=defender,
+        attacker_kind="pc",
+        dice=[12],
+        ac_visibility="public",  # even fully public mechanics…
+        attack_id="vis-atk",
+    )
+    _event_type, _payload, visibility = attack_domain_event(
+        attack, include_private=True
+    )
+    assert visibility == "dm_private"
+
+    spec = make_damage_spec(num_dice=1, die_size=8, modifier=1)
+    damage = resolve_damage(
+        spec=spec, damage_rolls=[4], attacker_kind="pc", damage_id="vis-dmg"
+    )
+    hp_change = apply_damage(
+        HitPoints(current=10, maximum=10, temporary=0),
+        damage.final_total,
+        change_id="vis-hp",
+    )
+    _event_type, _payload, visibility = damage_domain_event(
+        damage, hp_change, include_private=True, visibility="public"
+    )
+    assert visibility == "dm_private"  # …forced private despite caller arg
+
+    # Redacted projections keep their caller-chosen shared visibility.
+    _event_type, _payload, visibility = damage_domain_event(
+        damage, hp_change, include_private=False, visibility="public"
+    )
+    assert visibility == "public"
+
+
 # ── Staged-effect promotion (PC sheet + NPC entity) ───────────────────────
 
 
