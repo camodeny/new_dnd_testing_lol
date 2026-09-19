@@ -1076,6 +1076,13 @@ def test_private_payloads_always_pair_with_private_visibility():
     )
     assert visibility == "dm_private"  # …forced private despite caller arg
 
+    # Same guarantee when damage resolved without an HP snapshot.
+    _event_type, _payload, visibility = damage_domain_event(
+        damage, None, include_private=True, visibility="public"
+    )
+    assert visibility == "dm_private"
+    assert _payload["hp_change"] is None
+
     # Redacted projections keep their caller-chosen shared visibility.
     _event_type, _payload, visibility = damage_domain_event(
         damage, hp_change, include_private=False, visibility="public"

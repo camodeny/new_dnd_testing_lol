@@ -1443,13 +1443,18 @@ def damage_domain_event(
     Shared visibility is only ever returned for the redacted projection.
     """
     payload = damage.to_event_payload(include_private=include_private)
-    if hp_change is None:
-        payload["hp_change"] = None
-    elif include_private:
-        payload["hp_change"] = hp_change.model_dump(mode="json")
+    if include_private:
+        # Forced before branching on hp_change: damage resolved without an
+        # HP snapshot is still a full private payload (hidden dice,
+        # mitigation labels, provenance) and must never ride on shared
+        # visibility.
+        payload["hp_change"] = (
+            hp_change.model_dump(mode="json") if hp_change is not None else None
+        )
         return (DAMAGE_APPLIED_EVENT, payload, "dm_private")
-    else:
-        payload["hp_change"] = hp_change.public_projection()
+    payload["hp_change"] = (
+        hp_change.public_projection() if hp_change is not None else None
+    )
     return (DAMAGE_APPLIED_EVENT, payload, visibility)
 
 
