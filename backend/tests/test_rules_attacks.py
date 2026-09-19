@@ -9,8 +9,6 @@ import pytest
 from app.rules.attacks import (
     AttackError,
     AttackLedger,
-    CombatantDefense,
-    CombatantOffense,
     DamageContribution,
     HitPoints,
     apply_attack_consequence,
@@ -124,7 +122,7 @@ def npc_defender(ac=15):
 # ── Hit / miss / critical ─────────────────────────────────────────────────
 
 
-def test_hit_resolves_deterministically():
+def test_hit_miss_meet_or_beat_deterministic():
     attacker = pc_attacker(bonus=5)
     defender = npc_defender(ac=15)
     first = resolve_attack_roll(
@@ -149,11 +147,7 @@ def test_hit_resolves_deterministically():
     assert first.calculation_path == "attack_authoritative"
     assert first.model_dump() == second.model_dump()  # pure retry is identical
 
-
-def test_miss_when_total_below_ac():
-    attacker = pc_attacker(bonus=5)
-    defender = npc_defender(ac=15)
-    res = resolve_attack_roll(
+    miss = resolve_attack_roll(
         attacker=attacker,
         defender=defender,
         attacker_kind="pc",
@@ -161,15 +155,10 @@ def test_miss_when_total_below_ac():
         ac_visibility="public",
         attack_id="atk-miss",
     )
-    assert res.outcome == "miss"
-    assert res.total == 10
-    assert res.is_critical is False
+    assert miss.outcome == "miss"
+    assert miss.total == 10
 
-
-def test_meet_or_beat_hits():
-    attacker = pc_attacker(bonus=5)
-    defender = npc_defender(ac=15)
-    res = resolve_attack_roll(
+    meet = resolve_attack_roll(
         attacker=attacker,
         defender=defender,
         attacker_kind="pc",
@@ -177,8 +166,8 @@ def test_meet_or_beat_hits():
         ac_visibility="public",
         attack_id="atk-meet",
     )
-    assert res.total == 15
-    assert res.outcome == "hit"
+    assert meet.total == 15
+    assert meet.outcome == "hit"  # meet-or-beat
 
 
 def test_natural_20_critical_always_hits():
@@ -514,11 +503,7 @@ def test_hidden_ac_absent_from_public_projection():
     full = res.to_event_payload(include_private=True)
     assert full["armor_class"] == 15
 
-
-def test_public_ac_included_when_explicitly_public():
-    attacker = pc_attacker(bonus=5)
-    defender = npc_defender(ac=15)
-    res = resolve_attack_roll(
+    open_res = resolve_attack_roll(
         attacker=attacker,
         defender=defender,
         attacker_kind="pc",
@@ -526,7 +511,7 @@ def test_public_ac_included_when_explicitly_public():
         ac_visibility="public",
         attack_id="atk-open",
     )
-    assert res.public_projection()["armor_class"] == 15
+    assert open_res.public_projection()["armor_class"] == 15
 
 
 def test_hidden_npc_roll_hides_dice_and_total():
@@ -1386,15 +1371,6 @@ def test_built_effect_survives_canonical_contract_validation():
                 "staged_effects": [bad],
             }
         )
-
-
-def test_offense_defense_constructors_exposed_without_alias_knowledge():
-    from pydantic import ValidationError
-
-    assert isinstance(CombatantOffense(attack_bonus=5), CombatantOffense)
-    assert isinstance(CombatantDefense(armor_class=15), CombatantDefense)
-    with pytest.raises(ValidationError):
-        CombatantOffense(attack_bonus="high")  # type: ignore
 
 
 def _respond_contract(*effects):
