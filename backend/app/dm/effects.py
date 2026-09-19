@@ -465,11 +465,24 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
     change_id = _resolve_effect_key(attempt, effect)
 
     if target_kind == "pc":
+        from models.campaigns import CampaignMember
         from models.characters import Character, Dnd5eCharacterSheet
 
         character = db.get(Character, target_id)
         if character is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} not found")
+        # Roster scoping (#266 canonical, same pattern as combat participant
+        # validation): the character must be on this campaign's active roster.
+        # Without this, a staged effect committed for campaign A could reduce
+        # HP on an unrelated campaign/user character.
+        roster = db.execute(
+            _select(CampaignMember).where(
+                CampaignMember.campaign_id == campaign.id,
+                CampaignMember.selected_character_id == character.id,
+            )
+        ).scalars().first()
+        if roster is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
         sheet = db.execute(
             _select(Dnd5eCharacterSheet)
             .where(Dnd5eCharacterSheet.character_id == character.id)

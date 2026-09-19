@@ -971,7 +971,7 @@ def _handler_db():
 
 def _handler_fixture(db):
     import uuid as _uuid
-    from models.campaigns import Campaign
+    from models.campaigns import Campaign, CampaignMember
     from models.characters import Character, Dnd5eCharacterSheet
     from models.dm import DmTurn, DmTurnAttempt
     from models.profiles import Profile
@@ -985,6 +985,8 @@ def _handler_fixture(db):
     char = Character(id=_uuid.uuid4(), owner_id=owner, system="dnd5e", name="Fighter")
     db.add(char)
     db.flush()
+    # Canonical active roster (#266): Fighter is this campaign's selected PC.
+    db.add(CampaignMember(campaign_id=camp.id, user_id=owner, role="owner", selected_character_id=char.id))
     sheet = Dnd5eCharacterSheet.from_frontend(
         {
             "name": "Fighter",
@@ -1125,6 +1127,126 @@ def test_staged_effect_missing_target_fails_closed():
         )
         with pytest.raises(ValueError, match="not found"):
             apply_staged_effects(db, camp, [effect], turn, attempt)
+
+
+def test_staged_effect_rejects_character_outside_campaign_roster():
+    """Cross-campaign guard: a PC effect only applies to rostered characters."""
+    import uuid as _uuid
+
+    from app.dm.effects import apply_staged_effects
+    from models.characters import Character, Dnd5eCharacterSheet
+    from models.profiles import Profile
+
+    factory = _handler_db()
+    with factory() as db:
+        camp, turn, attempt, _char, _brute = _handler_fixture(db)
+        # Foreign character: owned elsewhere, never rostered in this campaign.
+        outsider_owner = _uuid.uuid4()
+        db.add(Profile(id=outsider_owner, email="outsider@example.com"))
+        outsider = Character(
+            id=_uuid.uuid4(), owner_id=outsider_owner, system="dnd5e", name="Outsider"
+        )
+        db.add(outsider)
+        db.flush()
+        sheet = Dnd5eCharacterSheet.from_frontend(
+            {
+                "name": "Outsider",
+                "total_level": 3,
+                "max_hp": 24,
+                "current_hp": 24,
+                "temp_hp": 0,
+            },
+            owner_id=outsider_owner,
+        )
+        sheet.character_id = outsider.id
+        db.add(sheet)
+        db.commit()
+        hp_before = (sheet.hit_points_current, sheet.hit_points_temp)
+
+        spec = make_damage_spec(num_dice=1, die_size=8, modifier=3)
+        damage = resolve_damage(
+            spec=spec, damage_rolls=[6], attacker_kind="pc", damage_id="h-xcamp-dmg"
+        )
+        effect = build_damage_effect(
+            effect_id="h-xcamp-eff",
+            target_kind="pc",
+            target_id=str(outsider.id),
+            damage=damage,
+            visibility="public",
+        )
+        with pytest.raises(ValueError, match="not on this campaign's active roster"):
+            apply_staged_effects(db, camp, [effect], turn, attempt)
+        db.rollback()
+        from sqlalchemy import select
+
+        row = db.execute(
+            select(Dnd5eCharacterSheet).where(
+                Dnd5eCharacterSheet.character_id == outsider.id
+            )
+        ).scalars().first()
+        assert (row.hit_points_current, row.hit_points_temp) == hp_before  # untouched
+
+
+def test_built_effect_survives_canonical_contract_validation():
+    """The staged damage effect passes the typed DM contract (#206 path)."""
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+
+    spec = make_damage_spec(num_dice=1, die_size=8, modifier=3, damage_type="slashing")
+    damage = resolve_damage(
+        spec=spec, damage_rolls=[6], attacker_kind="pc", damage_id="ctr-dmg"
+    )
+    effect = build_damage_effect(
+        effect_id="ctr-eff-1",
+        target_kind="pc",
+        target_id=str(uuid.uuid4()),
+        damage=damage,
+        visibility="public",
+    )
+    claim = {
+        "text": "The mace connects.",
+        "claim_kind": "observation",
+        "origin": "dm_adjudication",
+        "visibility": "public",
+    }
+    c = normalize_contract(
+        {
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": "attack lands",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [claim]}],
+            "staged_effects": [effect],
+        }
+    )
+    assert len(c.staged_effects) == 1
+    assert c.staged_effects[0].effect_type == "apply_attack_damage"
+    # Malformed damage args still fail closed at the contract boundary.
+    from app.dm.contract import ContractValidationError
+
+    bad = dict(effect)
+    bad["arguments"] = dict(effect["arguments"], damage_total=-5)
+    with pytest.raises(ContractValidationError):
+        normalize_contract(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "mode": "respond",
+                "reason": "x",
+                "beats": [
+                    {
+                        "id": "beat_1",
+                        "type": "narration",
+                        "claims": [
+                            {
+                                "text": "Boom.",
+                                "claim_kind": "observation",
+                                "origin": "dm_adjudication",
+                                "visibility": "public",
+                            }
+                        ],
+                    }
+                ],
+                "staged_effects": [bad],
+            }
+        )
 
 
 def test_offense_defense_constructors_exposed_without_alias_knowledge():

@@ -1349,6 +1349,12 @@ def build_damage_effect(
     widen explicitly for shared-table damage.
     """
     _require_stable_id(effect_id, field="effect_id", what="effect_id")
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", effect_id) or len(effect_id) > 48:
+        raise AttackError(
+            "invalid_effect_id",
+            "effect_id must match [A-Za-z0-9_-]+ (1-48 chars) so the effect survives canonical DM-contract validation",
+            field="effect_id",
+        )
     if target_kind not in ("pc", "npc"):
         raise AttackError(
             "invalid_target",
