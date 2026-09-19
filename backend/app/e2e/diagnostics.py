@@ -520,6 +520,7 @@ class ScenarioDiagnostics:
         self.scenario = scenario
         self._timeline: list[dict[str, Any]] = []
         self._ids: dict[str, Any] = {}
+        self._metadata: dict[str, Any] = {}
         self._first_failure: dict[str, Any] | None = None
 
     def begin_stage(self, stage: str) -> None:
@@ -545,6 +546,17 @@ class ScenarioDiagnostics:
                     self._ids[key] = list(value)
                 else:
                     self._ids[key] = value
+        except Exception:
+            pass
+
+    def record_metadata(self, **fields: Any) -> None:
+        """Merge privacy-safe run metadata without treating it as IDs.
+
+        Real-AI scenarios use this for provider/model/latency observations;
+        callers must still provide only metadata that is safe for diagnostics.
+        """
+        try:
+            self._metadata.update(_jsonable(fields))
         except Exception:
             pass
 
@@ -596,6 +608,7 @@ class ScenarioDiagnostics:
             "timeline": self.timeline(),
             "first_failure": _jsonable(self._first_failure),
             "ids": _jsonable(self._ids),
+            "metadata": _jsonable(self._metadata),
             "generated_at": _utcnow_iso(),
         }
 
