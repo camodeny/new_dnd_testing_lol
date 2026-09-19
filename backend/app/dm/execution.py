@@ -444,6 +444,7 @@ def _execute_owned_attempt(
     timeout_seconds: float = 90,
     trace_id: str | None = None,
     supplemental_status=None,
+    decision_service=None,
 ):
     """Claim and execute one prepared DM attempt end-to-end (idempotent).
 
@@ -717,10 +718,90 @@ def _execute_owned_attempt(
             _snapshot_contract = None
             _reuse_snapshot = False
 
+    # Issue #382 — decision-first routing probe. Runs after packet assembly
+    # and only for fresh attempts (narration retries reuse their snapshot).
+    # DIRECT outcomes still pass deterministic validation below; PRIMER
+    # outcomes attach the advisory prior to the adjudication packet while
+    # the generative path stays authoritative; anything else proceeds down
+    # the ordinary generative path with the trace recording which path was
+    # taken.
+    _direct_contract = None
+    _route_trace: dict = {}
+    _route_primer: dict | None = None
+    if _snapshot_contract is None:
+        try:
+            from app.dm import decision_routing as _routing
+
+            _outcome = _routing.route_attempt(
+                db, attempt=attempt, turn=turn, trace_id=tid,
+                decision_service=decision_service,
+            )
+            _route_trace = _outcome.trace
+            path_info.update(_routing.path_info_fields(_outcome))
+            if _outcome.primer is not None:
+                _route_primer = dict(_outcome.primer)
+                structured_log(
+                    logger, logging.INFO, "dm_execute_decision_primer",
+                    turn_id=str(turn.id), attempt_id=str(attempt.id),
+                    selected=str(_outcome.selected_id),
+                    primer=_outcome.primer, trace_id=tid,
+                )
+            if (
+                _outcome.directive == "direct_execute"
+                and _outcome.contract is not None
+            ):
+                _direct_contract = _outcome.contract
+            structured_log(
+                logger, logging.INFO, "dm_execute_decision_route",
+                turn_id=str(turn.id), attempt_id=str(attempt.id),
+                decision_path=_route_trace.get("decision_path"),
+                directive=_outcome.directive,
+                selected=str(_outcome.selected_id), trace_id=tid,
+            )
+        except Exception as exc:
+            logger.warning("dm_execute decision routing failed: %s", exc)
+            _direct_contract = None
+            _route_primer = None
+            _route_trace = {
+                "decision_path": "open_ended_generative",
+                "directive": "escalate",
+                "reason": f"router error: {exc}",
+            }
+
+    if _route_primer is not None and adjudicate is not None:
+        _base_adjudicate = adjudicate
+        _primer = _route_primer
+
+        def adjudicate(packet, feedback=None):  # type: ignore[misc]
+            try:
+                primed_packet = _routing.attach_primer(packet, _primer)
+            except Exception as exc:
+                logger.warning("dm_execute primer attach failed: %s", exc)
+                primed_packet = packet
+            return _base_adjudicate(primed_packet, feedback=feedback)
+
     try:
         if _snapshot_contract is not None:
             contract = _snapshot_contract
+        elif _direct_contract is not None:
+            _direct_report = default_pipeline.validate(_direct_contract, packet)
+            if _direct_report.passed:
+                contract = _direct_contract
+                structured_log(
+                    logger, logging.INFO, "dm_execute_decision_direct",
+                    turn_id=str(turn.id), attempt_id=str(attempt.id),
+                    mode=str(contract.mode),
+                    selected=str(_route_trace.get("selected_id")),
+                    trace_id=tid,
+                )
+            else:
+                # Deterministic validators rejected the direct contract:
+                # escalate to the generative path with input intact.
+                _route_trace["validator_rejection"] = True
+                contract = None
         else:
+            contract = None
+        if contract is None:
             # Evidence/tool loop first (no-op when the model never asks for
             # evidence), then strict validation with bounded regeneration.
             # Preserve the exact packet the last evidence adjudication saw, including
@@ -922,6 +1003,8 @@ def _execute_owned_attempt(
         model=path_info.get("model") or model,
         failover_reasons=path_info.get("failover_reasons") or [],
         ttft_added_ms=path_info.get("ttft_added_ms") or 0.0,
+        decision_path=path_info.get("decision_path") or "open_ended_generative",
+        decision_selected=path_info.get("decision_selected"),
         trace_id=tid,
     )
     return result
