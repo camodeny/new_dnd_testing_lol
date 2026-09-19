@@ -73,13 +73,21 @@ def _assert_encounter_visible(db: Session, encounter: Encounter, viewer_id: uuid
         raise HTTPException(status_code=404, detail="Encounter not found")
 
 
-def _publish_post_commit(db: Session, result: dict) -> None:
+def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -> None:
     """Best-effort realtime delivery after the outer idempotency commit.
 
     The durable outbox row (enqueued atomically with the mutation) is the
     guaranteed realtime hook; this direct publish is latency-only and never
     rolls back authoritative state. Stable event ids make replays idempotent.
+
+    On ``X-Idempotent-Replay: true`` the stored result is returned without
+    advancing state, so rebuilding turn events from the encounter's current
+    row could publish a false transition for a later turn (e.g. replaying an
+    old end-turn after a later skip). The outbox already owns delivery there,
+    so replays never trigger the direct publish.
     """
+    if replayed:
+        return
     try:
         from app.realtime.service import (
             publish_encounter_ready,
@@ -173,7 +181,10 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
             status_code=409, detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
-    _publish_post_commit(db, result)
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
     return result
 
 
@@ -273,7 +284,10 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
         command_type="encounter.initiative_fulfill", scope_type="encounter_participant", scope_id=scope_id,
         payload=payload, execute=execute,
     )
-    _publish_post_commit(db, result)
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
     return result
 
 
@@ -316,7 +330,10 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
         command_type="encounter.npc_roll", scope_type="encounter_participant", scope_id=participant_id,
         payload=payload, execute=execute,
     )
-    _publish_post_commit(db, result)
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
     return result
 
 
@@ -414,7 +431,10 @@ def post_end_turn(campaign_id: str, encounter_id: str, payload: dict, request: R
             status_code=409, detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
-    _publish_post_commit(db, result)
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
     return result
 
 
@@ -463,7 +483,10 @@ def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: 
             status_code=409, detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
-    _publish_post_commit(db, result)
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
     return result
 
 

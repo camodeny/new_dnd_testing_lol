@@ -1000,3 +1000,82 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
     finally:
         set_realtime_publisher(previous)
         app.dependency_overrides.clear()
+
+
+def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    fac, ctx = _fixture()
+    campaign_id = str(ctx["campaign_id"])
+    owner_id, player_id = str(ctx["owner"]), str(ctx["player"])
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        client = TestClient(app)
+        owner_h = {"x-test-user": owner_id}
+        player_h = {"x-test-user": player_id}
+        with fac() as db:
+            encounter = _ready_two_pc(
+                db, ctx, owner_raw=5, player_raw=18, operation_id="op-replay-skip")
+            encounter_id = str(encounter.id)
+            rev = _revision(db, ctx)
+        # Turn 1 (player) ends normally with key K.
+        first = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-turn",
+            json={"expected_revision": rev, "expected_turn_sequence": 1},
+            headers={**player_h, "Idempotency-Key": "replay-skip-K"})
+        assert first.status_code == 200, first.text
+        assert first.json()["turn_sequence"] == 2
+        published_after_first = len(recorder.published)
+        assert published_after_first > 0
+        # Turn 2 (owner) is skipped via a different transition kind → seq 3.
+        with fac() as db:
+            rev2 = _revision(db, ctx)
+            active_now = str(db.get(Encounter, uuid.UUID(encounter_id)).active_participant_id)
+        skip = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/skip-votes",
+            json={"expected_revision": rev2, "target_participant_id": active_now,
+                  "expected_turn_sequence": 2},
+            headers={**player_h, "Idempotency-Key": "replay-skip-S"})
+        assert skip.status_code == 200, skip.text
+        assert skip.json()["executed"] is True
+        assert skip.json()["encounter"]["turn_sequence"] == 3
+        published_after_skip = len(recorder.published)
+        assert published_after_skip > published_after_first
+        event_ids = [p["payload"].get("event_id") for p in recorder.published]
+        assert f"encounter:{encounter_id}:turn:3:ended" not in event_ids
+        # Lost-ack retry of K after the skip must replay stored state and
+        # publish nothing further — the real seq-3 transition was a skip.
+        replay = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-turn",
+            json={"expected_revision": rev, "expected_turn_sequence": 1},
+            headers={**player_h, "Idempotency-Key": "replay-skip-K"})
+        assert replay.status_code == 200, replay.text
+        assert replay.headers["X-Idempotent-Replay"] == "true"
+        assert replay.json()["turn_sequence"] == 2
+        assert len(recorder.published) == published_after_skip
+        event_ids = [p["payload"].get("event_id") for p in recorder.published]
+        assert f"encounter:{encounter_id}:turn:3:ended" not in event_ids
+    finally:
+        set_realtime_publisher(previous)
+        app.dependency_overrides.clear()
