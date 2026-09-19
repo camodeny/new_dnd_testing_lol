@@ -23,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 ENCOUNTER_STARTED_EVENT = "encounter.started"
 ENCOUNTER_READY_EVENT = "encounter.initiative_ready"
+# Turn progression events — issue #231. Thread-scoped like the lifecycle
+# events above; see THREAD_SCOPED_EVENT_TYPES.
+TURN_STARTED_EVENT = "encounter.turn_started"
+TURN_ENDED_EVENT = "encounter.turn_ended"
+TURN_SKIPPED_EVENT = "encounter.turn_skipped"
 
 MAX_PARTICIPANTS = 20
 
@@ -474,6 +479,18 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
             item.pop("roll_request_id", None)
         viewers_parts.append(item)
     payload["participants"] = viewers_parts
+    # Issue #231: durable turn/round/resource projection rides the same
+    # snapshot so reconnects reconstruct mechanical state exactly. Lazy
+    # import: turns.py owns these helpers and imports this module.
+    try:
+        from app.combat.turns import turn_projection
+
+        payload["turn"] = turn_projection(
+            db, encounter, viewer_id=viewer_id, is_owner=is_owner
+        )
+    except Exception:
+        logger.warning("encounter turn projection skipped", exc_info=True)
+        payload["turn"] = None
     return payload
 
 
@@ -503,7 +520,10 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
 #: history (issue #230 privacy). Pagination over the authorized stream is
 #: deferred to the thread/privacy work — hidden events may leave short
 #: pages, but filtering is deterministic per row so pages never duplicate.
-THREAD_SCOPED_EVENT_TYPES = frozenset({ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT})
+THREAD_SCOPED_EVENT_TYPES = frozenset({
+    ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT,
+    TURN_STARTED_EVENT, TURN_ENDED_EVENT, TURN_SKIPPED_EVENT,
+})
 
 
 def encounter_event_visible_to(db: Session, event, viewer_id: uuid.UUID) -> bool:
@@ -715,7 +735,17 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
     encounter.initiative_wait_ms = wait_ms
     encounter.time_to_first_turn_ms = wait_ms
     encounter.roll_sources = {str(p.id): p.roll_source for p in participants}
+    # Issue #231: the first mechanical turn opens here — sequence 1 with full
+    # per-participant budgets. Resource init never blocks readiness: speed
+    # resolution falls back to 30 ft rather than failing the encounter.
+    encounter.turn_sequence = 1
+    encounter.turn_started_at = ready_at
+    encounter.blocked_since = None
     db.flush()
+
+    from app.combat.turns import init_turn_states
+
+    init_turn_states(db, encounter, now=ready_at)
 
     from app.campaigns.events import commit_campaign_mutation
 
@@ -759,6 +789,38 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         initiative_wait_ms=wait_ms, time_to_first_turn_ms=wait_ms,
         roll_sources=dict(encounter.roll_sources or {}),
     )
+    # Issue #231: the first mechanical turn opens atomically with readiness —
+    # same transaction, next campaign revision — so turn duration tracking
+    # and reconnect reads never observe an active encounter without a turn.
+    first_turn_operation_id = f"encounter:{encounter.id}:turn:1:started"
+    _, first_turn_event = commit_campaign_mutation(
+        db,
+        campaign.id,
+        expected_revision=int(campaign.revision or 0),
+        event_type=TURN_STARTED_EVENT,
+        payload={
+            "encounter_id": str(encounter.id),
+            "thread_id": encounter.thread_id,
+            "turn_sequence": 1,
+            "active_participant_id": str(ordered_ids[0]),
+            "round": 1,
+            "rolled_over": False,
+        },
+        operation_id=first_turn_operation_id,
+        actor_id=campaign.owner_id,
+        outbox_event_type=TURN_STARTED_EVENT,
+        outbox_payload={
+            "encounter_id": str(encounter.id),
+            "campaign_id": str(campaign.id),
+            "thread_id": encounter.thread_id,
+            "turn_sequence": 1,
+            "active_participant_id": str(ordered_ids[0]),
+            "round": 1,
+        },
+        outbox_operation_id=first_turn_operation_id,
+        commit=commit,
+    )
+    event.payload = dict(event.payload or {}) | {"first_turn_event_id": str(first_turn_event.id)}
     return event
 
 
