@@ -622,14 +622,19 @@ def _bucket_index(confidence: float, bucket_count: int) -> int:
 def _is_wrong(record: DecisionRecord) -> bool | None:
     """Delayed wrongness evidence for one record, or ``None`` if unknown.
 
-    Definitive ground truth wins when present; otherwise a correction
-    signal indicating wrong counts as wrong evidence. Records with neither
-    carry no wrongness evidence either way.
+    Definitive ground truth wins when present; otherwise only an explicit
+    correction signal indicating wrong counts as wrong evidence. A
+    correction that does *not* indicate wrong merely reports no wrongness
+    evidence from that signal — without ground truth the outcome stays
+    unknown rather than counting as correct. Records with neither carry
+    no wrongness evidence either way.
     """
     if record.ground_truth_id is not None:
         return record.selected_id != record.ground_truth_id
-    if record.correction_indicates_wrong is not None:
-        return record.correction_indicates_wrong
+    # Truthiness is not evidence: only an explicit True establishes
+    # wrongness; False/None leave the outcome unknown.
+    if record.correction_indicates_wrong is True:
+        return True
     return None
 
 

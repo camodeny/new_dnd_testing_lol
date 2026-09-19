@@ -617,3 +617,41 @@ def test_superseded_attempt_still_records_policy_outcome_and_revalidation():
         assert str(row.turn_id) == str(turn_id)
         assert row.trace_id == "trace-superseded"
         assert row.selected_id == routing.ROUTE_SILENT_ID
+
+
+def test_non_wrong_correction_is_unknown_until_ground_truth_exists():
+    frame = _frame()
+
+    def _mk(selected, confidence, directive, truth=None, wrong=None, source=None):
+        _, result = _decide(frame, selected)
+        base = _verdict(frame, result)
+        verdict = PolicyVerdict(
+            directive=directive, reason="test", decision_class=base.decision_class,
+            selected_id=base.selected_id, probability=confidence,
+            confidence=confidence, margin=base.margin,
+        )
+        record = _record(frame, result, verdict)
+        return record.__class__(**{
+            **record.__dict__, "confidence": confidence,
+            "ground_truth_id": truth,
+            "correction_source": source,
+            "correction_indicates_wrong": wrong,
+        })
+
+    records = [
+        _mk("flank", 0.90, "direct_execute", truth="flank"),
+        # A correction signal that explicitly does NOT indicate wrongness
+        # is not proof the decision was right...
+        _mk("volley", 0.92, "direct_execute",
+            wrong=False, source="validator_review"),
+        _mk("flank", 0.91, "escalate", wrong=False, source="validator_review"),
+    ]
+    top = calibration_summary(records, buckets=10)["skirmish_action"][9]
+    assert top.n == 3
+    # ...so only the ground-truth record enters the known-outcome
+    # denominator: accuracy 1/1, not 3/3.
+    assert top.accuracy == pytest.approx(1.0)
+    assert top.direct_execute_error_rate == pytest.approx(0.0)
+    # No known escalated outcome: nothing to call unnecessarily escalated.
+    assert top.unnecessary_escalation_rate is None
+    assert top.correction_rate == pytest.approx(2 / 3)
