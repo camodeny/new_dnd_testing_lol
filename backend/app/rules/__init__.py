@@ -4,6 +4,45 @@ Must not import FastAPI, database, or provider code. Operates on value
 objects and returns results for the application layer to persist.
 """
 
+from app.rules.attacks import (  # noqa: F401
+    ACVisibility,
+    AttackerKind,
+    AttackError,
+    AttackLedger,
+    AttackOutcome,
+    AttackResolution,
+    CombatantDefense,
+    CombatantOffense,
+    DamageContribution,
+    DamageHook,
+    DamageHookContext,
+    DamageResolution,
+    DamageSpec,
+    DieSource,
+    DieVisibility,
+    FullAttackResult,
+    HitPoints,
+    HPChange,
+    apply_attack_consequence,
+    apply_damage,
+    attacker_from_npc,
+    attacker_from_sheet,
+    attack_domain_event,
+    build_damage_effect,
+    damage_domain_event,
+    defender_from_npc,
+    defender_from_sheet,
+    grant_temporary_hp,
+    heal_damage,
+    hp_from_npc,
+    hp_from_sheet,
+    make_damage_spec,
+    parse_damage_expression,
+    resolve_attack_roll,
+    resolve_damage,
+    resolve_full_attack,
+    runtime_damage_dice,
+)
 from app.rules.mechanics import (  # noqa: F401
     ALL_ABILITIES,
     ALL_SKILLS,
@@ -28,4 +67,3 @@ from app.rules.mechanics import (  # noqa: F401
     query_speed,
     query_spellcasting,
 )
-

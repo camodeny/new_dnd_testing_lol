@@ -874,14 +874,38 @@ class ContentBoundaryValidator:
 
 
 class RulesValidator:
-    """Hook for deterministic 2024 rules validation (#180)."""
+    """Deterministic 2024 rules validation (#180; first enforced rule #226).
+
+    Damage effects are code-built only: provider output must never author HP
+    damage totals, because model arithmetic is not authoritative — damage is
+    resolved server-side from authoritative mechanics plus supplied/runtime
+    dice (see :mod:`app.rules.attacks`). Any ``apply_attack_damage`` effect
+    in provider-validated output is rejected; server code stages damage via
+    ``build_damage_effect`` with a server-resolved ``DamageResolution``.
+    """
+
     name = "rules_validator"
     category = "mechanics"
 
     def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
         t0 = time.monotonic()
+        violations: list[ValidationViolation] = []
+        for eff in getattr(contract, "staged_effects", None) or []:
+            if getattr(eff, "effect_type", None) == "apply_attack_damage":
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name,
+                        category=self.category,
+                        code="provider_authored_damage",
+                        message=(
+                            f"staged effect {getattr(eff, 'id', '?')!r} authors HP damage: "
+                            "damage effects are code-built only (server-resolved DamageResolution), never provider output"
+                        ),
+                        details={"effect_id": getattr(eff, "id", None)},
+                    )
+                )
         latency = (time.monotonic() - t0) * 1000
-        return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=latency)
+        return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
 class RepairValidator:

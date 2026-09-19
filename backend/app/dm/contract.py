@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+import uuid
 from enum import Enum
 from typing import Annotated, Any, Literal
 
@@ -281,6 +282,7 @@ STAGED_EFFECT_TYPES = (
     "upsert_relation",
     "complete_adventure",
     "start_encounter",
+    "apply_attack_damage",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -409,13 +411,40 @@ class StartEncounterArgs(StrictModel):
         return v
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs
+class ApplyAttackDamageArgs(StrictModel):
+    """Deterministic attack damage application — issue #226.
+
+    The damage_total is already resolved by code-owned arithmetic before
+    staging; promotion only applies it to the target's HP (temp absorbs
+    first, remainder to current, floor 0). No model arithmetic enters here.
+    """
+    target_kind: Literal["pc", "npc"]
+    target_id: str = Field(min_length=1, max_length=160, description="Durable character (pc) or world-entity (npc) UUID")
+    damage_total: int = Field(ge=0, le=100000)
+    damage_type: str = Field(min_length=1, max_length=64)
+    mitigation: Literal["none", "resistance", "vulnerability", "immunity", "resistance+vulnerability"] = "none"
+    damage_id: str = Field(min_length=1, max_length=128)
+    attack_id: str | None = Field(default=None, max_length=128)
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("target_id")
+    @classmethod
+    def _valid_target_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("target_id must be a UUID") from exc
+        return str(v)
+
+
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | ApplyAttackDamageArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "apply_attack_damage"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -463,6 +492,8 @@ class StagedEffect(StrictModel):
                 CompleteAdventureArgs.model_validate(args)
             elif t == "start_encounter":
                 StartEncounterArgs.model_validate(args)
+            elif t == "apply_attack_damage":
+                ApplyAttackDamageArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation
@@ -902,6 +933,14 @@ def contract_json_schema_strict() -> dict[str, Any]:
             "type": "string",
             "description": "JSON-encoded effect arguments object (parsed and validated locally per effect_type)",
         }
+    # apply_attack_damage is code-built only (#226): the model must never
+    # author HP damage totals, so it is removed from the provider-facing
+    # effect_type enum. Local validation still accepts it for server-built
+    # effects, and RulesValidator rejects it in provider output as
+    # defense-in-depth.
+    effect_type_schema = staged_props.get("effect_type", {})
+    if isinstance(effect_type_schema.get("enum"), list) and "apply_attack_damage" in effect_type_schema["enum"]:
+        effect_type_schema["enum"] = [e for e in effect_type_schema["enum"] if e != "apply_attack_damage"]
 
     def _complete(node: Any) -> None:
         if isinstance(node, dict):
