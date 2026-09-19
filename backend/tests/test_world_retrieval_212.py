@@ -708,3 +708,23 @@ def test_campaign_knowledge_of_hidden_target_stays_restricted_in_mediation():
     records = evidence_results_to_records(results, audience)
     # dm_only evidence is adjudication-only: never narration-eligible.
     assert records[0].use == "adjudication_only"
+
+
+def test_private_knowledge_of_dm_only_target_stays_dm_only():
+    Fac, cid, owner, player, _ = _setup()
+    db = Fac()
+    seed = _seed_graph(db, cid)  # seed["secret"] is a dm_only fact
+    campaign = db.get(Campaign, cid)
+    # Private knowledge row pointing at a dm_only truth target: dm_only
+    # dominates private (adjudication-only always beats audience-scoped
+    # private), so the composed packet must stay dm_only.
+    assert_knowledge_inline(
+        db, campaign, subject_kind="character",
+        subject_entity_id=seed["a"].id, target_kind="fact",
+        target_fact_id=seed["secret"].id, knowledge_state="knows",
+        acquisition_source="overheard", visibility="private")
+    db.commit()
+    internal = query_character_knowledge(
+        db, cid, seed["a"].id, owner, dm_internal=True)
+    assert internal.visible == 1
+    assert internal.packets[0].visibility == "dm_only"

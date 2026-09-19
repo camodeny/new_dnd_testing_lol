@@ -1315,9 +1315,17 @@ _VISIBILITY_RESTRICTIVENESS = {"public": 0, "campaign": 1, "dm_only": 2, "privat
 
 
 def _most_restrictive_visibility(first: Any, second: Any) -> str:
-    """Most restrictive of two visibility labels (fail closed on unknown)."""
+    """Most restrictive of two visibility labels (fail closed on unknown).
+
+    ``dm_only`` dominates ``private``: ``dm_only`` evidence is always
+    adjudication-only, while ``private`` evidence can be narration-eligible
+    for a private audience — so a packet embedding a ``dm_only`` target must
+    stay ``dm_only`` even when the knowledge row itself is ``private``.
+    """
     a = _canonical_knowledge_visibility(first)
     b = _canonical_knowledge_visibility(second)
+    if a == "dm_only" or b == "dm_only":
+        return "dm_only"
     if _VISIBILITY_RESTRICTIVENESS.get(b, 2) > _VISIBILITY_RESTRICTIVENESS.get(a, 2):
         return b
     return a
