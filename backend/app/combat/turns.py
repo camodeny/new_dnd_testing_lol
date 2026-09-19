@@ -743,11 +743,47 @@ def _advance(
 # ── Read projection (reconnect-safe) ────────────────────────────────────────
 
 
-def turn_projection(db: Session, encounter: Encounter) -> dict | None:
-    """Full turn/round/resource projection; None while initiative is pending."""
+def turn_projection(
+    db: Session,
+    encounter: Encounter,
+    *,
+    viewer_id: uuid.UUID | None = None,
+    is_owner: bool = False,
+) -> dict | None:
+    """Full turn/round/resource projection; None while initiative is pending.
+
+    Viewer-aware (#230 privacy): NPC/monster turn resources derived from
+    DM-private canonical stats (``movement_max`` from ``WorldEntity.details``
+    speed) are redacted for non-owners — ``movement_remaining``,
+    ``movement_max`` become None and ``extra_resources`` becomes {} — so a
+    thread reader cannot reconstruct a hidden NPC's exact speed. The AI is
+    the only DM: ownership here means the campaign owner on the DM runtime
+    path, never a separate human DM. PCs stay fully visible; owners see all.
+    """
     if encounter.status != "active":
         return None
-    states = {str(s.participant_id): s.to_dict() for s in list_turn_states(db, encounter.id)}
+    participants = {
+        str(p.id): p
+        for p in db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id
+            )
+        ).scalars().all()
+    }
+    states: dict[str, dict] = {}
+    for row in list_turn_states(db, encounter.id):
+        payload = row.to_dict()
+        participant = participants.get(str(row.participant_id))
+        if (
+            participant is not None
+            and participant.kind in ("npc", "monster")
+            and participant.stat_visibility == "dm_private"
+            and not is_owner
+        ):
+            payload["movement_remaining"] = None
+            payload["movement_max"] = None
+            payload["extra_resources"] = {}
+        states[str(row.participant_id)] = payload
     active_id = str(encounter.active_participant_id) if encounter.active_participant_id else None
     votes: list[dict] = []
     blocked_since = encounter.blocked_since.isoformat() if encounter.blocked_since else None

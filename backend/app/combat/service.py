@@ -485,7 +485,9 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
     try:
         from app.combat.turns import turn_projection
 
-        payload["turn"] = turn_projection(db, encounter)
+        payload["turn"] = turn_projection(
+            db, encounter, viewer_id=viewer_id, is_owner=is_owner
+        )
     except Exception:
         logger.warning("encounter turn projection skipped", exc_info=True)
         payload["turn"] = None

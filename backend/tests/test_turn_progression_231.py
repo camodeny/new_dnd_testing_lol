@@ -755,6 +755,64 @@ def test_encounter_view_carries_turn_block_for_snapshot():
         assert view["skipped_count"] == 0
 
 
+def test_hidden_npc_speed_redacted_for_non_owners():
+    fac, ctx = _fixture()
+    with fac() as db:
+        swift = WorldEntity(
+            campaign_id=ctx["campaign_id"], entity_type="npc", name="Swift Stalker",
+            visibility="dm_only",
+            details={"initiative_modifier": 1, "dex_modifier": 0, "speed": 50},
+        )
+        db.add(swift)
+        db.flush()
+        db.commit()
+        swift_id = swift.id
+    with fac() as db:
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-hidden-speed", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+            source_attempt_id=ctx["attempt_id"],
+            participants=[{"character_id": str(ctx["owner_pc"])},
+                          {"npc_entity_id": str(swift_id)}],
+        )
+        owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+        npc = db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id,
+                EncounterParticipant.kind == "npc")
+        ).scalars().one()
+        assert npc.stat_visibility == "dm_private"
+        fulfill_human_initiative(
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"],
+            payload={"source": "app", "raw_rolls": [10],
+                     "modifier": owner_p.initiative_modifier,
+                     "total": 10 + owner_p.initiative_modifier})
+        roll_npc_initiative(db, encounter.id, npc.id, raw_d20=10)
+        encounter = db.get(Encounter, encounter.id)
+        assert encounter.status == "active"
+        npc_id = str(npc.id)
+        owner_id, player_id = ctx["owner"], ctx["player"]
+        # Owner (DM runtime path) sees the canonical derived speed.
+        owner_proj = turn_projection(db, encounter, viewer_id=owner_id, is_owner=True)
+        assert owner_proj["resources"][npc_id]["movement_max"] == 50
+        assert owner_proj["resources"][npc_id]["movement_remaining"] == 50
+        # A thread reader who is not the owner cannot reconstruct it.
+        player_proj = turn_projection(db, encounter, viewer_id=player_id, is_owner=False)
+        assert player_proj["resources"][npc_id]["movement_max"] is None
+        assert player_proj["resources"][npc_id]["movement_remaining"] is None
+        assert player_proj["resources"][npc_id]["extra_resources"] == {}
+        assert "50" not in str(player_proj["resources"][npc_id])
+        # The PC's own budget stays visible to the non-owner.
+        assert player_proj["resources"][str(owner_p.id)]["movement_max"] == 30
+        # Same redaction rides the snapshot view and the default (fail-closed) read.
+        owner_view = encounter_view(db, encounter, owner_id, is_owner=True)
+        player_view = encounter_view(db, encounter, player_id, is_owner=False)
+        assert owner_view["turn"]["resources"][npc_id]["movement_max"] == 50
+        assert player_view["turn"]["resources"][npc_id]["movement_max"] is None
+        default_proj = turn_projection(db, encounter)
+        assert default_proj["resources"][npc_id]["movement_max"] is None
+
+
 # ── HTTP transport ──────────────────────────────────────────────────────────
 
 

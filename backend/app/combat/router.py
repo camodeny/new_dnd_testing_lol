@@ -364,7 +364,10 @@ def read_turn_state(campaign_id: str, encounter_id: str, request: Request, db: S
     campaign = authorized_campaign(db, campaign_id, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    projection = turn_projection(db, encounter)
+    projection = turn_projection(
+        db, encounter, viewer_id=profile.id,
+        is_owner=campaign.owner_id == profile.id,
+    )
     if projection is None:
         raise HTTPException(status_code=409, detail="turn state becomes available when required initiative is complete")
     return {"encounter_id": str(encounter.id), "turn": projection}
