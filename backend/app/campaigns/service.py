@@ -245,13 +245,18 @@ def character_launch_validity(character, sheet) -> dict:
 def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
     """Server-side start eligibility from authoritative lobby/character state."""
     from models.characters import Character, Dnd5eCharacterSheet
+    from models.profiles import Profile
+
+    def member_label(m) -> str:
+        prof = db.get(Profile, m.user_id)
+        return prof.username if prof and prof.username else "adventurer"
 
     blockers: list[str] = []
     required = int(getattr(campaign, "required_players", 1) or 1)
     if len(members) < required:
         blockers.append(f"Campaign requires {required} members before starting (have {len(members)})")
     for m in members:
-        label = f"Member {m.user_id}"
+        label = member_label(m)
         char_id = getattr(m, "selected_character_id", None)
         if char_id is None:
             blockers.append(f"{label} has no selected character")
