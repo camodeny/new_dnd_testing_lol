@@ -43,6 +43,7 @@ from app.world.service import (
     get_entity_strict,
     is_world_authority,
     list_entities,
+    project_entity_for_viewer,
     scene_visible_to_viewer,
     set_scene_authoritative,
     validate_entity_name,
@@ -192,7 +193,8 @@ def api_list_entities(
     entities = filter_entities_for_viewer(
         entities, is_world_authority(camp, profile.id)
     )
-    return {"entities": [e.to_dict() for e in entities], "revision": camp.revision}
+    authority = is_world_authority(camp, profile.id)
+    return {"entities": [project_entity_for_viewer(e, authority) for e in entities], "revision": camp.revision}
 
 
 @router.post("/api/campaigns/{campaign_id}/world/entities")
@@ -624,4 +626,4 @@ def api_get_entity(campaign_id: str, entity_id: str, request: Request, db: Sessi
     # Viewer-aware: hide restricted entities from ordinary members as 404.
     if not entity_visible_to_viewer(entity, is_world_authority(camp, profile.id)):
         raise HTTPException(status_code=404, detail="World entity not found")
-    return {"entity": entity.to_dict()}
+    return {"entity": project_entity_for_viewer(entity, is_world_authority(camp, profile.id))}
