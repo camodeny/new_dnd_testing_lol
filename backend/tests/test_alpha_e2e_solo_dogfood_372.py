@@ -494,7 +494,7 @@ def setup_solo_campaign(scn: Scenario, char_id: str) -> str:
     r = scn.client.post(
         "/api/campaigns", json={"name": "Phase0 Solo 372", "required_players": 1}
     )
-    scn.check(r.status_code == 200, "setup", f"campaign creation failed: {r.text}")
+    scn.check(r.status_code == 200, "setup", f"campaign creation failed (status={r.status_code})")
     campaign_id = r.json()["campaign"]["id"]
     scn.campaign_id = campaign_id
     scn.ids["campaign_id"] = campaign_id
@@ -504,17 +504,17 @@ def setup_solo_campaign(scn: Scenario, char_id: str) -> str:
         json={"expected_revision": 0, "character_id": char_id},
         headers={"Idempotency-Key": "phase0-select"},
     )
-    scn.check(r.status_code == 200, "setup", f"character select failed: {r.text}")
+    scn.check(r.status_code == 200, "setup", f"character select failed (status={r.status_code})")
 
     r = scn.client.put(
         f"/api/campaigns/{campaign_id}/members/me/readiness",
         json={"expected_revision": 1, "ready": True},
         headers={"Idempotency-Key": "phase0-ready"},
     )
-    scn.check(r.status_code == 200, "setup", f"readiness failed: {r.text}")
+    scn.check(r.status_code == 200, "setup", f"readiness failed (status={r.status_code})")
 
     lobby = scn.client.get(f"/api/campaigns/{campaign_id}/lobby")
-    scn.check(lobby.status_code == 200, "setup", f"lobby read failed: {lobby.text}")
+    scn.check(lobby.status_code == 200, "setup", f"lobby read failed (status={lobby.status_code})")
     scn.check(
         lobby.json()["eligibility"]["eligible"] is True,
         "setup",
@@ -537,7 +537,7 @@ def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
         json={"operation_id": operation_key},
         headers={"Idempotency-Key": operation_key},
     )
-    scn.check(r.status_code == 200, "start", f"solo bootstrap failed: {r.text}")
+    scn.check(r.status_code == 200, "start", f"solo bootstrap failed (status={r.status_code})")
     body = r.json()
     scn.check(body["campaign"]["status"] == "active", "start", "campaign not active")
     scn.check(body.get("solo_bootstrap") is True, "start", "bootstrap marker missing")
@@ -568,7 +568,7 @@ def submit_player_turn(scn: Scenario, text: str, key: str, client=None) -> dict:
         json={"content": text},
         headers={"Idempotency-Key": key},
     )
-    scn.check(r.status_code == 201, "play", f"submission {key} failed: {r.text}")
+    scn.check(r.status_code == 201, "play", f"submission {key} failed (status={r.status_code})")
     body = r.json()
     scn.check((body.get("dm_turn") or {}).get("id"), "play", "no DM turn coordinated")
     scn.ids["submission_ids"].append(body["submission"]["id"])
@@ -723,7 +723,7 @@ def assert_ordering_invariants(scn: Scenario, stage: str, client=None) -> int:
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/events")
-    scn.check(r.status_code == 200, stage, f"events read failed: {r.text}")
+    scn.check(r.status_code == 200, stage, f"events read failed (status={r.status_code})")
     body = r.json()
     seqs = [e["sequence"] for e in body["events"]]
 
@@ -785,7 +785,7 @@ def assert_single_result_per_submission(
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/dm-turns")
-    scn.check(r.status_code == 200, stage, f"dm-turns read failed: {r.text}")
+    scn.check(r.status_code == 200, stage, f"dm-turns read failed (status={r.status_code})")
     turns = r.json()["turns"]
     scn.check(
         len(turns) == expected_turns,
@@ -809,7 +809,7 @@ def assert_single_result_per_submission(
         else None,
     )
     subs = http.get(f"/api/campaigns/{scn.campaign_id}/submissions")
-    scn.check(subs.status_code == 200, stage, f"submissions read failed: {subs.text}")
+    scn.check(subs.status_code == 200, stage, f"submissions read failed (status={subs.status_code})")
     for sub in subs.json()["submissions"]:
         count = consumed.count(sub["id"])
         scn.check(
@@ -835,7 +835,7 @@ def read_snapshot(scn: Scenario, stage: str, client=None) -> dict:
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/snapshot")
-    scn.check(r.status_code == 200, stage, f"snapshot read failed: {r.text}")
+    scn.check(r.status_code == 200, stage, f"snapshot read failed (status={r.status_code})")
     return r.json()
 
 
@@ -859,6 +859,23 @@ def assert_same_authoritative_projection(
             f"reconnect divergence in snapshot[{key}]",
             category="reconnect_reconstruction",
             detail=snapshot_detail,
+        )
+
+
+def assert_player_turns_preserved(
+    scn: Scenario, stage: str, expected_texts: list, contents: list
+) -> None:
+    """Every submitted player turn must survive reconnect.
+
+    Privacy-safe by construction: failure messages name the turn index,
+    never the raw player content (which would otherwise land verbatim in
+    the shared #374 artifact and CI log).
+    """
+    for index, text in enumerate(expected_texts):
+        scn.check(
+            text in contents,
+            stage,
+            f"player turn lost across reconnect (index={index} of {len(expected_texts)})",
         )
 
 
@@ -909,7 +926,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
         headers={"Idempotency-Key": "phase0-turn-1"},
     )
     scn.check(
-        replay.status_code == 201, "duplicate-guard", f"replay failed: {replay.text}"
+        replay.status_code == 201, "duplicate-guard", f"replay failed (status={replay.status_code})"
     )
     scn.check(
         replay.headers.get("X-Idempotent-Replay") == "true",
@@ -946,12 +963,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
             f"committed DM stream {stream_id} missing from reconnect snapshot",
         )
     contents = [m["raw_content"] for m in after["history"]["messages"]]
-    for text in FREEFORM_TURNS:
-        scn.check(
-            text in contents,
-            "reconnect",
-            f"player turn lost across reconnect: {text!r}",
-        )
+    assert_player_turns_preserved(scn, "reconnect", FREEFORM_TURNS, contents)
     with scn.factory() as db:
         for stream_id in scn.ids["stream_ids"]:
             scn.check(
@@ -1291,3 +1303,33 @@ def test_phase0_timeline_records_generative_and_commit_boundaries(
     assert scn.diag.first_failure is None
     scn.note("diagnostics")
     assert _canonical_stage("diagnostics") == "diagnostics"
+
+
+def test_ordinary_check_path_omits_player_content_from_artifact(
+    scn, phase0_provider, tmp_path, monkeypatch
+):
+    """Ordinary Scenario.check() failures must not leak player content.
+
+    The reconnect turn-preservation assertion previously embedded the raw
+    player turn in its message; with a sentinel turn submitted then dropped
+    from the compared contents, the saved artifact and log-facing report
+    must name the turn index only.
+    """
+    monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
+    _run_to_opening_reply(scn)
+    scn.note("reconnect")
+    sentinel = "SENTINEL-ORDINARY-CHECK-PRIVATE-374-must-never-reach-artifacts"
+    with pytest.raises(AssertionError, match=r"\[374:refresh_reconnect\]"):
+        assert_player_turns_preserved(scn, "reconnect", [sentinel], ["unrelated"])
+    failure = scn.diag.first_failure
+    assert failure is not None
+    assert failure["stage"] == "refresh_reconnect"
+    assert "index=0 of 1" in failure["message"]
+
+    artifacts = sorted(tmp_path.glob("e2e-374-phase0-*.json"))
+    assert artifacts, "ordinary check failure saved no artifact"
+    import json as _json
+
+    saved = _json.load(open(artifacts[-1]))
+    assert sentinel not in _json.dumps(saved)
+    assert sentinel not in format_failure_line(saved["first_failure"])
