@@ -419,9 +419,14 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                   )}
                 </>
               ) : isOwner ? (
-                <button type="button" className="lobby-begin-btn lobby-begin-locked" disabled>
-                  <i className="bi bi-lock" aria-hidden="true" /> Not ready to begin
-                </button>
+                <>
+                  <button type="button" className="lobby-begin-btn lobby-begin-locked" disabled>
+                    <i className="bi bi-lock" aria-hidden="true" /> Not ready to begin
+                  </button>
+                  {lobbyError && (
+                    <p className="lobby-locked-msg" role="alert">{lobbyError}</p>
+                  )}
+                </>
               ) : (
                 <>
                   <button type="button" className="lobby-begin-btn lobby-begin-locked" disabled>

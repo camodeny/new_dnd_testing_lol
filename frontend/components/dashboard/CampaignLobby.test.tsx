@@ -138,6 +138,27 @@ describe('authoritative lobby synchronization', () => {
     expect(onBegin).not.toHaveBeenCalled()
     expect(container.textContent).toContain('Party is no longer ready')
   })
+
+  it('still shows the Begin failure when the post-failure refresh turns ineligible', async () => {
+    remoteReady = true
+    await renderLobby()
+    vi.mocked(campaigns.transitionLifecycle).mockRejectedValue(new Error('Party is no longer ready'))
+    // The failed transition refreshes into an ineligible lobby (another
+    // member became unready); the owner-locked footer must still surface it.
+    vi.mocked(campaignMembers.getLobby).mockResolvedValueOnce({
+      campaign: { id: 'campaign', revision: serverRevision } as Campaign,
+      members: [
+        { user_id: 'owner', role: 'owner', username: 'Owner', is_ready: false, selected_character_id: 'hero' },
+        { user_id: 'friend', role: 'player', username: 'Friend', is_ready: false },
+      ],
+      eligibility: { eligible: false, blockers: ['Friend not ready'] },
+      launch_locked: false,
+    })
+    await act(async () => button('Begin adventure').click())
+    expect(onBegin).not.toHaveBeenCalled()
+    expect(container.textContent).toContain('Not ready to begin')
+    expect(container.textContent).toContain('Party is no longer ready')
+  })
 })
 
 describe('invite share-link copy', () => {
