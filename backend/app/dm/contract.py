@@ -641,7 +641,7 @@ class StagedEffect(StrictModel):
 
 class EvidenceRequest(StrictModel):
     id: str = Field(min_length=1, max_length=48)
-    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules"] = Field(description="Read-only evidence tool")
+    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
     question: str | None = Field(default=None, max_length=600)
     scope: Literal["current_player", "party", "character_id"] | None = None
     character_id: str | int | None = None
@@ -674,6 +674,14 @@ class EvidenceRequest(StrictModel):
         elif self.tool == "search_rules":
             if not (self.query and self.query.strip()) and not (self.question and self.question.strip()):
                 raise ValueError("search_rules requires query")
+        elif self.tool in ("lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "lookup_source_turn"):
+            if not (self.query and self.query.strip()):
+                raise ValueError(f"{self.tool} requires query (stable record id)")
+        elif self.tool == "query_character_knowledge":
+            if not (self.query and self.query.strip()) and self.character_id is None:
+                raise ValueError("query_character_knowledge requires query (subject entity id) or character_id")
+        elif self.tool == "query_world_timeline":
+            pass  # query optional (event-type filter); limit bounds the range
         return self
 
 
