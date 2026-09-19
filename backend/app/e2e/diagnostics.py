@@ -431,6 +431,20 @@ def _structural_ref(value: Any, _depth: int = 0) -> dict[str, Any]:
                     continue
             ref["children"] = children
         return ref
+    if value is None or isinstance(value, (bool, int, float)):
+        # Counts/flags/revisions are safe to preserve exactly — they are the
+        # distinguishing signal for scalar reconnect fields.
+        return {"type": type(value).__name__, "value": value}
+    if isinstance(value, str):
+        # Same-length strings (e.g. thread IDs) must still distinguish:
+        # length plus a stable one-way digest, never the raw content.
+        try:
+            import hashlib
+
+            digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+        except Exception:
+            digest = None
+        return {"type": "str", "length": len(value), "digest": digest}
     try:
         length = len(value) if hasattr(value, "__len__") else None
     except Exception:

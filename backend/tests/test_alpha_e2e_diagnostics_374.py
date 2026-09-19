@@ -492,6 +492,31 @@ def test_nested_history_messages_difference_yields_distinct_refs():
     assert "abc" not in json.dumps(secret_failure)
 
 
+def test_scalar_reconnect_mismatch_yields_distinguishable_refs():
+    """Scalar snapshot fields (revision, thread ID) must compare usefully."""
+    revision = format_snapshot_mismatch(
+        {"revision": 4}, {"revision": 5}, keys=("revision",)
+    )
+    assert revision["metadata"]["diverged_keys"] == ["revision"]
+    rev_entry = revision["metadata"]["diverged"]["revision"]
+    assert rev_entry["expected_ref"] != rev_entry["actual_ref"]
+    assert rev_entry["expected_ref"]["value"] == 4
+    assert rev_entry["actual_ref"]["value"] == 5
+
+    threads = format_snapshot_mismatch(
+        {"active_thread_id": "thread-aaaa"},
+        {"active_thread_id": "thread-bbbb"},
+        keys=("active_thread_id",),
+    )
+    thread_entry = threads["metadata"]["diverged"]["active_thread_id"]
+    assert thread_entry["expected_ref"] != thread_entry["actual_ref"]
+    assert thread_entry["expected_ref"]["length"] == len("thread-aaaa")
+    assert thread_entry["expected_ref"]["digest"] != thread_entry["actual_ref"]["digest"]
+    # Privacy: raw scalar strings never reach the artifact, only digests.
+    assert "thread-aaaa" not in json.dumps(threads)
+    assert "thread-bbbb" not in json.dumps(threads)
+
+
 # ── boundary 7: duplicate commit ───────────────────────────────────────────
 
 
