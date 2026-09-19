@@ -39,6 +39,9 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # Encounter selection references canonical identities only; stat
     # resolution is server-side, so announcing combat is party-visible.
     "start_encounter": "public",
+    # Attack damage defaults to dm_private (fail-closed): the builder sets
+    # explicit visibility per target, and a bare effect stays restricted.
+    "apply_attack_damage": "dm_private",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -420,6 +423,104 @@ def _handle_start_encounter(db: Session, campaign: Campaign, effect: dict[str, A
     logger.info(
         "effect start_encounter effect_id=%s encounter_id=%s participants=%s op=%s",
         effect.get("id"), encounter.id, encounter.participant_count, operation_key,
+    )
+
+
+@register("apply_attack_damage")
+def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply resolved attack damage to PC sheet HP or NPC entity HP (issue #226).
+
+    Runs inside the outer ``commit_campaign_mutation``: a failed turn commit
+    rolls back the HP write, so failed commits leave no half-applied damage.
+    The damage total is already resolved deterministically before staging —
+    this handler only performs code-owned HP arithmetic (temp absorbs first,
+    remainder to current, floor 0) via :func:`app.rules.attacks.apply_damage`.
+
+    Duplicate protection comes from the outer turn-commit idempotency (one
+    commit per attempt/effect key); the write itself is a pure function of
+    the staged total, so replaying the same staged effect converges.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    from app.rules.attacks import AttackError as _AttackError
+    from app.rules.attacks import HitPoints as _HitPoints
+    from app.rules.attacks import apply_damage as _apply_damage
+
+    args = effect.get("arguments") or {}
+    target_kind = args.get("target_kind")
+    if target_kind not in ("pc", "npc"):
+        raise ValueError(f"Staged effect {effect.get('id')!r} target_kind must be pc/npc")
+    try:
+        target_id = _uuid.UUID(str(args.get("target_id") or ""))
+    except ValueError:
+        raise ValueError(f"Staged effect {effect.get('id')!r} target_id must be a UUID")
+    try:
+        total = int(args.get("damage_total"))
+    except (TypeError, ValueError):
+        raise ValueError(f"Staged effect {effect.get('id')!r} damage_total must be an integer")
+    if total < 0:
+        raise ValueError(f"Staged effect {effect.get('id')!r} damage_total must be >= 0")
+    change_id = _resolve_effect_key(attempt, effect)
+
+    if target_kind == "pc":
+        from models.characters import Character, Dnd5eCharacterSheet
+
+        character = db.get(Character, target_id)
+        if character is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} not found")
+        sheet = db.execute(
+            _select(Dnd5eCharacterSheet)
+            .where(Dnd5eCharacterSheet.character_id == character.id)
+            .order_by(Dnd5eCharacterSheet.updated_at.desc())
+        ).scalars().first()
+        if sheet is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
+        try:
+            before = _HitPoints(current=int(sheet.hit_points_current), maximum=int(sheet.hit_points_max), temporary=int(sheet.hit_points_temp or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Staged effect {effect.get('id')!r} sheet HP is malformed: {exc}") from exc
+        try:
+            change = _apply_damage(before, total, change_id=change_id)
+        except _AttackError as exc:
+            raise ValueError(f"Staged effect {effect.get('id')!r} HP application failed: {exc}") from exc
+        sheet.hit_points_current = change.after.current
+        sheet.hit_points_temp = change.after.temporary
+        db.flush()
+        logger.info(
+            "effect apply_attack_damage pc effect_id=%s character_id=%s total=%s absorbed=%s applied=%s",
+            effect.get("id"), target_id, total, change.absorbed_by_temp, change.applied_to_current,
+        )
+        return
+
+    from models.world import WorldEntity
+
+    entity = db.get(WorldEntity, target_id)
+    if entity is None or str(entity.campaign_id) != str(campaign.id):
+        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} not found in this campaign")
+    details = dict(entity.details or {})
+    nested = details.get("hit_points")
+    if not isinstance(nested, dict):
+        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} has no hit_points in details")
+    try:
+        before = _HitPoints(
+            current=int(nested.get("current", nested.get("current_hp"))),
+            maximum=int(nested.get("maximum", nested.get("max_hp", nested.get("max")))),
+            temporary=int(nested.get("temporary", nested.get("temp_hp", 0)) or 0),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} NPC HP is malformed: {exc}") from exc
+    try:
+        change = _apply_damage(before, total, change_id=change_id)
+    except _AttackError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} HP application failed: {exc}") from exc
+    details["hit_points"] = {"current": change.after.current, "maximum": change.after.maximum, "temporary": change.after.temporary}
+    entity.details = details
+    db.flush()
+    logger.info(
+        "effect apply_attack_damage npc effect_id=%s entity_id=%s total=%s absorbed=%s applied=%s",
+        effect.get("id"), target_id, total, change.absorbed_by_temp, change.applied_to_current,
     )
 
 
