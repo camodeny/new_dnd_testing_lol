@@ -42,6 +42,13 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # Attack damage defaults to dm_private (fail-closed): the builder sets
     # explicit visibility per target, and a bare effect stays restricted.
     "apply_attack_damage": "dm_private",
+    # Rules-state transitions (#227) are code-built only and default to
+    # dm_private (fail-closed): hidden NPC conditions/resources stay DM-only
+    # unless the builder explicitly widens them for shared-table state.
+    "apply_condition": "dm_private",
+    "apply_resource": "dm_private",
+    "apply_concentration": "dm_private",
+    "apply_death_save": "dm_private",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -127,6 +134,7 @@ def apply_staged_effects(
     )
 
     _reject_duplicate_damage_ids(staged_effects)
+    _reject_duplicate_state_mutations(staged_effects)
 
     for eff in staged_effects:
         eff_id = eff.get("id", "<unknown>")
@@ -168,6 +176,38 @@ def _reject_duplicate_damage_ids(staged_effects: list[dict[str, Any]]) -> None:
                 f"{seen[damage_id]!r} and {eff.get('id')!r} — one logical damage effect cannot apply twice"
             )
         seen[damage_id] = str(eff.get("id"))
+
+
+def _reject_duplicate_state_mutations(staged_effects: list[dict[str, Any]]) -> None:
+    """Fail closed if one logical rules-state mutation would apply twice (#227).
+
+    Two staged entries of the ``apply_condition`` / ``apply_resource`` /
+    ``apply_concentration`` / ``apply_death_save`` types sharing one stable
+    ``mutation_id`` would both run and double-apply (double spend, double
+    condition tick) in the same atomic commit; outer turn idempotency only
+    protects whole-commit replay, not two entries inside it. The scan runs
+    before any handler, so rejection leaves zero partial mutation. A
+    missing/blank ``mutation_id`` is also rejected: the logical mutation
+    identity is required for the exactly-once guarantee.
+    """
+    from app.rules.state import STATE_EFFECT_TYPES as _STATE_TYPES
+
+    seen: dict[str, str] = {}
+    for eff in staged_effects:
+        if eff.get("effect_type") not in _STATE_TYPES:
+            continue
+        args = eff.get("arguments") or {}
+        mutation_id = args.get("mutation_id")
+        if not isinstance(mutation_id, str) or not mutation_id.strip():
+            raise ValueError(
+                f"Staged effect {eff.get('id')!r} type {eff.get('effect_type')!r} requires a stable mutation_id"
+            )
+        if mutation_id in seen:
+            raise ValueError(
+                f"Duplicate logical mutation_id {mutation_id!r} in staged effects "
+                f"{seen[mutation_id]!r} and {eff.get('id')!r} — one logical rules-state mutation cannot apply twice"
+            )
+        seen[mutation_id] = str(eff.get("id"))
 
 
 # ── Built-in handlers (stubs, extensible) ────────────────────────────────────
@@ -565,6 +605,395 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
     logger.info(
         "effect apply_attack_damage npc effect_id=%s entity_id=%s total=%s absorbed=%s applied=%s",
         effect.get("id"), target_id, total, change.absorbed_by_temp, change.applied_to_current,
+    )
+
+
+# ── Rules-state targets (#227) ────────────────────────────────────────────
+#
+# Canonical-store adapter: PCs mutate Dnd5eCharacterSheet columns/JSONB in
+# place; NPCs mutate WorldEntity.details keys. Both shapes use the same
+# condition/resource/slot/concentration dict vocabulary as
+# :mod:`app.rules.state`, so the pure transitions never branch on kind.
+
+
+class _StateTarget:
+    """Mutable view of one combatant's rules state with a single commit."""
+
+    def __init__(self, *, kind: str, row: Any, campaign_id: Any):
+        self.kind = kind
+        self.row = row
+        self.campaign_id = campaign_id
+        if kind == "pc":
+            self.conditions: list[dict[str, Any]] = [dict(i) for i in (row.conditions or []) if isinstance(i, dict)]
+            self.resources: list[dict[str, Any]] = [dict(i) for i in (row.resources or []) if isinstance(i, dict)]
+            self.slots: dict[str, Any] = dict(row.spell_slots or {})
+            extras = dict(row.extras or {})
+            self._extras = extras
+            self.concentration: dict[str, Any] | None = extras.get("concentration")
+            self.successes = int(row.death_save_successes or 0)
+            self.failures = int(row.death_save_failures or 0)
+            self.hp_current: int | None = int(row.hit_points_current)
+            self.exhaustion: int = int(row.exhaustion_level or 0)
+        else:
+            details = dict(row.details or {})
+            self._details = details
+            self.conditions = [dict(i) for i in (details.get("conditions") or []) if isinstance(i, dict)]
+            self.resources = [dict(i) for i in (details.get("resources") or []) if isinstance(i, dict)]
+            self.slots = dict(details.get("spell_slots") or {})
+            self.concentration = details.get("concentration")
+            death = details.get("death_saves") or {}
+            self.successes = int(death.get("successes", 0) or 0)
+            self.failures = int(death.get("failures", 0) or 0)
+            nested_hp = details.get("hit_points")
+            self.hp_current = int(nested_hp.get("current")) if isinstance(nested_hp, dict) and nested_hp.get("current") is not None else None
+            self.exhaustion = int(details.get("exhaustion_level", 0) or 0)
+
+    def commit(self, db: Session) -> None:
+        if self.kind == "pc":
+            self.row.conditions = self.conditions
+            self.row.resources = self.resources
+            self.row.spell_slots = self.slots
+            extras = dict(self._extras)
+            extras["concentration"] = self.concentration
+            self.row.extras = extras
+            self.row.death_save_successes = self.successes
+            self.row.death_save_failures = self.failures
+            if self.hp_current is not None:
+                self.row.hit_points_current = self.hp_current
+            self.row.exhaustion_level = self.exhaustion
+        else:
+            details = dict(self._details)
+            details["conditions"] = self.conditions
+            details["resources"] = self.resources
+            details["spell_slots"] = self.slots
+            details["concentration"] = self.concentration
+            details["death_saves"] = {"successes": self.successes, "failures": self.failures}
+            if self.hp_current is not None:
+                nested = dict(details.get("hit_points") or {})
+                nested["current"] = self.hp_current
+                details["hit_points"] = nested
+            details["exhaustion_level"] = self.exhaustion
+            self.row.details = details
+        db.flush()
+
+
+def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) -> _StateTarget:
+    """Load + scope-check the PC sheet or NPC entity for a rules-state effect."""
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    args = effect.get("arguments") or {}
+    target_kind = args.get("target_kind")
+    if target_kind not in ("pc", "npc"):
+        raise ValueError(f"Staged effect {effect.get('id')!r} target_kind must be pc/npc")
+    try:
+        target_id = _uuid.UUID(str(args.get("target_id") or ""))
+    except ValueError:
+        raise ValueError(f"Staged effect {effect.get('id')!r} target_id must be a UUID")
+
+    if target_kind == "pc":
+        from models.campaigns import CampaignMember
+        from models.characters import Character, Dnd5eCharacterSheet
+
+        character = db.get(Character, target_id)
+        if character is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} not found")
+        roster = db.execute(
+            _select(CampaignMember).where(
+                CampaignMember.campaign_id == campaign.id,
+                CampaignMember.selected_character_id == character.id,
+            )
+        ).scalars().first()
+        if roster is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
+        sheet = db.execute(
+            _select(Dnd5eCharacterSheet)
+            .where(Dnd5eCharacterSheet.character_id == character.id)
+            .order_by(Dnd5eCharacterSheet.updated_at.desc())
+        ).scalars().first()
+        if sheet is None:
+            raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
+        return _StateTarget(kind="pc", row=sheet, campaign_id=campaign.id)
+
+    from models.world import WorldEntity
+
+    entity = db.get(WorldEntity, target_id)
+    if entity is None or str(entity.campaign_id) != str(campaign.id):
+        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} not found in this campaign")
+    return _StateTarget(kind="npc", row=entity, campaign_id=campaign.id)
+
+
+@register("apply_condition")
+def _handle_apply_condition(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a condition add/remove/update/tick to canonical state (issue #227).
+
+    Runs inside the outer ``commit_campaign_mutation``: a failed turn commit
+    rolls back the write. Gaining an incapacitating condition deterministically
+    breaks active concentration (2024 linkage hook); exhaustion transitions
+    sync the exhaustion column and the structural entry together.
+    """
+    from app.rules.state import (
+        CONCENTRATION_BREAKING_CONDITIONS as _BREAKING,
+    )
+    from app.rules.state import (
+        StateError as _StateError,
+    )
+    from app.rules.state import (
+        add_condition as _add,
+    )
+    from app.rules.state import (
+        break_concentration as _break_conc,
+    )
+    from app.rules.state import (
+        normalize_condition_name as _norm,
+    )
+    from app.rules.state import (
+        remove_condition as _remove,
+    )
+    from app.rules.state import (
+        set_exhaustion as _set_exhaustion,
+    )
+    from app.rules.state import (
+        tick_conditions as _tick,
+    )
+    from app.rules.state import (
+        update_condition as _update,
+    )
+
+    args = effect.get("arguments") or {}
+    op = args.get("op")
+    mutation_id = args.get("mutation_id")
+    target = _load_state_target(db, campaign, effect)
+    concentration_broken: str | None = None
+    try:
+        if op == "add":
+            norm = _norm(args.get("condition"))
+            new_conditions, _record = _add(
+                target.conditions,
+                name=norm,
+                source=args.get("source"),
+                duration_rounds=args.get("duration_rounds"),
+                save_ends=args.get("save_ends"),
+                is_permanent=bool(args.get("is_permanent", False)),
+                visibility="public",
+                description=args.get("description"),
+                provenance=args.get("provenance"),
+                mutation_id=mutation_id,
+            )
+            target.conditions = new_conditions
+            if norm == "exhaustion":
+                target.exhaustion = _set_exhaustion(int(args.get("exhaustion_level")), mutation_id=mutation_id)
+            if norm in _BREAKING:
+                try:
+                    broke_state, broke = _break_conc(target.concentration, reason="incapacitated", mutation_id=f"{mutation_id}:conc")
+                    target.concentration = broke_state
+                    concentration_broken = broke.effect_name
+                except _StateError:
+                    pass  # no active concentration — nothing to break
+        elif op == "remove":
+            norm = _norm(args.get("condition"))
+            new_conditions, _removed = _remove(target.conditions, name=norm, mutation_id=mutation_id)
+            target.conditions = new_conditions
+            if norm == "exhaustion":
+                target.exhaustion = _set_exhaustion(0, mutation_id=mutation_id)
+        elif op == "update":
+            norm = _norm(args.get("condition"))
+            new_conditions, _updated = _update(
+                target.conditions,
+                name=norm,
+                mutation_id=mutation_id,
+                source=args.get("source"),
+                duration_rounds=args.get("duration_rounds"),
+                clear_duration=bool(args.get("clear_duration", False)),
+                save_ends=args.get("save_ends"),
+                clear_save_ends=bool(args.get("clear_save_ends", False)),
+                is_permanent=args.get("is_permanent"),
+                description=args.get("description"),
+                provenance=args.get("provenance"),
+            )
+            target.conditions = new_conditions
+            if norm == "exhaustion" and args.get("exhaustion_level") is not None:
+                target.exhaustion = _set_exhaustion(int(args.get("exhaustion_level")), mutation_id=mutation_id)
+        elif op == "tick":
+            new_conditions, _expired = _tick(target.conditions, rounds=int(args.get("rounds", 1) or 1), mutation_id=mutation_id)
+            target.conditions = new_conditions
+        else:
+            raise ValueError(f"Staged effect {effect.get('id')!r} unknown condition op {op!r}")
+    except _StateError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid condition transition ({exc.code}): {exc}") from exc
+    target.commit(db)
+    logger.info(
+        "effect apply_condition effect_id=%s target=%s:%s op=%s condition=%s conc_broken=%s",
+        effect.get("id"), args.get("target_kind"), args.get("target_id"), op, args.get("condition"), concentration_broken,
+    )
+
+
+@register("apply_resource")
+def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a resource spend/restore/set or spell-slot spend/restore (issue #227).
+
+    Runs inside the outer ``commit_campaign_mutation``: overdrafts and
+    unknown names/slots fail closed before any write, and a failed turn
+    commit rolls the write back.
+    """
+    from app.rules.state import StateError as _StateError
+    from app.rules.state import restore_resource as _restore
+    from app.rules.state import restore_spell_slot as _restore_slot
+    from app.rules.state import set_resource as _set
+    from app.rules.state import spend_resource as _spend
+    from app.rules.state import spend_spell_slot as _spend_slot
+
+    args = effect.get("arguments") or {}
+    op = args.get("op")
+    mutation_id = args.get("mutation_id")
+    target = _load_state_target(db, campaign, effect)
+    slot_level = args.get("slot_level")
+    resource = args.get("resource")
+    if isinstance(resource, str) and resource.strip().lower().startswith("spell_slots:"):
+        try:
+            slot_level = int(resource.strip().split(":", 1)[1])
+        except ValueError:
+            raise ValueError(f"Staged effect {effect.get('id')!r} unparseable slot resource {resource!r}")
+    try:
+        if slot_level is not None:
+            if op == "spend":
+                new_slots, _delta = _spend_slot(target.slots, level=int(slot_level), mutation_id=mutation_id)
+            elif op == "restore":
+                new_slots, _delta = _restore_slot(target.slots, level=int(slot_level), amount=int(args.get("amount", 1) or 1), mutation_id=mutation_id)
+            else:
+                raise ValueError(f"Staged effect {effect.get('id')!r} spell slots support spend/restore only, not {op!r}")
+            target.slots = new_slots
+        else:
+            if op == "spend":
+                new_resources, _delta = _spend(target.resources, name=resource, amount=int(args.get("amount", 1) or 1), mutation_id=mutation_id)
+            elif op == "restore":
+                new_resources, _delta = _restore(target.resources, name=resource, amount=int(args.get("amount", 1) or 1), mutation_id=mutation_id)
+            elif op == "set":
+                new_resources, _delta = _set(
+                    target.resources, name=resource,
+                    current=args.get("current"), maximum=args.get("maximum"), mutation_id=mutation_id,
+                )
+            else:
+                raise ValueError(f"Staged effect {effect.get('id')!r} unknown resource op {op!r}")
+            target.resources = new_resources
+    except _StateError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid resource transition ({exc.code}): {exc}") from exc
+    target.commit(db)
+    logger.info(
+        "effect apply_resource effect_id=%s target=%s:%s op=%s resource=%s slot=%s",
+        effect.get("id"), args.get("target_kind"), args.get("target_id"), op, resource, slot_level,
+    )
+
+
+@register("apply_concentration")
+def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a concentration start/replace/break to canonical state (issue #227)."""
+    from app.rules.state import StateError as _StateError
+    from app.rules.state import break_concentration as _break
+    from app.rules.state import replace_concentration as _replace
+    from app.rules.state import start_concentration as _start
+
+    args = effect.get("arguments") or {}
+    op = args.get("op")
+    mutation_id = args.get("mutation_id")
+    target = _load_state_target(db, campaign, effect)
+    try:
+        if op == "start":
+            new_state, _started = _start(
+                target.concentration,
+                effect_name=args.get("effect_name"),
+                effect_id=args.get("concentration_effect_id"),
+                source=args.get("source"),
+                visibility="public",
+                provenance=args.get("provenance"),
+                mutation_id=mutation_id,
+            )
+        elif op == "replace":
+            new_state, _started, _broke = _replace(
+                target.concentration,
+                effect_name=args.get("effect_name"),
+                effect_id=args.get("concentration_effect_id"),
+                source=args.get("source"),
+                visibility="public",
+                provenance=args.get("provenance"),
+                mutation_id=mutation_id,
+            )
+        elif op == "break":
+            new_state, _broke = _break(target.concentration, reason=args.get("reason"), mutation_id=mutation_id)
+        else:
+            raise ValueError(f"Staged effect {effect.get('id')!r} unknown concentration op {op!r}")
+    except _StateError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid concentration transition ({exc.code}): {exc}") from exc
+    target.concentration = new_state
+    target.commit(db)
+    logger.info(
+        "effect apply_concentration effect_id=%s target=%s:%s op=%s",
+        effect.get("id"), args.get("target_kind"), args.get("target_id"), op,
+    )
+
+
+@register("apply_death_save")
+def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a death-save record/reset with baseline unconscious/death hooks (issue #227).
+
+    Hooks (all code-owned, inside the same atomic commit):
+    - first save at 0 HP, or stabilization, ensures the ``unconscious``
+      condition is structurally present;
+    - death breaks active concentration;
+    - natural-20 revival restores 1 HP and clears ``unconscious``.
+    """
+    from app.rules.state import StateError as _StateError
+    from app.rules.state import add_condition as _add
+    from app.rules.state import break_concentration as _break_conc
+    from app.rules.state import has_condition as _has
+    from app.rules.state import record_death_save as _record
+    from app.rules.state import remove_condition as _remove
+    from app.rules.state import reset_death_saves as _reset
+
+    args = effect.get("arguments") or {}
+    op = args.get("op")
+    mutation_id = args.get("mutation_id")
+    target = _load_state_target(db, campaign, effect)
+    try:
+        if op == "record":
+            pre_s, pre_f = target.successes, target.failures
+            state = _record(target.successes, target.failures, result=args.get("result"), mutation_id=mutation_id)
+            target.successes, target.failures = state.successes, state.failures
+            if (pre_s, pre_f) == (0, 0) and target.hp_current == 0 and not _has(target.conditions, "unconscious"):
+                target.conditions, _rec = _add(
+                    target.conditions, name="unconscious", source="death_saves",
+                    description="Unconscious at 0 hit points; making death saving throws.",
+                    provenance={"mutation_id": mutation_id}, mutation_id=f"{mutation_id}:unconscious",
+                )
+            if state.stabilized and not _has(target.conditions, "unconscious"):
+                target.conditions, _rec = _add(
+                    target.conditions, name="unconscious", source="death_saves",
+                    description="Stable but unconscious.",
+                    provenance={"mutation_id": mutation_id}, mutation_id=f"{mutation_id}:stable",
+                )
+            if state.dead:
+                try:
+                    broke_state, _broke = _break_conc(target.concentration, reason="dead", mutation_id=f"{mutation_id}:conc")
+                    target.concentration = broke_state
+                except _StateError:
+                    pass
+            if state.outcome == "revived":
+                target.hp_current = max(target.hp_current or 0, state.revived_hp)
+                if _has(target.conditions, "unconscious"):
+                    target.conditions, _rem = _remove(target.conditions, name="unconscious", mutation_id=f"{mutation_id}:wake")
+        elif op == "reset":
+            state = _reset(target.successes, target.failures, reason=args.get("reset_reason"), mutation_id=mutation_id)
+            target.successes, target.failures = state.successes, state.failures
+        else:
+            raise ValueError(f"Staged effect {effect.get('id')!r} unknown death-save op {op!r}")
+    except _StateError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid death-save transition ({exc.code}): {exc}") from exc
+    target.commit(db)
+    logger.info(
+        "effect apply_death_save effect_id=%s target=%s:%s op=%s result=%s outcome=%s",
+        effect.get("id"), args.get("target_kind"), args.get("target_id"), op,
+        args.get("result"), target.successes if op == "reset" else None,
     )
 
 
