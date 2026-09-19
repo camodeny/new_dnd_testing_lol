@@ -687,11 +687,14 @@ class DamageResolution(StrictModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
 
     def public_projection(self) -> dict[str, Any]:
+        # The explicit mitigation classification (resistance/vulnerability/
+        # immunity) is a hidden NPC stat and is never public — narration may
+        # convey the fictional effect, but the mechanical label stays
+        # DM-private. It remains in the private payload for audit.
         value: dict[str, Any] = {
             "damage_id": self.damage_id,
             "damage_type": self.damage_type,
             "is_critical": self.is_critical,
-            "mitigation": self.mitigation,
             "final_total": self.final_total,
             "status": self.status,
         }

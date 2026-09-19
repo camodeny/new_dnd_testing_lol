@@ -1015,6 +1015,36 @@ def test_public_damage_event_never_exposes_hidden_npc_hp():
     assert payload["hp_change"]["is_down"] is False  # observable outcome kept
 
 
+def test_public_damage_event_hides_npc_mitigation_label():
+    """Resistance/immunity labels stay DM-only on the public path (#226)."""
+    import json
+
+    attacker = pc_attacker(bonus=5)
+    defender = defender_from_npc(
+        armor_class=15, resistances=["fire"], immunities=["poison"]
+    )
+    spec = make_damage_spec(num_dice=1, die_size=8, modifier=2, damage_type="fire")
+    damage = resolve_damage(
+        spec=spec,
+        damage_rolls=[6],
+        attacker_kind="pc",
+        defender=defender,
+        damage_id="hide-mit-dmg",
+    )
+    assert damage.mitigation == "resistance"
+    event_type, payload, _visibility = damage_domain_event(
+        damage, None, include_private=False
+    )
+    assert event_type == "damage.applied"
+    assert payload["final_total"] == 4  # observable damage stays
+    blob = json.dumps(payload, default=str)
+    assert "resistance" not in blob
+    assert "mitigation" not in payload  # the classification label itself
+    # DM-private payload keeps the label for audit/explanation.
+    _, private_payload, _ = damage_domain_event(damage, None, include_private=True)
+    assert private_payload["mitigation"] == "resistance"
+
+
 # ── Staged-effect promotion (PC sheet + NPC entity) ───────────────────────
 
 
