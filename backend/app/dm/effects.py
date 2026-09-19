@@ -126,6 +126,8 @@ def apply_staged_effects(
         turn.id, attempt.id, len(staged_effects), [e.get("effect_type") for e in staged_effects],
     )
 
+    _reject_duplicate_damage_ids(staged_effects)
+
     for eff in staged_effects:
         eff_id = eff.get("id", "<unknown>")
         eff_type = eff.get("effect_type")
@@ -137,6 +139,35 @@ def apply_staged_effects(
         logger.info("staged_effect applied turn_id=%s attempt_id=%s effect_id=%s effect_type=%s", turn.id, attempt.id, eff_id, eff_type)
 
     logger.info("staged_effects apply complete turn_id=%s attempt_id=%s count=%s", turn.id, attempt.id, len(staged_effects))
+
+
+def _reject_duplicate_damage_ids(staged_effects: list[dict[str, Any]]) -> None:
+    """Fail closed if one logical damage record would apply twice (#226).
+
+    Two ``apply_attack_damage`` effects with different staged-effect IDs but
+    the same logical ``damage_id`` would both run and reduce HP twice in the
+    same atomic commit; outer turn idempotency only protects whole-commit
+    replay, not two entries inside it. The scan runs before any handler, so
+    rejection leaves zero partial mutation. A missing/blank ``damage_id``
+    is also rejected: the logical damage identity is required for the
+    exactly-once guarantee.
+    """
+    seen: dict[str, str] = {}
+    for eff in staged_effects:
+        if eff.get("effect_type") != "apply_attack_damage":
+            continue
+        args = eff.get("arguments") or {}
+        damage_id = args.get("damage_id")
+        if not isinstance(damage_id, str) or not damage_id.strip():
+            raise ValueError(
+                f"Staged effect {eff.get('id')!r} apply_attack_damage requires a stable damage_id"
+            )
+        if damage_id in seen:
+            raise ValueError(
+                f"Duplicate logical damage_id {damage_id!r} in staged effects "
+                f"{seen[damage_id]!r} and {eff.get('id')!r} — one logical damage effect cannot apply twice"
+            )
+        seen[damage_id] = str(eff.get("id"))
 
 
 # ── Built-in handlers (stubs, extensible) ────────────────────────────────────

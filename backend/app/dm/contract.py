@@ -933,6 +933,14 @@ def contract_json_schema_strict() -> dict[str, Any]:
             "type": "string",
             "description": "JSON-encoded effect arguments object (parsed and validated locally per effect_type)",
         }
+    # apply_attack_damage is code-built only (#226): the model must never
+    # author HP damage totals, so it is removed from the provider-facing
+    # effect_type enum. Local validation still accepts it for server-built
+    # effects, and RulesValidator rejects it in provider output as
+    # defense-in-depth.
+    effect_type_schema = staged_props.get("effect_type", {})
+    if isinstance(effect_type_schema.get("enum"), list) and "apply_attack_damage" in effect_type_schema["enum"]:
+        effect_type_schema["enum"] = [e for e in effect_type_schema["enum"] if e != "apply_attack_damage"]
 
     def _complete(node: Any) -> None:
         if isinstance(node, dict):

@@ -1256,3 +1256,122 @@ def test_offense_defense_constructors_exposed_without_alias_knowledge():
     assert isinstance(CombatantDefense(armor_class=15), CombatantDefense)
     with pytest.raises(ValidationError):
         CombatantOffense(attack_bonus="high")  # type: ignore
+
+
+def _respond_contract(*effects):
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+
+    claim = {
+        "text": "Steel flashes.",
+        "claim_kind": "observation",
+        "origin": "dm_adjudication",
+        "visibility": "public",
+    }
+    return normalize_contract(
+        {
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": "combat beat",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [claim]}],
+            "staged_effects": list(effects),
+        }
+    )
+
+
+def test_provider_authored_damage_is_rejected_by_rules_validator():
+    """A forged model damage_total never becomes authoritative (#226)."""
+    from app.dm.validators import RulesValidator
+
+    spec = make_damage_spec(num_dice=2, die_size=6, modifier=5, damage_type="slashing")
+    damage = resolve_damage(
+        spec=spec, damage_rolls=[6, 6], attacker_kind="pc", damage_id="forge-dmg"
+    )
+    forged = build_damage_effect(
+        effect_id="forge-eff",
+        target_kind="pc",
+        target_id=str(uuid.uuid4()),
+        damage=damage,
+        visibility="public",
+    )
+    # Tamper the total the way model arithmetic would: still contract-valid…
+    forged["arguments"] = dict(forged["arguments"], damage_total=9999)
+    contract = _respond_contract(forged)
+    result = RulesValidator().validate(contract, object())
+    assert result.passed is False
+    assert [v.code for v in result.violations] == ["provider_authored_damage"]
+
+    # …while a damage-free contract passes the same validator.
+    clean = _respond_contract()
+    assert RulesValidator().validate(clean, object()).passed is True
+
+
+def test_provider_schema_excludes_code_built_damage_effect():
+    from app.dm.contract import contract_json_schema_strict
+
+    schema = contract_json_schema_strict()
+    effect_type_enum = schema["$defs"]["StagedEffect"]["properties"]["effect_type"][
+        "enum"
+    ]
+    assert "apply_attack_damage" not in effect_type_enum
+    assert "start_encounter" in effect_type_enum  # provider effects untouched
+
+
+def test_duplicate_logical_damage_id_cannot_apply_twice_in_one_commit():
+    """Two staged entries sharing one damage_id fail before any HP write."""
+    from app.dm.effects import apply_staged_effects
+    from models.characters import Dnd5eCharacterSheet
+    from sqlalchemy import select
+
+    factory = _handler_db()
+    with factory() as db:
+        camp, turn, attempt, char, _brute = _handler_fixture(db)
+        spec = make_damage_spec(num_dice=1, die_size=8, modifier=3)
+        damage = resolve_damage(
+            spec=spec, damage_rolls=[6], attacker_kind="pc", damage_id="dup-dmg-1"
+        )
+        first = build_damage_effect(
+            effect_id="dup-eff-a",
+            target_kind="pc",
+            target_id=str(char.id),
+            damage=damage,
+            visibility="public",
+        )
+        second = build_damage_effect(
+            effect_id="dup-eff-b",
+            target_kind="pc",
+            target_id=str(char.id),
+            damage=damage,
+            visibility="public",
+        )
+        assert first["id"] != second["id"]  # distinct staged IDs, same damage
+        with pytest.raises(ValueError, match="Duplicate logical damage_id"):
+            apply_staged_effects(db, camp, [first, second], turn, attempt)
+        db.rollback()
+        sheet = db.execute(
+            select(Dnd5eCharacterSheet).where(
+                Dnd5eCharacterSheet.character_id == char.id
+            )
+        ).scalars().first()
+        assert (sheet.hit_points_current, sheet.hit_points_temp) == (20, 6)
+
+        # Distinct logical damage records still each apply exactly once.
+        other = resolve_damage(
+            spec=spec, damage_rolls=[4], attacker_kind="pc", damage_id="dup-dmg-2"
+        )
+        third = build_damage_effect(
+            effect_id="dup-eff-c",
+            target_kind="pc",
+            target_id=str(char.id),
+            damage=other,
+            visibility="public",
+        )
+        apply_staged_effects(db, camp, [first, third], turn, attempt)
+        db.commit()
+        sheet = db.execute(
+            select(Dnd5eCharacterSheet).where(
+                Dnd5eCharacterSheet.character_id == char.id
+            )
+        ).scalars().first()
+        # 9 + 7 = 16 damage: 6 temp absorbed, 10 to current (20 -> 10).
+        assert sheet.hit_points_temp == 0
+        assert sheet.hit_points_current == 10
