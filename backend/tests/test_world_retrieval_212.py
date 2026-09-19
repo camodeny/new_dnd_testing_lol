@@ -312,6 +312,8 @@ def test_source_turn_not_found_and_submission_lookup():
 
 
 def test_private_submission_hidden_from_other_members():
+    from app.runtime.threads import create_private_thread
+
     Fac, cid, owner, player, _ = _setup()
     db = Fac()
     other = uuid.uuid4()
@@ -319,9 +321,14 @@ def test_private_submission_hidden_from_other_members():
     db.add(CampaignMember(campaign_id=cid, user_id=other, role="player"))
     db.commit()
     _turn, _sub = _seed_turn(db, cid, player)
+    # Private evidence lives on a private thread: only explicit thread
+    # members may read it (owner status alone never grants access).
+    private_thread = create_private_thread(
+        db, campaign_id=cid, created_by=player, member_ids=[player])
+    db.commit()
     private_sub = PlayerSubmission(
         id=uuid.uuid4(), campaign_id=cid, user_id=player,
-        thread_id="main", audience="private", sequence=2,
+        thread_id=str(private_thread.id), audience="private", sequence=2,
         raw_content="secret whisper")
     db.add(private_sub)
     db.commit()
@@ -598,3 +605,68 @@ def test_world_tool_contract_validation():
     req = EvidenceRequest.model_validate(
         {"id": "ok1", "tool": "query_world_timeline", "limit": 5})
     assert req.limit == 5
+
+
+# ── AI review round 1 regressions ──────────────────────────────────────────
+
+def test_private_source_turn_thread_member_allowed_owner_denied():
+    from app.runtime.threads import create_private_thread
+
+    Fac, cid, owner, player, _ = _setup()
+    db = Fac()
+    private_thread = create_private_thread(
+        db, campaign_id=cid, created_by=player, member_ids=[player])
+    db.commit()
+    turn = DmTurn(
+        id=uuid.uuid4(), campaign_id=cid, thread_id=str(private_thread.id),
+        audience="private", status="committed", source_revision=1,
+        input_set_revision=1, submission_ids=[],
+    )
+    db.add(turn)
+    db.commit()
+    member_ok = lookup_source_turn(db, cid, turn.id, player)
+    assert member_ok.status == STATUS_OK
+    assert member_ok.packets[0].source_type == "source_turn"
+    owner_denied = lookup_source_turn(db, cid, turn.id, owner)
+    assert owner_denied.packets == []
+    assert owner_denied.denied == 1
+    assert owner_denied.denied_reasons.get("turn_not_visible") == 1
+
+
+def test_timeline_outsider_gets_no_public_events():
+    Fac, cid, owner, player, outsider = _setup()
+    db = Fac()
+    _seed_graph(db, cid)
+    denied = query_timeline(db, cid, outsider, dm_internal=False)
+    assert denied.packets == []
+    assert denied.denied >= 1
+    assert denied.denied_reasons.get("not_campaign_member") >= 1
+    assert "not_campaign_member" not in str(denied.source_ids)
+
+
+def test_private_knowledge_internal_preserves_visibility_player_filters():
+    Fac, cid, owner, player, _ = _setup()
+    db = Fac()
+    seed = _seed_graph(db, cid)
+    fact, _ = create_fact_authoritative(
+        db, cid, seed["rev"], content="The well is dry.",
+        entity_refs=[seed["c"].id], epistemic_state="believed",
+        visibility="public", operation_id="op-fact-well-private-k")
+    campaign = db.get(Campaign, cid)
+    assert_knowledge_inline(
+        db, campaign, subject_kind="character",
+        subject_entity_id=seed["a"].id, target_kind="fact",
+        target_fact_id=fact.id, knowledge_state="knows",
+        acquisition_source="overheard", visibility="private")
+    db.commit()
+    internal = query_character_knowledge(
+        db, cid, seed["a"].id, owner, dm_internal=True)
+    assert internal.status == STATUS_OK
+    assert internal.visible == 1
+    assert internal.packets[0].visibility == "private"
+    assert internal.packets[0].revealable is None
+    player_view = query_character_knowledge(
+        db, cid, seed["a"].id, player, dm_internal=False)
+    assert player_view.packets == []
+    assert player_view.denied >= 1
+    assert player_view.denied_reasons.get("knowledge_not_visible") == 1

@@ -518,7 +518,7 @@ def _knowledge_packet(entry: dict[str, Any], rank: int,
         source_version="1",
         content=dict(entry),
         epistemic_state=str(entry.get("knowledge_state", "believes")),
-        visibility="dm_only",
+        visibility=str(entry.get("visibility", "dm_only") or "dm_only"),
         campaign_id=str(entry.get("campaign_id", "")),
         revision_or_sequence=None,
         provenance={"retrieved_by": RETRIEVAL_SOURCE,
@@ -560,12 +560,21 @@ def _authorize_world_record(
     return True, None
 
 
-def _event_visible_player_facing(event: CampaignDomainEvent,
-                                 viewers: list[uuid.UUID]) -> tuple[bool, str | None]:
+def _event_visible_player_facing(db: Session, campaign: Campaign,
+                                  event: CampaignDomainEvent,
+                                  viewers: list[uuid.UUID]) -> tuple[bool, str | None]:
     """Member feed rule mirroring ``list_campaign_events``: public events,
-    plus a viewer's own actor events. Anything else stays hidden."""
+    plus a viewer's own actor events. Anything else stays hidden.
+
+    Every player-facing viewer must first pass campaign membership — an
+    arbitrary user UUID plus a known campaign ID must not read that
+    campaign's public timeline.
+    """
     if not viewers:
         return False, "viewer_required"
+    for viewer in viewers:
+        if not _membership(db, campaign, viewer):
+            return False, "not_campaign_member"
     if str(getattr(event, "visibility", "public")) == "public":
         return True, None
     actor = getattr(event, "actor_id", None)
@@ -883,7 +892,7 @@ def fact_source_evidence(
             denied += 1
             denied_reasons["source_event_not_found"] = denied_reasons.get("source_event_not_found", 0) + 1
         else:
-            gate = (True, None) if dm_internal else _event_visible_player_facing(event, viewers)
+            gate = (True, None) if dm_internal else _event_visible_player_facing(db, campaign, event, viewers)
             if not gate[0]:
                 denied += 1
                 denied_reasons[gate[1] or "denied"] = denied_reasons.get(gate[1] or "denied", 0) + 1
@@ -984,7 +993,7 @@ def query_timeline(
     outcome.total = len(rows)
     packets: list[EvidencePacket] = []
     for event in rows:
-        gate = (True, None) if dm_internal else _event_visible_player_facing(event, viewers)
+        gate = (True, None) if dm_internal else _event_visible_player_facing(db, campaign, event, viewers)
         if not gate[0]:
             outcome.denied += 1
             outcome.denied_reasons[gate[1] or "denied"] = outcome.denied_reasons.get(gate[1] or "denied", 0) + 1
@@ -1008,6 +1017,47 @@ def query_timeline(
 
 # ── Source turns + submissions ───────────────────────────────────────────────
 
+def _thread_readable_for_viewer(
+    db: Session, campaign: Campaign, raw_thread_id: Any, viewer: uuid.UUID,
+) -> bool:
+    """Thread-ACL check for source-turn/submission evidence (read-only).
+
+    Uses the centralized ``can_read_thread`` primitive: shared campaign
+    threads require campaign membership; private threads require explicit
+    thread membership (owner status alone never grants private access).
+    Private content must live on a resolvable thread row — an unresolvable
+    thread reference denies fail-closed. (This helper is only invoked for
+    private-audience records; shared-audience legacy ``"main"`` turns
+    without a durable thread row never reach it.)
+    """
+    from app.runtime.threads import can_read_thread, parse_thread_id
+    from models.threads import CampaignThread
+    from sqlalchemy import select as _select
+
+    raw = "" if raw_thread_id is None else str(raw_thread_id)
+    if not raw or raw == "main":
+        thread = db.execute(
+            _select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign.id,
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        if thread is None:
+            return False
+        try:
+            return bool(can_read_thread(db, campaign.id, thread.id, viewer))
+        except Exception:
+            return False
+    try:
+        tid = parse_thread_id(raw)
+    except Exception:
+        return False
+    try:
+        return bool(can_read_thread(db, campaign.id, tid, viewer))
+    except Exception:
+        return False
+
+
 def _turn_gate(
     db: Session, campaign: Campaign, turn: DmTurn,
     viewers: list[uuid.UUID], *, dm_internal: bool,
@@ -1019,12 +1069,13 @@ def _turn_gate(
     for viewer in viewers:
         if not _membership(db, campaign, viewer):
             return False, "not_campaign_member"
-    from app.world.service import is_world_authority
-
     audience = str(getattr(turn, "audience", "campaign") or "campaign")
     if audience == "private":
-        if not any(is_world_authority(campaign, viewer) for viewer in viewers):
-            return False, "turn_not_visible"
+        for viewer in viewers:
+            if not _thread_readable_for_viewer(
+                db, campaign, getattr(turn, "thread_id", None), viewer
+            ):
+                return False, "turn_not_visible"
         return True, None
     return True, None
 
@@ -1040,14 +1091,13 @@ def _submission_gate(
     for viewer in viewers:
         if not _membership(db, campaign, viewer):
             return False, "not_campaign_member"
-    from app.world.service import is_world_authority
-
     audience = str(getattr(submission, "audience", "campaign") or "campaign")
     if audience == "private":
-        author = str(getattr(submission, "user_id", ""))
-        if not any(str(viewer) == author or is_world_authority(campaign, viewer)
-                   for viewer in viewers):
-            return False, "submission_not_visible"
+        for viewer in viewers:
+            if not _thread_readable_for_viewer(
+                db, campaign, getattr(submission, "thread_id", None), viewer
+            ):
+                return False, "submission_not_visible"
     return True, None
 
 
@@ -1236,6 +1286,69 @@ def retrieve_current_scene(
 
 # ── Character / NPC knowledge ────────────────────────────────────────────────
 
+def _knowledge_target_id_of_row(row: Any) -> tuple[str, str]:
+    kind = str(getattr(row, "target_kind", ""))
+    if kind == "fact" and getattr(row, "target_fact_id", None):
+        return kind, str(row.target_fact_id)
+    if kind == "relation" and getattr(row, "target_relation_id", None):
+        return kind, str(row.target_relation_id)
+    if kind == "entity" and getattr(row, "target_entity_id", None):
+        return kind, str(row.target_entity_id)
+    return kind, ""
+
+
+def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> dict[str, Any]:
+    """Campaign-scoped internal entry: real visibility, target snapshot included."""
+    from models.world import WorldEntity, WorldFact, WorldRelation
+
+    kind, target_id = _knowledge_target_id_of_row(row)
+    target: dict[str, Any] | None = None
+    try:
+        record = None
+        if kind == "fact" and getattr(row, "target_fact_id", None):
+            record = db.get(WorldFact, row.target_fact_id)
+        elif kind == "relation" and getattr(row, "target_relation_id", None):
+            record = db.get(WorldRelation, row.target_relation_id)
+        elif kind == "entity" and getattr(row, "target_entity_id", None):
+            record = db.get(WorldEntity, row.target_entity_id)
+        if record is not None and getattr(record, "campaign_id", None) == campaign_id:
+            target = record.to_dict()
+    except Exception:
+        target = None
+    return {
+        "knowledge_id": str(row.id),
+        "subject_kind": getattr(row, "subject_kind", None),
+        "subject_entity_id": str(getattr(row, "subject_entity_id", "")),
+        "target_kind": kind,
+        "target_id": target_id,
+        "knowledge_state": getattr(row, "knowledge_state", "believes"),
+        "acquisition_source": getattr(row, "acquisition_source", None),
+        "visibility": str(getattr(row, "visibility", "dm_only") or "dm_only"),
+        "target": target,
+        "campaign_id": str(campaign_id),
+    }
+
+
+def _enrich_entries_with_row_visibility(
+    db: Session, campaign_id: uuid.UUID, entries: list[dict[str, Any]]
+) -> None:
+    """Attach the source knowledge row's real visibility to authorized entries.
+
+    Only called for entries a human projection already authorized, so no
+    hidden row is introduced — this merely preserves its visibility metadata
+    instead of erasing it to a hardcoded default.
+    """
+    from models.world import WorldKnowledge
+
+    for entry in entries:
+        try:
+            row = db.get(WorldKnowledge, _coerce_optional_uuid(entry.get("knowledge_id")))
+        except Exception:
+            row = None
+        if row is not None and getattr(row, "campaign_id", None) == campaign_id:
+            entry["visibility"] = str(getattr(row, "visibility", "dm_only") or "dm_only")
+
+
 def query_character_knowledge(
     db: Session,
     campaign_id: Any,
@@ -1248,10 +1361,11 @@ def query_character_knowledge(
 ) -> RetrievalOutcome:
     """What may the viewer see of one subject's fictional knowledge?
 
-    Wraps the #211 ``what_does_subject_know`` projection (subject, knowledge
-    row, and truth target authorized independently). DM-internal retrieval
-    runs the projection as the campaign owner so visibility metadata is
-    preserved rather than erased.
+    Player-facing retrieval wraps the #211 ``what_does_subject_know``
+    projection (subject, knowledge row, and truth target authorized
+    independently). DM-internal retrieval bypasses human disclosure
+    filtering while remaining campaign-scoped, returning every knowledge
+    row for the subject with its real visibility metadata preserved.
     """
     from app.world.epistemics import validate_knowledge_state, what_does_subject_know
 
@@ -1267,9 +1381,37 @@ def query_character_knowledge(
         return _not_found("query_character_knowledge", campaign, depth=0,
                           limit=limit_applied, detail=str(exc))
     if dm_internal:
-        effective_viewer: Any = campaign.owner_id
-    elif len(viewers) == 1:
-        effective_viewer = viewers[0]
+        from app.world.epistemics import list_knowledge_for_subject
+        from models.world import WorldEntity
+
+        subject = db.get(WorldEntity, subject_id)
+        if subject is None or subject.campaign_id != campaign.id:
+            return _not_found("query_character_knowledge", campaign, depth=0,
+                              limit=limit_applied,
+                              detail=f"Subject entity {subject_id} not found")
+        rows = list_knowledge_for_subject(
+            db, campaign.id, subject_id,
+            knowledge_state=knowledge_state, limit=limit_applied + 1)
+        total_rows = len(rows)
+        truncated = total_rows > limit_applied
+        rows = rows[:limit_applied]
+        entries = [_knowledge_entry_from_row(db, row, campaign.id) for row in rows]
+        packets = [
+            _knowledge_packet(entry, rank, revealable=None)
+            for rank, entry in enumerate(entries)
+        ]
+        outcome = RetrievalOutcome(
+            status=STATUS_OK, packets=packets, total=total_rows,
+            visible=len(packets), denied=0, denied_reasons={},
+            depth_applied=0, limit_applied=limit_applied, truncated=truncated,
+            source_ids=_packet_source_ids(packets),
+            latency_ms=(time.monotonic() - started) * 1000,
+        )
+        _log_query("query_character_knowledge", campaign, depth=0,
+                   limit=limit_applied, outcome=outcome, dm_internal=dm_internal)
+        return outcome
+    if len(viewers) == 1:
+        effective_viewer: Any = viewers[0]
     elif not viewers:
         outcome = RetrievalOutcome(depth_applied=0, limit_applied=limit_applied)
         outcome.denied = 1
@@ -1292,9 +1434,10 @@ def query_character_knowledge(
     entries = list(projection.get("entries", []))
     truncated = len(entries) > limit_applied
     entries = entries[:limit_applied]
+    _enrich_entries_with_row_visibility(db, campaign.id, entries)
     packets = [
         _knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
-                          revealable=None if dm_internal else True)
+                          revealable=True)
         for rank, entry in enumerate(entries)
     ]
     outcome = RetrievalOutcome(
@@ -1338,6 +1481,7 @@ def _query_character_knowledge_multi(
     truncated = len(entries) > limit_applied
     entries = entries[:limit_applied]
     denied_total = max((int(p.get("total", 0)) - len(entries) for p in per_viewer), default=0)
+    _enrich_entries_with_row_visibility(db, campaign.id, entries)
     packets = [
         _knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
                           revealable=True)
@@ -1367,7 +1511,13 @@ def query_who_knows(
     limit: Any = RETRIEVAL_DEFAULT_LIMIT,
     dm_internal: bool = False,
 ) -> RetrievalOutcome:
-    """Which subjects may the viewer see as holding one truth target?"""
+    """Which subjects may the viewer see as holding one truth target?
+
+    Player-facing retrieval wraps the #211 ``who_knows_target`` projection.
+    DM-internal retrieval bypasses human disclosure filtering while
+    remaining campaign-scoped, returning every knower row with its real
+    visibility metadata preserved.
+    """
     from app.world.epistemics import (
         validate_knowledge_state,
         validate_knowledge_target_kind,
@@ -1386,10 +1536,47 @@ def query_who_knows(
     except ValueError as exc:
         return _not_found("query_character_knowledge", campaign, depth=0,
                           limit=limit_applied, detail=str(exc))
-    effective_viewer: Any
     if dm_internal:
-        effective_viewer = campaign.owner_id
-    elif len(viewers) >= 1:
+        from app.world.epistemics import list_knowledge_for_target
+        from models.world import WorldEntity, WorldFact, WorldRelation
+
+        target_record = None
+        try:
+            if kind == "fact":
+                target_record = db.get(WorldFact, tid)
+            elif kind == "relation":
+                target_record = db.get(WorldRelation, tid)
+            else:
+                target_record = db.get(WorldEntity, tid)
+        except Exception:
+            target_record = None
+        if target_record is None or getattr(target_record, "campaign_id", None) != campaign.id:
+            return _not_found("query_character_knowledge", campaign, depth=0,
+                              limit=limit_applied,
+                              detail=f"Target {kind} {tid} not found")
+        rows = list_knowledge_for_target(
+            db, campaign.id, kind, tid,
+            knowledge_state=knowledge_state, limit=limit_applied + 1)
+        total_rows = len(rows)
+        truncated = total_rows > limit_applied
+        rows = rows[:limit_applied]
+        packets = [
+            _knowledge_packet(_knowledge_entry_from_row(db, row, campaign.id), rank,
+                              revealable=None)
+            for rank, row in enumerate(rows)
+        ]
+        outcome = RetrievalOutcome(
+            status=STATUS_OK, packets=packets, total=total_rows,
+            visible=len(packets), denied=0, denied_reasons={},
+            depth_applied=0, limit_applied=limit_applied,
+            truncated=truncated,
+            source_ids=_packet_source_ids(packets),
+            latency_ms=(time.monotonic() - started) * 1000,
+        )
+        _log_query("query_character_knowledge", campaign, depth=0,
+                   limit=limit_applied, outcome=outcome, dm_internal=dm_internal)
+        return outcome
+    if len(viewers) >= 1:
         effective_viewer = viewers[0]
     else:
         outcome = RetrievalOutcome(depth_applied=0, limit_applied=limit_applied)
@@ -1401,6 +1588,7 @@ def query_who_knows(
         db, campaign, kind, tid, effective_viewer,
         knowledge_state=knowledge_state, limit=limit_applied + 1)
     knowers = list(projection.get("knowers", []))[:limit_applied]
+    _enrich_entries_with_row_visibility(db, campaign.id, knowers)
     packets = [
         _knowledge_packet(
             {"knowledge_id": k["knowledge_id"],
@@ -1409,8 +1597,9 @@ def query_who_knows(
              "target_kind": kind, "target_id": str(tid),
              "knowledge_state": k.get("knowledge_state"),
              "acquisition_source": k.get("acquisition_source"),
+             "visibility": k.get("visibility", "dm_only"),
              "campaign_id": str(campaign.id)}, rank,
-            revealable=None if dm_internal else True)
+            revealable=True)
         for rank, k in enumerate(knowers)
     ]
     outcome = RetrievalOutcome(
