@@ -485,3 +485,80 @@ def test_telemetry_writes_reject_a_gameplay_session():
             persist_record(gameplay_db, record)
         # ...while the fail-soft gameplay path degrades to None, never raising.
         assert record_fail_soft(gameplay_db, record) is None
+
+
+def _route_frame(**overrides):
+    kwargs = {
+        "state_revision": 3,
+        "submission_ids": ("sub-1",),
+        "segments": ({"type": "ic", "text": "I look around."},),
+    }
+    kwargs.update(overrides)
+    return routing.build_route_frame(routing.RouteSignals(**kwargs))
+
+
+def test_routing_telemetry_keeps_policy_directive_distinct_from_revalidation():
+    factory = _setup()
+    frame = _route_frame()
+    service = DecisionService(
+        FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID})
+    )
+    response = service.decide(routing.to_decision_request(frame))
+    result = response.results[routing.ROUTE_QUESTION_ID]
+    # Policy clears direct_execute, but the authoritative revision moved on,
+    # so deterministic revalidation fails and routing escalates.
+    outcome = routing.decide_from_result(
+        frame, result, current_revision=999,
+        frame_submission_ids=("sub-1",), current_submission_ids=("sub-1",),
+    )
+    assert outcome.directive == "escalate"
+    assert "revalidation_error" in outcome.trace
+    assert outcome.trace["directive"] == "direct_execute"
+
+    campaign_id, turn_id = uuid.uuid4(), uuid.uuid4()
+    routing._record_routing_telemetry(
+        object(), frame=frame, result=result, response=response,
+        outcome=outcome, mode=ACTIVE, trace_id="trace-reval",
+        campaign_id=campaign_id, turn_id=turn_id, session_factory=factory,
+    )
+    with factory() as db:
+        row = db.query(DecisionTelemetry).one()
+        assert row.policy_directive == "direct_execute"
+        assert row.verified is False
+        assert row.revalidation_error is not None
+        assert row.mode == ACTIVE
+        assert str(row.campaign_id) == str(campaign_id)
+        assert str(row.turn_id) == str(turn_id)
+        assert row.trace_id == "trace-reval"
+        assert row.operation_id == response.operation_id
+
+
+def test_routing_telemetry_persists_live_correlation_ids():
+    factory = _setup()
+    frame = _route_frame()
+    service = DecisionService(
+        FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID})
+    )
+    response = service.decide(routing.to_decision_request(frame))
+    result = response.results[routing.ROUTE_QUESTION_ID]
+    outcome = routing.decide_from_result(
+        frame, result, current_revision=3, submission_ids=("sub-1",),
+    )
+    assert outcome.directive == "direct_execute"
+
+    campaign_id, turn_id = uuid.uuid4(), uuid.uuid4()
+    routing._record_routing_telemetry(
+        object(), frame=frame, result=result, response=response,
+        outcome=outcome, mode=ACTIVE, trace_id=None,
+        campaign_id=campaign_id, turn_id=turn_id, session_factory=factory,
+    )
+    with factory() as db:
+        row = db.query(DecisionTelemetry).one()
+        assert row.policy_directive == "direct_execute"
+        assert row.verified is True
+        # Runtime correlation falls back to the adapter response when the
+        # caller supplies no trace override.
+        assert row.trace_id == response.trace_id
+        assert row.operation_id == response.operation_id
+        assert str(row.campaign_id) == str(campaign_id)
+        assert str(row.turn_id) == str(turn_id)

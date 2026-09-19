@@ -674,6 +674,9 @@ def _record_routing_telemetry(
     outcome: RoutingOutcome,
     mode: str,
     trace_id: str | None = None,
+    campaign_id: Any = None,
+    turn_id: Any = None,
+    session_factory: Any = None,
 ) -> None:
     """Persist one routing decision telemetry row, fail-soft (issue #383).
 
@@ -681,12 +684,20 @@ def _record_routing_telemetry(
     gameplay, so every error path is swallowed after a warning. Only
     stable candidate IDs reach the row — labels, state, and primer
     content stay out.
+
+    The recorded ``policy_directive`` is the original execution-policy
+    outcome from the trace — not the post-revalidation routing outcome —
+    so a ``direct_execute`` policy verdict that fails deterministic
+    revalidation (and therefore escalates) is stored as
+    ``direct_execute`` + ``verified=False`` + ``revalidation_error``.
+    When ``session_factory`` is omitted it is derived from ``db``.
     """
     try:
         trace = outcome.trace or {}
         selected_id = outcome.selected_id or getattr(result, "selected_id", "")
+        policy_directive = trace.get("directive") or outcome.directive
         verdict = PolicyVerdict(
-            directive=outcome.directive,
+            directive=policy_directive,
             reason=str(trace.get("reason", "")),
             decision_class=frame.decision_class,
             selected_id=selected_id,
@@ -708,23 +719,23 @@ def _record_routing_telemetry(
             provider=getattr(response, "provider", "unknown"),
             model=getattr(response, "model", None) or "unknown",
             mode=mode,
-            trace_id=trace_id or trace.get("trace_id"),
-            operation_id=trace.get("trace_id"),
-            campaign_id=getattr(frame, "campaign_id", None),
-            turn_id=None,
+            trace_id=trace_id or trace.get("trace_id") or getattr(response, "trace_id", None),
+            operation_id=getattr(response, "operation_id", None) or trace.get("trace_id"),
+            campaign_id=campaign_id,
+            turn_id=turn_id,
             latency_ms=getattr(response, "latency_ms", None),
             cost_usd=(getattr(response, "usage", None) or {}).get("cost_usd"),
             verified=verified,
             revalidation_error=revalidation_error,
         )
-        try:
-            from app.observability.service import telemetry_factory_for
-        except Exception:
-            return
-        try:
-            factory = telemetry_factory_for(db)
-        except Exception:
-            return
+        factory = session_factory
+        if factory is None:
+            try:
+                from app.observability.service import telemetry_factory_for
+
+                factory = telemetry_factory_for(db)
+            except Exception:
+                factory = None
         record_fail_soft(factory, record)
     except Exception as exc:
         logger.warning("decision routing telemetry dropped: %s", exc)
@@ -845,8 +856,9 @@ def route_attempt(
     trace.setdefault("provider", response.provider)
     trace.setdefault("model", response.model)
     trace.setdefault("latency_ms", response.latency_ms)
-    if trace_id is not None:
-        trace.setdefault("trace_id", trace_id)
+    effective_trace_id = trace_id or getattr(response, "trace_id", None)
+    if effective_trace_id is not None:
+        trace.setdefault("trace_id", effective_trace_id)
     outcome.trace = trace
     # Issue #383 — record the evaluated decision (shadow vs active/primer)
     # without ever disturbing the routing outcome. Telemetry is fail-soft.
@@ -858,7 +870,9 @@ def route_attempt(
         response=response,
         outcome=outcome,
         mode=SHADOW if shadow else live_mode,
-        trace_id=trace_id,
+        trace_id=effective_trace_id,
+        campaign_id=getattr(attempt, "campaign_id", None),
+        turn_id=getattr(turn, "id", None) or getattr(attempt, "turn_id", None),
     )
     if shadow:
         # Authoritative path continues unchanged: discard any direct
