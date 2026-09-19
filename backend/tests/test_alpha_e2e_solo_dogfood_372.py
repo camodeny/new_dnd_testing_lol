@@ -57,6 +57,22 @@ from app.campaigns.solo_bootstrap import OPENING_OOC_TEXT  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
 from app.dm.turns import list_turns  # noqa: E402
 from app.dm_streams.service import reconstruct_text  # noqa: E402
+from app.e2e.diagnostics import (  # noqa: E402
+    CATEGORY_STAGE,
+    STAGE_CONTINUATION,
+    STAGE_OPENING,
+    STAGE_REFRESH_RECONNECT,
+    STAGE_SETUP,
+    STAGE_START,
+    STAGE_SUBMISSION,
+    ScenarioDiagnostics,
+    format_commit_failure,
+    format_duplicate_commit,
+    format_failure_line,
+    format_revision_mismatch,
+    format_snapshot_mismatch,
+    format_sweep_failure,
+)
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
@@ -111,8 +127,46 @@ def phase0_provider(monkeypatch):
 # ── scenario harness ──────────────────────────────────────────────────────────
 
 
+def _canonical_stage(stage: str, category: str | None = None) -> str:
+    """Map the Phase 0 freeform stage to the #374 canonical pipeline stage.
+
+    The #374 artifact shape requires one exact logical stage per failure;
+    the timeline may also carry the raw harness stage via ``note(raw)`` but
+    failure reports always use the canonical name so CI output is greppable
+    as ``[374:<stage>]``. When the caller supplies a formatter category
+    (e.g. ``duplicate_commit`` from an ``integrity`` probe), the category's
+    canonical stage wins so generic probe names never leak into artifacts.
+    """
+    if category is not None and category in CATEGORY_STAGE:
+        return CATEGORY_STAGE[category]
+    if stage in (STAGE_SETUP, STAGE_START, STAGE_OPENING, STAGE_SUBMISSION):
+        return stage
+    if stage.startswith("play-") or stage in ("play", "opening"):
+        return STAGE_OPENING if stage == "opening" else STAGE_SUBMISSION
+    if stage == "duplicate-guard":
+        return STAGE_SUBMISSION
+    if stage == "reconnect":
+        return STAGE_REFRESH_RECONNECT
+    if stage == "post-reconnect":
+        return STAGE_CONTINUATION
+    if stage in ("setup", "diagnostics"):
+        return STAGE_SETUP
+    if stage == "integrity":
+        # Generic sabotage-probe stage; the formatter detail carries the
+        # canonical boundary, default to commit (revision/stream/duplicate).
+        return "commit"
+    return stage
+
+
 class Scenario:
-    """Owns one disposable Phase 0 run: stage-tagged checks plus identifiers."""
+    """Owns one disposable Phase 0 run: stage-tagged checks plus identifiers.
+
+    Wired to the #374 reusable diagnostics collector: every ``note()``
+    mirrors a stage boundary and every ``check()`` failure records the first
+    failure plus a best-effort JSON artifact to ``E2E_DIAGNOSTICS_DIR``. The
+    collector never masks the original failure and never touches gameplay
+    state — it only observes in-memory IDs and timelines.
+    """
 
     def __init__(self, client: TestClient, factory, owner_id: uuid.UUID):
         self.client = client
@@ -131,15 +185,105 @@ class Scenario:
             "stream_ids": [],
             "revisions": {},
         }
+        self.diag = ScenarioDiagnostics(scenario="phase0")
+        self._open_stage: str | None = None
 
     def note(self, stage: str) -> None:
         self.stage = stage
         logger.info("phase0-372 stage=%s campaign_id=%s", stage, self.campaign_id)
+        try:
+            canonical = _canonical_stage(stage)
+            if self._open_stage is not None and self._open_stage != canonical:
+                self.diag.end_stage(self._open_stage)
+                self._open_stage = None
+            if self._open_stage is None:
+                self.diag.begin_stage(canonical)
+                self._open_stage = canonical
+            self._sync_ids()
+        except Exception:
+            pass
 
-    def check(self, condition: bool, stage: str, message: str):
+    def _sync_ids(self) -> None:
+        try:
+            flat: dict = {}
+            for key, value in self.ids.items():
+                if key == "revisions":
+                    continue
+                flat[key] = list(value) if isinstance(value, list) else value
+            if isinstance(self.ids.get("revisions"), dict):
+                flat["revisions"] = dict(self.ids["revisions"])
+            if self.campaign_id is not None:
+                flat["campaign_id"] = self.campaign_id
+            self.diag.record_ids(**flat)
+        except Exception:
+            pass
+
+    def _record_failure(
+        self,
+        stage: str,
+        message: str,
+        *,
+        category: str | None = None,
+        detail: dict | None = None,
+    ) -> None:
+        try:
+            self._sync_ids()
+            canonical = _canonical_stage(stage, category)
+            self.diag.fail(canonical, message, category=category, detail=detail)
+            self.diag.save_artifact()
+        except Exception:
+            pass
+
+    def check(
+        self,
+        condition: bool,
+        stage: str,
+        message: str,
+        *,
+        category: str | None = None,
+        detail: dict | None = None,
+    ):
         if not condition:
-            raise AssertionError(f"[372:{stage}] {message} | ids={self.ids}")
+            self._record_failure(stage, message, category=category, detail=detail)
+            canonical = _canonical_stage(stage, category)
+            try:
+                line = format_failure_line(
+                    {
+                        "stage": canonical,
+                        "category": category or "assertion",
+                        "message": message,
+                        "ids": dict(self.ids),
+                    }
+                )
+            except Exception:
+                line = f"[374:{canonical}] {message}"
+            raise AssertionError(f"[372:{stage}] {line} | ids={self.ids}")
         return True
+
+    def sweep_failure_detail(self, outcome: dict) -> dict:
+        """Best-effort canonical detail for a failed execute sweep."""
+        try:
+            return format_sweep_failure(outcome)
+        except Exception:
+            return {
+                "category": "submission_execution",
+                "stage": STAGE_SUBMISSION,
+                "detail": str(outcome)[:500],
+                "metadata": {},
+            }
+
+    def check_sweep(self, outcome: dict, stage: str):
+        """Assert a production execute sweep has no failures (#374 detail)."""
+        if outcome.get("failed"):
+            detail = self.sweep_failure_detail(outcome)
+            return self.check(
+                False,
+                stage,
+                f"sweep failed: {outcome}",
+                category=detail.get("category", "submission_execution"),
+                detail=detail,
+            )
+        return self.check(True, stage, "sweep succeeded")
 
     def diagnostics(self) -> dict:
         return dict(self.ids)
@@ -150,7 +294,7 @@ def _resolve_test_profile(request, db):
 
 
 @pytest.fixture
-def scn(monkeypatch):
+def scn(monkeypatch, request):
     """Clean disposable database + HTTP client on production routers."""
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
@@ -180,9 +324,31 @@ def scn(monkeypatch):
             raising=False,
         )
     app.dependency_overrides[get_db] = override_db
+    scenario = Scenario(TestClient(app), factory, owner_id)
     try:
-        yield Scenario(TestClient(app), factory, owner_id)
+        yield scenario
     finally:
+        try:
+            # Capture the artifact after failure metadata is recorded; a
+            # missing/empty diagnostics dir must never mask the test result.
+            if scenario.diag.first_failure is not None:
+                scenario.diag.save_artifact()
+            elif getattr(request.node, "rep_call", None) is not None and getattr(
+                request.node.rep_call, "failed", False
+            ):
+                scenario._sync_ids()
+                scenario.diag.fail(
+                    _canonical_stage(scenario.stage),
+                    "phase0 teardown after failed test",
+                    category="assertion",
+                )
+                scenario.diag.save_artifact()
+            elif scenario._open_stage is not None:
+                scenario._sync_ids()
+                scenario.diag.end_stage(scenario._open_stage)
+                scenario._open_stage = None
+        except Exception:
+            pass
         app.dependency_overrides.clear()
         engine.dispose()
 
@@ -296,6 +462,10 @@ def drain_dm_execution(scn: Scenario, stage: str, adjudicate=None) -> dict:
     provider); an explicit callable overrides only the model seam (used
     by the injected-failure proof).
     """
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
     assert scn.campaign_id is not None
     cid = uuid.UUID(scn.campaign_id)
     outcome: dict = {"executed": [], "failed": [], "skipped": []}
@@ -330,6 +500,10 @@ def drain_dm_execution(scn: Scenario, stage: str, adjudicate=None) -> dict:
 
 def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
     """Assert one logical turn has exactly one committed, durable DM result."""
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
     with scn.factory() as db:
         turn = db.get(DmTurn, uuid.UUID(turn_id))
         scn.check(turn is not None, stage, f"turn {turn_id} missing")
@@ -356,6 +530,13 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
             attempt.stream_id is not None,
             stage,
             f"attempt {attempt.id} has no persisted stream",
+            category="stream_persistence",
+            detail=format_commit_failure(
+                turn_id=str(turn.id),
+                attempt_id=str(attempt.id),
+                stream_id=None,
+                detail=f"attempt {attempt.id} has no persisted stream",
+            ),
         )
         assert attempt.stream_id is not None
         chunks = (
@@ -367,12 +548,30 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
             .scalars()
             .all()
         )
-        scn.check(len(chunks) >= 1, stage, "DM reply has no durable stream chunks")
+        scn.check(
+            len(chunks) >= 1,
+            stage,
+            "DM reply has no durable stream chunks",
+            category="stream_persistence",
+            detail=format_commit_failure(
+                turn_id=str(turn.id),
+                attempt_id=str(attempt.id),
+                stream_id=str(attempt.stream_id),
+                detail="DM reply has no durable stream chunks",
+            ),
+        )
         text = reconstruct_text(db, attempt.stream_id)
         scn.check(
             "phase0-reply-" in text,
             stage,
             "durable narration lacks the committed-reply marker",
+            category="stream_persistence",
+            detail=format_commit_failure(
+                turn_id=str(turn.id),
+                attempt_id=str(attempt.id),
+                stream_id=str(attempt.stream_id),
+                detail="durable narration lacks the committed-reply marker",
+            ),
         )
         if str(turn.id) not in scn.ids["turn_ids"]:
             scn.ids["turn_ids"].append(str(turn.id))
@@ -385,27 +584,53 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
 
 def assert_ordering_invariants(scn: Scenario, stage: str, client=None) -> int:
     """Campaign revision == domain-event sequence invariant (#188)."""
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/events")
     scn.check(r.status_code == 200, stage, f"events read failed: {r.text}")
     body = r.json()
     seqs = [e["sequence"] for e in body["events"]]
+
+    def _revision_detail(message: str) -> dict:
+        try:
+            return format_revision_mismatch(
+                expected=list(range(1, len(seqs) + 1)),
+                actual=list(seqs),
+                revision=int(body.get("revision", -1)),
+            )
+        except Exception:
+            return {
+                "category": "revision_ordering",
+                "stage": "commit",
+                "detail": message,
+                "metadata": {},
+            }
+
     scn.check(
         seqs == sorted(seqs) and len(set(seqs)) == len(seqs),
         stage,
         f"event sequences not strictly increasing: {seqs}",
+        category="revision_ordering",
+        detail=_revision_detail(f"event sequences not strictly increasing: {seqs}"),
     )
     scn.check(
         seqs == list(range(1, len(seqs) + 1)),
         stage,
         f"event sequences not contiguous from 1: {seqs}",
+        category="revision_ordering",
+        detail=_revision_detail(f"event sequences not contiguous from 1: {seqs}"),
     )
     scn.check(
         body["revision"] == len(seqs),
         stage,
         f"revision {body['revision']} != event count {len(seqs)} "
         "(revision==sequence invariant broken)",
+        category="revision_ordering",
+        detail=_revision_detail("revision != event count"),
     )
     scn.check(
         body["revision"] >= scn.last_revision,
@@ -421,6 +646,10 @@ def assert_single_result_per_submission(
     scn: Scenario, stage: str, expected_turns: int, client=None
 ) -> list:
     """One accepted logical player intent -> one committed gameplay result."""
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/dm-turns")
@@ -434,23 +663,43 @@ def assert_single_result_per_submission(
     turn_ids = [t["id"] for t in turns]
     scn.check(len(set(turn_ids)) == len(turn_ids), stage, "duplicate turn ids listed")
     consumed = [s for t in turns for s in (t["submission_ids"] or [])]
+    duplicate_subs = sorted({s for s in consumed if consumed.count(s) > 1})
     scn.check(
         len(consumed) == len(set(consumed)),
         stage,
         "one submission consumed by multiple turns (duplicate gameplay)",
+        category="duplicate_commit" if duplicate_subs else None,
+        detail=format_duplicate_commit(
+            submission_id=duplicate_subs[0] if duplicate_subs else "unknown",
+            turn_ids=turn_ids,
+        )
+        if duplicate_subs
+        else None,
     )
     subs = http.get(f"/api/campaigns/{scn.campaign_id}/submissions")
     scn.check(subs.status_code == 200, stage, f"submissions read failed: {subs.text}")
     for sub in subs.json()["submissions"]:
+        count = consumed.count(sub["id"])
         scn.check(
-            consumed.count(sub["id"]) == 1,
+            count == 1,
             stage,
-            f"submission {sub['id']} committed {consumed.count(sub['id'])} times",
+            f"submission {sub['id']} committed {count} times",
+            category="duplicate_commit" if count != 1 else None,
+            detail=format_duplicate_commit(
+                submission_id=sub["id"],
+                turn_ids=[t["id"] for t in turns if sub["id"] in (t["submission_ids"] or [])],
+            )
+            if count != 1
+            else None,
         )
     return turns
 
 
 def read_snapshot(scn: Scenario, stage: str, client=None) -> dict:
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
     assert scn.campaign_id is not None
     http = client or scn.client
     r = http.get(f"/api/campaigns/{scn.campaign_id}/snapshot")
@@ -461,11 +710,23 @@ def read_snapshot(scn: Scenario, stage: str, client=None) -> dict:
 def assert_same_authoritative_projection(
     scn: Scenario, stage: str, before: dict, after: dict
 ) -> None:
+    try:
+        scn.note(stage)
+    except Exception:
+        pass
+    try:
+        snapshot_detail = format_snapshot_mismatch(
+            before, after, keys=SNAPSHOT_COMPARE_KEYS
+        )
+    except Exception:
+        snapshot_detail = None
     for key in SNAPSHOT_COMPARE_KEYS:
         scn.check(
             before[key] == after[key],
             stage,
             f"reconnect divergence in snapshot[{key}]",
+            category="reconnect_reconstruction",
+            detail=snapshot_detail,
         )
 
 
@@ -485,7 +746,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
     # Opening DM turn completes through the production execution path.
     scn.note("opening")
     outcome = drain_dm_execution(scn, "opening")
-    scn.check(not outcome.get("failed"), "opening", f"sweep failed: {outcome}")
+    scn.check_sweep(outcome, "opening")
     opening_text = await_committed_reply(scn, "opening", opening_turn_id)
     assert opening_text
     assert_single_result_per_submission(scn, "opening", 1)
@@ -498,7 +759,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
         submitted = submit_player_turn(scn, text, f"phase0-turn-{index + 1}")
         turn_id = submitted["dm_turn"]["id"]
         outcome = drain_dm_execution(scn, stage)
-        scn.check(not outcome.get("failed"), stage, f"sweep failed: {outcome}")
+        scn.check_sweep(outcome, stage)
         stream_texts.append(await_committed_reply(scn, stage, turn_id))
         assert_ordering_invariants(scn, stage)
         assert_single_result_per_submission(scn, stage, 2 + index)
@@ -574,7 +835,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
         scn, POST_RECONNECT_TURN, "phase0-turn-post", client=reconnected_client
     )
     outcome = drain_dm_execution(scn, "post-reconnect")
-    scn.check(not outcome.get("failed"), "post-reconnect", f"sweep failed: {outcome}")
+    scn.check_sweep(outcome, "post-reconnect")
     await_committed_reply(scn, "post-reconnect", submitted["dm_turn"]["id"])
     assert_ordering_invariants(scn, "post-reconnect", client=reconnected_client)
     assert_single_result_per_submission(
