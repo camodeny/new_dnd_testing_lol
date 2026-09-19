@@ -69,6 +69,7 @@ from app.e2e.diagnostics import (  # noqa: E402
     format_commit_failure,
     format_duplicate_commit,
     format_failure_line,
+    format_provider_failure,
     format_revision_mismatch,
     format_snapshot_mismatch,
     format_sweep_failure,
@@ -260,9 +261,36 @@ class Scenario:
             raise AssertionError(f"[372:{stage}] {line} | ids={self.ids}")
         return True
 
-    def sweep_failure_detail(self, outcome: dict) -> dict:
-        """Best-effort canonical detail for a failed execute sweep."""
+    def sweep_failure_detail(self, outcome: dict, stage: str | None = None) -> dict:
+        """Best-effort canonical detail for a failed execute sweep.
+
+        Provider-boundary failures (missing/misbehaving generative fixture)
+        route through the generative-execution formatter so the artifact
+        names ``generative_execution``; all other sweep failures stay
+        ``submission_execution``. Detection uses only the privacy-safe
+        error string (never payload bytes).
+        """
         try:
+            failed = outcome.get("failed") or []
+            first_error = str((failed[0] or {}).get("error", "") if failed else "")
+            lowered = first_error.lower()
+            if "no fixture for this logical request" in lowered or (
+                "fake-provider" in lowered and "no fixture" in lowered
+            ):
+                role = "forward_dm"
+                try:
+                    import re
+
+                    match = re.search(r"role\s*=\s*['\"]?([\w-]+)", first_error)
+                    if match:
+                        role = match.group(1)
+                except Exception:
+                    pass
+                return format_provider_failure(
+                    RuntimeError(first_error[:500]),
+                    role=role,
+                    step=stage,
+                )
             return format_sweep_failure(outcome)
         except Exception:
             return {
@@ -275,7 +303,7 @@ class Scenario:
     def check_sweep(self, outcome: dict, stage: str):
         """Assert a production execute sweep has no failures (#374 detail)."""
         if outcome.get("failed"):
-            detail = self.sweep_failure_detail(outcome)
+            detail = self.sweep_failure_detail(outcome, stage)
             return self.check(
                 False,
                 stage,
@@ -284,6 +312,29 @@ class Scenario:
                 detail=detail,
             )
         return self.check(True, stage, "sweep succeeded")
+
+    def record_external_failure(self, exc: BaseException) -> None:
+        """Record a failure that bypassed ``check()`` (teardown fallback).
+
+        Best-effort and never masks the original exception: mirrors current
+        IDs, marks the current canonical stage failed, and saves the
+        artifact. No gameplay state is touched.
+        """
+        try:
+            self._sync_ids()
+            if self.diag.first_failure is not None:
+                self.diag.save_artifact()
+                return
+            canonical = _canonical_stage(self.stage)
+            self.diag.fail(
+                canonical,
+                f"unexpected failure: {exc}",
+                category="assertion",
+                detail={"error": str(exc)[:500]},
+            )
+            self.diag.save_artifact()
+        except Exception:
+            pass
 
     def diagnostics(self) -> dict:
         return dict(self.ids)
@@ -327,21 +378,17 @@ def scn(monkeypatch, request):
     scenario = Scenario(TestClient(app), factory, owner_id)
     try:
         yield scenario
+    except BaseException as exc:
+        # Failures that bypass Scenario.check() (raw asserts, JSON/DB
+        # exceptions) are thrown into the fixture at yield: record the
+        # current canonical stage + artifact without masking the original.
+        scenario.record_external_failure(exc)
+        raise
     finally:
         try:
             # Capture the artifact after failure metadata is recorded; a
             # missing/empty diagnostics dir must never mask the test result.
             if scenario.diag.first_failure is not None:
-                scenario.diag.save_artifact()
-            elif getattr(request.node, "rep_call", None) is not None and getattr(
-                request.node.rep_call, "failed", False
-            ):
-                scenario._sync_ids()
-                scenario.diag.fail(
-                    _canonical_stage(scenario.stage),
-                    "phase0 teardown after failed test",
-                    category="assertion",
-                )
                 scenario.diag.save_artifact()
             elif scenario._open_stage is not None:
                 scenario._sync_ids()
@@ -1011,3 +1058,78 @@ def test_break_missing_fixture_fails_at_provider_boundary(scn, phase0_provider):
         turn = db.get(DmTurn, uuid.UUID(submitted["dm_turn"]["id"]))
         assert turn is not None and turn.status != "succeeded"
     assert not phase0_provider.calls_for_step("play-1")
+
+
+def test_missing_fixture_sweep_reports_generative_execution_artifact(
+    scn, phase0_provider, tmp_path, monkeypatch
+):
+    """Real-harness provider failure must artifact as generative_execution.
+
+    #374 requires the generative-execution stage to be named when the
+    provider boundary breaks; a generic ``submission`` report would send
+    investigators to the wrong pipeline stage.
+    """
+    monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
+    _run_to_opening_reply(scn)
+    scn.note("play-1")
+    phase0_provider._fixtures = [
+        fixture for fixture in phase0_provider._fixtures if fixture.step != "play-1"
+    ]
+    submitted = submit_player_turn(scn, FREEFORM_TURNS[0], "phase0-turn-1")
+    assert submitted["dm_turn"]["id"]
+    outcome = drain_dm_execution(scn, "play-1")
+    assert outcome.get("failed"), "sweep unexpectedly succeeded without a fixture"
+
+    with pytest.raises(AssertionError, match=r"\[374:generative_execution\]"):
+        scn.check_sweep(outcome, "play-1")
+
+    failure = scn.diag.first_failure
+    assert failure is not None
+    assert failure["stage"] == "generative_execution"
+    assert failure["category"] == "generative_execution"
+    assert failure["detail"]["metadata"]["decision_role"] == "forward_dm"
+    assert failure["detail"]["metadata"]["fixture_step"] == "play-1"
+    assert scn.diag.timeline()[-1] == {
+        "stage": "generative_execution",
+        "status": "failed",
+    }
+
+    artifacts = sorted(tmp_path.glob("e2e-374-phase0-*.json"))
+    assert artifacts, "provider sweep failure saved no artifact"
+    import json as _json
+
+    saved = _json.load(open(artifacts[-1]))
+    assert saved["first_failure"]["stage"] == "generative_execution"
+    assert saved["first_failure"]["category"] == "generative_execution"
+
+
+def test_external_failure_bypassing_check_still_marks_stage_failed(
+    scn, phase0_provider, tmp_path, monkeypatch
+):
+    """Exceptions outside Scenario.check() must still emit a stage artifact.
+
+    The fixture records failures thrown into it at yield (raw asserts,
+    JSON/DB exceptions); this exercises that fallback directly without
+    failing the test itself.
+    """
+    monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
+    _run_to_opening_reply(scn)
+    scn.note("play-1")
+
+    try:
+        raise RuntimeError("simulated raw failure bypassing check()")
+    except RuntimeError as exc:
+        scn.record_external_failure(exc)
+
+    failure = scn.diag.first_failure
+    assert failure is not None
+    assert failure["stage"] == "submission"
+    assert scn.diag.timeline()[-1] == {"stage": "submission", "status": "failed"}
+
+    artifacts = sorted(tmp_path.glob("e2e-374-phase0-*.json"))
+    assert artifacts, "external failure saved no artifact"
+    import json as _json
+
+    saved = _json.load(open(artifacts[-1]))
+    assert saved["first_failure"]["stage"] == "submission"
+    assert "simulated raw failure" in saved["first_failure"]["message"]
