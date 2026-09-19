@@ -306,19 +306,39 @@ def classify_decision_failure(
 
 
 def format_sweep_failure(outcome: dict[str, Any]) -> dict[str, Any]:
-    """First failed entry of a ``run_dm_execute_sweep`` outcome shape."""
+    """First failed entry of a ``run_dm_execute_sweep`` outcome shape.
+
+    Privacy-safe by construction: only whitelisted IDs and counts cross
+    into the artifact. The production executor's raw ``str(exc)`` (which
+    can echo player input or request excerpts) is never persisted.
+    """
     failed = outcome.get("failed") or []
     first = dict(failed[0]) if failed else {}
+    try:
+        attempt_ids = [
+            str(entry.get("attempt_id"))
+            for entry in failed
+            if isinstance(entry, dict) and entry.get("attempt_id") is not None
+        ]
+    except Exception:
+        attempt_ids = []
+    executed_count = len(outcome.get("executed") or [])
+    skipped_count = len(outcome.get("skipped") or [])
     return {
         "category": CATEGORY_SUBMISSION_EXECUTION,
         "stage": STAGE_SUBMISSION,
-        "detail": redact(str(first.get("error", "unknown sweep failure"))),
+        "detail": (
+            f"sweep failed: {len(failed)} failed, "
+            f"{executed_count} executed, {skipped_count} skipped "
+            f"(attempts={attempt_ids})"
+        ),
         "metadata": redact(
             {
                 "attempt_id": first.get("attempt_id"),
+                "attempt_ids": attempt_ids,
                 "failed_count": len(failed),
-                "executed_count": len(outcome.get("executed") or []),
-                "skipped_count": len(outcome.get("skipped") or []),
+                "executed_count": executed_count,
+                "skipped_count": skipped_count,
             }
         ),
     }
@@ -374,18 +394,48 @@ def format_revision_mismatch(
     }
 
 
-def _structural_ref(value: Any) -> dict[str, Any]:
-    """Compact structural fingerprint: type + length + scalar/ID summary."""
+def _structural_ref(value: Any, _depth: int = 0) -> dict[str, Any]:
+    """Compact structural fingerprint: type + length + scalar/ID summary.
+
+    Nested collections are summarized recursively (depth-capped) so a
+    nested visible list such as ``history.messages`` losing/reordering an
+    entry yields distinct refs. Only structural metadata (types, lengths,
+    key names, element IDs) is emitted — never raw content strings.
+    """
     if isinstance(value, list):
-        ids = [item.get("id") for item in value if isinstance(item, dict) and "id" in item]
+        try:
+            ids = [
+                str(item.get("id"))
+                for item in value
+                if isinstance(item, dict) and "id" in item
+            ]
+        except Exception:
+            ids = []
         return {"type": "list", "length": len(value), "ids": ids[:50]}
     if isinstance(value, dict):
-        return {
-            "type": "dict",
-            "length": len(value),
-            "keys": sorted(str(k) for k in value)[:50],
-        }
-    return {"type": type(value).__name__, "length": len(value) if hasattr(value, "__len__") else None}
+        try:
+            keys = sorted(str(k) for k in value)[:50]
+        except Exception:
+            keys = []
+        ref: dict[str, Any] = {"type": "dict", "length": len(value), "keys": keys}
+        if _depth < 2:
+            children: dict[str, Any] = {}
+            try:
+                items = list(value.items())[:50]
+            except Exception:
+                items = []
+            for key, item in items:
+                try:
+                    children[str(key)] = _structural_ref(item, _depth + 1)
+                except Exception:
+                    continue
+            ref["children"] = children
+        return ref
+    try:
+        length = len(value) if hasattr(value, "__len__") else None
+    except Exception:
+        length = None
+    return {"type": type(value).__name__, "length": length}
 
 
 def format_snapshot_mismatch(

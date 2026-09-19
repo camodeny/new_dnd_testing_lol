@@ -59,7 +59,9 @@ from app.dm.turns import list_turns  # noqa: E402
 from app.dm_streams.service import reconstruct_text  # noqa: E402
 from app.e2e.diagnostics import (  # noqa: E402
     CATEGORY_STAGE,
+    STAGE_COMMIT,
     STAGE_CONTINUATION,
+    STAGE_GENERATIVE_EXECUTION,
     STAGE_OPENING,
     STAGE_REFRESH_RECONNECT,
     STAGE_SETUP,
@@ -150,8 +152,13 @@ def _canonical_stage(stage: str, category: str | None = None) -> str:
         return STAGE_REFRESH_RECONNECT
     if stage == "post-reconnect":
         return STAGE_CONTINUATION
-    if stage in ("setup", "diagnostics"):
+    if stage in ("setup",):
         return STAGE_SETUP
+    if stage == "diagnostics":
+        # Epilogue identifier assertions — keep as an extension stage rather
+        # than aliasing back to setup (which would fabricate a final setup
+        # boundary in the completed-stage timeline).
+        return "diagnostics"
     if stage == "integrity":
         # Generic sabotage-probe stage; the formatter detail carries the
         # canonical boundary, default to commit (revision/stream/duplicate).
@@ -352,12 +359,28 @@ class Scenario:
             )
         return self.check(True, stage, "sweep succeeded")
 
+    def mark_completed(self, canonical: str) -> None:
+        """Record a completed logical boundary without moving the raw stage.
+
+        The raw harness label (``play-1``…) stays in ``self.stage`` for
+        failure attribution; the canonical pipeline boundary (generative
+        execution, commit) is recorded alongside so the timeline shows
+        completed logical stages rather than jumping submission→reconnect.
+        """
+        try:
+            self.diag.begin_stage(canonical)
+            self.diag.end_stage(canonical)
+        except Exception:
+            pass
+
     def record_external_failure(self, exc: BaseException) -> None:
         """Record a failure that bypassed ``check()`` (teardown fallback).
 
         Best-effort and never masks the original exception: mirrors current
         IDs, marks the current canonical stage failed, and saves the
-        artifact. No gameplay state is touched.
+        artifact. Only the error class (never the raw exception text, which
+        can echo player input) crosses into the shared artifact. No
+        gameplay state is touched.
         """
         try:
             self._sync_ids()
@@ -365,11 +388,12 @@ class Scenario:
                 self.diag.save_artifact()
                 return
             canonical = _canonical_stage(self.stage)
+            error_class = type(exc).__name__
             self.diag.fail(
                 canonical,
-                f"unexpected failure: {exc}",
+                f"unexpected failure ({error_class})",
                 category="assertion",
-                detail={"error": str(exc)[:500]},
+                detail={"error_class": error_class},
             )
             self.diag.save_artifact()
         except Exception:
@@ -600,6 +624,8 @@ def drain_dm_execution(scn: Scenario, stage: str, adjudicate=None) -> dict:
             )
         if not pending and not prepared:
             break
+    # The sweep ran the generative-execution boundary to completion.
+    scn.mark_completed(STAGE_GENERATIVE_EXECUTION)
     return outcome
 
 
@@ -621,8 +647,7 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
         scn.check(
             turn.status == "succeeded",
             stage,
-            f"turn {turn_id} not succeeded (status={turn.status}, "
-            f"attempt_error={(attempt.last_error if attempt else None)})",
+            f"turn {turn_id} not succeeded (status={turn.status})",
         )
         scn.check(attempt is not None, stage, f"turn {turn_id} has no attempt")
         assert attempt is not None
@@ -684,6 +709,8 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
             scn.ids["attempt_ids"].append(str(attempt.id))
         if str(attempt.stream_id) not in scn.ids["stream_ids"]:
             scn.ids["stream_ids"].append(str(attempt.stream_id))
+        # Durable commit boundary verified.
+        scn.mark_completed(STAGE_COMMIT)
         return text
 
 
@@ -1187,20 +1214,23 @@ def test_external_failure_bypassing_check_still_marks_stage_failed(
 
     The fixture records failures thrown into it at yield (raw asserts,
     JSON/DB exceptions); this exercises that fallback directly without
-    failing the test itself.
+    failing the test itself. Raw exception text (which can echo player
+    input) must never reach the shared artifact — only the error class.
     """
     monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
     _run_to_opening_reply(scn)
     scn.note("play-1")
 
+    sentinel = "SENTINEL-EXTERNAL-PRIVATE-374-must-never-reach-artifacts"
     try:
-        raise RuntimeError("simulated raw failure bypassing check()")
+        raise RuntimeError(f"simulated raw failure bypassing check() {sentinel}")
     except RuntimeError as exc:
         scn.record_external_failure(exc)
 
     failure = scn.diag.first_failure
     assert failure is not None
     assert failure["stage"] == "submission"
+    assert failure["detail"] == {"error_class": "RuntimeError"}
     assert scn.diag.timeline()[-1] == {"stage": "submission", "status": "failed"}
 
     artifacts = sorted(tmp_path.glob("e2e-374-phase0-*.json"))
@@ -1209,4 +1239,55 @@ def test_external_failure_bypassing_check_still_marks_stage_failed(
 
     saved = _json.load(open(artifacts[-1]))
     assert saved["first_failure"]["stage"] == "submission"
-    assert "simulated raw failure" in saved["first_failure"]["message"]
+    assert saved["first_failure"]["detail"] == {"error_class": "RuntimeError"}
+    assert sentinel not in _json.dumps(saved)
+
+
+def test_generic_sweep_failure_omits_raw_error_text(
+    scn, phase0_provider, tmp_path, monkeypatch
+):
+    """Non-missing-fixture sweep failures must also stay privacy-safe."""
+    monkeypatch.setenv("E2E_DIAGNOSTICS_DIR", str(tmp_path))
+    _run_to_opening_reply(scn)
+    scn.note("play-1")
+    sentinel = "SENTINEL-GENERIC-SWEEP-PRIVATE-374-must-never-reach-artifacts"
+    outcome = {
+        "executed": [],
+        "failed": [{"attempt_id": "a-sentinel-1", "error": sentinel}],
+        "skipped": [],
+    }
+    with pytest.raises(AssertionError, match=r"\[374:submission\]"):
+        scn.check_sweep(outcome, "play-1")
+    failure = scn.diag.first_failure
+    assert failure is not None
+    assert failure["stage"] == "submission"
+    assert failure["category"] == "submission_execution"
+    assert "a-sentinel-1" in failure["ids"]["attempt_ids"]
+
+    artifacts = sorted(tmp_path.glob("e2e-374-phase0-*.json"))
+    assert artifacts, "generic sweep failure saved no artifact"
+    import json as _json
+
+    saved = _json.load(open(artifacts[-1]))
+    assert sentinel not in _json.dumps(saved)
+
+
+def test_phase0_timeline_records_generative_and_commit_boundaries(
+    scn, phase0_provider
+):
+    """Real harness timeline must show completed logical stage boundaries.
+
+    A successful opening prefix runs submission → generative execution →
+    durable commit; the collector timeline must contain the completed
+    generative/commit boundaries rather than jumping submission→reconnect,
+    and the diagnostics epilogue must not fabricate a trailing setup stage.
+    """
+    _run_to_opening_reply(scn)
+    completed = {
+        entry["stage"] for entry in scn.diag.timeline() if entry["status"] == "completed"
+    }
+    assert STAGE_GENERATIVE_EXECUTION in completed
+    assert STAGE_COMMIT in completed
+    assert scn.diag.first_failure is None
+    scn.note("diagnostics")
+    assert _canonical_stage("diagnostics") == "diagnostics"

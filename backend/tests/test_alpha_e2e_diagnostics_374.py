@@ -200,7 +200,16 @@ def test_sweep_failure_names_submission_stage_with_attempt_id():
     assert failure["stage"] == "submission"
     assert failure["category"] == "submission_execution"
     assert failure["metadata"]["attempt_id"] == "a-1"
-    assert "injected provider failure" in failure["detail"]
+    assert failure["metadata"]["attempt_ids"] == ["a-1"]
+    # Privacy: raw executor error text is never persisted; only IDs/counts.
+    assert "injected provider failure" not in json.dumps(failure)
+    assert "a-1" in failure["detail"]
+
+    sentinel = "SENTINEL-SWEEP-PRIVATE-374-must-never-reach-artifacts"
+    leaky = format_sweep_failure(
+        {"executed": [], "failed": [{"attempt_id": "a-9", "error": sentinel}], "skipped": []}
+    )
+    assert sentinel not in json.dumps(leaky)
 
 
 def test_integration_sweep_failure_reports_stage_and_ids(scn, phase0_provider, tmp_path):
@@ -459,6 +468,28 @@ def test_snapshot_content_stays_redacted_when_included():
     )
     entry = altered["metadata"]["diverged"]["history"]
     assert entry["actual"][0]["auth_token"] == "[redacted]"
+
+
+def test_nested_history_messages_difference_yields_distinct_refs():
+    """Nested ``history.messages`` loss must not produce identical refs."""
+    before = {"history": {"messages": [{"id": "m-1"}, {"id": "m-2"}]}}
+    after = {"history": {"messages": [{"id": "m-1"}]}}
+    failure = format_snapshot_mismatch(before, after, keys=("history",))
+    assert failure["metadata"]["diverged_keys"] == ["history"]
+    entry = failure["metadata"]["diverged"]["history"]
+    assert entry["expected_ref"] != entry["actual_ref"]
+    assert entry["expected_ref"]["children"]["messages"]["ids"] == ["m-1", "m-2"]
+    assert entry["expected_ref"]["children"]["messages"]["length"] == 2
+    assert entry["actual_ref"]["children"]["messages"]["ids"] == ["m-1"]
+    assert entry["actual_ref"]["children"]["messages"]["length"] == 1
+    # Privacy: structural refs carry IDs/counts only, never message content.
+    assert "m-1" in json.dumps(entry)  # IDs are safe to retain
+    secret_before = {"history": {"messages": [{"id": "m-1", "auth_token": "abc"}]}}
+    secret_after = {"history": {"messages": []}}
+    secret_failure = format_snapshot_mismatch(
+        secret_before, secret_after, keys=("history",)
+    )
+    assert "abc" not in json.dumps(secret_failure)
 
 
 # ── boundary 7: duplicate commit ───────────────────────────────────────────
