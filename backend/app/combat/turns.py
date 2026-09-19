@@ -461,6 +461,7 @@ def cast_skip_vote(
     *,
     voter_id: uuid.UUID,
     expected_revision: int,
+    expected_turn_sequence: int,
     operation_id: str | None = None,
     commit: bool = True,
 ) -> tuple[dict, bool, Encounter, Any | None, Any | None]:
@@ -470,10 +471,21 @@ def cast_skip_vote(
     A repeated vote by the same voter replays the current tally without
     double-counting. Execution advances initiative with ``skipped=True`` and
     generates no actions for the absent PC — they are never AI-played.
+
+    The voter binds the source turn observed (``expected_turn_sequence``):
+    a mismatch raises StaleTurnError without recording, so a delayed vote
+    from turn N can never count against the same PC when they block again
+    in a later round.
     """
     started = _now()
     encounter = _lock_encounter(db, encounter_id)
     campaign = _require_playable(db, encounter.campaign_id)
+    try:
+        expected_turn_sequence = int(expected_turn_sequence)
+    except (TypeError, ValueError) as exc:
+        raise TurnError("expected_turn_sequence must be an integer") from exc
+    if expected_turn_sequence != int(encounter.turn_sequence or 0):
+        raise StaleTurnError(expected_turn_sequence, int(encounter.turn_sequence or 0))
     if encounter.status != "active":
         raise TurnError("skip votes require an active encounter")
     if not _is_member(db, encounter.campaign_id, voter_id):

@@ -476,7 +476,8 @@ def test_skip_executes_on_owner_vote_and_generates_no_actions():
         assert encounter.active_participant_id == player_p.id
         rev = _revision(db, ctx)
         tally, executed, updated, skipped_event, started_event = cast_skip_vote(
-            db, encounter.id, player_p.id, voter_id=ctx["owner"], expected_revision=rev)
+            db, encounter.id, player_p.id, voter_id=ctx["owner"], expected_revision=rev,
+            expected_turn_sequence=1)
         # Two-member table: one eligible voter (owner), threshold 1.
         assert tally == {
             "target_participant_id": str(player_p.id),
@@ -510,7 +511,8 @@ def test_skip_threshold_partial_then_reached_with_three_members():
         assert skip_threshold(2) == 2
         rev = _revision(db, ctx)
         tally, executed, updated, skipped_event, _ = cast_skip_vote(
-            db, encounter.id, player_p.id, voter_id=ctx["owner"], expected_revision=rev)
+            db, encounter.id, player_p.id, voter_id=ctx["owner"], expected_revision=rev,
+            expected_turn_sequence=1)
         assert executed is False
         assert skipped_event is None
         assert tally["vote_count"] == 1 and tally["threshold"] == 2
@@ -521,7 +523,7 @@ def test_skip_threshold_partial_then_reached_with_three_members():
         # Duplicate vote by the same voter replays the tally, no double count.
         tally2, executed2, _, _, _ = cast_skip_vote(
             db, encounter.id, player_p.id, voter_id=ctx["owner"],
-            expected_revision=_revision(db, ctx))
+            expected_revision=_revision(db, ctx), expected_turn_sequence=1)
         assert executed2 is False
         assert tally2["vote_count"] == 1
         assert db.execute(
@@ -531,12 +533,47 @@ def test_skip_threshold_partial_then_reached_with_three_members():
         # Second distinct voter reaches the majority: skip executes.
         rev = _revision(db, ctx)
         tally3, executed3, updated3, skipped_event3, _ = cast_skip_vote(
-            db, encounter.id, player_p.id, voter_id=ctx["third"], expected_revision=rev)
+            db, encounter.id, player_p.id, voter_id=ctx["third"], expected_revision=rev,
+            expected_turn_sequence=1)
         assert executed3 is True
         assert tally3["vote_count"] == 2
         assert skipped_event3 is not None
         assert updated3.turn_sequence == 2
         assert updated3.blocked_since is None
+
+
+def test_stale_skip_vote_after_round_rollover_fails_closed():
+    fac, ctx = _fixture(third_member=True)
+    with fac() as db:
+        encounter = _ready_two_pc(db, ctx, owner_raw=5, player_raw=18)
+        player_p = _pc(db, encounter.id, ctx["player_pc"])
+        assert encounter.active_participant_id == player_p.id
+        # Cycle the same PC back to active in round 2 via normal end-turns.
+        rev = _revision(db, ctx)
+        end_turn(db, encounter.id, actor_id=ctx["player"],
+                 expected_turn_sequence=1, expected_revision=rev)
+        rev = _revision(db, ctx)
+        end_turn(db, encounter.id, actor_id=ctx["owner"],
+                 expected_turn_sequence=2, expected_revision=rev)
+        revived = db.get(Encounter, encounter.id)
+        assert revived.turn_sequence == 3
+        assert revived.active_participant_id == player_p.id
+        # A delayed vote bound to turn 1 must not count against round 2.
+        with pytest.raises(StaleTurnError):
+            cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["owner"],
+                           expected_revision=_revision(db, ctx),
+                           expected_turn_sequence=1)
+        assert db.execute(
+            select(EncounterSkipVote).where(
+                EncounterSkipVote.encounter_id == encounter.id,
+                EncounterSkipVote.turn_sequence == 3)
+        ).scalars().first() is None
+        # The live turn still accepts a fresh vote (partial tally, threshold 2).
+        tally, executed, _, _, _ = cast_skip_vote(
+            db, encounter.id, player_p.id, voter_id=ctx["owner"],
+            expected_revision=_revision(db, ctx), expected_turn_sequence=3)
+        assert executed is False
+        assert tally["vote_count"] == 1
 
 
 def test_skip_authorization_and_target_rules():
@@ -551,15 +588,15 @@ def test_skip_authorization_and_target_rules():
         rev = _revision(db, ctx)
         with pytest.raises(TurnAuthorizationError):
             cast_skip_vote(db, encounter.id, player_p.id, voter_id=outsider,
-                           expected_revision=rev)
+                           expected_revision=rev, expected_turn_sequence=1)
         # Votes target the blocking active participant only.
         with pytest.raises(TurnError, match="currently active"):
             cast_skip_vote(db, encounter.id, owner_p.id, voter_id=ctx["player"],
-                           expected_revision=rev)
+                           expected_revision=rev, expected_turn_sequence=1)
         # The controller ends their own turn; they cannot self-skip-vote.
         with pytest.raises(TurnError, match="own turn"):
             cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["player"],
-                           expected_revision=rev)
+                           expected_revision=rev, expected_turn_sequence=1)
         assert db.get(Encounter, encounter.id).turn_sequence == 1
 
 
@@ -587,7 +624,7 @@ def test_skip_rejected_for_npc_targets():
         roll_npc_initiative(db, encounter.id, goblin.id, raw_d20=19)
         with pytest.raises(TurnError, match="NPC/monster"):
             cast_skip_vote(db, encounter.id, goblin.id, voter_id=ctx["owner"],
-                           expected_revision=_revision(db, ctx))
+                           expected_revision=_revision(db, ctx), expected_turn_sequence=1)
 
 
 # ── reconnect / chat / realtime ─────────────────────────────────────────────
@@ -607,9 +644,9 @@ def test_state_reconstructs_exactly_after_reconnect(tmp_path):
         consume_resource(db, encounter.id, player_p.id, actor_id=ctx["player"],
                          resource="movement", amount=5, expected_turn_sequence=1)
         cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["owner"],
-                       expected_revision=_revision(db, ctx))
+                       expected_revision=_revision(db, ctx), expected_turn_sequence=1)
         cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["third"],
-                       expected_revision=_revision(db, ctx))
+                       expected_revision=_revision(db, ctx), expected_turn_sequence=1)
         encounter_id = encounter.id
         assert db.get(Encounter, encounter_id).turn_sequence == 2
     eng.dispose()
@@ -822,13 +859,21 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
         assert str(active_now) == first_active
         skip = client.post(
             f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/skip-votes",
-            json={"expected_revision": rev3, "target_participant_id": first_active},
+            json={"expected_revision": rev3, "target_participant_id": first_active,
+                  "expected_turn_sequence": 2},
             headers={**player_h, "Idempotency-Key": "skip-1"})
         # Player votes to skip the active owner: eligible voters excluding the
         # owner are {player} → threshold 1 → executes immediately.
         assert skip.status_code == 200, skip.text
         assert skip.json()["executed"] is True
         assert skip.json()["tally"]["vote_count"] == 1
+        # Missing turn binding is a 400; stale turn binding is a 409.
+        missing_skip = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/skip-votes",
+            json={"expected_revision": rev3,
+                  "target_participant_id": skip.json()["encounter"]["active_participant_id"]},
+            headers={**player_h, "Idempotency-Key": "skip-missing-seq-1"})
+        assert missing_skip.status_code == 400, missing_skip.text
         # Realtime projections fired for ended + started + skipped turns.
         published_types = [p["payload"]["type"] for p in recorder.published]
         assert "encounter.turn_ended" in published_types

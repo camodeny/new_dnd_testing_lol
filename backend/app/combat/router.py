@@ -427,13 +427,17 @@ def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: 
     target_id = _id(str(target_raw), "participant id")
     key = require_idempotency_key(request, payload.get("operation_id"))
     expected_revision = _require_revision(payload)
+    if payload.get("expected_turn_sequence") is None:
+        raise HTTPException(status_code=400, detail="expected_turn_sequence is required")
+    expected_sequence = payload["expected_turn_sequence"]
 
     def execute():
         try:
             # Flush-only: the outer idempotent command owns the commit.
             tally, executed, updated, skipped_event, started_event = cast_skip_vote(
                 db, encounter.id, target_id, voter_id=profile.id,
-                expected_revision=expected_revision, commit=False,
+                expected_revision=expected_revision,
+                expected_turn_sequence=expected_sequence, commit=False,
             )
             return {
                 "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
