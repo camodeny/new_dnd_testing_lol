@@ -882,6 +882,12 @@ class RulesValidator:
     dice (see :mod:`app.rules.attacks`). Any ``apply_attack_damage`` effect
     in provider-validated output is rejected; server code stages damage via
     ``build_damage_effect`` with a server-resolved ``DamageResolution``.
+
+    Rules-state effects (#227) are likewise code-built only: provider output
+    must never author structural condition / resource / concentration /
+    death-save transitions — those are resolved server-side from
+    authoritative sheet/NPC state (see :mod:`app.rules.state`) and staged
+    via the ``build_*_effect`` helpers.
     """
 
     name = "rules_validator"
@@ -902,6 +908,24 @@ class RulesValidator:
                             "damage effects are code-built only (server-resolved DamageResolution), never provider output"
                         ),
                         details={"effect_id": getattr(eff, "id", None)},
+                    )
+                )
+            elif getattr(eff, "effect_type", None) in (
+                "apply_condition",
+                "apply_resource",
+                "apply_concentration",
+                "apply_death_save",
+            ):
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name,
+                        category=self.category,
+                        code="provider_authored_rules_state",
+                        message=(
+                            f"staged effect {getattr(eff, 'id', '?')!r} authors rules state: "
+                            "condition/resource/concentration/death-save effects are code-built only (server-resolved rules state), never provider output"
+                        ),
+                        details={"effect_id": getattr(eff, "id", None), "effect_type": getattr(eff, "effect_type", None)},
                     )
                 )
         latency = (time.monotonic() - t0) * 1000
