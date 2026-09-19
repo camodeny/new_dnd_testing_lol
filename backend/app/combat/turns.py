@@ -412,7 +412,10 @@ def consume_resource(
 # ── Skip votes ──────────────────────────────────────────────────────────────
 
 
-def _eligible_voters(db: Session, campaign_id: uuid.UUID, target: EncounterParticipant) -> list[uuid.UUID]:
+def _eligible_voters(db: Session, encounter: Encounter, target: EncounterParticipant) -> list[uuid.UUID]:
+    from app.combat.service import can_view_encounter
+
+    campaign_id = encounter.campaign_id
     members = db.execute(
         select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
     ).scalars().all()
@@ -426,14 +429,18 @@ def _eligible_voters(db: Session, campaign_id: uuid.UUID, target: EncounterParti
         if any(str(existing) == str(member.user_id) for existing in ids):
             continue
         ids.append(member.user_id)
-    return ids
+    # Private-thread encounters are readable only by explicit thread members
+    # (#230 privacy): members who cannot read this encounter can never reach
+    # the skip-vote endpoint, so they must not inflate the threshold and
+    # permanently block a missing player's turn.
+    return [uid for uid in ids if can_view_encounter(db, encounter, uid)]
 
 
 def skip_tally(db: Session, encounter: Encounter, target_id: uuid.UUID) -> dict:
     target = db.get(EncounterParticipant, target_id)
     if target is None or target.encounter_id != encounter.id:
         raise TurnError("skip target not found in this encounter")
-    eligible = _eligible_voters(db, encounter.campaign_id, target)
+    eligible = _eligible_voters(db, encounter, target)
     votes = db.execute(
         select(EncounterSkipVote).where(
             EncounterSkipVote.encounter_id == encounter.id,
@@ -490,6 +497,10 @@ def cast_skip_vote(
         raise TurnError("skip votes require an active encounter")
     if not _is_member(db, encounter.campaign_id, voter_id):
         raise TurnAuthorizationError("Only campaign members may vote to skip a turn")
+    from app.combat.service import can_view_encounter as _can_view_encounter
+
+    if not _can_view_encounter(db, encounter, voter_id):
+        raise TurnAuthorizationError("Only encounter thread readers may vote to skip a turn")
     target = db.get(EncounterParticipant, target_participant_id)
     if target is None or target.encounter_id != encounter.id:
         raise TurnError("skip target not found in this encounter")

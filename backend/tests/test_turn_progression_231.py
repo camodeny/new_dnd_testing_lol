@@ -35,6 +35,7 @@ from app.combat.turns import (  # noqa: E402
     end_turn,
     get_turn_state_row,
     grant_extra_resource,
+    skip_tally,
     skip_threshold,
     turn_projection,
 )
@@ -574,6 +575,65 @@ def test_stale_skip_vote_after_round_rollover_fails_closed():
             expected_revision=_revision(db, ctx), expected_turn_sequence=3)
         assert executed is False
         assert tally["vote_count"] == 1
+
+
+def test_private_thread_nonreaders_excluded_from_skip_threshold():
+    from app.runtime.threads import create_private_thread
+
+    fac, ctx = _fixture(third_member=True)
+    with fac() as db:
+        thread = create_private_thread(
+            db, campaign_id=ctx["campaign_id"], created_by=ctx["owner"],
+            member_ids=[ctx["owner"], ctx["player"]], title="Side Room",
+        )
+        db.commit()
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
+            character_id=ctx["owner_pc"],
+            raw_content="Something moves in the dark!",
+            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
+            thread_id=str(thread.id),
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
+        db.commit()
+        private_turn_id, private_attempt_id = turn.id, attempt.id
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-private-skip-231",
+            expected_revision=_revision(db, ctx), actor_id=ctx["owner"],
+            source_turn_id=private_turn_id, source_attempt_id=private_attempt_id,
+            participants=[{"character_id": str(ctx["owner_pc"])},
+                          {"character_id": str(ctx["player_pc"])}],
+        )
+        owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+        player_p = _pc(db, encounter.id, ctx["player_pc"])
+        fulfill_human_initiative(
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"],
+            payload={"source": "app", "raw_rolls": [5],
+                     "modifier": owner_p.initiative_modifier,
+                     "total": 5 + owner_p.initiative_modifier})
+        _, _, _, encounter, _ = fulfill_human_initiative(
+            db, encounter.id, player_p.id, actor_id=ctx["player"],
+            payload={"source": "app", "raw_rolls": [18],
+                     "modifier": player_p.initiative_modifier,
+                     "total": 18 + player_p.initiative_modifier})
+        assert encounter.active_participant_id == player_p.id
+        # The third campaign member cannot read the private encounter thread,
+        # so they are not an eligible skip voter and do not inflate the bar.
+        tally = skip_tally(db, encounter, player_p.id)
+        assert tally["eligible_voter_count"] == 1
+        assert tally["threshold"] == 1
+        with pytest.raises(TurnAuthorizationError):
+            cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["third"],
+                           expected_revision=_revision(db, ctx),
+                           expected_turn_sequence=1)
+        tally2, executed, updated, skipped_event, _ = cast_skip_vote(
+            db, encounter.id, player_p.id, voter_id=ctx["owner"],
+            expected_revision=_revision(db, ctx), expected_turn_sequence=1)
+        assert executed is True
+        assert skipped_event is not None
+        assert updated.turn_sequence == 2
+        assert tally2["eligible_voter_count"] == 1
 
 
 def test_skip_authorization_and_target_rules():
