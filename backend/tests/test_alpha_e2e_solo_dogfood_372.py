@@ -629,7 +629,13 @@ def drain_dm_execution(scn: Scenario, stage: str, adjudicate=None) -> dict:
     return outcome
 
 
-def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
+def await_committed_reply(
+    scn: Scenario,
+    stage: str,
+    turn_id: str,
+    *,
+    expected_reply_marker: str | None = "phase0-reply-",
+) -> str:
     """Assert one logical turn has exactly one committed, durable DM result."""
     try:
         scn.note(stage)
@@ -691,18 +697,23 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
             ),
         )
         text = reconstruct_text(db, attempt.stream_id)
-        scn.check(
-            "phase0-reply-" in text,
-            stage,
-            "durable narration lacks the committed-reply marker",
-            category="stream_persistence",
-            detail=format_commit_failure(
-                turn_id=str(turn.id),
-                attempt_id=str(attempt.id),
-                stream_id=str(attempt.stream_id),
-                detail="durable narration lacks the committed-reply marker",
-            ),
-        )
+        if expected_reply_marker is not None:
+            scn.check(
+                expected_reply_marker in text,
+                stage,
+                "durable narration lacks the committed-reply marker",
+                category="stream_persistence",
+                detail=format_commit_failure(
+                    turn_id=str(turn.id),
+                    attempt_id=str(attempt.id),
+                    stream_id=str(attempt.stream_id),
+                    detail="durable narration lacks the committed-reply marker",
+                ),
+            )
+        else:
+            # Real model prose is deliberately nondeterministic. The durable
+            # non-empty stream assertion above remains the invariant.
+            scn.check(bool(text.strip()), stage, "durable narration is empty")
         if str(turn.id) not in scn.ids["turn_ids"]:
             scn.ids["turn_ids"].append(str(turn.id))
         if str(attempt.id) not in scn.ids["attempt_ids"]:
@@ -882,7 +893,18 @@ def assert_player_turns_preserved(
 # ── main scenario ─────────────────────────────────────────────────────────────
 
 
-def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_provider):
+def run_phase0_solo_scenario(
+    scn: Scenario,
+    *,
+    expected_reply_marker: str | None = "phase0-reply-",
+    provider_calls=None,
+) -> None:
+    """Run the one Phase 0 scenario flow for fake and opt-in real AI.
+
+    Only the expected deterministic prose marker differs by mode. Setup,
+    execution, duplicate protection, reconnect, and continuation assertions
+    intentionally remain a single shared harness.
+    """
     # Setup: synthetic fixtures + authoritative select/ready.
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
@@ -896,7 +918,9 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
     scn.note("opening")
     outcome = drain_dm_execution(scn, "opening")
     scn.check_sweep(outcome, "opening")
-    opening_text = await_committed_reply(scn, "opening", opening_turn_id)
+    opening_text = await_committed_reply(
+        scn, "opening", opening_turn_id, expected_reply_marker=expected_reply_marker
+    )
     assert opening_text
     assert_single_result_per_submission(scn, "opening", 1)
 
@@ -909,7 +933,11 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
         turn_id = submitted["dm_turn"]["id"]
         outcome = drain_dm_execution(scn, stage)
         scn.check_sweep(outcome, stage)
-        stream_texts.append(await_committed_reply(scn, stage, turn_id))
+        stream_texts.append(
+            await_committed_reply(
+                scn, stage, turn_id, expected_reply_marker=expected_reply_marker
+            )
+        )
         assert_ordering_invariants(scn, stage)
         assert_single_result_per_submission(scn, stage, 2 + index)
     scn.check(
@@ -980,7 +1008,12 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
     )
     outcome = drain_dm_execution(scn, "post-reconnect")
     scn.check_sweep(outcome, "post-reconnect")
-    await_committed_reply(scn, "post-reconnect", submitted["dm_turn"]["id"])
+    await_committed_reply(
+        scn,
+        "post-reconnect",
+        submitted["dm_turn"]["id"],
+        expected_reply_marker=expected_reply_marker,
+    )
     assert_ordering_invariants(scn, "post-reconnect", client=reconnected_client)
     assert_single_result_per_submission(
         scn, "post-reconnect", 5, client=reconnected_client
@@ -1004,19 +1037,24 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
     scn.check(len(diag["turn_ids"]) == 5, "diagnostics", "turn ids incomplete")
     scn.check(len(diag["attempt_ids"]) == 5, "diagnostics", "attempt ids incomplete")
     scn.check(len(diag["stream_ids"]) == 5, "diagnostics", "stream ids incomplete")
-    # #373 observability: every AI role call was satisfied by a named fixture.
-    satisfied = {call["fixture_step"] for call in phase0_provider.calls}
-    scn.check(
-        satisfied == {"opening", "play-1", "play-2", "play-3", "post-reconnect"},
-        "diagnostics",
-        f"fake-provider call attribution incomplete: {sorted(satisfied)}",
-    )
-    scn.check(
-        all(call["role"] == "forward_dm" for call in phase0_provider.calls),
-        "diagnostics",
-        "unexpected AI role served by the fake provider",
-    )
+    if provider_calls is not None:
+        # #373 observability: every AI role call was satisfied by a named fixture.
+        satisfied = {call["fixture_step"] for call in provider_calls}
+        scn.check(
+            satisfied == {"opening", "play-1", "play-2", "play-3", "post-reconnect"},
+            "diagnostics",
+            f"fake-provider call attribution incomplete: {sorted(satisfied)}",
+        )
+        scn.check(
+            all(call["role"] == "forward_dm" for call in provider_calls),
+            "diagnostics",
+            "unexpected AI role served by the fake provider",
+        )
     logger.info("phase0-372 diagnostics=%s", diag)
+
+
+def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_provider):
+    run_phase0_solo_scenario(scn, provider_calls=phase0_provider.calls)
 
 
 # ── intentional-break proofs: each sabotage must fail at its assertion ────────
