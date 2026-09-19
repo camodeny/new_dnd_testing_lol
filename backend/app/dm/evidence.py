@@ -64,7 +64,9 @@ MAX_REQUESTS_PER_ROUND: int = 3
 MAX_TOTAL_REQUESTS: int = 9
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(
-    {"ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules"}
+    {"ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules",
+     "lookup_world_entity", "traverse_world_relations", "lookup_world_fact",
+     "query_world_timeline", "lookup_source_turn", "query_character_knowledge"}
 )
 
 # For forward compatibility, also allow combat/rules hooks as stubs but keep
@@ -460,6 +462,14 @@ def execute_evidence_round(
                 handlers.setdefault(k, v)
         except Exception:
             pass
+    # Auto-register authoritative world retrieval handlers (issue #212)
+    try:
+        from app.world.retrieval import TOOL_HANDLERS as _world_handlers
+
+        for k, v in _world_handlers.items():
+            handlers.setdefault(k, v)
+    except Exception:
+        pass
 
     for req in requests:
         tool_types.append(req.tool)
