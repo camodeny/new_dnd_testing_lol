@@ -138,6 +138,60 @@ class WorkerExecution(Base):
         }
 
 
+class DecisionTelemetry(Base):
+    """Bounded-decision telemetry — issue #383.
+
+    One row per evaluated decision question: which candidates/policy/model
+    produced the selected path, in which execution mode, with what
+    deterministic revalidation result. Privacy-safe by construction: only
+    stable candidate IDs (never labels/debug hints) and never raw decision
+    state cross into this table. Downstream correction signals
+    (``correction_*``) are delayed wrongness evidence and stay distinct
+    from definitive ``ground_truth_id``.
+    """
+
+    __tablename__ = "decision_telemetry"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    decision_class: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    question_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    question_kind: Mapped[str] = mapped_column(String(16), nullable=False, default="choice")
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    model_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    candidate_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    frame_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    policy_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    telemetry_schema_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    candidate_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    selected_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    probabilities: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    runner_up_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    margin: Mapped[float | None] = mapped_column(Float, nullable=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    turn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_turns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    frame_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    state_revision: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    policy_directive: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    verified: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    revalidation_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ground_truth_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    correction_source: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    correction_indicates_wrong: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    corrected_to: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class OperationTrace(Base):
     __tablename__ = "operation_traces"
     trace_id: Mapped[str] = mapped_column(String(64), primary_key=True)

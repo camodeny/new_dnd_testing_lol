@@ -46,18 +46,23 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.decisions import (
+    ACTIVE,
     DIRECT_EXECUTE,
     ESCALATE,
+    PRIMER,
     PRIMER_ADVISORY,
+    SHADOW,
     CandidateRecord,
     DecisionClassPolicy,
     DecisionFrame,
     DecisionService,
     PolicyVerdict,
     build_frame,
+    build_record,
     evaluate_execution,
     frame_trace,
     policy_trace,
+    record_fail_soft,
     register_policy,
     revalidate_for_execution,
     to_decision_request,
@@ -660,6 +665,140 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
     return primed
 
 
+def _record_routing_telemetry(
+    db: Any,
+    *,
+    frame: DecisionFrame,
+    result: Any,
+    response: Any,
+    outcome: RoutingOutcome,
+    mode: str,
+    trace_id: str | None = None,
+    campaign_id: Any = None,
+    turn_id: Any = None,
+    session_factory: Any = None,
+) -> None:
+    """Persist one routing decision telemetry row, fail-soft (issue #383).
+
+    Never raises: observability failure must not mutate or duplicate
+    gameplay, so every error path is swallowed after a warning. Only
+    stable candidate IDs reach the row — labels, state, and primer
+    content stay out.
+
+    The recorded ``policy_directive`` is the original execution-policy
+    outcome from the trace — not the post-revalidation routing outcome —
+    so a ``direct_execute`` policy verdict that fails deterministic
+    revalidation (and therefore escalates) is stored as
+    ``direct_execute`` + ``verified=False`` + ``revalidation_error``.
+    When ``session_factory`` is omitted it is derived from ``db``.
+    """
+    try:
+        trace = outcome.trace or {}
+        selected_id = outcome.selected_id or getattr(result, "selected_id", "")
+        policy_directive = trace.get("directive") or outcome.directive
+        verdict = PolicyVerdict(
+            directive=policy_directive,
+            reason=str(trace.get("reason", "")),
+            decision_class=frame.decision_class,
+            selected_id=selected_id,
+            probability=float(trace.get("probability", 0.0)),
+            confidence=float(trace.get("confidence", 0.0)),
+            margin=float(trace.get("margin", 0.0)),
+        )
+        revalidation_error = trace.get("revalidation_error")
+        if outcome.directive == DIRECT_EXECUTE:
+            verified: bool | None = True
+        elif revalidation_error is not None:
+            verified = False
+        else:
+            verified = None
+        record = build_record(
+            frame,
+            result,
+            verdict,
+            provider=getattr(response, "provider", "unknown"),
+            model=getattr(response, "model", None) or "unknown",
+            mode=mode,
+            trace_id=trace_id or trace.get("trace_id") or getattr(response, "trace_id", None),
+            operation_id=getattr(response, "operation_id", None) or trace.get("trace_id"),
+            campaign_id=campaign_id,
+            turn_id=turn_id,
+            latency_ms=getattr(response, "latency_ms", None),
+            cost_usd=(getattr(response, "usage", None) or {}).get("cost_usd"),
+            verified=verified,
+            revalidation_error=revalidation_error,
+        )
+        factory = session_factory
+        if factory is None:
+            try:
+                from app.observability.service import telemetry_factory_for
+
+                factory = telemetry_factory_for(db)
+            except Exception:
+                factory = None
+        record_fail_soft(factory, record)
+    except Exception as exc:
+        logger.warning("decision routing telemetry dropped: %s", exc)
+
+
+def _record_superseded_telemetry(
+    db: Any,
+    *,
+    frame: DecisionFrame,
+    result: Any,
+    response: Any,
+    revision: str | int,
+    signals: RouteSignals,
+    error: Exception,
+    shadow: bool,
+    trace_id: str | None,
+    attempt: Any,
+    turn: Any,
+) -> None:
+    """Record an evaluated decision lost to attempt supersession (issue #383).
+
+    Best-effort and fail-soft: the authoritative escalation is unchanged.
+    The execution-policy outcome is derived from a pure re-evaluation probe
+    against the frame-time input set; the supersession failure is attached
+    as the deterministic revalidation result (``verified=False``). A probe
+    of its own that already failed revalidation keeps its own error.
+    """
+    try:
+        probe = decide_from_result(
+            frame,
+            result,
+            current_revision=revision,
+            frame_submission_ids=signals.submission_ids,
+            current_submission_ids=signals.submission_ids,
+        )
+    except Exception as probe_exc:
+        logger.warning("decision supersession telemetry probe dropped: %s", probe_exc)
+        return
+    trace = dict(probe.trace)
+    trace.update({"decision_path": OPEN_ENDED_GENERATIVE})
+    trace.setdefault("revalidation_error", str(error))
+    tele_outcome = RoutingOutcome(
+        directive=ESCALATE, selected_id=probe.selected_id, trace=trace,
+    )
+    if shadow:
+        mode = SHADOW
+    elif probe.directive == PRIMER_ADVISORY:
+        mode = PRIMER
+    else:
+        mode = ACTIVE
+    _record_routing_telemetry(
+        db,
+        frame=frame,
+        result=result,
+        response=response,
+        outcome=tele_outcome,
+        mode=mode,
+        trace_id=trace_id or getattr(response, "trace_id", None),
+        campaign_id=getattr(attempt, "campaign_id", None),
+        turn_id=getattr(turn, "id", None) or getattr(attempt, "turn_id", None),
+    )
+
+
 def route_attempt(
     db: Any,
     *,
@@ -667,11 +806,16 @@ def route_attempt(
     turn: Any,
     trace_id: str | None = None,
     decision_service: DecisionService | None = None,
+    shadow: bool = False,
 ) -> RoutingOutcome:
     """Route one prepared attempt: direct, primer, or generative escape.
 
     Never raises for decision-plane problems — those escalate. Unexpected
     errors also escalate so a router bug cannot wedge turn execution.
+
+    ``shadow`` evaluates the bounded decision and records it as shadow
+    telemetry, but the authoritative path continues unchanged: the outcome
+    always escalates to the ordinary generative path (issue #383).
     """
     # Resumed player-roll attempts carry fulfilled outcomes as evidence for
     # the generative adjudicator; there is no bounded roll-continuation
@@ -746,6 +890,22 @@ def route_attempt(
                 "revalidation_error": str(exc),
             }
         )
+        # The bounded decision was already evaluated: record its policy
+        # outcome plus this deterministic revalidation failure (fail-soft)
+        # while the authoritative path escalates unchanged.
+        _record_superseded_telemetry(
+            db,
+            frame=frame,
+            result=result,
+            response=response,
+            revision=revision,
+            signals=signals,
+            error=exc,
+            shadow=shadow,
+            trace_id=trace_id,
+            attempt=attempt,
+            turn=turn,
+        )
         return RoutingOutcome(directive=ESCALATE, trace=base)
     try:
         outcome = decide_from_result(
@@ -770,9 +930,42 @@ def route_attempt(
     trace.setdefault("provider", response.provider)
     trace.setdefault("model", response.model)
     trace.setdefault("latency_ms", response.latency_ms)
-    if trace_id is not None:
-        trace.setdefault("trace_id", trace_id)
+    effective_trace_id = trace_id or getattr(response, "trace_id", None)
+    if effective_trace_id is not None:
+        trace.setdefault("trace_id", effective_trace_id)
     outcome.trace = trace
+    # Issue #383 — record the evaluated decision (shadow vs active/primer)
+    # without ever disturbing the routing outcome. Telemetry is fail-soft.
+    live_mode = PRIMER if outcome.directive == PRIMER_ADVISORY else ACTIVE
+    _record_routing_telemetry(
+        db,
+        frame=frame,
+        result=result,
+        response=response,
+        outcome=outcome,
+        mode=SHADOW if shadow else live_mode,
+        trace_id=effective_trace_id,
+        campaign_id=getattr(attempt, "campaign_id", None),
+        turn_id=getattr(turn, "id", None) or getattr(attempt, "turn_id", None),
+    )
+    if shadow:
+        # Authoritative path continues unchanged: discard any direct
+        # contract or primer and escalate to the generative path.
+        shadow_trace = dict(trace)
+        shadow_trace.update(
+            {
+                "decision_path": OPEN_ENDED_GENERATIVE,
+                "shadow": True,
+                "shadow_selected": outcome.selected_id,
+                "shadow_directive": outcome.directive,
+                "reason": "shadow evaluation only; authoritative path unchanged",
+            }
+        )
+        return RoutingOutcome(
+            directive=ESCALATE,
+            selected_id=outcome.selected_id,
+            trace=shadow_trace,
+        )
     return outcome
 
 
