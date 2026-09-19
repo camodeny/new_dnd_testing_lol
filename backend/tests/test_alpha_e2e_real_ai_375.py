@@ -21,6 +21,9 @@ from datetime import datetime
 import pytest
 from sqlalchemy import select
 
+from app.decisions.contracts import ChoiceResult, DecisionResponse
+from app.decisions.frames import OPEN_ENDED_DM_CANDIDATE_ID
+from app.dm import execution as dm_execution
 from models.reliability import AIRun
 from test_alpha_e2e_solo_dogfood_372 import run_phase0_solo_scenario, scn
 
@@ -29,6 +32,39 @@ logger = logging.getLogger(__name__)
 REAL_AI_ENV = "E2E_REAL_AI"
 REAL_AI_CONFIRM_ENV = "E2E_REAL_AI_CONFIRM"
 REAL_AI_CONFIRM_VALUE = "paid"
+
+
+class _OpenEndedDecisionService:
+    """Test-only route seam: choose the ordinary generative escape.
+
+    The real-AI observation must not contact a decision provider.  Production
+    execution still receives a decision service so the route is exercised,
+    but this deterministic response makes the OPEN_ENDED_DM escape explicit.
+    """
+
+    def __init__(self) -> None:
+        self.decision_calls = 0
+        self.adapter_calls = 0
+
+    @property
+    def adapter(self):
+        self.adapter_calls += 1
+        raise AssertionError("real scenario must not access a decision adapter")
+
+    def decide(self, request) -> DecisionResponse:
+        self.decision_calls += 1
+        return DecisionResponse(
+            results={
+                request.questions[0].question_id: ChoiceResult(
+                    question_id=request.questions[0].question_id,
+                    selected_id=OPEN_ENDED_DM_CANDIDATE_ID,
+                )
+            },
+            provider="test-open-ended-route",
+            model="test-open-ended-route",
+            latency_ms=0,
+            trace_id="test-open-ended-route",
+        )
 
 
 def real_ai_enabled() -> bool:
@@ -82,8 +118,18 @@ def _run_metadata(scenario) -> dict:
         "E2E_REAL_AI_CONFIRM=paid for a deliberate manual paid run"
     ),
 )
-def test_phase0_solo_dogfood_with_configured_real_generative_route(scn):
+def test_phase0_solo_dogfood_with_configured_real_generative_route(scn, monkeypatch):
     """Same #372 flow, with prose-only assertions relaxed for real output."""
+    decision_service = _OpenEndedDecisionService()
+    production_execute = dm_execution.execute_dm_attempt
+
+    def execute_open_ended(db, attempt_id, **kwargs):
+        kwargs["decision_service"] = decision_service
+        return production_execute(db, attempt_id, **kwargs)
+
+    # run_dm_execute_sweep resolves execute_dm_attempt from its production
+    # module, so this remains a test-local injection with no production change.
+    monkeypatch.setattr(dm_execution, "execute_dm_attempt", execute_open_ended)
     try:
         run_phase0_solo_scenario(scn, expected_reply_marker=None)
     finally:
@@ -103,6 +149,16 @@ def test_phase0_solo_dogfood_with_configured_real_generative_route(scn):
         all(run["provider"] and run["model"] for run in runs),
         "diagnostics",
         "real route telemetry lacks provider or model identity",
+    )
+    scn.check(
+        decision_service.decision_calls >= 1,
+        "diagnostics",
+        "real scenario did not exercise the OPEN_ENDED_DM route",
+    )
+    scn.check(
+        decision_service.adapter_calls == 0,
+        "diagnostics",
+        "real scenario unexpectedly called a decision adapter",
     )
     # Success needs an operator-readable record too; this uses the same
     # redacted #374 artifact format as failures and contains no credentials
