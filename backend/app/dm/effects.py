@@ -667,6 +667,10 @@ class _StateTarget:
             details["resources"] = self.resources
             details["spell_slots"] = self.slots
             details["concentration"] = self.concentration
+            # Scalar death-save counters carry no per-field visibility lane;
+            # DM-only disclosure is tracked in details["rules_state_visibility"]
+            # via _mark_npc_section() so projections can redact without
+            # inventing a second counter shape.
             details["death_saves"] = {"successes": self.successes, "failures": self.failures}
             if self.hp_current is not None:
                 nested = dict(details.get("hit_points") or {})
@@ -675,6 +679,15 @@ class _StateTarget:
             details["exhaustion_level"] = self.exhaustion
             self.row.details = details
         db.flush()
+
+
+def _mark_npc_section(target: _StateTarget, section: str, visibility: Any) -> None:
+    """Preserve staged visibility in NPC marker map (no-op for PCs)."""
+    if target.kind != "npc":
+        return
+    from app.rules.state import mark_npc_section_visibility as _mark
+
+    _mark(target._details, section, visibility)
 
 
 def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) -> _StateTarget:
@@ -765,6 +778,9 @@ def _handle_apply_condition(db: Session, campaign: Campaign, effect: dict[str, A
     op = args.get("op")
     mutation_id = args.get("mutation_id")
     target = _load_state_target(db, campaign, effect)
+    # Preserve staged visibility in persisted NPC state: builders default to
+    # dm_private (fail-closed) so a hidden mutation never persists as public.
+    staged_visibility = args.get("visibility") or "dm_private"
     concentration_broken: str | None = None
     try:
         if op == "add":
@@ -776,27 +792,32 @@ def _handle_apply_condition(db: Session, campaign: Campaign, effect: dict[str, A
                 duration_rounds=args.get("duration_rounds"),
                 save_ends=args.get("save_ends"),
                 is_permanent=bool(args.get("is_permanent", False)),
-                visibility="public",
+                visibility=staged_visibility,
                 description=args.get("description"),
                 provenance=args.get("provenance"),
                 mutation_id=mutation_id,
             )
             target.conditions = new_conditions
+            _mark_npc_section(target, "conditions", staged_visibility)
             if norm == "exhaustion":
                 target.exhaustion = _set_exhaustion(int(args.get("exhaustion_level")), mutation_id=mutation_id)
+                _mark_npc_section(target, "exhaustion_level", staged_visibility)
             if norm in _BREAKING:
                 try:
                     broke_state, broke = _break_conc(target.concentration, reason="incapacitated", mutation_id=f"{mutation_id}:conc")
                     target.concentration = broke_state
                     concentration_broken = broke.effect_name
+                    _mark_npc_section(target, "concentration", staged_visibility)
                 except _StateError:
                     pass  # no active concentration — nothing to break
         elif op == "remove":
             norm = _norm(args.get("condition"))
             new_conditions, _removed = _remove(target.conditions, name=norm, mutation_id=mutation_id)
             target.conditions = new_conditions
+            _mark_npc_section(target, "conditions", staged_visibility)
             if norm == "exhaustion":
                 target.exhaustion = _set_exhaustion(0, mutation_id=mutation_id)
+                _mark_npc_section(target, "exhaustion_level", staged_visibility)
         elif op == "update":
             norm = _norm(args.get("condition"))
             new_conditions, _updated = _update(
@@ -809,15 +830,19 @@ def _handle_apply_condition(db: Session, campaign: Campaign, effect: dict[str, A
                 save_ends=args.get("save_ends"),
                 clear_save_ends=bool(args.get("clear_save_ends", False)),
                 is_permanent=args.get("is_permanent"),
+                visibility=staged_visibility,
                 description=args.get("description"),
                 provenance=args.get("provenance"),
             )
             target.conditions = new_conditions
+            _mark_npc_section(target, "conditions", staged_visibility)
             if norm == "exhaustion" and args.get("exhaustion_level") is not None:
                 target.exhaustion = _set_exhaustion(int(args.get("exhaustion_level")), mutation_id=mutation_id)
+                _mark_npc_section(target, "exhaustion_level", staged_visibility)
         elif op == "tick":
             new_conditions, _expired = _tick(target.conditions, rounds=int(args.get("rounds", 1) or 1), mutation_id=mutation_id)
             target.conditions = new_conditions
+            _mark_npc_section(target, "conditions", staged_visibility)
         else:
             raise ValueError(f"Staged effect {effect.get('id')!r} unknown condition op {op!r}")
     except _StateError as exc:
@@ -848,6 +873,7 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
     op = args.get("op")
     mutation_id = args.get("mutation_id")
     target = _load_state_target(db, campaign, effect)
+    staged_visibility = args.get("visibility") or "dm_private"
     slot_level = args.get("slot_level")
     resource = args.get("resource")
     if isinstance(resource, str) and resource.strip().lower().startswith("spell_slots:"):
@@ -864,6 +890,7 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
             else:
                 raise ValueError(f"Staged effect {effect.get('id')!r} spell slots support spend/restore only, not {op!r}")
             target.slots = new_slots
+            _mark_npc_section(target, "spell_slots", staged_visibility)
         else:
             if op == "spend":
                 new_resources, _delta = _spend(target.resources, name=resource, amount=int(args.get("amount", 1) or 1), mutation_id=mutation_id)
@@ -877,6 +904,7 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
             else:
                 raise ValueError(f"Staged effect {effect.get('id')!r} unknown resource op {op!r}")
             target.resources = new_resources
+            _mark_npc_section(target, "resources", staged_visibility)
     except _StateError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} invalid resource transition ({exc.code}): {exc}") from exc
     target.commit(db)
@@ -898,6 +926,7 @@ def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[st
     op = args.get("op")
     mutation_id = args.get("mutation_id")
     target = _load_state_target(db, campaign, effect)
+    staged_visibility = args.get("visibility") or "dm_private"
     try:
         if op == "start":
             new_state, _started = _start(
@@ -905,7 +934,7 @@ def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[st
                 effect_name=args.get("effect_name"),
                 effect_id=args.get("concentration_effect_id"),
                 source=args.get("source"),
-                visibility="public",
+                visibility=staged_visibility,
                 provenance=args.get("provenance"),
                 mutation_id=mutation_id,
             )
@@ -915,7 +944,7 @@ def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[st
                 effect_name=args.get("effect_name"),
                 effect_id=args.get("concentration_effect_id"),
                 source=args.get("source"),
-                visibility="public",
+                visibility=staged_visibility,
                 provenance=args.get("provenance"),
                 mutation_id=mutation_id,
             )
@@ -926,6 +955,7 @@ def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[st
     except _StateError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} invalid concentration transition ({exc.code}): {exc}") from exc
     target.concentration = new_state
+    _mark_npc_section(target, "concentration", staged_visibility)
     target.commit(db)
     logger.info(
         "effect apply_concentration effect_id=%s target=%s:%s op=%s",
@@ -955,36 +985,45 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
     op = args.get("op")
     mutation_id = args.get("mutation_id")
     target = _load_state_target(db, campaign, effect)
+    staged_visibility = args.get("visibility") or "dm_private"
     try:
         if op == "record":
             pre_s, pre_f = target.successes, target.failures
             state = _record(target.successes, target.failures, result=args.get("result"), mutation_id=mutation_id)
             target.successes, target.failures = state.successes, state.failures
+            _mark_npc_section(target, "death_saves", staged_visibility)
             if (pre_s, pre_f) == (0, 0) and target.hp_current == 0 and not _has(target.conditions, "unconscious"):
                 target.conditions, _rec = _add(
                     target.conditions, name="unconscious", source="death_saves",
                     description="Unconscious at 0 hit points; making death saving throws.",
+                    visibility=staged_visibility,
                     provenance={"mutation_id": mutation_id}, mutation_id=f"{mutation_id}:unconscious",
                 )
+                _mark_npc_section(target, "conditions", staged_visibility)
             if state.stabilized and not _has(target.conditions, "unconscious"):
                 target.conditions, _rec = _add(
                     target.conditions, name="unconscious", source="death_saves",
                     description="Stable but unconscious.",
+                    visibility=staged_visibility,
                     provenance={"mutation_id": mutation_id}, mutation_id=f"{mutation_id}:stable",
                 )
+                _mark_npc_section(target, "conditions", staged_visibility)
             if state.dead:
                 try:
                     broke_state, _broke = _break_conc(target.concentration, reason="dead", mutation_id=f"{mutation_id}:conc")
                     target.concentration = broke_state
+                    _mark_npc_section(target, "concentration", staged_visibility)
                 except _StateError:
                     pass
             if state.outcome == "revived":
                 target.hp_current = max(target.hp_current or 0, state.revived_hp)
                 if _has(target.conditions, "unconscious"):
                     target.conditions, _rem = _remove(target.conditions, name="unconscious", mutation_id=f"{mutation_id}:wake")
+                    _mark_npc_section(target, "conditions", staged_visibility)
         elif op == "reset":
             state = _reset(target.successes, target.failures, reason=args.get("reset_reason"), mutation_id=mutation_id)
             target.successes, target.failures = state.successes, state.failures
+            _mark_npc_section(target, "death_saves", staged_visibility)
         else:
             raise ValueError(f"Staged effect {effect.get('id')!r} unknown death-save op {op!r}")
     except _StateError as exc:

@@ -206,6 +206,101 @@ def _check_visibility(visibility: str) -> str:
     return visibility
 
 
+# ── NPC rules-state visibility (issue #227 review round 1) ────────────────
+#
+# Staged effects default to dm_private (fail-closed). The promotion handlers
+# must preserve that visibility in persisted NPC WorldEntity.details, and
+# non-authority entity projections must redact DM-private sections. Code owns
+# both the marker writes and the redaction; decision models only choose
+# whether a transition happens.
+
+_DM_PRIVATE_VISIBILITIES = frozenset({"dm_private", "dm_only", "private"})
+
+RULES_STATE_VISIBILITY_KEY = "rules_state_visibility"
+
+RULES_STATE_SECTIONS = (
+    "conditions",
+    "resources",
+    "spell_slots",
+    "concentration",
+    "death_saves",
+    "exhaustion_level",
+)
+
+
+def is_rules_state_private(visibility: Any) -> bool:
+    """True when a staged/persisted visibility value is DM-only."""
+    return str(visibility or "dm_private") in _DM_PRIVATE_VISIBILITIES
+
+
+def mark_npc_section_visibility(details: dict[str, Any], section: str, visibility: Any) -> dict[str, Any]:
+    """Record the staged visibility for one NPC rules-state section. Pure.
+
+    Single canonical marker map (``details["rules_state_visibility"]``);
+    last-write-wins mirrors the stored section itself. Per-entry visibility
+    on conditions/concentration remains authoritative for mixed lists — this
+    marker covers the scalar/list sections (resources, slots, death saves,
+    exhaustion) that have no per-entry visibility lane.
+    """
+    if not isinstance(details, dict):
+        raise StateError("malformed_rules_state", "NPC details must be an object", field="details")
+    if section not in RULES_STATE_SECTIONS:
+        raise StateError("invalid_section", f"unknown rules-state section {section!r}", field="section")
+    marker = details.get(RULES_STATE_VISIBILITY_KEY)
+    if not isinstance(marker, dict):
+        marker = {}
+    else:
+        marker = dict(marker)
+    marker[section] = str(visibility or "dm_private")
+    details[RULES_STATE_VISIBILITY_KEY] = marker
+    return details
+
+
+def get_npc_section_visibility(details: dict[str, Any] | None, section: str) -> str:
+    """Stored section visibility; missing markers mean public (backward compat)."""
+    if not isinstance(details, dict):
+        return "public"
+    marker = details.get(RULES_STATE_VISIBILITY_KEY)
+    if isinstance(marker, dict) and marker.get(section) is not None:
+        return str(marker[section])
+    return "public"
+
+
+def project_npc_details_for_viewer(details: dict[str, Any] | None, is_authority: bool) -> dict[str, Any]:
+    """Authority-safe copy of NPC rules-state details.
+
+    Authority (campaign owner / DM) sees the stored shape unchanged.
+    Ordinary members see member-visible state only: DM-private conditions
+    are filtered, private concentration projects as inactive, and
+    DM-private resource/slot/death-save/exhaustion sections project as
+    empty/zeroed. The marker map itself never leaves the authority lane
+    (its presence would disclose that hidden state exists).
+    """
+    if not isinstance(details, dict):
+        return {}
+    if is_authority:
+        return {k: v for k, v in details.items()}
+    projected: dict[str, Any] = {k: v for k, v in details.items() if k != RULES_STATE_VISIBILITY_KEY}
+    conditions = projected.get("conditions")
+    if isinstance(conditions, list):
+        projected["conditions"] = [
+            c for c in conditions
+            if not (isinstance(c, dict) and is_rules_state_private(c.get("visibility", "public")))
+        ]
+    conc = projected.get("concentration")
+    if isinstance(conc, dict) and conc.get("active") and is_rules_state_private(conc.get("visibility", "public")):
+        projected["concentration"] = {"active": False}
+    if is_rules_state_private(get_npc_section_visibility(details, "resources")):
+        projected["resources"] = []
+    if is_rules_state_private(get_npc_section_visibility(details, "spell_slots")):
+        projected["spell_slots"] = {}
+    if is_rules_state_private(get_npc_section_visibility(details, "death_saves")):
+        projected["death_saves"] = {"successes": 0, "failures": 0}
+    if is_rules_state_private(get_npc_section_visibility(details, "exhaustion_level")):
+        projected["exhaustion_level"] = 0
+    return projected
+
+
 def _observe_invalid(code: str, **fields: Any) -> None:
     try:
         structured_log(logger, logging.WARNING, "rules_state_invalid_transition", invalid_transition=code, **fields)
@@ -984,7 +1079,7 @@ def record_death_save(
     elif result == "failure":
         new_f += 1
     elif result == "critical_failure":
-        new_f += 2
+        new_f = min(3, new_f + 2)
     else:  # critical_success: natural 20 — regain 1 HP, counters reset
         new_s, new_f = 0, 0
         revived_hp = 1

@@ -344,8 +344,12 @@ def test_death_save_progression_reset():
 
 def test_death_save_death_nat1_nat20():
     s = record_death_save(0, 2, result="critical_failure", mutation_id="ds-7")
-    assert s.failures == 4  # natural 1 counts double
+    assert s.failures == 3  # natural 1 counts double but clamps at the 0-3 canonical bound
     assert s.outcome == "dead" and s.dead is True
+
+    # A clamped terminal counter stays resettable via the canonical reset path.
+    cleared = reset_death_saves(s.successes, s.failures, reason="revived", mutation_id="ds-7b")
+    assert (cleared.successes, cleared.failures) == (0, 0)
 
     revived = record_death_save(1, 1, result="critical_success", mutation_id="ds-8")
     assert revived.outcome == "revived"
@@ -882,6 +886,84 @@ def test_staged_npc_hidden_state_applies_and_stays_structural():
         row = db.get(WorldEntity, brute.id)
         assert has_condition(row.details["conditions"], "poisoned") is True
         assert row.details["resources"][0]["current"] == 1
+
+
+def test_campaign_visible_npc_dm_private_state_redacted_for_members():
+    """DM-private mutations on a member-visible NPC stay structural but hidden (#227)."""
+    import uuid as _uuid
+
+    from app.dm.effects import apply_staged_effects
+    from app.rules.state import project_npc_details_for_viewer
+    from app.world.service import project_entity_for_viewer
+    from models.world import WorldEntity
+
+    factory = _handler_db()
+    with factory() as db:
+        camp, turn, attempt, _char, _brute = _handler_fixture(db)
+        visible = WorldEntity(
+            id=_uuid.uuid4(),
+            campaign_id=camp.id,
+            entity_type="monster",
+            name="Scout",
+            status="active",
+            visibility="campaign",
+            details={
+                "hit_points": {"current": 12, "maximum": 12, "temporary": 0},
+                "resources": [{"name": "Rage", "current": 2, "maximum": 2}],
+                "conditions": [],
+                "spell_slots": {"1": {"max": 2, "used": 0}},
+                "death_saves": {"successes": 0, "failures": 0},
+                "exhaustion_level": 0,
+            },
+        )
+        db.add(visible)
+        db.commit()
+        apply_staged_effects(db, camp, [
+            build_condition_effect(
+                effect_id="vis-cond", mutation_id="vis-m1", target_kind="npc",
+                target_id=str(visible.id), op="add", condition="poisoned",
+                source="venom",
+            ),
+            build_resource_effect(
+                effect_id="vis-res", mutation_id="vis-m2", target_kind="npc",
+                target_id=str(visible.id), op="spend", resource="Rage",
+            ),
+            build_concentration_effect(
+                effect_id="vis-conc", mutation_id="vis-m3", target_kind="npc",
+                target_id=str(visible.id), op="start", effect_name="Hex",
+                concentration_effect_id="eff-hex", source="spell",
+            ),
+            build_death_save_effect(
+                effect_id="vis-ds", mutation_id="vis-m4", target_kind="npc",
+                target_id=str(visible.id), op="record", result="failure",
+            ),
+        ], turn, attempt)
+        db.commit()
+        row = db.get(WorldEntity, visible.id)
+        # Authority lane keeps the full structural state for mechanics/audit.
+        assert has_condition(row.details["conditions"], "poisoned") is True
+        assert row.details["conditions"][0]["visibility"] == "dm_private"
+        assert row.details["resources"][0]["current"] == 1
+        assert row.details["concentration"]["effect_name"] == "Hex"
+        assert row.details["death_saves"] == {"successes": 0, "failures": 1}
+
+        member_details = project_npc_details_for_viewer(row.details, False)
+        assert "poisoned" not in str(member_details)
+        assert member_details["conditions"] == []
+        assert member_details["resources"] == []
+        assert member_details["spell_slots"] == {} or "Hex" not in str(member_details.get("concentration"))
+        assert member_details.get("concentration", {}).get("active") is False
+        assert "Hex" not in str(member_details)
+        assert member_details["death_saves"] == {"successes": 0, "failures": 0}
+        assert "rules_state_visibility" not in member_details
+
+        member_view = project_entity_for_viewer(row, False)
+        assert "poisoned" not in str(member_view["details"])
+        assert "Hex" not in str(member_view["details"])
+        assert member_view["visibility"] == "campaign"
+
+        authority_view = project_entity_for_viewer(row, True)
+        assert has_condition(authority_view["details"]["conditions"], "poisoned") is True
 
 
 def test_multi_effect_mutation_is_transactional_with_source_turn():
