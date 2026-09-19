@@ -195,20 +195,25 @@ def test_consume_action_bonus_movement_and_double_consume_fails_closed():
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         assert active_id == owner_p.id
         state = consume_resource(
-            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action")
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action",
+            expected_turn_sequence=1)
         assert state.action_available is False
         assert state.bonus_action_available is True
         with pytest.raises(TurnError, match="already consumed"):
-            consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action")
+            consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action",
+                             expected_turn_sequence=1)
         state = consume_resource(
-            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="bonus_action")
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="bonus_action",
+            expected_turn_sequence=1)
         assert state.bonus_action_available is False
         state = consume_resource(
-            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=10)
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=10,
+            expected_turn_sequence=1)
         assert state.movement_remaining == 20
         with pytest.raises(TurnError, match="insufficient movement"):
             consume_resource(
-                db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=25)
+                db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=25,
+                expected_turn_sequence=1)
         # Failed consumption leaves the budget untouched.
         assert db.get(EncounterTurnState, state.id).movement_remaining == 20
 
@@ -220,11 +225,13 @@ def test_reaction_consumable_off_turn_as_explicit_exception():
         player_p = _pc(db, encounter.id, ctx["player_pc"])
         assert encounter.active_participant_id != player_p.id
         state = consume_resource(
-            db, encounter.id, player_p.id, actor_id=ctx["player"], resource="reaction")
+            db, encounter.id, player_p.id, actor_id=ctx["player"], resource="reaction",
+            expected_turn_sequence=1)
         assert state.reaction_available is False
         with pytest.raises(TurnError, match="already consumed"):
             consume_resource(
-                db, encounter.id, player_p.id, actor_id=ctx["player"], resource="reaction")
+                db, encounter.id, player_p.id, actor_id=ctx["player"], resource="reaction",
+                expected_turn_sequence=1)
 
 
 def test_out_of_turn_consume_rejected_and_counted():
@@ -234,14 +241,47 @@ def test_out_of_turn_consume_rejected_and_counted():
         player_p = _pc(db, encounter.id, ctx["player_pc"])
         with pytest.raises(TurnError, match="only the active participant"):
             consume_resource(
-                db, encounter.id, player_p.id, actor_id=ctx["player"], resource="action")
+                db, encounter.id, player_p.id, actor_id=ctx["player"], resource="action",
+                expected_turn_sequence=1)
         assert db.get(Encounter, encounter.id).invalid_attempt_count == 1
         # Wrong actor for the active PC is a 403-class failure, also counted.
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         with pytest.raises(TurnAuthorizationError):
             consume_resource(
-                db, encounter.id, owner_p.id, actor_id=ctx["player"], resource="action")
+                db, encounter.id, owner_p.id, actor_id=ctx["player"], resource="action",
+                expected_turn_sequence=1)
         assert db.get(Encounter, encounter.id).invalid_attempt_count == 2
+
+
+def test_stale_consume_after_round_rollover_fails_closed():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter = _ready_two_pc(db, ctx)
+        owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+        assert encounter.active_participant_id == owner_p.id
+        # Cycle the owner back to active in round 2 without spending.
+        rev = _revision(db, ctx)
+        end_turn(db, encounter.id, actor_id=ctx["owner"],
+                 expected_turn_sequence=1, expected_revision=rev)
+        rev = _revision(db, ctx)
+        end_turn(db, encounter.id, actor_id=ctx["player"],
+                 expected_turn_sequence=2, expected_revision=rev)
+        revived = db.get(Encounter, encounter.id)
+        assert revived.turn_sequence == 3
+        assert revived.active_participant_id == owner_p.id
+        assert revived.round == 2
+        # A delayed command bound to turn 1 must not spend round 2's action.
+        with pytest.raises(StaleTurnError):
+            consume_resource(
+                db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action",
+                expected_turn_sequence=1)
+        fresh = get_turn_state_row(db, encounter.id, owner_p.id)
+        assert fresh.action_available is True
+        # The live turn still consumes exactly once.
+        state = consume_resource(
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action",
+            expected_turn_sequence=3)
+        assert state.action_available is False
 
 
 def test_extra_resources_seeded_consumed_and_reset():
@@ -253,11 +293,13 @@ def test_extra_resources_seeded_consumed_and_reset():
             db, encounter.id, owner_p.id, name="surge", maximum=1)
         assert state.extra_resources == {"surge": {"max": 1, "remaining": 1}}
         state = consume_resource(
-            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="extra:surge")
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="extra:surge",
+            expected_turn_sequence=1)
         assert state.extra_resources == {"surge": {"max": 1, "remaining": 0}}
         with pytest.raises(TurnError, match="not available"):
             consume_resource(
-                db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="extra:surge")
+                db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="extra:surge",
+                expected_turn_sequence=1)
         # Full round later the extra resets to max at the owner's turn start.
         rev = _revision(db, ctx)
         end_turn(db, encounter.id, actor_id=ctx["owner"],
@@ -274,8 +316,10 @@ def test_resources_reset_at_own_turn_start():
     with fac() as db:
         encounter = _ready_two_pc(db, ctx)
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
-        consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action")
-        consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=15)
+        consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="action",
+                         expected_turn_sequence=1)
+        consume_resource(db, encounter.id, owner_p.id, actor_id=ctx["owner"], resource="movement", amount=15,
+                         expected_turn_sequence=1)
         rev = _revision(db, ctx)
         end_turn(db, encounter.id, actor_id=ctx["owner"],
                  expected_turn_sequence=1, expected_revision=rev)
@@ -561,7 +605,7 @@ def test_state_reconstructs_exactly_after_reconnect(tmp_path):
         player_p = _pc(db, encounter.id, ctx["player_pc"])
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         consume_resource(db, encounter.id, player_p.id, actor_id=ctx["player"],
-                         resource="movement", amount=5)
+                         resource="movement", amount=5, expected_turn_sequence=1)
         cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["owner"],
                        expected_revision=_revision(db, ctx))
         cast_skip_vote(db, encounter.id, player_p.id, voter_id=ctx["third"],
@@ -751,9 +795,23 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
         # Out-of-turn consumption is rejected over HTTP.
         oot = client.post(
             f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-resources/consume",
-            json={"participant_id": str(player_p.id), "resource": "action"},
+            json={"participant_id": str(player_p.id), "resource": "action",
+                  "expected_turn_sequence": 2},
             headers={**player_h, "Idempotency-Key": "consume-oot-1"})
         assert oot.status_code == 422, oot.text
+        # Missing turn binding is a 400; stale turn binding is a 409.
+        missing_seq = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-resources/consume",
+            json={"participant_id": str(player_p.id), "resource": "action"},
+            headers={**player_h, "Idempotency-Key": "consume-missing-seq-1"})
+        assert missing_seq.status_code == 400, missing_seq.text
+        stale_consume = client.post(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-resources/consume",
+            json={"participant_id": str(player_p.id), "resource": "action",
+                  "expected_turn_sequence": 1},
+            headers={**player_h, "Idempotency-Key": "consume-stale-1"})
+        assert stale_consume.status_code == 409, stale_consume.text
+        assert stale_consume.headers["X-Current-Turn-Sequence"] == "2"
         # Owner skip-votes the now-active owner PC? No — owner is active;
         # advance to the player then skip them via owner vote.
         first_active = first.json()["encounter"]["active_participant_id"]

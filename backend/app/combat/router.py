@@ -473,6 +473,9 @@ def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, re
     resource = payload.get("resource")
     if not resource:
         raise HTTPException(status_code=422, detail="resource is required")
+    if payload.get("expected_turn_sequence") is None:
+        raise HTTPException(status_code=400, detail="expected_turn_sequence is required")
+    expected_sequence = payload["expected_turn_sequence"]
     key = require_idempotency_key(request, payload.get("operation_id"))
 
     def execute():
@@ -480,7 +483,8 @@ def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, re
             # Flush-only: the outer idempotent command owns the commit.
             state = consume_resource(
                 db, encounter.id, participant_id, actor_id=profile.id,
-                resource=str(resource), amount=payload.get("amount", 1), commit=False,
+                resource=str(resource), amount=payload.get("amount", 1),
+                expected_turn_sequence=expected_sequence, commit=False,
             )
             return {
                 "encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id),

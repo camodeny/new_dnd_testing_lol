@@ -305,6 +305,7 @@ def consume_resource(
     actor_id: uuid.UUID,
     resource: str,
     amount: int = 1,
+    expected_turn_sequence: int,
     commit: bool = True,
 ) -> EncounterTurnState:
     """Consume one turn-bound resource under the active-turn gate.
@@ -315,9 +316,20 @@ def consume_resource(
     consumes a seeded per-turn resource for the active participant.
     Out-of-turn and wrong-actor attempts fail closed and count toward the
     encounter's invalid-attempt observability.
+
+    The caller binds the source turn it observed
+    (``expected_turn_sequence``): a mismatch raises StaleTurnError without
+    consuming, so a delayed command from turn N can never spend the same
+    participant's budget when they become active again in a later round.
     """
     encounter = _lock_encounter(db, encounter_id)
     _require_playable(db, encounter.campaign_id)
+    try:
+        expected_turn_sequence = int(expected_turn_sequence)
+    except (TypeError, ValueError) as exc:
+        raise TurnError("expected_turn_sequence must be an integer") from exc
+    if expected_turn_sequence != int(encounter.turn_sequence or 0):
+        raise StaleTurnError(expected_turn_sequence, int(encounter.turn_sequence or 0))
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise TurnError("participant not found in this encounter")
