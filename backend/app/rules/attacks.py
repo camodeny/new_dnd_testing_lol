@@ -728,7 +728,18 @@ class HPChange(StrictModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
 
     def public_projection(self) -> dict[str, Any]:
-        return self.model_dump(mode="json")
+        """Observable outcome only: exact HP snapshots stay DM-private.
+
+        Before/after current/maximum/temporary values can be hidden NPC
+        stats, so the public form carries just the change kind and whether
+        the target dropped — both observable at a shared table — and never
+        HP numbers.
+        """
+        return {
+            "change_id": self.change_id,
+            "kind": self.kind,
+            "is_down": self.is_down,
+        }
 
 
 # ── Core resolution ───────────────────────────────────────────────────────
@@ -1410,7 +1421,12 @@ def damage_domain_event(
 ) -> tuple[str, dict[str, Any], str]:
     """(event_type, payload, visibility) triple for commit_campaign_mutation."""
     payload = damage.to_event_payload(include_private=include_private)
-    payload["hp_change"] = hp_change.public_projection() if hp_change else None
+    if hp_change is None:
+        payload["hp_change"] = None
+    elif include_private:
+        payload["hp_change"] = hp_change.model_dump(mode="json")
+    else:
+        payload["hp_change"] = hp_change.public_projection()
     return (DAMAGE_APPLIED_EVENT, payload, visibility)
 
 

@@ -948,7 +948,71 @@ def test_domain_event_builders():
     )
     assert event_type == "damage.applied"
     assert payload["final_total"] == 5
-    assert payload["hp_change"]["after"]["current"] == 5
+    # Public HP payload is redacted: no exact snapshots, only the observable
+    # outcome (kind + whether the target dropped).
+    assert payload["hp_change"] == {
+        "change_id": "evt-hp",
+        "kind": "damage",
+        "is_down": False,
+    }
+    assert "current" not in str(payload["hp_change"])
+    assert "maximum" not in str(payload["hp_change"])
+    # DM-private path still carries the full change for audit/replay.
+    _, private_payload, _ = damage_domain_event(
+        damage, hp_change, include_private=True
+    )
+    assert private_payload["hp_change"]["after"]["current"] == 5
+    assert private_payload["hp_change"]["before"] == {
+        "current": 10,
+        "maximum": 10,
+        "temporary": 0,
+    }
+
+
+def test_public_damage_event_never_exposes_hidden_npc_hp():
+    """Hidden-NPC HP state stays DM-only on the public damage path (#226)."""
+    import json
+
+    attacker = attacker_from_npc(attack_bonus=4, attack_name="Claw")
+    defender = defender_from_npc(armor_class=13)
+    attack = resolve_attack_roll(
+        attacker=attacker,
+        defender=defender,
+        attacker_kind="npc",
+        dice=[15],
+        attack_id="hide-hp-atk",
+    )
+    spec = make_damage_spec(num_dice=2, die_size=6, modifier=2)
+    damage = resolve_damage(
+        spec=spec,
+        damage_rolls=[5, 5],
+        attacker_kind="npc",
+        defender=defender,
+        die_visibility="hidden",
+        damage_id="hide-hp-dmg",
+        attack_id=attack.attack_id,
+    )
+    hp_change = apply_damage(
+        HitPoints(current=30, maximum=30, temporary=4),
+        damage.final_total,
+        change_id="hide-hp-chg",
+    )
+    full = resolve_full_attack(
+        attacker=attacker,
+        defender=defender,
+        attacker_kind="npc",
+        attack_dice=[15],
+        attack_id="hide-hp-full",
+    )
+    assert full.attack.outcome == "hit"
+    event_type, payload, visibility = damage_domain_event(
+        damage, hp_change, include_private=False
+    )
+    assert event_type == "damage.applied"
+    blob = json.dumps(payload, default=str)
+    for leaked in ('"current"', '"maximum"', '"temporary"', '"before"', '"after"'):
+        assert leaked not in blob
+    assert payload["hp_change"]["is_down"] is False  # observable outcome kept
 
 
 # ── Staged-effect promotion (PC sheet + NPC entity) ───────────────────────
