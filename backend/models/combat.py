@@ -120,6 +120,20 @@ class Encounter(Base):
     initiative_wait_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     time_to_first_turn_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     roll_sources: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # ── Turn progression (issue #231) ─────────────────────────────────────
+    # Monotonic per-encounter turn counter: 0 until initiative is ready, 1 for
+    # the first turn, +1 on every end-turn/skip advance. End-turn and skip
+    # commands bind the sequence they observed (source turn); a mismatch
+    # fails closed as stale instead of advancing twice.
+    turn_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    turn_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Set when the party opens a skip vote against the blocking active PC;
+    # cleared on every advance. Observability: blocked-on-player duration.
+    blocked_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    skipped_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    invalid_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_turn_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    last_end_turn_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -153,6 +167,13 @@ class Encounter(Base):
             "initiative_wait_ms": self.initiative_wait_ms,
             "time_to_first_turn_ms": self.time_to_first_turn_ms,
             "roll_sources": dict(self.roll_sources or {}),
+            "turn_sequence": int(self.turn_sequence or 0),
+            "turn_started_at": self.turn_started_at.isoformat() if self.turn_started_at else None,
+            "blocked_since": self.blocked_since.isoformat() if self.blocked_since else None,
+            "skipped_count": int(self.skipped_count or 0),
+            "invalid_attempt_count": int(self.invalid_attempt_count or 0),
+            "last_turn_duration_ms": self.last_turn_duration_ms,
+            "last_end_turn_latency_ms": self.last_end_turn_latency_ms,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -252,3 +273,104 @@ class EncounterParticipant(Base):
                 roll_source=self.roll_source,
             )
         return value
+
+
+class EncounterTurnState(Base):
+    """Durable per-participant action economy — issue #231.
+
+    One row per encounter participant, created when initiative completes.
+    Resources reset at the participant's own turn start (action, bonus
+    action, movement to max, reaction per 2024 refresh, per-turn extras to
+    max). Current-state rows are authoritative for reads; turn Started/Ended
+    domain events provide provenance.
+    """
+
+    __tablename__ = "encounter_turn_states"
+    __table_args__ = (
+        UniqueConstraint("encounter_id", "participant_id", name="uq_turn_states_encounter_participant"),
+        Index("ix_turn_states_encounter", "encounter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounter_participants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    action_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    bonus_action_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    reaction_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default="true")
+    movement_remaining: Mapped[int] = mapped_column(Integer, nullable=False, default=30, server_default="30")
+    movement_max: Mapped[int] = mapped_column(Integer, nullable=False, default=30, server_default="30")
+    # Extensible per-turn resources: {name: {"max": int, "remaining": int}}.
+    extra_resources: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    turn_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    turn_ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "participant_id": str(self.participant_id),
+            "action_available": bool(self.action_available),
+            "bonus_action_available": bool(self.bonus_action_available),
+            "reaction_available": bool(self.reaction_available),
+            "movement_remaining": int(self.movement_remaining),
+            "movement_max": int(self.movement_max),
+            "extra_resources": dict(self.extra_resources or {}),
+            "turn_started_at": self.turn_started_at.isoformat() if self.turn_started_at else None,
+            "turn_ended_at": self.turn_ended_at.isoformat() if self.turn_ended_at else None,
+        }
+
+
+class EncounterSkipVote(Base):
+    """Durable party skip vote — issue #231.
+
+    One row per (encounter, target, turn sequence, voter). Votes are scoped
+    to the turn sequence active when cast so stale votes from earlier turns
+    never accumulate toward a later skip. A skipped PC is never AI-played:
+    skip advances initiative with no actions generated.
+    """
+
+    __tablename__ = "encounter_skip_votes"
+    __table_args__ = (
+        UniqueConstraint(
+            "encounter_id", "target_participant_id", "turn_sequence", "voter_user_id",
+            name="uq_skip_votes_encounter_target_seq_voter",
+        ),
+        Index("ix_skip_votes_encounter", "encounter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    target_participant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounter_participants.id", ondelete="CASCADE"), nullable=False
+    )
+    voter_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    turn_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "target_participant_id": str(self.target_participant_id),
+            "voter_user_id": str(self.voter_user_id) if self.voter_user_id else None,
+            "turn_sequence": int(self.turn_sequence or 0),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

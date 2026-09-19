@@ -217,6 +217,31 @@ def build_encounter_ready_event(encounter, *, revision: int | None = None) -> di
     }
 
 
+def build_encounter_turn_event(encounter, kind: str, *, revision: int | None = None) -> dict[str, Any]:
+    """Projection for turn progression — issue #231.
+
+    ``kind`` is one of ``started`` / ``ended`` / ``skipped``. Payloads carry
+    turn order positions and round/sequence only — never resource budgets or
+    hidden stat breakdowns (members converge via the snapshot projection).
+    """
+    return {
+        "type": f"encounter.turn_{kind}",
+        "event_id": f"encounter:{encounter.id}:turn:{int(encounter.turn_sequence or 0)}:{kind}",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "round": int(encounter.round or 1),
+        "revision": int(revision) if revision is not None else None,
+        "turn_sequence": int(encounter.turn_sequence or 0),
+        "active_participant_id": str(encounter.active_participant_id) if encounter.active_participant_id else None,
+        "active_index": int(encounter.active_index or 0),
+        "skipped_count": int(encounter.skipped_count or 0),
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:turn:{int(encounter.turn_sequence or 0)}:{kind}",
+    }
+
+
 # ── publisher abstraction ───────────────────────────────────────────────────
 
 class RealtimePublisher:
@@ -467,6 +492,26 @@ def publish_encounter_ready(db: Session, encounter) -> bool:
     except Exception as exc:
         _inc("publish_failures")
         logger.warning("publish_encounter_ready failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
+        return False
+
+
+def publish_encounter_turn(db: Session, encounter, kind: str) -> bool:
+    """Publish a turn progression projection (best-effort, post-commit).
+
+    ``kind`` is ``started`` / ``ended`` / ``skipped``. Same durability
+    contract as the lifecycle publishers: the outbox row committed with the
+    mutation is the guaranteed hook; this is latency-only with stable event
+    ids so replays stay idempotent.
+    """
+    if kind not in ("started", "ended", "skipped"):
+        return False
+    try:
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(db, encounter, build_encounter_turn_event(encounter, kind, revision=revision))
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_turn failed encounter_id=%s kind=%s error=%s", getattr(encounter, "id", "?"), kind, exc)
         return False
 
 

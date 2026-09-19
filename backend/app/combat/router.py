@@ -1,4 +1,5 @@
-"""HTTP transport for the authoritative encounter lifecycle — issue #230."""
+"""HTTP transport for the authoritative encounter lifecycle — issue #230,
+turn progression — issue #231."""
 import logging
 import uuid
 
@@ -21,6 +22,15 @@ from app.combat.service import (
     list_participants,
     roll_npc_initiative,
     start_encounter,
+)
+from app.combat.turns import (
+    StaleTurnError,
+    TurnAuthorizationError,
+    TurnError,
+    cast_skip_vote,
+    consume_resource,
+    end_turn,
+    turn_projection,
 )
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
@@ -71,7 +81,11 @@ def _publish_post_commit(db: Session, result: dict) -> None:
     rolls back authoritative state. Stable event ids make replays idempotent.
     """
     try:
-        from app.realtime.service import publish_encounter_ready, publish_encounter_started
+        from app.realtime.service import (
+            publish_encounter_ready,
+            publish_encounter_started,
+            publish_encounter_turn,
+        )
 
         encounter_id = (result.get("encounter") or {}).get("id")
         if not encounter_id:
@@ -83,6 +97,14 @@ def _publish_post_commit(db: Session, result: dict) -> None:
             publish_encounter_started(db, encounter)
         if result.get("ready_event") is not None:
             publish_encounter_ready(db, encounter)
+            # Readiness opens turn 1 atomically (#231): project it too.
+            publish_encounter_turn(db, encounter, "started")
+        if result.get("ended_event") is not None:
+            publish_encounter_turn(db, encounter, "ended")
+        if result.get("skipped_event") is not None:
+            publish_encounter_turn(db, encounter, "skipped")
+        if result.get("started_event") is not None:
+            publish_encounter_turn(db, encounter, "started")
     except Exception:
         logger.warning("encounter post-commit publish skipped", exc_info=True)
 
@@ -295,4 +317,183 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
         payload=payload, execute=execute,
     )
     _publish_post_commit(db, result)
+    return result
+
+
+# ── Turn progression — issue #231 ────────────────────────────────────────────
+
+
+def _turn_http_error(exc: Exception) -> HTTPException:
+    """Map deterministic turn failures to transport status (never 500)."""
+    if isinstance(exc, StaleTurnError):
+        return HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Turn-Sequence": str(exc.actual_sequence)},
+        )
+    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError)):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, CampaignArchivedError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, (TurnError, EncounterError)):
+        message = str(exc)
+        status = 409 if any(
+            token in message for token in ("status", "already", "advanced", "pending", "blocking")
+        ) else 422
+        return HTTPException(status_code=status, detail=message)
+    if isinstance(exc, RevisionConflictError):
+        return HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        )
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _require_revision(payload: dict) -> int:
+    expected_revision = payload.get("expected_revision")
+    if expected_revision is None:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    try:
+        return int(expected_revision)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+
+
+@router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-state")
+def read_turn_state(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    projection = turn_projection(db, encounter)
+    if projection is None:
+        raise HTTPException(status_code=409, detail="turn state becomes available when required initiative is complete")
+    return {"encounter_id": str(encounter.id), "turn": projection}
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-turn")
+def post_end_turn(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+    if payload.get("expected_turn_sequence") is None:
+        raise HTTPException(status_code=400, detail="expected_turn_sequence is required")
+    expected_sequence = payload["expected_turn_sequence"]
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit so the
+            # record, state change, and both turn events commit atomically.
+            updated, ended_event, started_event = end_turn(
+                db, encounter.id, actor_id=profile.id,
+                expected_turn_sequence=expected_sequence,
+                expected_revision=expected_revision, commit=False,
+            )
+            return {
+                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "ended_event": ended_event.to_dict() if hasattr(ended_event, "to_dict") else None,
+                "started_event": started_event.to_dict() if hasattr(started_event, "to_dict") else None,
+                "turn_sequence": int(updated.turn_sequence or 0),
+            }
+        except Exception as exc:
+            raise _turn_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.end_turn", scope_type="encounter", scope_id=encounter.id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_post_commit(db, result)
+    return result
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/skip-votes")
+def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    target_raw = payload.get("target_participant_id")
+    if not target_raw:
+        raise HTTPException(status_code=422, detail="target_participant_id is required")
+    target_id = _id(str(target_raw), "participant id")
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit.
+            tally, executed, updated, skipped_event, started_event = cast_skip_vote(
+                db, encounter.id, target_id, voter_id=profile.id,
+                expected_revision=expected_revision, commit=False,
+            )
+            return {
+                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "tally": tally,
+                "executed": executed,
+                "skipped_event": skipped_event.to_dict() if skipped_event is not None and hasattr(skipped_event, "to_dict") else None,
+                "started_event": started_event.to_dict() if started_event is not None and hasattr(started_event, "to_dict") else None,
+            }
+        except Exception as exc:
+            raise _turn_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.skip_vote", scope_type="encounter", scope_id=encounter.id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_post_commit(db, result)
+    return result
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-resources/consume")
+def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    participant_raw = payload.get("participant_id")
+    if not participant_raw:
+        raise HTTPException(status_code=422, detail="participant_id is required")
+    participant_id = _id(str(participant_raw), "participant id")
+    resource = payload.get("resource")
+    if not resource:
+        raise HTTPException(status_code=422, detail="resource is required")
+    key = require_idempotency_key(request, payload.get("operation_id"))
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit.
+            state = consume_resource(
+                db, encounter.id, participant_id, actor_id=profile.id,
+                resource=str(resource), amount=payload.get("amount", 1), commit=False,
+            )
+            return {
+                "encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id),
+                "participant_id": str(participant_id),
+                "resource": str(resource),
+                "turn_state": state.to_dict(),
+            }
+        except Exception as exc:
+            raise _turn_http_error(exc) from exc
+
+    result = execute_http_idempotent(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.consume", scope_type="encounter_participant", scope_id=participant_id,
+        payload=payload, execute=execute,
+    )
     return result
