@@ -235,10 +235,12 @@ def build_direct_contract(selected_id: str) -> DmTurnContractV1:
     )
 
 
-def _silent_still_legal(
-    frame: DecisionFrame, submission_ids: tuple[str, ...]
-) -> Any:
-    """Legality closure: silent stays legal while the input set is unchanged."""
+def _silent_still_legal(frame: DecisionFrame) -> Any:
+    """Legality closure: the selection must belong to the frame.
+
+    Input-set drift is checked separately by comparing the frame-time and
+    freshly re-read submission sets in :func:`decide_from_result`.
+    """
 
     def _check(candidate: CandidateRecord) -> bool:
         if candidate.id != ROUTE_SILENT_ID:
@@ -251,7 +253,6 @@ def _silent_still_legal(
             return False
         return True
 
-    _ = submission_ids
     return _check
 
 
@@ -260,11 +261,17 @@ def decide_from_result(
     result: ChoiceResult,
     *,
     current_revision: str | int,
-    submission_ids: tuple[str, ...],
+    frame_submission_ids: tuple[str, ...] = (),
+    current_submission_ids: tuple[str, ...] | None = None,
+    submission_ids: tuple[str, ...] = (),
 ) -> RoutingOutcome:
     """Apply policy + revalidation to one decision result.
 
     Pure (no I/O): shared by the service path and unit tests.
+    ``frame_submission_ids`` is the input set the frame was enumerated
+    against; ``current_submission_ids`` is the freshly re-read set (defaults
+    to ``submission_ids`` for backward-compatible callers). Any drift
+    escalates instead of executing against stale input.
     """
     from app.decisions.policy import alternative_margin
 
@@ -279,13 +286,27 @@ def decide_from_result(
         verified=True,
     )
     base_trace = policy_trace(frame, verdict)
+    # Backward-compatible default: callers that pass one set assert it is
+    # both the frame-time and the current set.
+    frame_ids = tuple(frame_submission_ids) or tuple(submission_ids)
+    live_ids = (
+        tuple(current_submission_ids)
+        if current_submission_ids is not None
+        else tuple(submission_ids)
+    )
     if verdict.directive == DIRECT_EXECUTE:
         try:
+            if frame_ids != live_ids:
+                raise DecisionError(
+                    "decision frame input set changed during the decision call; "
+                    "escalating to the generative path",
+                    kind="stale",
+                )
             revalidate_for_execution(
                 frame,
                 verdict.selected_id,
                 current_revision,
-                still_legal=_silent_still_legal(frame, submission_ids),
+                still_legal=_silent_still_legal(frame),
             )
             contract = build_direct_contract(verdict.selected_id)
         except DecisionError as exc:
@@ -334,9 +355,9 @@ def decide_from_result(
             "probability": verdict.probability,
             "confidence": verdict.confidence,
             "margin": margin,
-            # Advisory only: the generative adjudicator is never forced to
-            # agree. Prompt-level injection of the prior is a follow-up;
-            # today the primer travels as trace/diagnostic metadata.
+            # Advisory only: execution attaches this to the adjudication
+            # packet via attach_primer, and the generative adjudicator is
+            # never forced to agree.
         }
         return RoutingOutcome(
             directive=PRIMER_ADVISORY,
@@ -447,6 +468,175 @@ def current_revision(db: Any, campaign_id: Any) -> str | int:
     return campaign.revision
 
 
+def assert_attempt_current(db: Any, attempt: Any) -> tuple[str, ...]:
+    """Require the attempt to still own its turn's input set.
+
+    Re-reads the turn and attempt rows (refreshing cached ORM state) and
+    requires this attempt to still be ``turn.current_attempt_id`` with the
+    same ``input_set_revision`` and submission set. A superseding
+    submission — which does not bump campaign revision — otherwise lets a
+    decision made on stale input resolve the old attempt and strand the
+    player's newer input. Returns the freshly read submission IDs.
+    Raises :exc:`DecisionError` (stale) on any drift.
+    """
+    from models.dm import DmTurn, DmTurnAttempt
+
+    try:
+        db.refresh(attempt)
+    except Exception:
+        pass
+    fresh_attempt = db.get(DmTurnAttempt, attempt.id)
+    if fresh_attempt is None:
+        raise DecisionError(
+            "decision routing attempt disappeared; escalating",
+            kind="stale",
+        )
+    try:
+        db.refresh(fresh_attempt)
+    except Exception:
+        pass
+    turn = db.get(DmTurn, fresh_attempt.turn_id)
+    if turn is None:
+        raise DecisionError(
+            "decision routing turn is missing; escalating",
+            kind="stale",
+        )
+    try:
+        db.refresh(turn)
+    except Exception:
+        pass
+    if turn.current_attempt_id != fresh_attempt.id:
+        raise DecisionError(
+            "decision routing attempt is no longer the current attempt; "
+            "a newer submission superseded it",
+            kind="stale",
+        )
+    if turn.input_set_revision != fresh_attempt.input_set_revision:
+        raise DecisionError(
+            "decision routing input set revision moved on; escalating",
+            kind="stale",
+        )
+    if list(turn.submission_ids or []) != list(fresh_attempt.submission_ids or []):
+        raise DecisionError(
+            "decision routing submission set changed; escalating",
+            kind="stale",
+        )
+    if str(getattr(fresh_attempt, "status", "")) in (
+        "superseded",
+        "abandoned",
+        "discarded",
+        "succeeded",
+        "failed_visible",
+        "failed",
+    ):
+        raise DecisionError(
+            f"decision routing attempt is {fresh_attempt.status}; escalating",
+            kind="stale",
+        )
+    # Resumed player-roll attempts carry fulfilled roll outcomes as evidence
+    # for the generative adjudicator. There is no bounded roll-continuation
+    # route yet, so any non-empty roll evidence escalates: silently
+    # resolving here would discard the player-owned roll outcome.
+    if fresh_attempt.roll_evidence:
+        raise DecisionError(
+            "decision routing defers to the generative path when resumed "
+            "roll evidence is present",
+            kind="stale",
+        )
+    return tuple(str(s) for s in (fresh_attempt.submission_ids or []))
+
+
+def _fresh_roll_evidence(db: Any, attempt: Any) -> list[Any]:
+    """Re-read resumed roll evidence (refreshing cached ORM state)."""
+    from models.dm import DmTurnAttempt
+
+    try:
+        db.refresh(attempt)
+    except Exception:
+        pass
+    fresh = db.get(DmTurnAttempt, attempt.id)
+    if fresh is None:
+        return []
+    try:
+        db.refresh(fresh)
+    except Exception:
+        pass
+    return list(fresh.roll_evidence or [])
+
+
+PRIMER_RECORD_PREFIX = "decision-primer:"
+
+
+def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
+    """Attach a primer advisory to the adjudication packet (non-authoritative).
+
+    Returns a copy of the packet with one ``adjudication_only`` record
+    appended to the player-inputs lane, so the generative adjudicator can
+    observe the bounded route lean without being forced to agree. The
+    record is idempotent by stable record ID and never reaches narration
+    (``adjudication_only`` records are stripped from the narration
+    projection). Raises :exc:`DecisionError` (malformed) when the packet
+    shape is unexpected — callers escalate without the primer in that case.
+    """
+    from app.dm.context import (
+        AuthorizationScope,
+        ContextRecord,
+        LaneName,
+        SourceRef,
+    )
+
+    frame_id = str(primer.get("frame_id") or "unknown")
+    record_id = f"{PRIMER_RECORD_PREFIX}{frame_id}"
+    try:
+        audience = packet.audience
+        lanes = list(packet.lanes)
+        lane_index = next(
+            i for i, lane in enumerate(lanes) if lane.name == LaneName.PLAYER_INPUTS
+        )
+    except Exception as exc:
+        raise DecisionError(
+            f"primer attachment needs a player-inputs lane: {exc}",
+            kind="malformed",
+        ) from exc
+    if any(r.record_id == record_id for r in lanes[lane_index].records):
+        return packet
+    record = ContextRecord(
+        record_id=record_id,
+        value={
+            "advisory_route": primer.get("selected_id"),
+            "label": f"Bounded routing leans toward {primer.get('selected_id')}",
+            "probability": primer.get("probability"),
+            "confidence": primer.get("confidence"),
+            "margin": primer.get("margin"),
+            "authority": (
+                "advisory only: the adjudicator weighs this prior against "
+                "the full authoritative context and is not bound by it"
+            ),
+        },
+        sources=[
+            SourceRef(
+                source_type="decision_primer",
+                source_id=frame_id,
+                source_version="1",
+                campaign_revision=None,
+                provenance={"decision_class": FORWARD_DM_ROUTE_CLASS},
+            )
+        ],
+        authorization=AuthorizationScope(
+            campaign_id=str(audience.campaign_id),
+            thread_ids=[str(audience.thread_id)],
+            user_ids=[],
+        ),
+        visibility="campaign",
+        use="adjudication_only",
+        required=False,
+        priority=5,
+    )
+    primed = packet.model_copy(deep=True)
+    primed.lanes[lane_index].records.append(record)
+    return primed
+
+
 def route_attempt(
     db: Any,
     *,
@@ -460,6 +650,18 @@ def route_attempt(
     Never raises for decision-plane problems — those escalate. Unexpected
     errors also escalate so a router bug cannot wedge turn execution.
     """
+    # Resumed player-roll attempts carry fulfilled outcomes as evidence for
+    # the generative adjudicator; there is no bounded roll-continuation
+    # route yet, so gate before spending a decision call.
+    try:
+        if _fresh_roll_evidence(db, attempt):
+            return _escalate(
+                "resumed roll evidence present; generative path preserves "
+                "the player-owned roll outcome",
+                decision_skipped=True,
+            )
+    except Exception as exc:
+        logger.warning("decision routing evidence gate failed: %s", exc)
     try:
         signals = collect_signals(db, attempt, turn)
     except Exception as exc:
@@ -502,11 +704,23 @@ def route_attempt(
     except DecisionError as exc:
         return _escalate(f"revalidation authority missing: {exc}")
     try:
+        fresh_submission_ids = assert_attempt_current(db, attempt)
+    except DecisionError as exc:
+        base = frame_trace(frame)
+        base.update(
+            {
+                "decision_path": OPEN_ENDED_GENERATIVE,
+                "revalidation_error": str(exc),
+            }
+        )
+        return RoutingOutcome(directive=ESCALATE, trace=base)
+    try:
         outcome = decide_from_result(
             frame,
             result,
             current_revision=revision,
-            submission_ids=signals.submission_ids,
+            frame_submission_ids=signals.submission_ids,
+            current_submission_ids=fresh_submission_ids,
         )
     except DecisionError as exc:
         base = frame_trace(frame)
@@ -517,6 +731,8 @@ def route_attempt(
             }
         )
         return RoutingOutcome(directive=ESCALATE, trace=base)
+    if outcome.primer is not None:
+        outcome.primer["frame_id"] = frame.frame_id
     trace = outcome.trace
     trace.setdefault("provider", response.provider)
     trace.setdefault("model", response.model)

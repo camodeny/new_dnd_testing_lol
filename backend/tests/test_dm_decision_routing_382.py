@@ -281,3 +281,148 @@ def test_generative_path_runs_when_router_escalates(db):
     assert calls == [1]
     assert result.mode == "silent"
     assert s.get(DmTurn, turn.id).status == "succeeded"
+
+
+def _stub_service(result_fn):
+    from app.decisions.contracts import DecisionResponse
+
+    class _Stub:
+        def __init__(self):
+            self.calls = 0
+
+        def decide(self, request):
+            self.calls += 1
+            return result_fn(request, self.calls)
+
+    return _Stub()
+
+
+def _choice_response(request, selected_id, probabilities, confidence):
+    from app.decisions.contracts import ChoiceResult, DecisionResponse
+
+    qid = request.questions[0].question_id
+    return DecisionResponse(
+        results={
+            qid: ChoiceResult(
+                question_id=qid,
+                selected_id=selected_id,
+                probabilities=probabilities,
+                confidence=confidence,
+            )
+        },
+        provider="stub",
+        model="stub-model",
+        latency_ms=1,
+        trace_id="t",
+    )
+
+
+def test_primer_reaches_generative_packet_as_advisory_only(db):
+    from app.dm.context import LaneName
+    from app.dm.execution import execute_dm_attempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    seen = {}
+
+    def _generative(packet, feedback=None):
+        seen["packet"] = packet
+        from app.dm.contract import CONTRACT_VERSION, normalize_contract
+        return normalize_contract(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "mode": "silent",
+                "reason": "generative escape weighs the advisory prior",
+            }
+        )
+
+    def _mid_band(request, calls):
+        ids = [c.id for c in request.questions[0].candidates]
+        rest = [i for i in ids if i != routing.ROUTE_SILENT_ID]
+        probs = {routing.ROUTE_SILENT_ID: 0.60}
+        for i in rest:
+            probs[i] = 0.40 / len(rest)
+        return _choice_response(request, routing.ROUTE_SILENT_ID, probs, 0.60)
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=_generative, narrator="deterministic",
+        decision_service=_stub_service(_mid_band),
+    )
+    assert result.mode == "silent"
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+    packet = seen["packet"]
+    lane = next(l for l in packet.lanes if l.name == LaneName.PLAYER_INPUTS)
+    primers = [r for r in lane.records if r.record_id.startswith("decision-primer:")]
+    assert len(primers) == 1
+    assert primers[0].use == "adjudication_only"
+    assert primers[0].value["advisory_route"] == routing.ROUTE_SILENT_ID
+    assert "not bound" in primers[0].value["authority"]
+
+
+def test_superseding_input_during_decision_escalates(db):
+    s, camp_id, thread_id = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    def _supersede_then_answer(request, calls):
+        # A newer submission supersedes this attempt mid-decision call.
+        fresh_turn = s.get(DmTurn, turn.id)
+        fresh_turn.current_attempt_id = uuid.uuid4()
+        fresh_turn.input_set_revision = int(fresh_turn.input_set_revision) + 1
+        s.add(fresh_turn)
+        s.commit()
+        ids = [c.id for c in request.questions[0].candidates]
+        probs = {i: (1.0 if i == routing.ROUTE_SILENT_ID else 0.0) for i in ids}
+        return _choice_response(request, routing.ROUTE_SILENT_ID, probs, 1.0)
+
+    outcome = routing.route_attempt(
+        s, attempt=attempt, turn=turn,
+        decision_service=_stub_service(_supersede_then_answer),
+    )
+    assert outcome.directive == "escalate"
+    assert outcome.contract is None
+    assert "revalidation_error" in outcome.trace
+
+
+def test_resumed_roll_evidence_escalates_without_decision_call(db):
+    from app.dm.execution import execute_dm_attempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    fresh_attempt.roll_evidence = [
+        {"request_id": "req_1", "status": "fulfilled", "total": 17}
+    ]
+    s.add(fresh_attempt)
+    s.commit()
+
+    def _must_not_decide(request, calls):
+        raise AssertionError("no decision call when roll evidence is present")
+
+    outcome = routing.route_attempt(
+        s, attempt=fresh_attempt, turn=turn,
+        decision_service=_stub_service(_must_not_decide),
+    )
+    assert outcome.directive == "escalate"
+    assert outcome.trace.get("decision_skipped") is True
+
+    calls = []
+
+    def _generative(packet, feedback=None):
+        calls.append(1)
+        from app.dm.contract import CONTRACT_VERSION, normalize_contract
+        return normalize_contract(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "mode": "silent",
+                "reason": "generative path resolves the fulfilled roll",
+            }
+        )
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=_generative, narrator="deterministic",
+        decision_service=DecisionService(
+            FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID})
+        ),
+    )
+    assert calls == [1]
+    assert result.mode == "silent"

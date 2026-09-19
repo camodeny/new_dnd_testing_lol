@@ -720,11 +720,14 @@ def _execute_owned_attempt(
 
     # Issue #382 — decision-first routing probe. Runs after packet assembly
     # and only for fresh attempts (narration retries reuse their snapshot).
-    # DIRECT outcomes still pass deterministic validation below; anything
-    # else proceeds down the ordinary generative path with the trace
-    # recording which path was taken.
+    # DIRECT outcomes still pass deterministic validation below; PRIMER
+    # outcomes attach the advisory prior to the adjudication packet while
+    # the generative path stays authoritative; anything else proceeds down
+    # the ordinary generative path with the trace recording which path was
+    # taken.
     _direct_contract = None
     _route_trace: dict = {}
+    _route_primer: dict | None = None
     if _snapshot_contract is None:
         try:
             from app.dm import decision_routing as _routing
@@ -736,6 +739,7 @@ def _execute_owned_attempt(
             _route_trace = _outcome.trace
             path_info.update(_routing.path_info_fields(_outcome))
             if _outcome.primer is not None:
+                _route_primer = dict(_outcome.primer)
                 structured_log(
                     logger, logging.INFO, "dm_execute_decision_primer",
                     turn_id=str(turn.id), attempt_id=str(attempt.id),
@@ -757,11 +761,24 @@ def _execute_owned_attempt(
         except Exception as exc:
             logger.warning("dm_execute decision routing failed: %s", exc)
             _direct_contract = None
+            _route_primer = None
             _route_trace = {
                 "decision_path": "open_ended_generative",
                 "directive": "escalate",
                 "reason": f"router error: {exc}",
             }
+
+    if _route_primer is not None and adjudicate is not None:
+        _base_adjudicate = adjudicate
+        _primer = _route_primer
+
+        def adjudicate(packet, feedback=None):  # type: ignore[misc]
+            try:
+                primed_packet = _routing.attach_primer(packet, _primer)
+            except Exception as exc:
+                logger.warning("dm_execute primer attach failed: %s", exc)
+                primed_packet = packet
+            return _base_adjudicate(primed_packet, feedback=feedback)
 
     try:
         if _snapshot_contract is not None:
