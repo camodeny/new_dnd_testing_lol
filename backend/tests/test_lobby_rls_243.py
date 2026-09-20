@@ -128,8 +128,8 @@ def test_lobby_topic_authorizes_members_and_denies_outsiders():
                 {"cid": campaign_id, "owner": owner_id},
             )
             conn.execute(
-                text("INSERT INTO campaign_members (campaign_id, user_id) "
-                     "VALUES (:cid, :uid) ON CONFLICT DO NOTHING"),
+                text("INSERT INTO campaign_members (campaign_id, user_id, role) "
+                     "VALUES (:cid, :uid, 'player') ON CONFLICT DO NOTHING"),
                 {"cid": campaign_id, "uid": member_id},
             )
             for tid, ttype in (
