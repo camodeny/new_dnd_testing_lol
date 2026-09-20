@@ -409,6 +409,43 @@ def test_save_spell_resolves_via_225_primitive():
     assert saved.success is True  # natural 20 always succeeds
 
 
+def test_save_spell_pc_cast_at_npc_uses_npc_roller_path():
+    caster = wizard_sheet()  # int 16, prof 2 → DC 13 (public)
+    npc_target = FakeSheet(dexterity=10)  # +0 dex save
+    failed = resolve_spell_save(
+        caster=caster, spell_name="Fireball", target=npc_target,
+        target_kind="npc", dice=[2], roll_id="save-npc-1",
+    )
+    assert failed.success is False
+    assert failed.provenance["roller"] == "npc"
+    assert failed.die_source == "dm_supplied"
+    assert failed.die_visibility == "hidden"
+    assert "dice_all" not in failed.public_projection()  # NPC dice stay DM-private
+    assert failed.public_projection()["dc"] == 13  # PC caster DC is public
+    # NPC saves never require player-supplied dice: runtime generation works.
+    generated = resolve_spell_save(
+        caster=caster, spell_name="Fireball", target=npc_target,
+        target_kind="npc", roll_id="save-npc-2",
+    )
+    assert generated.die_source == "runtime_generated"
+    assert generated.success in (True, False)
+
+
+def test_save_spell_npc_cast_at_pc_hides_dc():
+    npc_caster = {"spell_save_dc": 14, "spell_attack_bonus": 6}
+    pc_target = FakeSheet(dexterity=10)  # +0 dex save
+    result = resolve_spell_save(
+        caster=npc_caster, spell_name="Fireball", target=pc_target,
+        caster_kind="npc", target_kind="pc", dice=[12], roll_id="save-pcnpc-1",
+    )
+    assert result.success is False  # 12 < hidden DC 14
+    assert result.dc == 14
+    assert result.dc_visibility == "hidden"
+    assert "dc" not in result.public_projection()  # NPC DC stays DM-private
+    assert result.die_visibility == "public"  # PC roller dice stay observable
+    assert result.public_projection()["die_kept"] == 12
+
+
 # ── Resolution: damage + healing ──────────────────────────────────────────
 
 

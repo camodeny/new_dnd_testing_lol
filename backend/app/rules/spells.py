@@ -1150,6 +1150,7 @@ def resolve_spell_save(
     spell_name: Any,
     target: Any,
     caster_kind: CasterKind = "pc",
+    target_kind: CasterKind = "pc",
     target_modifier: int | None = None,
     dice: list[int] | None = None,
     advantage_sources: list[str] | None = None,
@@ -1160,23 +1161,30 @@ def resolve_spell_save(
 
     Either a target ``sheet`` (authoritative #224 derivation) or an explicit
     DM-supplied ``target_modifier`` is required — never both missing.
+    ``target_kind`` selects the #225 roller path (PC dice are player-supplied;
+    NPC dice may be DM-supplied or runtime-generated) and die visibility, so a
+    PC casting at an NPC never requires player dice for the NPC's save. The
+    caster's DC stays public for PC casters and DM-private for NPC casters.
     """
     from app.rules.resolution import resolve_saving_throw
 
     definition = get_spell_def(spell_name)
     if definition.save_ability is None:
         raise SpellError("no_save", f"spell {definition.name!r} allows no saving throw", field="spell")
+    if target_kind not in ("pc", "npc"):
+        raise SpellError("invalid_target", f"target_kind must be pc/npc, got {target_kind!r}", field="target")
     dc = spell_save_dc(caster, spell_name, caster_kind=caster_kind)
     try:
         return resolve_saving_throw(
             ability=definition.save_ability,
+            roller=target_kind,
             sheet=target,
             modifier=target_modifier,
             dice=dice,
             advantage_sources=advantage_sources,  # type: ignore[arg-type]
             dc=dc,
-            dc_visibility="public",
-            die_visibility="public" if caster_kind == "pc" else None,
+            dc_visibility="public" if caster_kind == "pc" else "hidden",
+            die_visibility="public" if target_kind == "pc" else "hidden",
             roll_id=roll_id,
             rng=rng,
         )
