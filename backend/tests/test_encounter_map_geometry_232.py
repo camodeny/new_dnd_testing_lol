@@ -822,7 +822,11 @@ def test_shared_terrain_event_omits_hidden_stranded():
                    for s in owner_view["stranded_placements"])
 
 
-def test_non_owner_reachable_ignores_hidden_occupancy_and_probe_is_masked():
+def test_non_owner_preview_and_commit_share_hidden_occupancy():
+    """Preview/commit consistency: hidden tokens neither carve the
+    non-owner reachable shape nor block that actor's commits, so probing a
+    hidden cell reveals nothing (no reachable-yet-unreachable oracle).
+    Owners keep the full authoritative collision."""
     fac, ctx = _fixture()
     with fac() as db:
         encounter, player_p, goblin_p = _active_duo(
@@ -839,19 +843,19 @@ def test_non_owner_reachable_ignores_hidden_occupancy_and_probe_is_masked():
             db, encounter.id, player_p.id, viewer_id=ctx["player"], is_owner=False)["cells"]}
         assert (5, 5) not in owner_cells
         assert (5, 5) in player_cells
-        # Probing the hidden cell as a non-owner fails generic-unreachable
-        # (never "occupied"), moves nothing, spends nothing.
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        with pytest.raises(MapError, match="unreachable") as excinfo:
-            move_participant(
-                db, encounter.id, player_p.id, actor_id=ctx["player"],
-                to_col=5, to_row=5,
-                expected_turn_sequence=int(encounter.turn_sequence or 0),
-                expected_revision=revision, operation_id="op-probe-hidden",
-            )
-        assert excinfo.value.reason == "unreachable"
-        assert "occupied" not in str(excinfo.value).lower()
-        db.rollback()
+        # The commit agrees with the preview: stepping onto the hidden cell
+        # as a non-owner succeeds exactly as previewed (no oracle).
+        move, _, _ = _move(db, ctx, encounter, player_p, 5, 5,
+                           actor_id=ctx["player"], operation_id="op-probe-hidden")
+        assert (move.to_col, move.to_row) == (5, 5)
         assert (get_placement(db, encounter.id, player_p.id).col,
-                get_placement(db, encounter.id, player_p.id).row) == (0, 0)
-        assert get_turn_state_row(db, encounter.id, player_p.id).movement_remaining == 30
+                get_placement(db, encounter.id, player_p.id).row) == (5, 5)
+        # Same destination as the owner (who sees the hidden token) still
+        # collides: isolate the goblin's cell at the geometry level.
+        from app.combat.maps import _occupied_cells
+        assert (5, 5) in _occupied_cells(db, encounter.id,
+                                         exclude_participant_id=player_p.id,
+                                         include_hidden=True)
+        assert (5, 5) not in _occupied_cells(db, encounter.id,
+                                             exclude_participant_id=player_p.id,
+                                             include_hidden=False)

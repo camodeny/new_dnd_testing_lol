@@ -1048,31 +1048,17 @@ def move_participant(
 
     max_squares = feet_to_squares(int(state.movement_remaining))
     zones = _zone_dicts(list_zones(db, encounter_map.id))
-    # Authoritative collision always uses the full occupancy set; only the
-    # *reported* reason is visibility-aware (see below).
-    occupied = _occupied_cells(db, encounter.id, exclude_participant_id=participant.id)
+    # Commit geometry uses the same visibility-aware occupancy as the
+    # reachable preview: hidden-entity tokens do not block non-owner actors.
+    # Preview/commit consistency (same inputs, same occupancy) removes the
+    # probing oracle where a reachable cell fails only because a hidden
+    # token stands there. Owners keep the full authoritative collision set.
+    actor_is_owner = _is_owner(db, encounter.campaign_id, actor_id)
+    occupied = _occupied_cells(
+        db, encounter.id, exclude_participant_id=participant.id,
+        include_hidden=actor_is_owner,
+    )
     if goal in occupied:
-        occupant_id = next(
-            (str(p.participant_id) for p in list_placements(db, encounter.id)
-             if (int(p.col), int(p.row)) == goal),
-            None,
-        )
-        actor_is_owner = _is_owner(db, encounter.campaign_id, actor_id)
-        if (
-            occupant_id is not None
-            and not actor_is_owner
-            and occupant_id in _hidden_token_ids(db, encounter.id)
-        ):
-            # Masked: a non-owner probing a hidden token's cell learns
-            # nothing beyond a generic unreachable failure, while the
-            # collision is still enforced (nothing moves, nothing spends).
-            _log_rejection(encounter, participant, operation_id, "unreachable",
-                           started, from_cell, {"col": goal[0], "row": goal[1]})
-            raise MapError(
-                f"destination ({goal[0]}, {goal[1]}) is unreachable "
-                f"with {state.movement_remaining} ft remaining",
-                reason="unreachable",
-            )
         _log_rejection(encounter, participant, operation_id, "occupied", started, from_cell,
                         {"col": goal[0], "row": goal[1]})
         raise MapError(
