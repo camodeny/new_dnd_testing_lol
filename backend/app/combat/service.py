@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 ENCOUNTER_STARTED_EVENT = "encounter.started"
 ENCOUNTER_READY_EVENT = "encounter.initiative_ready"
+ENCOUNTER_ENDED_EVENT = "encounter.ended"
 # Turn progression events — issue #231. Thread-scoped like the lifecycle
 # events above; see THREAD_SCOPED_EVENT_TYPES.
 TURN_STARTED_EVENT = "encounter.turn_started"
@@ -532,7 +533,7 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
 #: deferred to the thread/privacy work — hidden events may leave short
 #: pages, but filtering is deterministic per row so pages never duplicate.
 THREAD_SCOPED_EVENT_TYPES = frozenset({
-    ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT,
+    ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT, ENCOUNTER_ENDED_EVENT,
     TURN_STARTED_EVENT, TURN_ENDED_EVENT, TURN_SKIPPED_EVENT,
     # Issue #232: movement/map mutations inherit the encounter's source
     # thread under the same read boundary (literals avoid a maps import
