@@ -102,6 +102,11 @@ def test_real_promotion_path_near_name_requires_bounded_outcome():
         db, campaign, turn, attempt, identity_decision_service=keep_service)
     assert promoted[0].name == "Mara"
     assert promoted[0].details["identity_resolution"]["outcome"] == KEEP_DISTINCT
+    assert len(keep_service.adapter.calls) == 1
+    retried = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=keep_service)
+    assert retried[0].id == promoted[0].id
+    assert len(keep_service.adapter.calls) == 1
 
 
 def test_bounded_candidates_and_stale_revalidation_fail_closed():

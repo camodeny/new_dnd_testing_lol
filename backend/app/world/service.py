@@ -733,6 +733,11 @@ def promote_new_entities_from_contract(
             location_ref = getattr(raw, "location_ref", None)
         if not temp_id:
             raise ValueError("new_entities proposal missing temp_id")
+        jit_key = _stable_jit_key(attempt_id, temp_id)
+        existing_retry = _find_by_idempotency(db, campaign.id, jit_key)
+        if existing_retry is not None:
+            promoted.append(existing_retry)
+            continue
         # Committed proposals never bypass canonical identity. Exact stable
         # refs/names/aliases are deterministic and therefore must not fall
         # through to a semantic model or create a duplicate row.
@@ -788,7 +793,7 @@ def promote_new_entities_from_contract(
             db, campaign, frame, selected_id,
             entity_type=kind,
             name=validate_entity_name(public_name),
-            idempotency_key=_stable_jit_key(attempt_id, temp_id),
+            idempotency_key=jit_key,
             summary=str(public_summary)[:2000] if public_summary else None,
             source_turn_id=turn_id,
             source_attempt_id=attempt_id,
