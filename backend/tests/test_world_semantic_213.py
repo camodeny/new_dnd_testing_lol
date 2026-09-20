@@ -844,3 +844,43 @@ def test_same_id_version_change_rebuilds_new_worker_job():
     db.refresh(row)
     assert row.status == "active"
     assert row.source_version == result2["source_version"]
+
+
+def test_hidden_top_hit_does_not_suppress_visible_result():
+    import math
+
+    Fac, cid, owner, player, _ = _setup()
+    db = Fac()
+    hidden = _seed_fact(db, cid, content="Hidden vault rumor.",
+                        visibility="dm_only", operation_id="op-wind-hidden")
+    visible = _seed_fact(db, cid, content="Open market rumor.", rev=1,
+                         visibility="campaign", operation_id="op-wind-open")
+    # Crafted vectors: the hidden row outranks the visible row (1.0 > 0.9).
+    dim = 1536
+    query_vec = [1.0] + [0.0] * (dim - 1)
+    visible_vec = [0.9, math.sqrt(1.0 - 0.81)] + [0.0] * (dim - 2)
+    hidden_text = build_source_text(db, "world_fact", hidden)
+    visible_text = build_source_text(db, "world_fact", visible)
+    query_text = "vault rumor query"
+
+    def _provider(texts: list[str]):
+        table = {hidden_text: query_vec, visible_text: visible_vec,
+                 query_text: query_vec}
+        return [list(table[t]) for t in texts]
+
+    index_source_record(db, cid, "world_fact", hidden.id, provider=_provider)
+    index_source_record(db, cid, "world_fact", visible.id, provider=_provider)
+
+    # Player window of 1: the hidden top hit is denied, the visible
+    # runner-up must still be returned — never a forced NO_MATCH.
+    outcome = semantic_search(db, cid, query_text, player, dm_internal=False,
+                              limit=1, provider=_provider)
+    assert outcome.status == SEM_OK
+    assert [p.source_id for p in outcome.packets] == [str(visible.id)]
+    assert outcome.denied >= 1
+    # The window stays bounded: DM-internal search still returns only the
+    # authorized top hit.
+    dm_outcome = semantic_search(db, cid, query_text, owner, dm_internal=True,
+                                 limit=1, provider=_provider)
+    assert dm_outcome.status == SEM_OK
+    assert [p.source_id for p in dm_outcome.packets] == [str(hidden.id)]

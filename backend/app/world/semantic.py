@@ -1323,14 +1323,17 @@ def semantic_search(
             ranked = sorted(
                 ((row, by_id[row.id]) for row in rows if row.id in by_id),
                 key=lambda item: item[1], reverse=True,
-            )[:limit_applied]
+            )
     else:
         ranked = _python_candidates(
             db, campaign, query_vec, embedding_model=embedding_model,
             embedding_version=embedding_version, limit=limit_applied * 2,
         )
         # Python path over-retrieves for threshold filtering, then bounds.
-    ranked = ranked[:limit_applied]
+    # NOTE: no pre-filter truncation to limit_applied here. Resolve →
+    # version-check → authorize runs over the bounded overfetch pool and
+    # stops at limit_applied AUTHORIZED packets, so a hidden/stale
+    # top-ranked row cannot suppress a valid hit behind it in the window.
 
     if not ranked:
         return _fail(STATUS_DEFER, "no active semantic index rows; use direct retrieval",
@@ -1350,12 +1353,15 @@ def semantic_search(
 
     # Resolve → version-check → authorize. Anything failing the chain is
     # dropped (stale rows are marked for rebuild); hidden rows are counted
-    # as denials without leaking ids/content.
+    # as denials without leaking ids/content. The loop stops once the
+    # authorized window is full — later pool rows are never served.
     packets: list[Any] = []
     denied_reasons: dict[str, int] = {}
     denied = 0
     stale_dropped = 0
     for row, similarity in ranked:
+        if len(packets) >= limit_applied:
+            break
         if similarity < threshold:
             continue
         record = _current_record(db, campaign.id, row.source_type, row.source_id)
