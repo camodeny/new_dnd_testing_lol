@@ -368,6 +368,74 @@ def test_coordinate_turn_refuses_lobby_thread(api):
         ).scalars().all() == []
 
 
+def test_concurrent_start_transition_refused_under_lock(api, monkeypatch):
+    """TOCTOU race: starting->active committing after the transport-level
+    checks but before persistence must still refuse the lobby write."""
+    import app.campaigns.router as campaign_router
+
+    client, factory, actor, owner_id, member_id, _ = api
+    camp = _create(client)
+    cid = camp["id"]
+    _join(factory, cid, member_id)
+
+    real_require_key = campaign_router.require_idempotency_key
+
+    def _flip_to_active_then_delegate(request, fallback=None):
+        with factory() as db:
+            row = db.get(Campaign, uuid.UUID(cid))
+            row.status = "active"
+            db.commit()
+        return real_require_key(request, fallback)
+
+    monkeypatch.setattr(
+        campaign_router, "require_idempotency_key", _flip_to_active_then_delegate
+    )
+    actor["id"] = member_id
+    resp = _post(client, cid, "sneaks in after start", "race-start-1")
+    assert resp.status_code == 409, resp.text
+    with factory() as db:
+        assert db.execute(
+            select(PlayerSubmission).where(
+                PlayerSubmission.campaign_id == uuid.UUID(cid)
+            )
+        ).scalars().all() == []
+
+
+def test_concurrent_member_removal_refused_under_lock(api, monkeypatch):
+    """TOCTOU race: member removal committing after the transport-level
+    checks but before persistence must still refuse the lobby write."""
+    import app.campaigns.router as campaign_router
+
+    client, factory, actor, owner_id, member_id, _ = api
+    camp = _create(client)
+    cid = camp["id"]
+    _join(factory, cid, member_id)
+
+    real_require_key = campaign_router.require_idempotency_key
+
+    def _remove_then_delegate(request, fallback=None):
+        with factory() as db:
+            db.delete(db.get(
+                CampaignMember,
+                {"campaign_id": uuid.UUID(cid), "user_id": member_id},
+            ))
+            db.commit()
+        return real_require_key(request, fallback)
+
+    monkeypatch.setattr(
+        campaign_router, "require_idempotency_key", _remove_then_delegate
+    )
+    actor["id"] = member_id
+    resp = _post(client, cid, "sneaks in after removal", "race-remove-1")
+    assert resp.status_code == 403, resp.text
+    with factory() as db:
+        assert db.execute(
+            select(PlayerSubmission).where(
+                PlayerSubmission.campaign_id == uuid.UUID(cid)
+            )
+        ).scalars().all() == []
+
+
 def test_start_transition_preserves_lobby_without_mixing(api):
     client, factory, actor, owner_id, _, _ = api
     camp = _create(client, required_players=1)

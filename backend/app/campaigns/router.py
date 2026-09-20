@@ -1008,13 +1008,46 @@ def post_lobby_chat(
     )
 
     def _execute():
+        # Issue #243 lifecycle race: re-check lobby-writable status and thread
+        # membership on the locked campaign row. A concurrent starting->active
+        # transition or member removal that commits after the transport-level
+        # checks above must still refuse the write (mirrors the #265
+        # lifecycle-race pattern; accept_submission's campaign lock alone only
+        # re-checks archive, not lobby status/membership).
+        from app.campaigns.lobby_chat import require_lobby_chat_writable
+        from app.runtime.threads import (
+            ThreadNotFoundError as _ThreadNotFoundError,
+        )
+
+        locked = db.execute(
+            select(Campaign)
+            .where(Campaign.id == camp.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalars().first()
+        if locked is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        try:
+            require_lobby_chat_writable(locked)
+        except LobbyChatStatusError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        try:
+            assert_can_write_thread(db, camp.id, thread.id, profile.id)
+        except _ThreadNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Thread not found") from exc
+        except ThreadAuthorizationError as exc:
+            logger.info(
+                "lobby_chat write denied under lock campaign_id=%s user_id=%s",
+                camp.id, profile.id,
+            )
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         submission, stored_segments = post_lobby_message(
-            db, campaign=camp, user_id=profile.id, content=content,
+            db, campaign=locked, user_id=profile.id, content=content,
         )
         return {
             "thread": get_or_create_lobby_thread(db, camp.id, created_by=profile.id).to_dict(),
             "message": submission.to_dict(stored_segments),
-            "campaign_status": camp.status,
+            "campaign_status": locked.status,
         }
 
     result = execute_http_idempotent(
