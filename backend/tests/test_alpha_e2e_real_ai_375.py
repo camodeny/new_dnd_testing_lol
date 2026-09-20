@@ -30,8 +30,14 @@ from app.decisions.contracts import ChoiceResult, DecisionResponse
 from app.decisions.frames import OPEN_ENDED_DM_CANDIDATE_ID
 from app.decisions.runtime import DecisionService
 from app.dm import execution as dm_execution
+from app.dm.decision_routing import ROUTE_QUESTION_ID, ROUTE_SILENT_ID
+from models.dm import DmTurnAttempt
 from models.reliability import AIRun, DecisionTelemetry
-from test_alpha_e2e_solo_dogfood_372 import run_phase0_solo_scenario, scn
+from test_alpha_e2e_solo_dogfood_372 import (
+    phase0_provider,
+    run_phase0_solo_scenario,
+    scn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +81,38 @@ class _OpenEndedDecisionService:
         )
 
 
+class _OpeningThenSilentDecisionService:
+    """Keep one visible reply, then exercise deterministic direct silence."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def decide(self, request) -> DecisionResponse:
+        self.calls += 1
+        selected_id = (
+            OPEN_ENDED_DM_CANDIDATE_ID if self.calls == 1 else ROUTE_SILENT_ID
+        )
+        candidates = request.questions[0].candidates
+        probabilities = {
+            candidate.id: 1.0 if candidate.id == selected_id else 0.0
+            for candidate in candidates
+        }
+        return DecisionResponse(
+            results={
+                ROUTE_QUESTION_ID: ChoiceResult(
+                    question_id=ROUTE_QUESTION_ID,
+                    selected_id=selected_id,
+                    probabilities=probabilities,
+                    confidence=1.0,
+                )
+            },
+            provider="fake-decision",
+            model="direct-silent-regression",
+            latency_ms=0,
+            trace_id=f"direct-silent-{self.calls}",
+        )
+
+
 def real_ai_enabled() -> bool:
     """Require two exact, deliberately unambiguous paid-call opt-ins."""
     return (
@@ -99,6 +137,40 @@ def test_real_decision_ai_requires_explicit_experimental_opt_in(monkeypatch):
     assert not real_decision_ai_enabled()
     monkeypatch.setenv(REAL_DECISION_AI_ENV, REAL_DECISION_AI_VALUE)
     assert real_decision_ai_enabled()
+
+
+def test_shared_phase0_harness_accepts_authorized_direct_silent_results(
+    scn, phase0_provider, monkeypatch
+):
+    """A valid #382 silent commit has no stream but remains reconnect-safe."""
+    decision_service = _OpeningThenSilentDecisionService()
+    production_execute = dm_execution.execute_dm_attempt
+
+    def execute_with_direct_silence(db, attempt_id, **kwargs):
+        kwargs["decision_service"] = decision_service
+        return production_execute(db, attempt_id, **kwargs)
+
+    monkeypatch.setattr(dm_execution, "execute_dm_attempt", execute_with_direct_silence)
+    run_phase0_solo_scenario(
+        scn,
+        expected_reply_marker="phase0-reply-",
+        allow_silent=True,
+    )
+
+    with scn.factory() as db:
+        attempts = list(
+            db.execute(select(DmTurnAttempt).order_by(DmTurnAttempt.created_at))
+            .scalars()
+            .all()
+        )
+    silent = [
+        attempt
+        for attempt in attempts
+        if (attempt.contract_snapshot or {}).get("mode") == "silent"
+        and attempt.stream_id is None
+    ]
+    assert silent
+    assert len(scn.ids["stream_ids"]) < len(scn.ids["attempt_ids"])
 
 
 def _milliseconds(start: datetime | None, end: datetime | None) -> int | None:
@@ -184,7 +256,9 @@ def test_phase0_solo_dogfood_with_configured_real_generative_route(scn, monkeypa
     # module, so this remains a test-local injection with no production change.
     monkeypatch.setattr(dm_execution, "execute_dm_attempt", execute_open_ended)
     try:
-        run_phase0_solo_scenario(scn, expected_reply_marker=None)
+        run_phase0_solo_scenario(
+            scn, expected_reply_marker=None, allow_silent=True
+        )
     finally:
         # Failure artifacts from #374 include this metadata because the
         # shared scenario fixture saves diagnostics after this function exits.
