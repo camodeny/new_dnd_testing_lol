@@ -1015,7 +1015,10 @@ def evaluate_clock_for_range(
                 operation_id=operation_id,
             )
         except ClockStaleError:
-            db.rollback()
+            # No rollback here: a stale clock wrote nothing of its own, and
+            # isolation belongs to the caller's savepoint (consolidation
+            # evaluates each clock inside one) so sibling clocks' flushed
+            # watermarks survive the skip.
             fresh = get_clock_strict(db, campaign.id, clock.id)
             return {**base, "evaluated": False, "reason": "stale_revision_skipped",
                     "revision": int(fresh.revision or 1)}
@@ -1070,7 +1073,8 @@ def evaluate_clock_for_range(
             operation_id=operation_id,
         )
     except ClockStaleError:
-        db.rollback()
+        # Same savepoint-owned isolation as the deterministic path above:
+        # never a full-session rollback here.
         fresh = get_clock_strict(db, campaign.id, clock.id)
         return {**base, "evaluated": False, "reason": "stale_revision_skipped",
                 "revision": int(fresh.revision or 1),
@@ -1137,21 +1141,35 @@ def consolidate_clocks_for_range(
             f"{operation_id}:clock:{clock.id}:{from_sequence}-{to_sequence}"
             if operation_id else f"clock:{clock.id}:{from_sequence}-{to_sequence}"
         )
+        # One savepoint per clock: a stale skip rolls back only that clock's
+        # pending work, never sibling clocks' flushed watermarks or (already
+        # committed) advancements. The guards below handle writers that
+        # already closed the transaction themselves — a successful apply
+        # commits, and the shared mutation helper fully rolls back on a
+        # mid-mutation race — so the savepoint is closed only while active.
+        # Any other required processing error propagates (no catch) so the
+        # post-turn run fails and the range is retried cumulatively.
+        savepoint = db.begin_nested()
         try:
-            results.append(evaluate_clock_for_range(
+            outcome = evaluate_clock_for_range(
                 db, campaign, clock, events,
                 from_sequence=from_sequence, to_sequence=to_sequence,
                 decision_service=decision_service, session_factory=session_factory,
                 operation_id=op_id,
-            ))
+            )
         except ClockStaleError:
-            db.rollback()
+            if savepoint.is_active:
+                savepoint.rollback()
             fresh = get_clock_strict(db, cid, clock.id)
             results.append({
                 "clock_id": str(clock.id), "status": fresh.status,
                 "revision": int(fresh.revision or 1),
                 "evaluated": False, "reason": "stale_revision_skipped",
             })
+        else:
+            if savepoint.is_active:
+                savepoint.commit()
+            results.append(outcome)
     advanced = sum(1 for r in results if r.get("outcome") in ("advanced", "completed"))
     return {
         "clocks_evaluated": len(results),

@@ -650,6 +650,46 @@ def test_consolidate_skips_stale_clock_and_continues(monkeypatch):
     db.close()
 
 
+def test_stale_skip_preserves_sibling_clock_work(monkeypatch):
+    F, db, c, *_ = _setup()
+    first = _mkclock(db, c, name="First")  # deterministic: advances on game.play
+    # Second clock matches nothing in the range: its watermark flush must
+    # survive a later sibling's stale skip.
+    second = _mkclock(db, c, name="Second",
+                      advancement_criteria={"kind": "deterministic",
+                                            "event_types": ["game.combat"]})
+    third = _mkclock(db, c, name="Third")
+    lo, hi = _play(db, c, 1)
+    real_apply = C.apply_clock_outcome
+
+    def _flaky(*args, **kwargs):
+        if str(args[2]) == str(third.id):
+            raise C.ClockStaleError("x", 1, 2)
+        return real_apply(*args, **kwargs)
+
+    monkeypatch.setattr(C, "apply_clock_outcome", _flaky)
+    out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                         decision_service=DecisionService(_NeverCall()))
+    by_id = {r["clock_id"]: r for r in out["results"]}
+    assert by_id[str(first.id)]["outcome"] == "advanced"
+    assert by_id[str(third.id)]["reason"] == "stale_revision_skipped"
+    assert by_id[str(third.id)]["evaluated"] is False
+    db.commit()  # outer transaction commits: sibling work must be durable
+    F2 = F()
+    try:
+        assert int(F2.get(CampaignClock, first.id).progress) == 1
+        assert len(F2.execute(select(CampaignDomainEvent).where(
+            CampaignDomainEvent.event_type == "clock.advanced")).scalars().all()) == 1
+        # The flushed no-change watermark of the sibling survived the stale
+        # skip (a full-session rollback would have reset it to 0).
+        assert int(F2.get(CampaignClock, second.id).evaluated_through_sequence) == hi
+        stale = F2.get(CampaignClock, third.id)
+        assert int(stale.evaluated_through_sequence) == 0  # stale: watermark untouched
+    finally:
+        F2.close()
+    db.close()
+
+
 def test_duplicate_retry_never_advances_twice():
     _F, db, c, *_ = _setup()
     clock = _mkclock(db, c, threshold=6)
