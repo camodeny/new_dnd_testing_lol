@@ -731,9 +731,17 @@ def validate_spell_cast(
                 field="spell",
                 details={"spell": definition.name},
             )
-        castable = any(n in known.prepared for n in known_names) or display in known.prepared
+        castable: bool
+        known_hit = any(n in known.cantrips or n in known.spells for n in known_names)
+        if definition.level == 0:
+            # Cantrips need no preparation: being known is sufficient, so the
+            # frontend editor's default ``is_prepared: false`` never blocks a
+            # known cantrip (e.g. a ``spell_level: 0`` row in ``spells``).
+            castable = known_hit or display in known.cantrips or display in known.spells
+        else:
+            castable = any(n in known.prepared for n in known_names) or display in known.prepared
         if not castable:
-            if any(n in known.cantrips or n in known.spells for n in known_names):
+            if known_hit:
                 raise SpellError(
                     "spell_not_prepared",
                     f"spell {definition.name!r} is known but not prepared",

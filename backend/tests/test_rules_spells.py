@@ -179,6 +179,20 @@ def test_validate_frontend_shaped_is_prepared_flag_honored():
     assert v.valid is True and v.cast_slot_level == 1
 
 
+def test_validate_frontend_shaped_cantrip_needs_no_preparation():
+    # Cantrips are castable when known: the editor's default
+    # is_prepared:false must not block a spell_level:0 row.
+    sheet = wizard_sheet(
+        cantrips=[],
+        spells=[{"name": "Fire Bolt", "spell_level": 0, "is_prepared": False}],
+    )
+    v = validate_spell_cast(sheet, "Fire Bolt")
+    assert v.valid is True and v.cast_slot_level is None
+    with pytest.raises(SpellError) as exc:
+        validate_spell_cast(sheet, "Sacred Flame")  # known nowhere
+    assert exc.value.code == "spell_not_known"
+
+
 def test_validate_missing_spell_lists_fails_closed():
     with pytest.raises(SpellError) as exc:
         validate_spell_cast(FakeSheet(spells=None, cantrips=None), "Fire Bolt")
