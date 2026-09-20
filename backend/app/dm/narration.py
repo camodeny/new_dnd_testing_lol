@@ -573,15 +573,192 @@ def _tally_fidelity_violations(violations: list[dict[str, Any]]) -> None:
             _inc("contradiction_rejections")
 
 
+# ── Semantic judge integration (issue #384, shadow-first) ─────────────────────
+#
+# The semantic judge supplements deterministic fidelity; it never weakens or
+# bypasses a deterministic failure. Wiring is shadow-only: judge verdicts are
+# recorded for calibration (#383) and never change the deterministic outcome.
+# Judges run once per full candidate at completion (the authoritative
+# full-candidate checkpoint), never per token/delta — streaming stays on the
+# cheap incremental deterministic gates per delta.
+
+
+def build_narration_judge_evidence(
+    narration: str,
+    contract: DmTurnContractV1,
+    *,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+    evidence_revision: str = "",
+) -> Any:
+    """Assemble code-owned judge evidence from a narration + contract.
+
+    Supported public content is drawn from the same audience-safe
+    projection the deterministic renderer may emit (public beat claim
+    texts plus text-bearing public fields: speaker names, roll reason /
+    label, open choice, clarify question, safe prelude, table-chat
+    intent) — so the unsupported-addition/secrecy questions never see
+    legitimate renderer output as unsupported. Player-declaration texts
+    ground verbatim PC attribution, secret strings (DM-authorized,
+    server-side judge use only) ground restricted material, and PC tokens
+    ground agency attribution. Never imports decision internals at module
+    scope — the import stays local so DM layers keep one direction.
+    """
+    from app.decisions.judges import build_evidence
+
+    public_claims = [
+        c.text for b in contract.beats for c in b.claims if c.visibility == "public"
+    ]
+    try:
+        projection = build_narration_projection(contract)
+    except Exception:
+        projection = None
+    if isinstance(projection, dict):
+        # Mirror render_deterministic_narration's allowed public inputs so
+        # the judge support set equals the renderer-allowed set.
+        for beat in projection.get("beats") or []:
+            name = beat.get("speaker_public_name")
+            if isinstance(name, str) and name.strip():
+                public_claims.append(name.strip())
+        roll = projection.get("roll_request")
+        if isinstance(roll, dict):
+            for key in ("reason_public", "label"):
+                value = roll.get(key)
+                if isinstance(value, str) and value.strip():
+                    public_claims.append(value.strip())
+        for key in (
+            "open_player_choice",
+            "clarify_question",
+            "safe_prelude",
+            "table_chat_intent",
+        ):
+            value = projection.get(key)
+            if isinstance(value, str) and value.strip():
+                public_claims.append(value.strip())
+    else:  # projection unavailable: fall back to direct contract fields
+        for beat in contract.beats:
+            if getattr(beat, "speaker_public_name", None):
+                public_claims.append(str(beat.speaker_public_name).strip())
+        roll_request = getattr(contract, "roll_request", None)
+        if roll_request is not None:
+            for value in (
+                getattr(roll_request, "reason_public", None),
+                getattr(roll_request, "label", None),
+            ):
+                if isinstance(value, str) and value.strip():
+                    public_claims.append(value.strip())
+        for value in (
+            getattr(contract, "open_player_choice", None),
+            getattr(contract, "clarify_question", None),
+            getattr(contract, "safe_prelude", None),
+            getattr(contract, "table_chat_intent", None),
+        ):
+            if isinstance(value, str) and value.strip():
+                public_claims.append(value.strip())
+    declarations = [
+        c.text
+        for b in contract.beats
+        for c in b.claims
+        if c.claim_kind == "player_declaration"
+    ]
+    secrets = sorted(_collect_secret_strings(contract, extra_secrets=extra_secrets))
+    tokens: set[str] = set()
+    for beat in contract.beats:
+        for claim in beat.claims:
+            if claim.actor_ref is not None and claim.actor_ref.type == "character":
+                raw_id = str(claim.actor_ref.id)
+                tokens.add(raw_id.lower())
+                tokens.add(raw_id.split(":")[-1].lower())
+    for name in (pc_names or {}).values():
+        if name and name.strip():
+            tokens.add(name.strip().lower())
+    return build_evidence(
+        narration or "",
+        public_claim_texts=public_claims,
+        declaration_texts=declarations,
+        secret_texts=secrets,
+        pc_tokens=sorted(tokens),
+        evidence_revision=evidence_revision,
+    )
+
+
+def shadow_judge_narration(
+    narration: str,
+    contract: DmTurnContractV1,
+    deterministic_violations: list[dict[str, Any]] | None,
+    *,
+    judge_service: Any | None = None,
+    judge_session_factory: Any | None = None,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+    trace_id: str | None = None,
+    campaign_id: Any | None = None,
+    turn_id: Any | None = None,
+) -> Any | None:
+    """Run semantic judges in shadow mode over one full narration candidate.
+
+    Fail-soft: returns the shadow verdict or ``None`` (no service, judge
+    failure, telemetry failure). Never raises and never changes the
+    deterministic outcome — a semantic pass cannot overturn a deterministic
+    rejection. This is the full-candidate checkpoint for streamed narration:
+    call once at completion, never per delta.
+    """
+    if judge_service is None:
+        return None
+    try:
+        from app.decisions.judges import shadow_judge
+
+        evidence = build_narration_judge_evidence(
+            narration,
+            contract,
+            extra_secrets=extra_secrets,
+            pc_names=pc_names,
+            evidence_revision=str(trace_id or ""),
+        )
+        violations = list(deterministic_violations or [])
+        return shadow_judge(
+            judge_service,
+            evidence,
+            deterministic_passed=len(violations) == 0,
+            deterministic_codes=[str(v.get("code", "")) for v in violations if v.get("code")],
+            session_factory=judge_session_factory,
+            trace_id=trace_id,
+            campaign_id=campaign_id,
+            turn_id=turn_id,
+        )
+    except Exception as exc:  # never breaks narration on judge-path failure
+        logger.warning("narration shadow judge dropped: %s", exc)
+        return None
+
+
 def check_narration_fidelity_or_raise(
     narration: str,
     contract: DmTurnContractV1,
     *,
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
+    judge_service: Any | None = None,
+    judge_session_factory: Any | None = None,
+    trace_id: str | None = None,
+    campaign_id: Any | None = None,
+    turn_id: Any | None = None,
 ) -> None:
     violations = validate_narration_fidelity(
         narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
+    )
+    # Shadow-first semantic judgment (issue #384): calibration only, never
+    # gates. Deterministic failures stay final below.
+    shadow_judge_narration(
+        narration,
+        contract,
+        violations,
+        judge_service=judge_service,
+        judge_session_factory=judge_session_factory,
+        extra_secrets=extra_secrets,
+        pc_names=pc_names,
+        trace_id=trace_id,
+        campaign_id=campaign_id,
+        turn_id=turn_id,
     )
     if violations:
         _tally_fidelity_violations(violations)
@@ -720,6 +897,8 @@ def stream_narration(
     trace_id: str | None = None,
     on_first_persist: Callable[[uuid.UUID], None] | None = None,
     on_first_persist_tx: Callable[[Session, uuid.UUID], None] | None = None,
+    judge_service: Any | None = None,
+    judge_session_factory: Any | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
@@ -1025,6 +1204,21 @@ def stream_narration(
         violations = validate_narration_fidelity(
             narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names
         )
+        # Shadow-first semantic judgment (#384): full-candidate checkpoint
+        # only — never per delta, so TTFT/buffering policy holds. Verdict is
+        # calibration-only; deterministic failures below stay final.
+        shadow_judge_narration(
+            narration_text,
+            contract,
+            violations,
+            judge_service=judge_service,
+            judge_session_factory=judge_session_factory,
+            extra_secrets=extra_secrets,
+            pc_names=pc_names,
+            trace_id=trace_id,
+            campaign_id=campaign_id,
+            turn_id=turn_id,
+        )
         if violations:
             _tally_fidelity_violations(violations)
             if persisted == 0:
@@ -1168,6 +1362,8 @@ def execute_validated_turn(
     trace_id: str | None = None,
     identity_decision_service: Any | None = None,
     identity_session_factory: Any | None = None,
+    judge_service: Any | None = None,
+    judge_session_factory: Any | None = None,
 ) -> ValidatedTurnResult:
     """Run a validated structured turn through narration to final commit.
 
@@ -1273,6 +1469,8 @@ def execute_validated_turn(
             pc_names=pc_names,
             trace_id=trace_id,
             on_first_persist_tx=_boundary_tx,
+            judge_service=judge_service,
+            judge_session_factory=judge_session_factory,
         )
     except NarrationStreamError:
         # Defined remediation for post-visibility failure: if the
@@ -1364,6 +1562,11 @@ def continue_partial_stream(
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
     commit: bool = True,
+    judge_service: Any | None = None,
+    judge_session_factory: Any | None = None,
+    trace_id: str | None = None,
+    campaign_id: Any | None = None,
+    turn_id: Any | None = None,
 ) -> NarrationResult:
     """Semantically continue a partial visible stream without contradiction.
 
@@ -1390,6 +1593,9 @@ def continue_partial_stream(
     check_narration_fidelity_or_raise(
         continued_text, contract,
         extra_secrets=extra_secrets, pc_names=pc_names,
+        judge_service=judge_service,
+        judge_session_factory=judge_session_factory,
+        trace_id=trace_id, campaign_id=campaign_id, turn_id=turn_id,
     )
     result = _resume_stream_suffix(
         db, stream_id, continued_text,
