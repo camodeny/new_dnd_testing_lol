@@ -125,6 +125,67 @@ def get_or_create_campaign_thread(
     return thread
 
 
+def get_lobby_thread(db: Session, campaign_id: uuid.UUID) -> CampaignThread | None:
+    """Return the shared pre-start OOC lobby thread, if one exists — issue #243.
+
+    Read-only: never creates. The lobby thread is explicitly non-fictional
+    table coordination; it is never assembled into DM turns and never feeds
+    world-seed canon.
+    """
+    return (
+        db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.thread_type == "lobby",
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+def is_lobby_thread(thread: CampaignThread | None) -> bool:
+    """True when the thread is the shared OOC lobby thread."""
+    return thread is not None and thread.thread_type == "lobby"
+
+
+def get_or_create_lobby_thread(
+    db: Session, campaign_id: uuid.UUID, *, created_by: uuid.UUID | None = None
+) -> CampaignThread:
+    """Return the durable lobby OOC thread, creating it if needed — issue #243.
+
+    Mirrors :func:`get_or_create_campaign_thread`: does NOT commit, and a
+    concurrent creation race converges on the winner via the partial unique
+    index (``uq_campaign_threads_one_lobby_per_campaign``).
+    """
+    existing = get_lobby_thread(db, campaign_id)
+    if existing is not None:
+        return existing
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise ThreadNotFoundError("Campaign not found")
+    thread = CampaignThread(
+        campaign_id=campaign_id,
+        thread_type="lobby",
+        title="Lobby",
+        created_by=created_by or campaign.owner_id,
+    )
+    # Isolate the insert/race recovery so a benign lobby-thread race does not
+    # discard unrelated pending work in the caller's session.
+    if db.new or db.dirty or db.deleted:
+        db.flush()
+    try:
+        with db.begin_nested():
+            db.add(thread)
+            db.flush()
+    except IntegrityError:
+        winner = get_lobby_thread(db, campaign_id)
+        if winner is not None:
+            return winner
+        raise
+    return thread
+
+
 def resolve_thread_id(
     db: Session,
     campaign_id: uuid.UUID,
@@ -292,6 +353,8 @@ def can_read_thread(
     """Centralized read-authorization check.
 
     - Shared ``campaign`` threads: any campaign member (including owner) may read.
+    - ``lobby`` OOC threads (issue #243): same rule — any campaign member
+      (including owner) may read. Removed/non-member users are denied.
     - Private threads: only explicit thread members may read.  Owner/admin status
       alone does NOT grant access — this is the critical privacy invariant.
     - Missing thread or ambiguous state → deny (fail closed).
@@ -304,7 +367,7 @@ def can_read_thread(
             thread_id,
         )
         return False
-    if thread.thread_type == "campaign":
+    if thread.thread_type in ("campaign", "lobby"):
         campaign = db.get(Campaign, campaign_id)
         if campaign is None:
             return False
@@ -409,7 +472,7 @@ def list_threads_for_user(
     )
     visible: list[CampaignThread] = []
     for thread in all_threads:
-        if thread.thread_type == "campaign":
+        if thread.thread_type in ("campaign", "lobby"):
             visible.append(thread)
         elif thread.thread_type == "private" and is_thread_member(
             db, thread.id, user_id

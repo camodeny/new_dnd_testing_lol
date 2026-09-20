@@ -11,17 +11,29 @@ from database import Base
 
 
 class CampaignThread(Base):
-    """Durable thread identity for live-table messaging — issue #195."""
+    """Durable thread identity for live-table messaging — issue #195.
+
+    ``thread_type`` is ``campaign`` (shared game transcript), ``lobby``
+    (shared pre-start OOC coordination, issue #243 — explicitly
+    non-fictional, never assembled into DM turns), or ``private``.
+    """
 
     __tablename__ = "campaign_threads"
     __table_args__ = (
-        CheckConstraint("thread_type IN ('campaign', 'private')", name="ck_campaign_threads_type"),
+        CheckConstraint("thread_type IN ('campaign', 'private', 'lobby')", name="ck_campaign_threads_type"),
         Index(
             "uq_campaign_threads_one_campaign_per_campaign",
             "campaign_id",
             unique=True,
             postgresql_where=text("thread_type = 'campaign'"),
             sqlite_where=text("thread_type = 'campaign'"),
+        ),
+        Index(
+            "uq_campaign_threads_one_lobby_per_campaign",
+            "campaign_id",
+            unique=True,
+            postgresql_where=text("thread_type = 'lobby'"),
+            sqlite_where=text("thread_type = 'lobby'"),
         ),
         Index(
             "uq_campaign_threads_private_key",

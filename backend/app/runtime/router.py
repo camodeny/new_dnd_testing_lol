@@ -25,6 +25,7 @@ from app.runtime.threads import (
     get_or_create_private_gameplay_thread,
     get_campaign_thread,
     get_or_create_campaign_thread,
+    is_lobby_thread,
     list_threads_for_user,
     parse_thread_id,
     resolve_thread_id,
@@ -74,6 +75,21 @@ def create_player_submission(
         # Private existence is hidden as 404 — see threads.assert_can_write_thread
         assert_can_write_thread(db, campaign.id, resolved_thread_id, profile.id)
         thread = get_campaign_thread(db, campaign.id, resolved_thread_id)
+        # Issue #243 — the lobby OOC thread is non-fictional table talk. Gameplay
+        # (IC-capable) submissions can never target it: lobby chat has its own
+        # OOC-forced endpoint, and this refusal keeps lobby history out of DM
+        # turn assembly by construction.
+        if is_lobby_thread(thread):
+            logger.warning(
+                "player_submission rejected campaign_id=%s reason=lobby_thread thread_id=%s user_id=%s",
+                campaign.id,
+                resolved_thread_id,
+                profile.id,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="The lobby thread is out-of-character only; post lobby chat via the lobby chat endpoint",
+            )
         audience = (
             "campaign" if thread and thread.thread_type == "campaign" else "private"
         )

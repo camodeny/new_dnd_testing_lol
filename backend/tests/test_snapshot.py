@@ -127,13 +127,14 @@ def test_campaign_creation_creates_shared_thread(api_via_router):
     assert r.status_code == 200
     snap = r.json()
     assert snap["active_thread"]["thread_type"] == "campaign"
-    assert len(snap["threads"]) == 1
+    # Issue #243 — creation also seeds the shared OOC lobby thread.
+    assert {t["thread_type"] for t in snap["threads"]} == {"campaign", "lobby"}
     # durable across reconnect
     r2 = client.get(f"/api/campaigns/{campaign_id}/snapshot")
     assert r2.json()["active_thread_id"] == snap["active_thread_id"]
     with factory() as db:
         count = db.scalar(select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == campaign_id))
-        assert count == 1
+        assert count == 2
 
 
 def test_snapshot_reconstructs_current_state_after_disconnected_mutations(api):
