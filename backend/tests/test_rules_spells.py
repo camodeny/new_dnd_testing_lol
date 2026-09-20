@@ -166,6 +166,19 @@ def test_validate_explicitly_unprepared_spell_rejected():
     assert exc.value.code == "spell_not_prepared"
 
 
+def test_validate_frontend_shaped_is_prepared_flag_honored():
+    # Real character-editor rows store is_prepared (passed through
+    # from_frontend unchanged): explicit false is known-but-unprepared.
+    sheet = wizard_sheet(spells=[{"name": "Magic Missile", "spell_level": 1, "is_prepared": False}])
+    assert "magic missile" in query_known_spells(sheet).spells
+    with pytest.raises(SpellError) as exc:
+        validate_spell_cast(sheet, "Magic Missile")
+    assert exc.value.code == "spell_not_prepared"
+    checked = wizard_sheet(spells=[{"name": "Magic Missile", "spell_level": 1, "is_prepared": True}])
+    v = validate_spell_cast(checked, "Magic Missile")
+    assert v.valid is True and v.cast_slot_level == 1
+
+
 def test_validate_missing_spell_lists_fails_closed():
     with pytest.raises(SpellError) as exc:
         validate_spell_cast(FakeSheet(spells=None, cantrips=None), "Fire Bolt")

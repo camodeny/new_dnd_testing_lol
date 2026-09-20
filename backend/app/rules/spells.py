@@ -323,9 +323,10 @@ def _normalize_spell_entries(raw: Any) -> tuple[list[str], list[str]]:
     """Parse a JSONB spell list of strings or ``{name, prepared}`` dicts.
 
     Returns ``(names, prepared_names)``. String shorthand and dicts without
-    an explicit ``prepared: false`` count as castable; dicts with
-    ``prepared: false`` are known but not prepared. Unparseable entries are
-    skipped (fail-closed per entry, not per list).
+    an explicit opt-out count as castable; dicts with ``prepared: false`` or
+    the frontend character-editor ``is_prepared: false`` (stored unchanged by
+    ``Dnd5eCharacterSheet.from_frontend``) are known but not prepared.
+    Unparseable entries are skipped (fail-closed per entry, not per list).
     """
     if raw is None:
         return [], []
@@ -349,7 +350,7 @@ def _normalize_spell_entries(raw: Any) -> tuple[list[str], list[str]]:
                     break
             if entry_name is None:
                 continue
-            if item.get("prepared") is False:
+            if item.get("prepared") is False or item.get("is_prepared") is False:
                 is_prepared = False
         else:
             continue
