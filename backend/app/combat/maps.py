@@ -826,6 +826,66 @@ def update_terrain_inline(
     return encounter_map
 
 
+def update_placements_inline(
+    db: Session,
+    campaign: Campaign,
+    encounter: Encounter,
+    args: Mapping,
+    operation_key: str,
+) -> EncounterMap:
+    """DM structured-effect path: validated placement change inside the turn-commit txn.
+
+    No commit here — the outer turn commit owns the transaction (registered by
+    the dm lane; this module never imports dm code). Explicit staged cells win;
+    unmentioned participants keep their current cells; participants with no
+    cell yet fall back to the deterministic row-major default (same legality
+    as :func:`ensure_map`: known participants, in-bounds, unblocked, unique).
+    """
+    if not isinstance(args, Mapping):
+        raise MapError("placement effect arguments must be an object")
+    encounter_map = get_map(db, encounter.id)
+    if encounter_map is None:
+        raise MapError("encounter has no map yet; initialize geometry first", reason="no_map")
+    raw = args.get("placements")
+    if raw is None:
+        raw = []
+    zones = list_zones(db, encounter_map.id)
+    validated = _validate_placements_args(db, encounter, encounter_map, zones, raw)
+    current = {
+        str(p.participant_id): (int(p.col), int(p.row))
+        for p in list_placements(db, encounter.id)
+    }
+    for participant_id in validated:
+        current.pop(participant_id, None)
+    if set(validated.values()) & set(current.values()):
+        raise MapError("placement effect target cell is already occupied", reason="occupied")
+    full = _default_placements(
+        db, encounter, encounter_map, zones, keep={**current, **validated}
+    )
+    db.query(EncounterPlacement).filter(
+        EncounterPlacement.encounter_id == encounter.id
+    ).delete(synchronize_session=False)
+    db.flush()
+    for participant_id, (col, row) in full.items():
+        db.add(EncounterPlacement(
+            encounter_id=encounter.id,
+            campaign_id=encounter.campaign_id,
+            participant_id=uuid.UUID(participant_id),
+            col=col, row=row,
+        ))
+    db.flush()
+    _bump_map_revision(encounter_map)
+    db.flush()
+    structured_log(
+        logger, logging.INFO, "encounter_placements_changed",
+        encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
+        map_revision=int(encounter_map.revision or 1),
+        placements_moved=len(validated), placement_count=len(full),
+        operation_id=operation_key,
+    )
+    return encounter_map
+
+
 def _stranded_placements(
     db: Session, encounter: Encounter, encounter_map: EncounterMap
 ) -> list[dict]:

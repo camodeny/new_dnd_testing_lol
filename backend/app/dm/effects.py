@@ -53,6 +53,10 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # hidden trap/stranded geometry must never widen to a shared audience
     # unless the staged effect explicitly says so.
     "update_map_terrain": "dm_private",
+    # DM-authored token placements (#232) likewise default to dm_private
+    # (fail-closed): repositioning hidden tokens must never widen to a
+    # shared audience unless the staged effect explicitly says so.
+    "update_map_placement": "dm_private",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -536,6 +540,44 @@ def _handle_update_map_terrain(db: Session, campaign: Campaign, effect: dict[str
         raise ValueError(f"Staged effect {effect.get('id')!r} invalid terrain change: {exc}") from exc
     logger.info(
         "effect update_map_terrain effect_id=%s encounter_id=%s map_revision=%s op=%s",
+        effect.get("id"), encounter.id, encounter_map.revision, operation_key,
+    )
+
+
+@register("update_map_placement")
+def _handle_update_map_placement(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a DM-authored placement change inside the turn-commit txn (issue #232).
+
+    Routes to the combat-lane :func:`app.combat.maps.update_placements_inline`
+    (lazy import; combat code never imports dm code). Runs inside the outer
+    ``commit_campaign_mutation``: a failed turn commit rolls the placement
+    rewrite and map-revision bump back. Placement legality stays code-owned
+    in the combat lane — this handler only scopes the encounter to this
+    campaign and converts :class:`MapError` into a fail-closed ``ValueError``.
+    """
+    import uuid as _uuid
+
+    from models.combat import Encounter as _Encounter
+
+    args = effect.get("arguments") or {}
+    try:
+        encounter_id = _uuid.UUID(str(args.get("encounter_id") or ""))
+    except ValueError:
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter_id must be a UUID")
+    encounter = db.get(_Encounter, encounter_id)
+    if encounter is None or str(encounter.campaign_id) != str(campaign.id):
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
+    operation_key = _resolve_effect_key(attempt, effect)
+
+    from app.combat.maps import MapError as _MapError
+    from app.combat.maps import update_placements_inline as _update_placements_inline
+
+    try:
+        encounter_map = _update_placements_inline(db, campaign, encounter, args, operation_key)
+    except _MapError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid placement change: {exc}") from exc
+    logger.info(
+        "effect update_map_placement effect_id=%s encounter_id=%s map_revision=%s op=%s",
         effect.get("id"), encounter.id, encounter_map.revision, operation_key,
     )
 
