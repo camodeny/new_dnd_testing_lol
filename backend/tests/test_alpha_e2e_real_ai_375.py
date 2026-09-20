@@ -256,9 +256,7 @@ def test_phase0_solo_dogfood_with_configured_real_generative_route(scn, monkeypa
     # module, so this remains a test-local injection with no production change.
     monkeypatch.setattr(dm_execution, "execute_dm_attempt", execute_open_ended)
     try:
-        run_phase0_solo_scenario(
-            scn, expected_reply_marker=None, allow_silent=True
-        )
+        run_phase0_solo_scenario(scn, expected_reply_marker=None)
     finally:
         # Failure artifacts from #374 include this metadata because the
         # shared scenario fixture saves diagnostics after this function exits.
@@ -316,7 +314,9 @@ def test_phase0_solo_dogfood_with_experimental_real_decision_route(
 
     monkeypatch.setattr(dm_execution, "execute_dm_attempt", execute_decision_first)
     try:
-        run_phase0_solo_scenario(scn, expected_reply_marker=None)
+        run_phase0_solo_scenario(
+            scn, expected_reply_marker=None, allow_silent=True
+        )
     finally:
         metadata = _run_metadata(
             scn,
