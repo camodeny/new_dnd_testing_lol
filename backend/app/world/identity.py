@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.decisions import (
     ACTIVE, DIRECT_EXECUTE, CandidateRecord, DecisionClassPolicy, DecisionError,
     DecisionFrame, DecisionService, build_frame, build_record, evaluate_execution,
-    persist_record, register_policy, revalidate_for_execution, to_decision_request,
+    record_fail_soft, register_policy, revalidate_for_execution, to_decision_request,
 )
 from models.campaigns import Campaign
 from models.world import WorldEntity, WorldEntityAlias
@@ -200,7 +200,7 @@ def decide_identity(
                               model=response.model or "unknown", mode=ACTIVE,
                               trace_id=response.trace_id, operation_id=response.operation_id,
                               campaign_id=campaign.id, latency_ms=response.latency_ms, verified=True)
-        persist_record(session_factory, record)
+        record_fail_soft(session_factory, record)
     selected = result.selected_id if verdict.directive == DIRECT_EXECUTE else DEFER
     return IdentityDecision(selected, verdict.directive, frame)
 
