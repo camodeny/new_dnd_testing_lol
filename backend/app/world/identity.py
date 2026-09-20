@@ -208,6 +208,8 @@ def decide_identity(
 def create_entity_after_resolution(
     db: Session, campaign: Campaign, frame: DecisionFrame, selected_id: str, *,
     entity_type: str, name: str, idempotency_key: str, details: dict | None = None,
+    summary: str | None = None, source_turn_id: uuid.UUID | None = None,
+    source_attempt_id: uuid.UUID | None = None, operation_id: str | None = None,
 ) -> tuple[WorldEntity, bool]:
     """Revalidate a resolved outcome immediately before its durable write."""
     prior = db.execute(select(WorldEntity).where(
@@ -241,7 +243,11 @@ def create_entity_after_resolution(
         "state_revision": frame.state_revision,
     }
     return create_entity_inline(db, campaign, entity_type=entity_type, name=name,
-                                details=payload, idempotency_key=idempotency_key)
+                                summary=summary, details=payload,
+                                source_turn_id=source_turn_id,
+                                source_attempt_id=source_attempt_id,
+                                operation_id=operation_id,
+                                idempotency_key=idempotency_key)
 
 
 def supersede_entity(db: Session, duplicate: WorldEntity, canonical: WorldEntity, *, provenance: dict) -> None:

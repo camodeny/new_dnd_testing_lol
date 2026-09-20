@@ -689,6 +689,9 @@ def promote_new_entities_from_contract(
     campaign: Campaign,
     turn: Any,
     attempt: Any,
+    *,
+    identity_decision_service: Any | None = None,
+    identity_session_factory: Any | None = None,
 ) -> list[WorldEntity]:
     """Promote ``new_entities`` proposals to durable canonical identity.
 
@@ -733,32 +736,67 @@ def promote_new_entities_from_contract(
         # Committed proposals never bypass canonical identity. Exact stable
         # refs/names/aliases are deterministic and therefore must not fall
         # through to a semantic model or create a duplicate row.
-        from app.world.identity import exact_identity
+        from app.world.identity import (
+            DEFER,
+            KEEP_DISTINCT,
+            NEW_ENTITY,
+            build_identity_frame,
+            create_entity_after_resolution,
+            decide_identity,
+            exact_identity,
+        )
         collision = exact_identity(db, campaign.id, public_name)
         if collision is not None:
             raise ValueError(
                 f"new entity {temp_id!r} collides with canonical identity {collision.id}"
             )
-        entity, _ = create_entity_inline(
-            db, campaign,
+        location_value = (
+            location_ref if isinstance(location_ref, dict)
+            else (location_ref.model_dump(mode="json") if hasattr(location_ref, "model_dump") else location_ref)
+        )
+        frame = build_identity_frame(
+            db, campaign, name=validate_entity_name(public_name), entity_type=kind,
+            location_ref=str(location_value) if location_value is not None else None,
+            provenance_refs=tuple(filter(None, (str(turn_id) if turn_id else None,
+                                                   str(attempt_id) if attempt_id else None))),
+            is_authority=True,
+        )
+        domain_candidates = {
+            candidate.id for candidate in frame.candidates
+            if candidate.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}
+        }
+        if domain_candidates:
+            if identity_decision_service is None:
+                from app.decisions import DecisionService
+                identity_decision_service = DecisionService()
+            if identity_session_factory is None:
+                from database import SessionLocal
+                identity_session_factory = SessionLocal
+            decision = decide_identity(
+                db, campaign, frame, identity_decision_service,
+                session_factory=identity_session_factory,
+            )
+            selected_id = decision.selected_id
+        else:
+            # Exhaustive deterministic search found no plausible identity.
+            # NEW_ENTITY is therefore an explicit code-owned bounded outcome,
+            # still revalidated against the frame immediately before insert.
+            selected_id = NEW_ENTITY
+        if selected_id == DEFER:
+            raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+        entity, _ = create_entity_after_resolution(
+            db, campaign, frame, selected_id,
             entity_type=kind,
             name=validate_entity_name(public_name),
+            idempotency_key=_stable_jit_key(attempt_id, temp_id),
             summary=str(public_summary)[:2000] if public_summary else None,
-            status="active",
-            visibility="campaign",
-            details={
-                "temp_id": temp_id,
-                "role": role,
-                "location_ref": (
-                    location_ref if isinstance(location_ref, dict)
-                    else (location_ref.model_dump(mode="json") if hasattr(location_ref, "model_dump") else location_ref)
-                ),
-                "promoted_from": "dm_turn_contract",
-            },
             source_turn_id=turn_id,
             source_attempt_id=attempt_id,
             operation_id=str(operation_id) if operation_id else None,
-            idempotency_key=_stable_jit_key(attempt_id, temp_id),
+            details={
+                "temp_id": temp_id, "role": role, "location_ref": location_value,
+                "promoted_from": "dm_turn_contract",
+            },
         )
         promoted.append(entity)
     return promoted

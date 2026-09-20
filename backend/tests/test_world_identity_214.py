@@ -82,6 +82,28 @@ def test_obvious_duplicate_jit_proposal_rejected_and_retry_stays_idempotent():
     assert exact_identity(db, campaign.id, "Mara Venn").id == original.id
 
 
+def test_real_promotion_path_near_name_requires_bounded_outcome():
+    db, campaign = setup_db()
+    original = make_entity(db, campaign, "Mara Venn")
+    attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op", "contract_snapshot": {
+        "new_entities": [{"temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}})()
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": DEFER}))
+    with pytest.raises(ValueError, match="deferred"):
+        promote_new_entities_from_contract(
+            db, campaign, turn, attempt, identity_decision_service=service)
+    assert service.adapter.calls
+    assert [row.id for row in db.query(type(original)).all()] == [original.id]
+
+    keep_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=keep_service)
+    assert promoted[0].name == "Mara"
+    assert promoted[0].details["identity_resolution"]["outcome"] == KEEP_DISTINCT
+
+
 def test_bounded_candidates_and_stale_revalidation_fail_closed():
     db, campaign = setup_db()
     candidate = make_entity(db, campaign, "Mara", kind="npc")
