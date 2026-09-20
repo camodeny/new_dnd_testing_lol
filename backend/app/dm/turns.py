@@ -1376,6 +1376,21 @@ def commit_turn(
         except Exception as e:
             logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
+    # Post-commit #213 semantic-index hook for turn-path writes. Staged
+    # assert_fact / upsert_relation effects (and JIT-promoted entities) use
+    # the *_inline writers inside the turn transaction, so they bypass the
+    # *_authoritative hooks — without this, committed turn records would
+    # never become searchable. Best-effort derived work only: never breaks
+    # the committed turn. Skipped when the caller owns the transaction
+    # (commit=False), mirroring the encounter hook above.
+    if commit:
+        try:
+            from app.world import semantic as _semantic
+
+            _semantic.note_turn_committed(db, turn.campaign_id, turn.id, attempt.id)
+        except Exception as e:
+            logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
+
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "
         "input_set_revision=%s submission_count=%s assembly_window_start=%s assembly_window_end=%s time_executing_ms=%s "

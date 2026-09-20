@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import os
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -35,6 +36,8 @@ from app.world import semantic  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
     create_fact_authoritative,
     create_relation_authoritative,
+    list_facts,
+    list_relations,
     supersede_fact_authoritative,
 )
 from app.world.retrieval import (  # noqa: E402
@@ -55,6 +58,9 @@ from app.world.semantic import (  # noqa: E402
     handle_world_semantic_index,
     index_source_record,
     mark_stale,
+    note_turn_committed,
+    request_semantic_index,
+    resolve_embedding_model,
     semantic_search,
 )
 from app.world.service import create_entity_authoritative  # noqa: E402
@@ -507,8 +513,6 @@ def test_migration_defines_pgvector_branch_and_fallback():
     assert 'hnsw' in text.lower()
     assert 'embedding_text' in text
     assert 'world_embeddings' in text
-
-
 @pytest.mark.postgres
 def test_live_pgvector_column_when_postgres_available():
     url = (os.getenv("POSTGRES_URL_NON_POOLING") or os.getenv("POSTGRES_URL")
@@ -536,3 +540,236 @@ def test_live_pgvector_column_when_postgres_available():
             "WHERE schemaname='public' AND tablename='world_embeddings' "
             "AND indexdef ILIKE '%hnsw%'")).fetchall()
         assert hnsw, "expected HNSW index on world_embeddings.embedding"
+
+
+# ── AI review round 1 regressions ────────────────────────────────────────────
+
+def test_default_model_selection_prefers_configured_real_model(monkeypatch):
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
+                "GEMINI_EMBEDDING_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    # Offline: explicit stub fallback.
+    assert resolve_embedding_model(None) == "stub-hash-v1"
+    # Configured key: production model, never silent stub.
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    assert resolve_embedding_model(None) == "gemini-embedding-2"
+    # Explicit env/model always wins.
+    monkeypatch.setenv("GEMINI_EMBEDDING_MODEL", "text-embedding-004")
+    assert resolve_embedding_model(None) == "text-embedding-004"
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GEMINI_EMBEDDING_MODEL", raising=False)
+    assert resolve_embedding_model("custom-model") == "custom-model"
+
+
+def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
+    import app.rules.gemini as gemini_mod
+
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
+                "GEMINI_EMBEDDING_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    seen_tasks: list[str] = []
+
+    def _fake_factory(*, model=None, api_key=None,
+                      task_type="RETRIEVAL_DOCUMENT",
+                      output_dimensionality=None):
+        seen_tasks.append(task_type)
+
+        def _fake_provider(texts: list[str]):
+            return [[0.05] * 1536 for _ in texts]
+
+        return _fake_provider
+
+    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _fake_factory)
+
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    fact = _seed_fact(db, cid)
+    # The factory returns a plain callable (no .embed attribute): the old
+    # code raised AttributeError here and degraded to "no provider".
+    row = index_source_record(db, cid, "world_fact", fact.id,
+                              embedding_model="gemini-embedding-2")
+    assert row is not None and row.status == "active"
+    assert row.embedding_model == "gemini-embedding-2"
+    assert "RETRIEVAL_DOCUMENT" in seen_tasks
+
+    query = build_source_text(db, "world_fact", fact)
+    outcome = semantic_search(db, cid, query, owner, dm_internal=True,
+                              embedding_model="gemini-embedding-2")
+    assert outcome.status == SEM_OK
+    assert outcome.packets[0].source_id == str(fact.id)
+    assert "RETRIEVAL_QUERY" in seen_tasks
+
+    # A real model with no usable provider fails visibly — never mints stub
+    # vectors labeled as the real model.
+    def _boom(*, model=None, api_key=None, task_type="RETRIEVAL_DOCUMENT",
+              output_dimensionality=None):
+        raise RuntimeError("GEMINI_API_KEY not set")
+
+    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _boom)
+    with pytest.raises(RuntimeError, match="no provider"):
+        index_source_record(db, cid, "world_fact", fact.id,
+                            embedding_model="gemini-embedding-2")
+    leftovers = db.execute(
+        select(WorldEmbedding).where(
+            WorldEmbedding.source_id == fact.id,
+            WorldEmbedding.embedding_model == "gemini-embedding-2")
+    ).scalars().all()
+    assert all(r.status == "active" for r in leftovers)
+
+
+def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
+    from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started
+    from app.runtime.submissions import accept_submission
+    from models.dm import DMStream, DMStreamChunk
+
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="The DM speaks",
+        segments=[{"type": "ic", "text": "The DM speaks."}], thread_id=tid,
+    )
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, tid)
+    attempt.staged_effects = staged_effects
+    attempt.contract_snapshot = {"contract_version": "dm_turn_contract_v1",
+                                 "new_entities": [], "staged_effects": []}
+    db.flush()
+    db.commit()
+    stream = DMStream(
+        id=uuid.uuid4(), campaign_id=turn.campaign_id,
+        thread_id=uuid.UUID(str(turn.thread_id)),
+        turn_id=str(turn.id), attempt_id=str(attempt.id),
+        status="streaming", audience=turn.audience,
+    )
+    db.add(stream)
+    db.flush()
+    db.add(DMStreamChunk(
+        id=uuid.uuid4(), stream_id=stream.id, sequence=0,
+        text="Narration begins.", byte_length=len("Narration begins.".encode()),
+    ))
+    stream.first_chunk_at = datetime.now(timezone.utc)
+    stream.chunk_count = 1
+    db.flush()
+    db.commit()
+    mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+    return commit_turn(db, turn.id, attempt.id)
+
+
+def test_committed_turn_staged_effects_become_searchable():
+    from app.runtime.threads import get_or_create_campaign_thread
+
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    entity, _ = create_entity_authoritative(
+        db, cid, 0, entity_type="npc", name="Mara",
+        visibility="campaign", operation_id="op-turn-ent")
+    guild, _ = create_entity_authoritative(
+        db, cid, 1, entity_type="faction", name="Guild",
+        visibility="campaign", operation_id="op-turn-guild")
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    turn, attempt, event = _commit_knowledge_turn(db, cid, owner, str(thread.id), [
+        {"id": "eff-rel-1", "effect_type": "upsert_relation", "arguments": {
+            "subject_entity_id": str(entity.id), "relation_type": "works_for",
+            "object_entity_id": str(guild.id), "epistemic_state": "confirmed",
+            "visibility": "campaign",
+        }},
+        {"id": "eff-fact-1", "effect_type": "assert_fact", "arguments": {
+            "content": "Mara serves the Guild openly.",
+            "entity_refs": [str(entity.id), str(guild.id)],
+            "epistemic_state": "confirmed", "visibility": "campaign",
+        }},
+    ])
+    assert event is not None
+    rels = list_relations(db, cid)
+    facts = list_facts(db, cid)
+    assert len(rels) == 1 and len(facts) == 1
+
+    # The committed turn's inline writes published async index work
+    # (placeholders) even though they bypassed the *_authoritative hooks.
+    placeholders = db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
+    ).scalars().all()
+    assert {(p.source_type, str(p.source_id)) for p in placeholders} >= {
+        ("world_relation", str(rels[0].id)), ("world_fact", str(facts[0].id))}
+    assert all(p.status == "stale" for p in placeholders)
+
+    # Driving the worker handler indexes both records; exact-text search
+    # resolves each back to its authoritative row.
+    for source_type, source_id in (("world_relation", rels[0].id),
+                                   ("world_fact", facts[0].id)):
+        envelope = new_envelope(
+            job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
+            aggregate_id=cid, operation_id=f"op-turn-idx-{source_type}",
+            idempotency_key=f"semidx-turn-test:{source_type}:{source_id}",
+            payload={"campaign_id": str(cid), "source_type": source_type,
+                     "source_id": str(source_id),
+                     "embedding_model": DEFAULT_MODEL,
+                     "embedding_version": DEFAULT_VERSION},
+        )
+        result = handle_world_semantic_index(envelope, db)
+        assert result["status"] == "active"
+    for source_type, record in (("world_relation", rels[0]),
+                                ("world_fact", facts[0])):
+        query = build_source_text(db, source_type, record)
+        outcome = semantic_search(db, cid, query, owner, dm_internal=True)
+        assert outcome.status == SEM_OK, source_type
+        assert outcome.packets[0].source_id == str(record.id), source_type
+
+
+def test_same_id_version_change_rebuilds_new_worker_job():
+    from app.worker.executor import execute_worker_job
+    from app.world.service import set_scene_authoritative
+
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    scene, _ = set_scene_authoritative(
+        db, cid, 0, location_name="Cinder Keep",
+        operation_id="op-scene-1")
+    assert scene is not None
+    jid1 = request_semantic_index(db, cid, "scene", cid)
+    assert jid1 is not None
+
+    def _run(job_id_str):
+        envelope = new_envelope(
+            job_id=uuid.UUID(str(job_id_str)),
+            job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
+            aggregate_id=cid, operation_id=f"op-scene-idx-{job_id_str}",
+            idempotency_key=f"semidx-scene-test:{job_id_str}",
+            payload={"campaign_id": str(cid), "source_type": "scene",
+                     "source_id": str(cid), "embedding_model": DEFAULT_MODEL,
+                     "embedding_version": DEFAULT_VERSION},
+        )
+        return execute_worker_job(
+            db, envelope, lambda env: handle_world_semantic_index(env, db))
+
+    result1, duplicate1 = _run(jid1)
+    assert duplicate1 is False
+    assert result1["status"] == "active"
+    first_version = result1["source_version"]
+
+    # Same-ID source change: the scene row keeps its id, the version moves.
+    rev1 = int(scene.revision)
+    scene2, _ = set_scene_authoritative(
+        db, cid, 1, location_name="Ember Gate",
+        operation_id="op-scene-2")
+    assert scene2 is not None
+    assert int(scene2.revision) == rev1 + 1
+    jid2 = request_semantic_index(db, cid, "scene", cid)
+    assert jid2 is not None
+    # A new logical job id: the ledger must not serve the stale cached hit.
+    assert jid2 != jid1
+    result2, duplicate2 = _run(jid2)
+    assert duplicate2 is False
+    assert result2["status"] == "active"
+    assert result2["source_version"] != first_version
+    row = db.execute(
+        select(WorldEmbedding).where(
+            WorldEmbedding.campaign_id == cid,
+            WorldEmbedding.source_type == "scene",
+            WorldEmbedding.embedding_model == DEFAULT_MODEL)
+    ).scalars().first()
+    assert row is not None and row.status == "active"
+    assert row.source_version == result2["source_version"]
+
+    # Same-version re-request stays idempotent (ledger duplicate, no re-run).
+    jid3 = request_semantic_index(db, cid, "scene", cid)
+    assert jid3 == jid2

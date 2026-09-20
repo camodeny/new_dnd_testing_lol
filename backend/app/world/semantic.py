@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -63,6 +64,41 @@ SEMANTIC_INDEX_JOB_TYPE = "world.semantic.index"
 
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"
+
+# Production embedding model selected when Gemini is configured (mirrors the
+# #333 ingest-CLI precedence). The stub stays the explicit offline/test
+# fallback — never silently minted under a real model name.
+GEMINI_DEFAULT_MODEL = "gemini-embedding-2"
+
+
+def is_stub_model(embedding_model: str | None) -> bool:
+    """True for the explicit offline/test stub (or an unset model)."""
+    if not embedding_model:
+        return True
+    text = str(embedding_model).strip()
+    return text == DEFAULT_MODEL or text.startswith("stub")
+
+
+def resolve_embedding_model(explicit_model: str | None = None) -> str:
+    """Model for automatic index/search paths (issue #213 review round 1).
+
+    Precedence: explicit model > ``GEMINI_EMBEDDING_MODEL`` env > the
+    production Gemini model when a Gemini key is configured > stub-hash-v1.
+    Keeps writers and search consistent: both resolve through this one
+    function instead of hardcoding the stub.
+    """
+    raw = (str(explicit_model).strip() if explicit_model else "") or os.getenv(
+        "GEMINI_EMBEDDING_MODEL", ""
+    ).strip()
+    if raw:
+        return raw
+    if (
+        os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+        or os.getenv("GOOGLE_GENAI_API_KEY")
+    ):
+        return GEMINI_DEFAULT_MODEL
+    return DEFAULT_MODEL
 
 try:  # Single canonical indexed dimension (issue #334); safe local fallback.
     from app.rules.gemini import EMBEDDING_DIM as _DIM  # type: ignore
@@ -186,9 +222,18 @@ def _vector_json(vec: list[float]) -> str:
 
 
 def _resolve_embedder(
-    embedding_model: str, provider: Callable[[list[str]], list[list[float]]] | None
+    embedding_model: str,
+    provider: Callable[[list[str]], list[list[float]]] | None,
+    *,
+    task_type: str = "RETRIEVAL_DOCUMENT",
 ) -> Callable[[list[str]], list[list[float]]] | None:
     """Return a real embedder or None for the deterministic stub path.
+
+    ``make_gemini_provider`` already returns a ``texts -> vectors`` callable
+    (see the #223 rules-embeddings precedent), so it is used directly — never
+    via a nonexistent ``.embed`` attribute. Document indexing uses
+    ``RETRIEVAL_DOCUMENT``; query embedding must pass
+    ``RETRIEVAL_QUERY`` so both sides share the retrieval task space.
 
     Real models fail visibly when no provider is available — never silently
     mint stub vectors labeled as a real model.
@@ -199,7 +244,7 @@ def _resolve_embedder(
         try:
             from app.rules.gemini import make_gemini_provider
 
-            return make_gemini_provider(model=embedding_model).embed  # type: ignore[attr-defined]
+            return make_gemini_provider(model=embedding_model, task_type=task_type)
         except Exception as exc:
             raise RuntimeError(
                 f"Embedding model {embedding_model!r} requested but no provider "
@@ -284,8 +329,6 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
         raise ValueError(f"unsupported semantic source type {source_type!r}")
     text_value = "\n".join(p for p in (s.strip() for s in parts if s) if p)
     return text_value[:MAX_INDEX_TEXT_CHARS]
-
-
 def _current_record(
     db: Session, campaign_id: uuid.UUID, source_type: str, source_id: uuid.UUID
 ) -> Any | None:
@@ -322,6 +365,25 @@ def _record_active(record: Any, source_type: str) -> bool:
     if source_type in {"world_relation", "world_fact"}:
         return str(getattr(record, "status", "active")) == "active"
     return True
+
+
+def _authoritative_source_version(record: Any, source_type: str) -> str:
+    """Canonical version string for one authoritative record.
+
+    Matches what evidence packets report (``_scene_packet`` uses
+    ``r{revision}``): the transient scene row has no ``version`` column, so
+    the generic ``_version_of`` falls back to ``updated_at`` — which is
+    second-precision on some backends and never moves on rapid revision
+    bumps. Using the scene ``revision`` keeps stored index versions,
+    search-time staleness checks, and job keys on the same canonical
+    version the rest of the world path already uses.
+    """
+    if source_type == "scene":
+        try:
+            return f"r{int(getattr(record, 'revision', 0) or 0)}"
+        except (TypeError, ValueError):
+            pass
+    return retrieval_mod._version_of(record)
 
 
 # ── pgvector detection (cached; code-owned failure taxonomy) ─────────────────
@@ -431,7 +493,7 @@ def index_source_record(
     source_type: Any,
     source_id: Any,
     *,
-    embedding_model: str = DEFAULT_MODEL,
+    embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
     provider: Callable[[list[str]], list[list[float]]] | None = None,
     commit: bool = True,
@@ -445,6 +507,7 @@ def index_source_record(
     """
     started = time.monotonic()
     stype = validate_source_type(source_type)
+    embedding_model = resolve_embedding_model(embedding_model)
     campaign = retrieval_mod._resolve_campaign(db, campaign_id)
     try:
         sid = retrieval_mod._coerce_uuid(source_id, field_name="source_id")
@@ -467,13 +530,13 @@ def index_source_record(
         )
         return existing
 
-    source_version = retrieval_mod._version_of(record)
+    source_version = _authoritative_source_version(record, stype)
     index_text = build_source_text(db, stype, record)
     embedder = _resolve_embedder(embedding_model, provider)
     if embedder is not None:
         vectors = embedder([index_text])
     else:
-        if embedding_model != DEFAULT_MODEL and not embedding_model.startswith("stub"):
+        if not is_stub_model(embedding_model):
             raise RuntimeError(
                 f"Embedding model {embedding_model!r} has no provider; "
                 "refusing to mint stub vectors under a non-stub model name."
@@ -604,12 +667,13 @@ def mark_superseded(
 
 
 def get_semantic_stats(
-    db: Session, campaign_id: Any, *, embedding_model: str = DEFAULT_MODEL,
+    db: Session, campaign_id: Any, *, embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
 ) -> dict[str, Any]:
     """Indexing observability: counts by status + oldest-stale lag."""
     from sqlalchemy import func as _func
 
+    embedding_model = resolve_embedding_model(embedding_model)
     campaign = retrieval_mod._resolve_campaign(db, campaign_id)
     rows = db.execute(
         select(WorldEmbedding.status, _func.count()).where(
@@ -650,9 +714,43 @@ def get_semantic_stats(
 def _deterministic_job_id(
     campaign_id: uuid.UUID, source_type: str, source_id: uuid.UUID,
     embedding_model: str, embedding_version: str,
+    source_version: str | None = None,
 ) -> uuid.UUID:
-    key = f"semidx:{campaign_id}:{source_type}:{source_id}:{embedding_model}:{embedding_version}"
+    """Logical job id for one (source, model) index request.
+
+    The current authoritative ``source_version`` is part of the key when
+    known: after the first job succeeds, the #191 ledger returns the cached
+    result for a repeated id without running the handler, so a changed
+    same-ID source must get a new logical id or its rebuild never runs.
+    Same version re-requests stay idempotent (same id, duplicate hit).
+    """
+    version_part = str(source_version or "")
+    key = (
+        f"semidx:{campaign_id}:{source_type}:{source_id}:"
+        f"{embedding_model}:{embedding_version}:{version_part}"
+    )
     return uuid.uuid5(uuid.NAMESPACE_URL, key)
+
+
+def _read_source_version(
+    db: Session | None,
+    campaign_id: uuid.UUID,
+    source_type: str,
+    source_id: uuid.UUID,
+) -> str | None:
+    """Best-effort current authoritative version for the job key."""
+    if db is None:
+        return None
+    try:
+        record = _current_record(db, campaign_id, source_type, source_id)
+    except Exception:
+        return None
+    if record is None:
+        return None
+    try:
+        return _authoritative_source_version(record, source_type)
+    except Exception:
+        return None
 
 
 def request_semantic_index(
@@ -661,7 +759,7 @@ def request_semantic_index(
     source_type: Any,
     source_id: Any,
     *,
-    embedding_model: str = DEFAULT_MODEL,
+    embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
 ) -> str | None:
     """Best-effort async index request: stale placeholder + queue envelope.
@@ -671,8 +769,10 @@ def request_semantic_index(
     """
     try:
         stype = validate_source_type(source_type)
+        embedding_model = resolve_embedding_model(embedding_model)
         cid = retrieval_mod._coerce_uuid(campaign_id, field_name="campaign_id")
         sid = retrieval_mod._coerce_uuid(source_id, field_name="source_id")
+        source_version = _read_source_version(db, cid, stype, sid)
         if db is not None:
             try:
                 existing = _find_row(db, cid, stype, sid, embedding_model, embedding_version)
@@ -697,17 +797,24 @@ def request_semantic_index(
                 logger.warning("world_semantic_placeholder_failed error=%s", exc)
         from app.queue.adapter import new_envelope, publish_envelope
 
+        version_suffix = f":{source_version}" if source_version else ""
         envelope = new_envelope(
-            job_id=_deterministic_job_id(cid, stype, sid, embedding_model, embedding_version),
+            job_id=_deterministic_job_id(
+                cid, stype, sid, embedding_model, embedding_version,
+                source_version),
             job_type=SEMANTIC_INDEX_JOB_TYPE,
             campaign_id=cid,
             aggregate_id=cid,
-            operation_id=f"semidx:{stype}:{sid}",
-            idempotency_key=f"semidx:{stype}:{sid}:{embedding_model}:{embedding_version}",
+            operation_id=f"semidx:{stype}:{sid}{version_suffix}",
+            idempotency_key=(
+                f"semidx:{stype}:{sid}:{embedding_model}:"
+                f"{embedding_version}{version_suffix}"
+            ),
             payload={
                 "campaign_id": str(cid),
                 "source_type": stype,
                 "source_id": str(sid),
+                "source_version": source_version,
                 "embedding_model": embedding_model,
                 "embedding_version": embedding_version,
             },
@@ -723,10 +830,11 @@ def note_authoritative_write(
     campaign_id: Any,
     entries: list[tuple[str, Any]],
     *,
-    embedding_model: str = DEFAULT_MODEL,
+    embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
 ) -> None:
     """Writer hook: request async reindex for created/changed sources."""
+    embedding_model = resolve_embedding_model(embedding_model)
     for source_type, source_id in entries:
         request_semantic_index(
             db, campaign_id, source_type, source_id,
@@ -757,6 +865,102 @@ def note_supersession(
         logger.warning("world_semantic_supersede_note_failed error=%s", exc)
 
 
+def note_turn_committed(
+    db: Session | None,
+    campaign_id: Any,
+    turn_id: Any,
+    attempt_id: Any | None = None,
+) -> dict[str, int]:
+    """Post-commit hook for staged DM-turn writes (issue #213 review round 1).
+
+    Staged ``assert_fact`` / ``upsert_relation`` effects (plus JIT-promoted
+    entities) write via the ``*_inline`` knowledge writers inside the turn
+    transaction, bypassing the ``*_authoritative`` hooks — so a committed
+    turn's records would never become searchable without this. Call once,
+    AFTER the turn commit, with the committed session: it collects the
+    turn's facts/relations/entities (attempt-scoped, falling back to the
+    turn) and routes creates through :func:`note_authoritative_write` and
+    version successors through :func:`note_supersession`.
+
+    Publishing/enqueueing must never happen inside the turn transaction
+    (the queue adapter publishes immediately, outside the DB txn), hence
+    this post-commit boundary. Never raises.
+    """
+    counts = {"entities": 0, "relations": 0, "facts": 0}
+    if db is None:
+        return counts
+    try:
+        cid = retrieval_mod._coerce_uuid(campaign_id, field_name="campaign_id")
+        try:
+            tid = retrieval_mod._coerce_uuid(turn_id, field_name="turn_id")
+        except ValueError:
+            tid = None
+        try:
+            aid = (
+                retrieval_mod._coerce_uuid(attempt_id, field_name="attempt_id")
+                if attempt_id is not None else None
+            )
+        except ValueError:
+            aid = None
+        if tid is None and aid is None:
+            return counts
+        tables: list[tuple[str, Any]] = [
+            ("world_entity", WorldEntity),
+            ("world_relation", WorldRelation),
+            ("world_fact", WorldFact),
+        ]
+        for stype, model in tables:
+            rows: list[Any] = []
+            if aid is not None:
+                try:
+                    rows = list(db.execute(
+                        select(model).where(
+                            model.campaign_id == cid,
+                            model.source_attempt_id == aid,
+                        )
+                    ).scalars().all())
+                except Exception:
+                    rows = []
+            if not rows and tid is not None:
+                try:
+                    rows = list(db.execute(
+                        select(model).where(
+                            model.campaign_id == cid,
+                            model.source_turn_id == tid,
+                        )
+                    ).scalars().all())
+                except Exception:
+                    rows = []
+            creates: list[tuple[str, Any]] = []
+            for row in rows:
+                try:
+                    prior_id = getattr(row, "supersedes_id", None)
+                    if prior_id is not None:
+                        note_supersession(
+                            db, cid, (stype, prior_id), (stype, row.id))
+                    else:
+                        creates.append((stype, row.id))
+                except Exception as exc:
+                    logger.warning(
+                        "world_semantic_turn_note_row_failed source_type=%s error=%s",
+                        stype, exc,
+                    )
+            if creates:
+                try:
+                    note_authoritative_write(db, cid, creates)
+                except Exception as exc:
+                    logger.warning(
+                        "world_semantic_turn_note_failed source_type=%s error=%s",
+                        stype, exc,
+                    )
+            key = {"world_entity": "entities", "world_relation": "relations",
+                   "world_fact": "facts"}[stype]
+            counts[key] = len(rows)
+    except Exception as exc:
+        logger.warning("world_semantic_turn_note_failed error=%s", exc)
+    return counts
+
+
 def handle_world_semantic_index(envelope: Any, db: Session | None = None) -> dict[str, Any]:
     """Worker handler for ``world.semantic.index`` (identifiers only).
 
@@ -784,7 +988,9 @@ def handle_world_semantic_index(envelope: Any, db: Session | None = None) -> dic
                 payload.get("campaign_id"),
                 payload.get("source_type"),
                 payload.get("source_id"),
-                embedding_model=str(payload.get("embedding_model") or DEFAULT_MODEL),
+                embedding_model=(
+                    str(payload.get("embedding_model") or "").strip() or None
+                ),
                 embedding_version=str(payload.get("embedding_version") or DEFAULT_VERSION),
                 commit=True,
             )
@@ -823,7 +1029,8 @@ def _record_index_failure(db: Session, payload: dict[str, Any], error: str, *, c
         return
     row = _find_row(
         db, cid, str(payload.get("source_type") or ""),
-        sid, str(payload.get("embedding_model") or DEFAULT_MODEL),
+        sid, resolve_embedding_model(
+            str(payload.get("embedding_model") or "").strip() or None),
         str(payload.get("embedding_version") or DEFAULT_VERSION),
     )
     if row is None:
@@ -869,11 +1076,13 @@ def _embed_query(
         raise ValueError("semantic search requires a non-empty query")
     if len(cleaned) > MAX_INDEX_TEXT_CHARS:
         cleaned = cleaned[:MAX_INDEX_TEXT_CHARS]
-    embedder = _resolve_embedder(embedding_model, provider)
+    embedding_model = resolve_embedding_model(embedding_model)
+    embedder = _resolve_embedder(
+        embedding_model, provider, task_type="RETRIEVAL_QUERY")
     if embedder is not None:
         vectors = embedder([cleaned])
     else:
-        if embedding_model != DEFAULT_MODEL and not embedding_model.startswith("stub"):
+        if not is_stub_model(embedding_model):
             raise RuntimeError(
                 f"Embedding model {embedding_model!r} has no provider; "
                 "refusing to mint stub vectors under a non-stub model name."
@@ -1014,7 +1223,7 @@ def semantic_search(
     *,
     limit: Any = SEMANTIC_DEFAULT_LIMIT,
     min_similarity: Any = DEFAULT_MIN_SIMILARITY,
-    embedding_model: str = DEFAULT_MODEL,
+    embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
     provider: Callable[[list[str]], list[list[float]]] | None = None,
     dm_internal: bool = False,
@@ -1029,6 +1238,7 @@ def semantic_search(
     """
     started = time.monotonic()
     limit_applied = _clamp_limit(limit)
+    embedding_model = resolve_embedding_model(embedding_model)
     try:
         threshold = float(min_similarity)
     except (TypeError, ValueError):
@@ -1116,7 +1326,7 @@ def semantic_search(
                     pass
             stale_dropped += 1
             continue
-        current_version = retrieval_mod._version_of(record)
+        current_version = _authoritative_source_version(record, row.source_type)
         if current_version != row.source_version:
             try:
                 row.status = "stale"
