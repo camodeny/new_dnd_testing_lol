@@ -475,6 +475,8 @@ class JudgeVerdict:
     ``deterministic_final`` is True when deterministic checks already
     rejected the candidate: the directive is then ``escalate`` regardless
     of judge probabilities, and a semantic pass never overturns it.
+    ``max_regenerations`` carries the active policy budget so retry
+    helpers enforce the same versioned policy that produced the verdict.
     """
 
     directive: str
@@ -486,6 +488,7 @@ class JudgeVerdict:
     attempts_used: int
     policy_version: int = JUDGE_POLICY_VERSION
     question_version: int = JUDGE_SCHEMA_VERSION
+    max_regenerations: int = 2
 
 
 def _checked_violation_probability(value: Any, *, question_id: str) -> float:
@@ -595,6 +598,7 @@ def evaluate_judges(
             deterministic_passed=False,
             deterministic_final=True,
             attempts_used=attempts_used,
+            max_regenerations=active.max_regenerations,
         )
     if not failed:
         return JudgeVerdict(
@@ -605,6 +609,7 @@ def evaluate_judges(
             deterministic_passed=True,
             deterministic_final=False,
             attempts_used=attempts_used,
+            max_regenerations=active.max_regenerations,
         )
     if any(qid in SAFETY_QUESTIONS for qid in failed):
         safety = sorted(qid for qid in failed if qid in SAFETY_QUESTIONS)
@@ -619,6 +624,7 @@ def evaluate_judges(
             deterministic_passed=True,
             deterministic_final=False,
             attempts_used=attempts_used,
+            max_regenerations=active.max_regenerations,
         )
     if attempts_used >= active.max_regenerations:
         return JudgeVerdict(
@@ -633,6 +639,7 @@ def evaluate_judges(
             deterministic_passed=True,
             deterministic_final=False,
             attempts_used=attempts_used,
+            max_regenerations=active.max_regenerations,
         )
     if any(qid in REPAIR_QUESTIONS for qid in failed):
         return JudgeVerdict(
@@ -646,6 +653,7 @@ def evaluate_judges(
             deterministic_passed=True,
             deterministic_final=False,
             attempts_used=attempts_used,
+            max_regenerations=active.max_regenerations,
         )
     return JudgeVerdict(
         directive=JUDGE_REGENERATE,
@@ -658,8 +666,18 @@ def evaluate_judges(
     )
 
 
-def judge_retry_allowed(verdict: JudgeVerdict, *, attempts_used: int) -> bool:
-    """Whether a regenerate/repair directive may still run within bounds."""
+def judge_retry_allowed(
+    verdict: JudgeVerdict,
+    *,
+    attempts_used: int,
+    policy: JudgePolicy | None = None,
+) -> bool:
+    """Whether a regenerate/repair directive may still run within bounds.
+
+    Enforces the same versioned budget that produced the verdict
+    (``verdict.max_regenerations``); an explicit ``policy`` overrides for
+    callers holding the active policy object.
+    """
     if verdict.directive not in (JUDGE_REPAIR, JUDGE_REGENERATE):
         return False
     if isinstance(attempts_used, bool) or not isinstance(attempts_used, int):
@@ -667,7 +685,13 @@ def judge_retry_allowed(verdict: JudgeVerdict, *, attempts_used: int) -> bool:
             f"judge input attempts_used {attempts_used!r} is not an integer",
             kind="malformed",
         )
-    return attempts_used < DEFAULT_JUDGE_POLICY.max_regenerations
+    budget = policy.max_regenerations if policy is not None else verdict.max_regenerations
+    if isinstance(budget, bool) or not isinstance(budget, int):
+        raise DecisionError(
+            f"judge retry budget {budget!r} is not an integer",
+            kind="malformed",
+        )
+    return attempts_used < budget
 
 
 def format_judge_feedback(

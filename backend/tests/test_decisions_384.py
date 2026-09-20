@@ -704,3 +704,80 @@ def test_narration_judge_evidence_includes_non_claim_projection_fields():
     assert "The ledge looks treacherous and demands care." in evidence.public_claim_texts
     assert "Acrobatics check" in evidence.public_claim_texts
     assert "What do you do?" in evidence.public_claim_texts
+
+
+# --- retry budget follows the active policy -----------------------------------
+
+
+def test_retry_allowed_follows_non_default_policy_budget():
+    answers = _clean_answers()
+    answers[JUDGE_CONTRADICTION] = 0.8
+    policy = JudgePolicy(max_regenerations=3)
+    verdict, _ = run_judges(
+        _service(answers), _evidence(), deterministic_passed=True,
+        attempts_used=2, policy=policy,
+    )
+    assert verdict.directive == JUDGE_REPAIR
+    assert verdict.max_regenerations == 3
+    # The default budget is 2, so a hard-coded default would refuse here.
+    assert judge_retry_allowed(verdict, attempts_used=2) is True
+    assert judge_retry_allowed(verdict, attempts_used=2, policy=policy) is True
+    assert judge_retry_allowed(verdict, attempts_used=3) is False
+
+
+def test_production_validated_turn_invokes_shadow_judge():
+    import uuid as _uuid
+
+    from sqlalchemy.pool import StaticPool
+
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+    from app.dm.narration import execute_validated_turn
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    with factory() as s:
+        from models.campaigns import Campaign
+        from models.profiles import Profile
+        from models.threads import CampaignThread
+        from app.runtime.submissions import accept_submission
+        from app.dm.turns import coordinate_turn
+
+        owner = _uuid.uuid4()
+        camp_id = _uuid.uuid4()
+        thread_id = _uuid.uuid4()
+        s.add(Profile(id=owner, email="owner@example.com"))
+        s.add(Campaign(id=camp_id, owner_id=owner, name="Table", revision=0))
+        s.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
+        s.commit()
+        accept_submission(
+            s, campaign_id=camp_id, user_id=_uuid.uuid4(),
+            raw_content="I listen at the door.",
+            segments=[{"type": "ic", "text": "I listen at the door."}],
+            thread_id=str(thread_id),
+        )
+        s.commit()
+        turn, attempt = coordinate_turn(s, camp_id, str(thread_id))
+        contract = normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "respond",
+            "reason": "story continuation",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{
+                    "text": "Silence presses against the oak door.",
+                    "claim_kind": "observation", "origin": "dm_adjudication",
+                    "visibility": "public",
+                }],
+            }],
+            "open_player_choice": "What do you do?",
+        })
+        judge_service = _service(_clean_answers())
+        out = execute_validated_turn(
+            s, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
+            publish_realtime=False,
+            judge_service=judge_service,
+            judge_session_factory=None,
+        )
+        assert out.narration.completed
+        # The production validated-turn path ran the shadow judge call.
+        assert len(judge_service.adapter.calls) == 1

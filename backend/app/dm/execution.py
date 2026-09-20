@@ -938,6 +938,25 @@ def _execute_owned_attempt(
         # call): same production stream/commit path, used by tests.
         narrator = None
 
+    # Issue #384 — shadow-first semantic judges over narration fidelity.
+    # Reuses the existing decision-service path (same object the router
+    # uses, defaulting to a service like the router does) and an
+    # independent telemetry session factory. Shadow verdicts are
+    # calibration-only: deterministic failures stay final and a judge
+    # failure never breaks narration.
+    try:
+        from app.decisions.runtime import DecisionService as _JudgeService
+
+        _judge_service = decision_service if decision_service is not None else _JudgeService()
+    except Exception:
+        _judge_service = decision_service
+    try:
+        from database import SessionLocal as _JudgeSessionLocal
+
+        _judge_factory = _JudgeSessionLocal
+    except Exception:
+        _judge_factory = None
+
     try:
         result = execute_validated_turn(
             db,
@@ -948,6 +967,8 @@ def _execute_owned_attempt(
             provider=pname or "dm-provider",
             publish_realtime=True,
             trace_id=tid,
+            judge_service=_judge_service,
+            judge_session_factory=_judge_factory,
         )
     except NarrationStreamError as exc:
         # Post-visibility remediation already applied inside
