@@ -20,6 +20,11 @@ from models.campaigns import Campaign
 from models.world import WorldEntity, WorldEntityAlias
 
 IDENTITY_DECISION_CLASS = "world_entity_identity"
+IDENTITY_QUESTION_ID = "resolve_world_entity_identity"
+IDENTITY_FRAME_INSTRUCTIONS = (
+    "Select only a supplied existing identity or an explicit outcome. "
+    "Defer when evidence is insufficient."
+)
 NEW_ENTITY = "NEW_ENTITY"
 KEEP_DISTINCT = "KEEP_DISTINCT"
 DEFER = "DEFER"
@@ -235,8 +240,8 @@ def build_identity_frame(
         CandidateRecord(id=DEFER, label="Identity is ambiguous; defer", source="world:identity_outcome", risk="low"),
     ))
     return build_frame(
-        decision_class=IDENTITY_DECISION_CLASS, question_id="resolve_world_entity_identity",
-        instructions="Select only a supplied existing identity or an explicit outcome. Defer when evidence is insufficient.",
+        decision_class=IDENTITY_DECISION_CLASS, question_id=IDENTITY_QUESTION_ID,
+        instructions=IDENTITY_FRAME_INSTRUCTIONS,
         state={"proposed": {"name": name, "entity_type": entity_type, "location_ref": location_ref,
                             "provenance_refs": list(provenance_refs)}},
         state_revision=identity_revision(db, campaign), candidates=records, include_escapes=False,
@@ -338,6 +343,62 @@ def create_entity_after_resolution(
                                 source_attempt_id=source_attempt_id,
                                 operation_id=operation_id,
                                 idempotency_key=idempotency_key)
+
+
+def serialize_identity_frame(frame: DecisionFrame) -> dict:
+    """Persist a bounded identity frame onto an attempt-local outcome payload.
+
+    Only JSON-safe code-owned enumeration data crosses: candidate IDs +
+    labels + sources, the proposed-entity state, frame ID, and the revision
+    the candidates were enumerated against. Model telemetry stays out;
+    commit-time revalidation rebuilds via :func:`rebuild_identity_frame`.
+    """
+    return {
+        "frame_id": frame.frame_id,
+        "state_revision": frame.state_revision,
+        "state": frame.state,
+        "candidates": [
+            {
+                "id": candidate.id, "label": candidate.label,
+                "source": candidate.source,
+                "source_ref": candidate.source_ref,
+                "payload_ref": candidate.payload_ref,
+                "debug_hint": candidate.debug_hint,
+                "risk": candidate.risk, "reversible": candidate.reversible,
+            }
+            for candidate in frame.candidates
+        ],
+    }
+
+
+def rebuild_identity_frame(payload: dict) -> DecisionFrame:
+    """Rebuild a persisted pre-narration frame for commit-time revalidation.
+
+    The rebuilt frame carries the ORIGINAL frame ID and state revision so
+    :func:`create_entity_after_resolution` fails closed (stale) when fresh
+    identity state drifted since the pre-narration decision. No model call.
+    """
+    stored = dict(payload or {})
+    return DecisionFrame(
+        decision_class=IDENTITY_DECISION_CLASS,
+        question_id=IDENTITY_QUESTION_ID,
+        instructions=IDENTITY_FRAME_INSTRUCTIONS,
+        state=stored.get("state"),
+        state_revision=stored.get("state_revision"),
+        candidates=tuple(
+            CandidateRecord(
+                id=str(item.get("id")), label=str(item.get("label")),
+                source=str(item.get("source")),
+                source_ref=item.get("source_ref"),
+                payload_ref=item.get("payload_ref"),
+                debug_hint=item.get("debug_hint"),
+                risk=item.get("risk") or "standard",
+                reversible=bool(item.get("reversible", True)),
+            )
+            for item in stored.get("candidates") or []
+        ),
+        frame_id=str(stored.get("frame_id") or ""),
+    )
 
 
 def supersede_entity(db: Session, duplicate: WorldEntity, canonical: WorldEntity, *, provenance: dict) -> None:

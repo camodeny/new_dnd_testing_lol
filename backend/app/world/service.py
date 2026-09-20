@@ -684,6 +684,294 @@ def _stable_jit_key(attempt_id: uuid.UUID, temp_id: str) -> str:
     return f"jit:{attempt_id}:{str(temp_id).strip()}"[:128]
 
 
+def _extract_identity_proposals(source: Any) -> list[dict]:
+    """Normalize ``new_entities`` proposals from a snapshot dict, contract model, or raw list."""
+    if source is None:
+        return []
+    if isinstance(source, dict):
+        raw_list = source.get("new_entities") or []
+    elif isinstance(source, (list, tuple)):
+        raw_list = list(source)
+    else:
+        raw_list = getattr(source, "new_entities", None) or []
+    proposals: list[dict] = []
+    for raw in raw_list:
+        if isinstance(raw, dict):
+            proposals.append({
+                "temp_id": str(raw.get("temp_id") or "").strip(),
+                "kind": str(raw.get("kind") or "npc").strip().lower() or "npc",
+                "public_name": raw.get("public_name"),
+                "public_summary": raw.get("public_summary"),
+                "role": raw.get("role"),
+                "location_ref": raw.get("location_ref"),
+            })
+        else:
+            proposals.append({
+                "temp_id": str(getattr(raw, "temp_id", "") or "").strip(),
+                "kind": str(getattr(raw, "kind", "npc") or "npc").strip().lower(),
+                "public_name": getattr(raw, "public_name", None),
+                "public_summary": getattr(raw, "public_summary", None),
+                "role": getattr(raw, "role", None),
+                "location_ref": getattr(raw, "location_ref", None),
+            })
+    return proposals
+
+
+def _location_value(location_ref: Any) -> Any:
+    if isinstance(location_ref, dict) or location_ref is None:
+        return location_ref
+    if hasattr(location_ref, "model_dump"):
+        return location_ref.model_dump(mode="json")
+    return location_ref
+
+
+def _resolve_identity_proposal(
+    db: Session,
+    campaign: Campaign,
+    *,
+    temp_id: str,
+    kind: str,
+    public_name: Any,
+    location_ref: Any,
+    turn_id: Any,
+    attempt_id: Any,
+    identity_decision_service: Any | None = None,
+    identity_session_factory: Any | None = None,
+    identity_telemetry_outbox: list | None = None,
+) -> tuple[Any | None, str, WorldEntity | None, Any | None]:
+    """Run deterministic + bounded identity resolution for one proposal.
+
+    No durable entity write happens here. Returns ``(frame, selected_id,
+    reused_entity, decision_service)`` where ``reused_entity`` is set for
+    deterministic stable UUID/alias hits (reuse with zero model calls) and
+    ``frame``/``selected_id`` otherwise. Raises ``ValueError`` fail-closed
+    (no insert) on ``DEFER`` or on plain ``NEW_ENTITY`` against an exact
+    canonical collision. The returned service is the (lazily constructed)
+    service to reuse for subsequent proposals.
+    """
+    from app.world.identity import (
+        DEFER,
+        KEEP_DISTINCT,
+        NEW_ENTITY,
+        _candidate_label,
+        build_identity_frame,
+        decide_identity,
+        exact_identity_match,
+    )
+    collision, match_kind = exact_identity_match(db, campaign.id, public_name)
+    if collision is not None and match_kind in {"uuid", "alias"}:
+        # Deterministic stable ref: the proposal IS the existing
+        # canonical entity. Reuse it with zero model calls — aliases
+        # can never reach KEEP_DISTINCT creation, so the frame has
+        # nothing legal left to decide.
+        return None, str(collision.id), collision, identity_decision_service
+    location_value = _location_value(location_ref)
+    frame = build_identity_frame(
+        db, campaign, name=validate_entity_name(public_name), entity_type=kind,
+        location_ref=str(location_value) if location_value is not None else None,
+        provenance_refs=tuple(filter(None, (str(turn_id) if turn_id else None,
+                                            str(attempt_id) if attempt_id else None))),
+        is_authority=True,
+    )
+    if collision is not None and str(collision.id) not in {c.id for c in frame.candidates}:
+        # Exact stable hit must stay a bounded candidate even when fuzzy
+        # scoring misses it (e.g. alias/UUID reference). The model may
+        # still only choose among supplied candidates. Same enriched
+        # label as framed candidates so the hit stays distinguishable.
+        from dataclasses import replace as _replace
+
+        from app.decisions import CandidateRecord as _CandidateRecord
+        from models.world import WorldEntityAlias as _WorldEntityAlias
+        _collision_aliases = [
+            a.alias for a in db.execute(select(_WorldEntityAlias).where(
+                _WorldEntityAlias.campaign_id == campaign.id,
+                _WorldEntityAlias.entity_id == collision.id,
+            )).scalars()
+        ]
+        extra = _CandidateRecord(
+            id=str(collision.id),
+            label=_candidate_label(collision, aliases=_collision_aliases),
+            source="world:identity_search",
+            payload_ref=str(collision.id),
+        )
+        frame = _replace(frame, candidates=(extra, *frame.candidates))
+    domain_candidates = {
+        candidate.id for candidate in frame.candidates
+        if candidate.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}
+    }
+    if domain_candidates:
+        if identity_decision_service is None:
+            from app.decisions import DecisionService
+            identity_decision_service = DecisionService()
+        decision = decide_identity(
+            db, campaign, frame, identity_decision_service,
+            session_factory=identity_session_factory,
+            record_outbox=identity_telemetry_outbox,
+        )
+        selected_id = decision.selected_id
+    else:
+        # Exhaustive deterministic search found no plausible identity.
+        # NEW_ENTITY is therefore an explicit code-owned bounded outcome,
+        # still revalidated against the frame immediately before insert.
+        selected_id = NEW_ENTITY
+    if selected_id == DEFER:
+        raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+    if collision is not None and selected_id == NEW_ENTITY:
+        # Exact canonical collision: only policy-approved KEEP_DISTINCT
+        # (same-name distinct entity) or reuse of the canonical entity
+        # may proceed. Plain NEW_ENTITY fails closed with no insert.
+        raise ValueError(
+            f"new entity {temp_id!r} collides with canonical identity {collision.id}"
+        )
+    return frame, selected_id, None, identity_decision_service
+
+
+def _stored_identity_outcomes(attempt: Any) -> dict:
+    stored = getattr(attempt, "identity_resolutions", None) or []
+    outcomes: dict = {}
+    for item in stored:
+        if isinstance(item, dict) and item.get("temp_id"):
+            outcomes[str(item["temp_id"])] = item
+    return outcomes
+
+
+def _apply_stored_identity_outcome(
+    db: Session,
+    campaign: Campaign,
+    *,
+    proposal: dict,
+    outcome: dict,
+    jit_key: str,
+    turn_id: Any,
+    attempt_id: Any,
+    operation_id: Any,
+) -> WorldEntity:
+    """Apply one pre-narration identity outcome against fresh commit-time state.
+
+    Revalidates deterministically in code; never makes a model call. Stale
+    or illegal outcomes fail closed with no insert.
+    """
+    from app.world.identity import DEFER, create_entity_after_resolution, exact_identity_match, rebuild_identity_frame
+    temp_id = proposal["temp_id"]
+    selected_id = str(outcome.get("outcome") or "")
+    if not selected_id or selected_id == DEFER:
+        raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+    if outcome.get("frame"):
+        # Bounded NEW_ENTITY / KEEP_DISTINCT (or reuse-by-selection):
+        # rebuild the original frame so revision drift fails closed as
+        # stale, then apply with no second decision call.
+        frame = rebuild_identity_frame(outcome["frame"])
+        entity, _ = create_entity_after_resolution(
+            db, campaign, frame, selected_id,
+            entity_type=proposal["kind"],
+            name=validate_entity_name(proposal["public_name"]),
+            idempotency_key=jit_key,
+            summary=str(proposal["public_summary"])[:2000] if proposal["public_summary"] else None,
+            source_turn_id=turn_id,
+            source_attempt_id=attempt_id,
+            operation_id=str(operation_id) if operation_id else None,
+            details={
+                "temp_id": temp_id, "role": proposal["role"],
+                "location_ref": _location_value(proposal["location_ref"]),
+                "promoted_from": "dm_turn_contract",
+            },
+        )
+        return entity
+    # Deterministic stable reuse recorded pre-narration: the same public
+    # name must still resolve to the same live canonical entity, else the
+    # alias moved (or the entity was archived) and reuse fails closed.
+    try:
+        expected_id = uuid.UUID(selected_id)
+    except ValueError:
+        raise ValueError(f"stored identity outcome for new entity {temp_id!r} is not a canonical identity")
+    current, _ = exact_identity_match(db, campaign.id, proposal["public_name"])
+    if current is None or current.id != expected_id or current.superseded_by_id:
+        raise ValueError(
+            f"stored identity outcome for new entity {temp_id!r} is no longer canonical"
+        )
+    return current
+
+
+def resolve_new_entity_identities_pre_narration(
+    db: Session,
+    campaign: Campaign,
+    turn: Any,
+    attempt: Any,
+    contract: Any,
+    *,
+    identity_decision_service: Any | None = None,
+    identity_session_factory: Any | None = None,
+) -> list[dict]:
+    """Resolve ``new_entities`` identity after normalization, before first visibility.
+
+    Runs the same deterministic + bounded resolution the commit path
+    applies, but pre-narration: ambiguous proposals ``DEFER`` here — before
+    any #197 chunk can persist — instead of stranding visible narration
+    that the later commit then refuses. Selected attempt-local outcomes
+    persist on the attempt row (all-or-nothing; ``DEFER`` raises before
+    anything is stored); commit-time
+    :func:`promote_new_entities_from_contract` only revalidates/applies
+    them against fresh state with no second model call.
+
+    No campaign lock is held here, so fail-soft telemetry may write on its
+    own session via ``identity_session_factory``. Commits the attempt
+    update; pre-visibility failure stays freely retryable.
+    """
+    from app.world.identity import serialize_identity_frame
+    proposals = _extract_identity_proposals(contract)
+    if not proposals:
+        return []
+    if len(proposals) > 8:
+        raise ValueError("new_entities proposals exceed bound of 8")
+    turn_id = getattr(turn, "id", None)
+    attempt_id = getattr(attempt, "id", None)
+    service = identity_decision_service
+    outcomes: list[dict] = []
+    for proposal in proposals:
+        temp_id = proposal["temp_id"]
+        if not temp_id:
+            raise ValueError("new_entities proposal missing temp_id")
+        jit_key = _stable_jit_key(attempt_id, temp_id)
+        existing_retry = _find_by_idempotency(db, campaign.id, jit_key)
+        if existing_retry is not None:
+            outcomes.append({
+                "temp_id": temp_id, "outcome": str(existing_retry.id),
+                "via": "idempotent_reuse", "jit_key": jit_key,
+            })
+            continue
+        frame, selected_id, reused, service = _resolve_identity_proposal(
+            db, campaign, temp_id=temp_id, kind=proposal["kind"],
+            public_name=proposal["public_name"], location_ref=proposal["location_ref"],
+            turn_id=turn_id, attempt_id=attempt_id,
+            identity_decision_service=service,
+            identity_session_factory=identity_session_factory,
+            identity_telemetry_outbox=None,
+        )
+        if reused is not None:
+            outcomes.append({
+                "temp_id": temp_id, "outcome": str(reused.id),
+                "via": "exact_stable", "jit_key": jit_key,
+            })
+        else:
+            outcomes.append({
+                "temp_id": temp_id, "outcome": selected_id,
+                "via": "bounded_decision" if frame is not None and any(
+                    c.id not in {"NEW_ENTITY", "KEEP_DISTINCT", "DEFER"}
+                    for c in frame.candidates
+                ) else "deterministic_no_candidate",
+                "jit_key": jit_key,
+                "frame": serialize_identity_frame(frame) if frame is not None else None,
+            })
+    attempt.identity_resolutions = outcomes
+    db.flush()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return outcomes
+
+
 def promote_new_entities_from_contract(
     db: Session,
     campaign: Campaign,
@@ -702,41 +990,35 @@ def promote_new_entities_from_contract(
     (attempt, temp_id) → committed exactly once; duplicate retry returns the
     existing row.
 
+    Identity itself is decided pre-narration by
+    :func:`resolve_new_entity_identities_pre_narration` (after contract
+    normalization, before the first visible chunk) and persisted
+    attempt-local. This function only revalidates those stored outcomes
+    against fresh state and applies them — no second model call. Proposals
+    with no stored outcome (direct commit callers that skipped the
+    pre-narration step) fall back to the same inline bounded resolution.
+
     Telemetry never opens an independent session while the campaign lock is
     held: pass ``identity_telemetry_outbox`` to collect decision records
     for a post-commit flush. ``identity_session_factory`` remains only for
     unlocked callers; locked paths must leave it None.
     """
-    snapshot = getattr(attempt, "contract_snapshot", None) or {}
-    if isinstance(snapshot, dict):
-        proposals = snapshot.get("new_entities") or []
-    else:
-        proposals = getattr(snapshot, "new_entities", None) or []
+    from app.world.identity import create_entity_after_resolution
+    proposals = _extract_identity_proposals(getattr(attempt, "contract_snapshot", None))
     if not proposals:
         return []
     if len(proposals) > 8:
         raise ValueError("new_entities proposals exceed bound of 8")
+    stored = _stored_identity_outcomes(attempt)
 
     promoted: list[WorldEntity] = []
     turn_id = getattr(turn, "id", None)
     attempt_id = getattr(attempt, "id", None)
     operation_id = getattr(attempt, "commit_operation_id", None) or (str(attempt_id) if attempt_id else None)
+    service = identity_decision_service
 
-    for raw in proposals:
-        if isinstance(raw, dict):
-            temp_id = str(raw.get("temp_id") or "").strip()
-            kind = str(raw.get("kind") or "npc").strip().lower() or "npc"
-            public_name = raw.get("public_name")
-            public_summary = raw.get("public_summary")
-            role = raw.get("role")
-            location_ref = raw.get("location_ref")
-        else:
-            temp_id = str(getattr(raw, "temp_id", "") or "").strip()
-            kind = str(getattr(raw, "kind", "npc") or "npc").strip().lower()
-            public_name = getattr(raw, "public_name", None)
-            public_summary = getattr(raw, "public_summary", None)
-            role = getattr(raw, "role", None)
-            location_ref = getattr(raw, "location_ref", None)
+    for proposal in proposals:
+        temp_id = proposal["temp_id"]
         if not temp_id:
             raise ValueError("new_entities proposal missing temp_id")
         jit_key = _stable_jit_key(attempt_id, temp_id)
@@ -744,100 +1026,40 @@ def promote_new_entities_from_contract(
         if existing_retry is not None:
             promoted.append(existing_retry)
             continue
-        # Committed proposals never bypass canonical identity. Stable
-        # UUID/alias refs reuse their owner above without a model call;
-        # an exact canonical-name hit enters the bounded frame below where
-        # only policy-approved KEEP_DISTINCT (or reuse) may proceed.
-        from app.world.identity import (
-            DEFER,
-            KEEP_DISTINCT,
-            NEW_ENTITY,
-            _candidate_label,
-            build_identity_frame,
-            create_entity_after_resolution,
-            decide_identity,
-            exact_identity_match,
-        )
-        collision, match_kind = exact_identity_match(db, campaign.id, public_name)
-        if collision is not None and match_kind in {"uuid", "alias"}:
-            # Deterministic stable ref: the proposal IS the existing
-            # canonical entity. Reuse it with zero model calls — aliases
-            # can never reach KEEP_DISTINCT creation, so the frame has
-            # nothing legal left to decide.
-            promoted.append(collision)
+        outcome = stored.get(temp_id)
+        if outcome is not None:
+            # Pre-narration decision: revalidate against fresh state and
+            # apply with no second model call.
+            promoted.append(_apply_stored_identity_outcome(
+                db, campaign, proposal=proposal, outcome=outcome,
+                jit_key=jit_key, turn_id=turn_id, attempt_id=attempt_id,
+                operation_id=operation_id,
+            ))
             continue
-        location_value = (
-            location_ref if isinstance(location_ref, dict)
-            else (location_ref.model_dump(mode="json") if hasattr(location_ref, "model_dump") else location_ref)
+        # Fallback for direct commit callers without a pre-narration step.
+        frame, selected_id, reused, service = _resolve_identity_proposal(
+            db, campaign, temp_id=temp_id, kind=proposal["kind"],
+            public_name=proposal["public_name"], location_ref=proposal["location_ref"],
+            turn_id=turn_id, attempt_id=attempt_id,
+            identity_decision_service=service,
+            identity_session_factory=identity_session_factory,
+            identity_telemetry_outbox=identity_telemetry_outbox,
         )
-        frame = build_identity_frame(
-            db, campaign, name=validate_entity_name(public_name), entity_type=kind,
-            location_ref=str(location_value) if location_value is not None else None,
-            provenance_refs=tuple(filter(None, (str(turn_id) if turn_id else None,
-                                                   str(attempt_id) if attempt_id else None))),
-            is_authority=True,
-        )
-        if collision is not None and str(collision.id) not in {c.id for c in frame.candidates}:
-            # Exact stable hit must stay a bounded candidate even when fuzzy
-            # scoring misses it (e.g. alias/UUID reference). The model may
-            # still only choose among supplied candidates. Same enriched
-            # label as framed candidates so the hit stays distinguishable.
-            from dataclasses import replace as _replace
-
-            from app.decisions import CandidateRecord as _CandidateRecord
-            from models.world import WorldEntityAlias as _WorldEntityAlias
-            _collision_aliases = [
-                a.alias for a in db.execute(select(_WorldEntityAlias).where(
-                    _WorldEntityAlias.campaign_id == campaign.id,
-                    _WorldEntityAlias.entity_id == collision.id,
-                )).scalars()
-            ]
-            extra = _CandidateRecord(
-                id=str(collision.id),
-                label=_candidate_label(collision, aliases=_collision_aliases),
-                source="world:identity_search",
-                payload_ref=str(collision.id),
-            )
-            frame = _replace(frame, candidates=(extra, *frame.candidates))
-        domain_candidates = {
-            candidate.id for candidate in frame.candidates
-            if candidate.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}
-        }
-        if domain_candidates:
-            if identity_decision_service is None:
-                from app.decisions import DecisionService
-                identity_decision_service = DecisionService()
-            decision = decide_identity(
-                db, campaign, frame, identity_decision_service,
-                session_factory=identity_session_factory,
-                record_outbox=identity_telemetry_outbox,
-            )
-            selected_id = decision.selected_id
-        else:
-            # Exhaustive deterministic search found no plausible identity.
-            # NEW_ENTITY is therefore an explicit code-owned bounded outcome,
-            # still revalidated against the frame immediately before insert.
-            selected_id = NEW_ENTITY
-        if selected_id == DEFER:
-            raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
-        if collision is not None and selected_id == NEW_ENTITY:
-            # Exact canonical collision: only policy-approved KEEP_DISTINCT
-            # (same-name distinct entity) or reuse of the canonical entity
-            # may proceed. Plain NEW_ENTITY fails closed with no insert.
-            raise ValueError(
-                f"new entity {temp_id!r} collides with canonical identity {collision.id}"
-            )
+        if reused is not None:
+            promoted.append(reused)
+            continue
         entity, _ = create_entity_after_resolution(
             db, campaign, frame, selected_id,
-            entity_type=kind,
-            name=validate_entity_name(public_name),
+            entity_type=proposal["kind"],
+            name=validate_entity_name(proposal["public_name"]),
             idempotency_key=jit_key,
-            summary=str(public_summary)[:2000] if public_summary else None,
+            summary=str(proposal["public_summary"])[:2000] if proposal["public_summary"] else None,
             source_turn_id=turn_id,
             source_attempt_id=attempt_id,
             operation_id=str(operation_id) if operation_id else None,
             details={
-                "temp_id": temp_id, "role": role, "location_ref": location_value,
+                "temp_id": temp_id, "role": proposal["role"],
+                "location_ref": _location_value(proposal["location_ref"]),
                 "promoted_from": "dm_turn_contract",
             },
         )

@@ -302,3 +302,233 @@ def test_locked_promotion_collects_telemetry_outbox_without_independent_write():
         assert record_fail_soft(flush_factory, record) is not None
     rows = db.execute(select(DecisionTelemetry)).scalars().all()
     assert [row.selected_id for row in rows] == [KEEP_DISTINCT]
+
+
+# ── Pre-narration bounded resolution (#214 re-review) ─────────────────────────
+
+def _attempt_fake(contract_snapshot):
+    return type("Attempt", (), {
+        "id": uuid.uuid4(), "commit_operation_id": "op-pre",
+        "contract_snapshot": contract_snapshot, "identity_resolutions": None,
+    })()
+
+
+def test_pre_narration_resolution_persists_attempt_local_outcome():
+    from app.world.service import resolve_new_entity_identities_pre_narration
+    db, campaign = setup_db()
+    make_entity(db, campaign, "Mara Venn")
+    attempt = _attempt_fake({"new_entities": [{
+        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]})
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    outcomes = resolve_new_entity_identities_pre_narration(
+        db, campaign, turn, attempt, attempt.contract_snapshot,
+        identity_decision_service=service)
+    assert len(outcomes) == 1
+    assert outcomes[0]["temp_id"] == "tmp"
+    assert outcomes[0]["outcome"] == KEEP_DISTINCT
+    assert outcomes[0]["frame"]["frame_id"]
+    assert attempt.identity_resolutions == outcomes
+    assert len(service.adapter.calls) == 1
+    # Nothing durably created pre-commit: resolution never writes authority.
+    from models.world import WorldEntity as _WorldEntity
+    assert [row.name for row in db.query(_WorldEntity).all()] == ["Mara Venn"]
+
+
+def test_commit_revalidation_applies_stored_outcome_without_new_decision():
+    from app.world.service import resolve_new_entity_identities_pre_narration
+    db, campaign = setup_db()
+    north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
+    snapshot = {"new_entities": [{
+        "temp_id": "tmp-south", "kind": "npc", "public_name": "The Guard",
+        "location_ref": "south gate"}]}
+    attempt = _attempt_fake(snapshot)
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    pre_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    resolve_new_entity_identities_pre_narration(
+        db, campaign, turn, attempt, snapshot, identity_decision_service=pre_service)
+    assert len(pre_service.adapter.calls) == 1
+    # Commit-time promotion applies the stored outcome. A fresh service that
+    # would DEFER proves no second model call happens: success means zero calls.
+    commit_service = DecisionService(FakeDecisionAdapter(answers={}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=commit_service)
+    assert promoted[0].name == "The Guard"
+    assert promoted[0].id != north_guard.id
+    assert promoted[0].details["identity_resolution"]["outcome"] == KEEP_DISTINCT
+    assert commit_service.adapter.calls == []
+    # Idempotent retry returns the same row with still no decision call.
+    retried = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=commit_service)
+    assert retried[0].id == promoted[0].id
+    assert commit_service.adapter.calls == []
+
+
+def test_pre_narration_defer_aborts_before_anything_durable():
+    from app.world.service import resolve_new_entity_identities_pre_narration
+    db, campaign = setup_db()
+    original = make_entity(db, campaign, "Mara Venn")
+    attempt = _attempt_fake({"new_entities": [{
+        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]})
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": DEFER}))
+    with pytest.raises(ValueError, match="deferred"):
+        resolve_new_entity_identities_pre_narration(
+            db, campaign, turn, attempt, attempt.contract_snapshot,
+            identity_decision_service=service)
+    # All-or-nothing: no outcome persisted, no entity created.
+    assert attempt.identity_resolutions is None
+    assert [row.id for row in db.query(type(original)).all()] == [original.id]
+
+
+def test_stored_outcome_stale_revision_fails_closed_at_commit():
+    from app.world.service import resolve_new_entity_identities_pre_narration
+    db, campaign = setup_db()
+    make_entity(db, campaign, "Mara Venn")
+    snapshot = {"new_entities": [{
+        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}
+    attempt = _attempt_fake(snapshot)
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    pre_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    resolve_new_entity_identities_pre_narration(
+        db, campaign, turn, attempt, snapshot, identity_decision_service=pre_service)
+    # Fresh identity state drifted after the pre-narration decision.
+    campaign.revision += 1; db.flush()
+    commit_service = DecisionService(FakeDecisionAdapter(answers={}))
+    with pytest.raises(DecisionError) as exc:
+        promote_new_entities_from_contract(
+            db, campaign, turn, attempt, identity_decision_service=commit_service)
+    assert exc.value.kind == "stale"
+    assert commit_service.adapter.calls == []
+    from models.world import WorldEntity as _WorldEntity2
+    assert [row.name for row in db.query(_WorldEntity2).all()] == ["Mara Venn"]
+
+
+def test_pre_narration_exact_alias_reuses_owner_with_zero_model_calls():
+    from app.world.service import resolve_new_entity_identities_pre_narration
+    db, campaign = setup_db()
+    mara_venn = make_entity(db, campaign, "Mara Venn")
+    add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
+    snapshot = {"new_entities": [{
+        "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}
+    attempt = _attempt_fake(snapshot)
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(answers={}))
+    outcomes = resolve_new_entity_identities_pre_narration(
+        db, campaign, turn, attempt, snapshot, identity_decision_service=service)
+    assert outcomes[0] == {
+        "temp_id": "tmp-alias", "outcome": str(mara_venn.id),
+        "via": "exact_stable", "jit_key": outcomes[0]["jit_key"],
+    }
+    assert service.adapter.calls == []
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=service)
+    assert promoted[0].id == mara_venn.id
+    assert service.adapter.calls == []
+    assert [row.id for row in db.query(type(mara_venn)).all()] == [mara_venn.id]
+
+
+# ── Pre-narration vs first-visible-chunk ordering (failed-visible audit) ──────
+
+def _streaming_setup():
+    from models.dm import DmTurn, DmTurnAttempt
+    from models.threads import CampaignThread
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    db = sessionmaker(bind=engine, expire_on_commit=False)()
+    owner = uuid.uuid4()
+    camp_id = uuid.uuid4()
+    thread_id = uuid.uuid4()
+    db.add(Profile(id=owner, email="stream@example.com"))
+    campaign = Campaign(id=camp_id, owner_id=owner, name="Streamed", revision=0)
+    db.add(campaign)
+    db.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
+    db.commit()
+    return db, campaign, thread_id
+
+
+def _coordinated_attempt(db, campaign, thread_id):
+    from app.runtime.submissions import accept_submission
+    from app.dm.turns import coordinate_turn
+    user_id = uuid.uuid4()
+    accept_submission(
+        db, campaign_id=campaign.id, user_id=user_id,
+        raw_content="We greet the stranger.",
+        segments=[{"type": "ic", "text": "We greet the stranger."}],
+        thread_id=str(thread_id),
+    )
+    db.commit()
+    return coordinate_turn(db, campaign.id, str(thread_id))
+
+
+def _respond_with_new_entity(public_name, temp_id="tmp_npc_1"):
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+    return normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "respond",
+        "reason": "a stranger arrives",
+        "beats": [{
+            "id": "beat_1", "type": "narration",
+            "claims": [{"text": "A stranger steps from the treeline.",
+                        "claim_kind": "observation", "origin": "established_state",
+                        "visibility": "public"}],
+        }],
+        "new_entities": [{
+            "temp_id": temp_id, "kind": "npc", "public_name": public_name,
+        }],
+        "open_player_choice": "What do you do?",
+    })
+
+
+def test_ambiguous_identity_defer_leaves_no_visible_narration():
+    from sqlalchemy import select
+    from models.dm import DMStream, DMStreamChunk, DmTurn, DmTurnAttempt
+    from models.world import WorldEntity as _WorldEntity
+    from app.dm.narration import execute_validated_turn
+    db, campaign, thread_id = _streaming_setup()
+    make_entity(db, campaign, "Mara Venn")
+    turn, attempt = _coordinated_attempt(db, campaign, thread_id)
+    contract = _respond_with_new_entity("Mara")
+    defer_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": DEFER}))
+    with pytest.raises(ValueError, match="deferred"):
+        execute_validated_turn(
+            db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
+            publish_realtime=False, identity_decision_service=defer_service)
+    # Abort happened before the first visible chunk: no stream, no chunks,
+    # no failed-visible audit, no stranded duplicate.
+    assert db.query(DMStream).count() == 0
+    assert db.query(DMStreamChunk).count() == 0
+    assert [row.name for row in db.query(_WorldEntity).all()] == ["Mara Venn"]
+    fresh_attempt = db.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status not in ("streaming", "failed_visible", "succeeded")
+    assert fresh_attempt.identity_resolutions is None
+    assert fresh_attempt.stream_id is None
+    fresh_turn = db.get(DmTurn, turn.id)
+    assert fresh_turn.status not in ("streaming", "failed_visible", "succeeded")
+
+
+def test_same_name_keep_distinct_narrates_then_commits_with_one_decision():
+    from models.world import WorldEntity as _WorldEntity
+    from app.dm.narration import execute_validated_turn
+    db, campaign, thread_id = _streaming_setup()
+    north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
+    turn, attempt = _coordinated_attempt(db, campaign, thread_id)
+    contract = _respond_with_new_entity("The Guard")
+    keep_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    out = execute_validated_turn(
+        db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
+        publish_realtime=False, identity_decision_service=keep_service)
+    assert out.narration.completed and out.narration.chunk_count >= 1
+    assert out.turn.status == "succeeded"
+    # Exactly one bounded decision (pre-narration); commit revalidated/applied.
+    assert len(keep_service.adapter.calls) == 1
+    rows = db.query(_WorldEntity).all()
+    assert sorted(row.name for row in rows) == ["The Guard", "The Guard"]
+    assert {row.id for row in rows} != {north_guard.id}
+    south = next(row for row in rows if row.id != north_guard.id)
+    assert south.details["identity_resolution"]["outcome"] == KEEP_DISTINCT

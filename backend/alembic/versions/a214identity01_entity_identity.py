@@ -1,7 +1,7 @@
 """canonical entity identity and aliases — issue #214.
 
 Revision ID: a214identity01
-Revises: f232mapgeom01
+Revises: a215npcstate01 (re-pointed after #408 merge to keep one linear head)
 """
 from typing import Sequence, Union
 from alembic import op
@@ -9,7 +9,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a214identity01"
-down_revision: Union[str, Sequence[str], None] = "f232mapgeom01"
+down_revision: Union[str, Sequence[str], None] = "a215npcstate01"
 branch_labels = None
 depends_on = None
 

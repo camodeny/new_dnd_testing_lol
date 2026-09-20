@@ -122,6 +122,7 @@ class DmTurnAttempt(Base):
     roll_evidence: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
     staged_effects: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
     contract_snapshot: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    identity_resolutions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     stream_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("dm_streams.id", ondelete="SET NULL"), nullable=True, index=True)
     commit_operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
     abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

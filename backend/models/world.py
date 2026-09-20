@@ -171,28 +171,6 @@ class NPCState(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
-class WorldEntityAlias(Base):
-    """Durable, normalized name/reference pointing at stable canonical identity."""
-
-    __tablename__ = "world_entity_aliases"
-    __table_args__ = (
-        UniqueConstraint("campaign_id", "normalized_alias", name="uq_world_entity_alias_campaign_alias"),
-        Index("ix_world_entity_alias_entity", "entity_id"),
-    )
-
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    campaign_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False
-    )
-    entity_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("world_entities.id", ondelete="CASCADE"), nullable=False
-    )
-    alias: Mapped[str] = mapped_column(String(160), nullable=False)
-    normalized_alias: Mapped[str] = mapped_column(String(160), nullable=False)
-    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
-    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-
 
 
 class CampaignCurrentScene(Base):
