@@ -57,7 +57,12 @@ def _require_committed_source(
     db: Session, campaign_id: uuid.UUID, *, turn_id: uuid.UUID | None,
     attempt_id: uuid.UUID | None, event_id: uuid.UUID | None,
 ) -> None:
-    """Fail closed unless at least one cited source is durably committed."""
+    """Fail closed unless at least one cited source is durably committed.
+
+    The DM state machine's terminal success state for both turns and
+    attempts is ``"succeeded"`` (see ``app.dm.turns``); anything earlier
+    (streaming/prepared/failed) cannot back a standalone write.
+    """
     from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -67,15 +72,56 @@ def _require_committed_source(
             return
     if turn_id:
         turn = db.get(DmTurn, turn_id)
-        if turn is not None and turn.campaign_id == campaign_id and turn.status == "committed":
+        if turn is not None and turn.campaign_id == campaign_id and turn.status == "succeeded":
+            if attempt_id is not None:
+                attempt = db.get(DmTurnAttempt, attempt_id)
+                if attempt is None or str(attempt.turn_id) != str(turn_id):
+                    raise ValueError("NPC state source_attempt does not belong to source_turn")
             return
     if attempt_id:
         attempt = db.get(DmTurnAttempt, attempt_id)
-        if attempt is not None and attempt.campaign_id == campaign_id and attempt.status == "completed":
+        if attempt is not None and attempt.campaign_id == campaign_id and attempt.status == "succeeded":
             turn = db.get(DmTurn, attempt.turn_id)
-            if turn is not None and turn.status == "committed":
+            if turn is not None and turn.campaign_id == campaign_id and turn.status == "succeeded":
                 return
     raise ValueError("NPC state source must reference committed gameplay/post-turn history")
+
+
+def _resolve_npc_source_refs(
+    db: Session, campaign_id: uuid.UUID, *, turn_id: uuid.UUID | None,
+    attempt_id: uuid.UUID | None, event_id: uuid.UUID | None,
+) -> tuple[uuid.UUID | None, uuid.UUID | None, uuid.UUID | None]:
+    """Resolve source refs by existence/campaign/link — no status gate.
+
+    The caller owns the surrounding transaction (turn-commit mutate,
+    post-turn range), so cited rows may still be mid-flight — e.g. a
+    ``streaming`` turn whose commit owns this write. Status gating lives
+    in :func:`_require_committed_source` for standalone writes only.
+    """
+    from models.campaigns import CampaignDomainEvent
+    from models.dm import DmTurn, DmTurnAttempt
+
+    resolved_event: uuid.UUID | None = None
+    if event_id is not None:
+        event = db.get(CampaignDomainEvent, event_id)
+        if event is None or event.campaign_id != campaign_id:
+            raise ValueError(f"source_event {event_id} not found in campaign {campaign_id}")
+        resolved_event = event.id
+    resolved_turn: uuid.UUID | None = None
+    if turn_id is not None:
+        turn = db.get(DmTurn, turn_id)
+        if turn is None or turn.campaign_id != campaign_id:
+            raise ValueError(f"source_turn {turn_id} not found in campaign {campaign_id}")
+        resolved_turn = turn.id
+    resolved_attempt: uuid.UUID | None = None
+    if attempt_id is not None:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None or attempt.campaign_id != campaign_id:
+            raise ValueError(f"source_attempt {attempt_id} not found in campaign {campaign_id}")
+        resolved_attempt = attempt.id
+        if resolved_turn is not None and str(attempt.turn_id) != str(resolved_turn):
+            raise ValueError(f"source_attempt {attempt_id} does not belong to source_turn {turn_id}")
+    return resolved_turn, resolved_attempt, resolved_event
 
 
 def _visibility_map(value: Any, current: dict | None = None) -> dict:
@@ -99,8 +145,8 @@ def get_npc_state(db: Session, campaign_id: Any, entity_id: Any) -> NPCState | N
     return row if row is not None and row.campaign_id == _uuid(campaign_id, "campaign_id") else None
 
 
-def update_npc_state_authoritative(
-    db: Session, campaign_id: Any, entity_id: Any, expected_revision: int, *,
+def apply_npc_state_inline(
+    db: Session, campaign: Campaign, entity_id: Any, *, new_revision: int,
     role: Any = UNSET, goals: Any = UNSET, disposition: Any = UNSET,
     resources: Any = UNSET, current_activity: Any = UNSET,
     location_entity_id: Any = UNSET, location_name: Any = UNSET,
@@ -108,19 +154,24 @@ def update_npc_state_authoritative(
     provenance: dict | None = None, source_turn_id: Any = None,
     source_attempt_id: Any = None, source_event_id: Any = None,
     operation_id: str | None = None,
-) -> tuple[NPCState, Any]:
-    """Create or progressively enrich state under campaign revision ordering.
+) -> NPCState:
+    """Create or progressively enrich NPC state inside the caller's transaction.
 
-    Omitted fields are preserved; explicit ``None`` clears nullable fields.
-    Importance and depth are monotonic so an enrichment cannot accidentally
-    erase a dossier. Corrections use a later repair update with new provenance.
+    Flushes; never commits. Records the current turn/attempt provenance even
+    when those rows are still mid-flight (``streaming``), so staged-effect
+    and post-turn callers can run inside the outer revision transaction and
+    roll back atomically with it. All domain validation lives here — the
+    authoritative wrapper only adds the committed-source gate plus the
+    revision bump and domain event.
     """
-    cid, eid = _uuid(campaign_id, "campaign_id"), _uuid(entity_id, "entity_id")
+    cid, eid = _uuid(campaign.id, "campaign_id"), _uuid(entity_id, "entity_id")
     turn_id = _uuid(source_turn_id, "source_turn_id") if source_turn_id else None
     attempt_id = _uuid(source_attempt_id, "source_attempt_id") if source_attempt_id else None
     event_id = _uuid(source_event_id, "source_event_id") if source_event_id else None
     prov = _provenance(provenance, source_turn_id=turn_id, source_attempt_id=attempt_id, source_event_id=event_id)
-    _require_committed_source(db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id)
+    turn_id, attempt_id, event_id = _resolve_npc_source_refs(
+        db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id,
+    )
     entity = get_entity_strict(db, cid, eid)
     if entity.entity_type != "npc":
         raise ValueError("NPC state may only be attached to an npc world entity")
@@ -141,44 +192,83 @@ def update_npc_state_authoritative(
         if value is not UNSET and not isinstance(value, kind):
             raise ValueError(f"{label} must be a {kind.__name__}")
 
+    row = db.get(NPCState, eid)
+    if row is not None and row.campaign_id != cid:
+        raise ValueError("NPC state belongs to another campaign")
+    if row is None:
+        row = NPCState(
+            entity_id=eid, campaign_id=cid, campaign_revision=new_revision,
+            provenance=prov, source_turn_id=turn_id, source_attempt_id=attempt_id,
+            source_event_id=event_id, operation_id=(str(operation_id)[:128] if operation_id else None),
+        )
+        db.add(row)
+    else:
+        row.state_revision += 1
+        row.campaign_revision = new_revision
+        row.provenance = prov
+        row.source_turn_id, row.source_attempt_id, row.source_event_id = turn_id, attempt_id, event_id
+        row.operation_id = str(operation_id)[:128] if operation_id else None
+    if importance is not UNSET:
+        if IMPORTANCE.index(importance) < IMPORTANCE.index(row.importance or "incidental"):
+            raise ValueError("importance cannot decrease during progressive enrichment")
+        row.importance = importance
+    if depth is not UNSET:
+        if depth < int(row.depth or 0):
+            raise ValueError("depth cannot decrease during progressive enrichment")
+        row.depth = depth
+    for field, value in {
+        "role": role, "goals": goals, "disposition": disposition,
+        "resources": resources, "current_activity": current_activity,
+        "location_entity_id": location_entity_id, "location_name": location_name,
+    }.items():
+        if value is not UNSET:
+            setattr(row, field, value)
+    row.field_visibility = _visibility_map(field_visibility, row.field_visibility)
+    db.flush()
+    return row
+
+
+def update_npc_state_authoritative(
+    db: Session, campaign_id: Any, entity_id: Any, expected_revision: int, *,
+    role: Any = UNSET, goals: Any = UNSET, disposition: Any = UNSET,
+    resources: Any = UNSET, current_activity: Any = UNSET,
+    location_entity_id: Any = UNSET, location_name: Any = UNSET,
+    importance: Any = UNSET, depth: Any = UNSET, field_visibility: Any = UNSET,
+    provenance: dict | None = None, source_turn_id: Any = None,
+    source_attempt_id: Any = None, source_event_id: Any = None,
+    operation_id: str | None = None,
+) -> tuple[NPCState, Any]:
+    """Create or progressively enrich state under campaign revision ordering.
+
+    Omitted fields are preserved; explicit ``None`` clears nullable fields.
+    Importance and depth are monotonic so an enrichment cannot accidentally
+    erase a dossier. Corrections use a later repair update with new provenance.
+    """
+    cid = _uuid(campaign_id, "campaign_id")
+    turn_id = _uuid(source_turn_id, "source_turn_id") if source_turn_id else None
+    attempt_id = _uuid(source_attempt_id, "source_attempt_id") if source_attempt_id else None
+    event_id = _uuid(source_event_id, "source_event_id") if source_event_id else None
+    _provenance(provenance, source_turn_id=turn_id, source_attempt_id=attempt_id, source_event_id=event_id)
+    _require_committed_source(db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id)
+    eid = _uuid(entity_id, "entity_id")
+    prov = dict(provenance)
+
     holder: dict[str, Any] = {}
     started = time.monotonic()
 
     def mutate(campaign: Campaign) -> None:
-        row = db.get(NPCState, eid)
-        if row is not None and row.campaign_id != cid:
-            raise ValueError("NPC state belongs to another campaign")
-        if row is None:
-            row = NPCState(
-                entity_id=eid, campaign_id=cid, campaign_revision=expected_revision + 1,
-                provenance=prov, source_turn_id=turn_id, source_attempt_id=attempt_id,
-                source_event_id=event_id, operation_id=(str(operation_id)[:128] if operation_id else None),
-            )
-            db.add(row)
-        else:
-            row.state_revision += 1
-            row.campaign_revision = expected_revision + 1
-            row.provenance = prov
-            row.source_turn_id, row.source_attempt_id, row.source_event_id = turn_id, attempt_id, event_id
-            row.operation_id = str(operation_id)[:128] if operation_id else None
-        if importance is not UNSET:
-            if IMPORTANCE.index(importance) < IMPORTANCE.index(row.importance or "incidental"):
-                raise ValueError("importance cannot decrease during progressive enrichment")
-            row.importance = importance
-        if depth is not UNSET:
-            if depth < int(row.depth or 0):
-                raise ValueError("depth cannot decrease during progressive enrichment")
-            row.depth = depth
-        for field, value in {
-            "role": role, "goals": goals, "disposition": disposition,
-            "resources": resources, "current_activity": current_activity,
-            "location_entity_id": location_entity_id, "location_name": location_name,
-        }.items():
-            if value is not UNSET:
-                setattr(row, field, value)
-        row.field_visibility = _visibility_map(field_visibility, row.field_visibility)
-        db.flush()
-        holder["row"] = row
+        # new_revision is prior+1 — mirrors commit_campaign_mutation's bump.
+        prior = int(campaign.revision) if campaign.revision is not None else 0
+        holder["row"] = apply_npc_state_inline(
+            db, campaign, entity_id, new_revision=prior + 1,
+            role=role, goals=goals, disposition=disposition,
+            resources=resources, current_activity=current_activity,
+            location_entity_id=location_entity_id, location_name=location_name,
+            importance=importance, depth=depth, field_visibility=field_visibility,
+            provenance=provenance, source_turn_id=turn_id,
+            source_attempt_id=attempt_id, source_event_id=event_id,
+            operation_id=operation_id,
+        )
 
     _campaign, event = commit_campaign_mutation(
         db, cid, expected_revision, event_type="world.npc_state_updated",
