@@ -483,6 +483,37 @@ def test_hidden_enemy_final_data_stays_scoped():
         assert player_view["turn"] is None
 
 
+def test_non_owner_end_projection_redacts_reason_and_hidden_fates():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter = _ready_party(db, ctx, with_npc=True, operation_id="op-start-redact")
+        npc = db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id,
+                EncounterParticipant.npc_entity_id == ctx["goblin_id"],
+            )
+        ).scalars().one()
+        assert npc.stat_visibility == "dm_private"
+        owner_pc = _pc(db, encounter.id, ctx["owner_pc"])
+        secret_reason = "The hidden ambusher slips away with the stolen seal."
+        _end(
+            db, ctx, encounter, expected_revision=_revision(db, ctx),
+            operation_id="op-end-redact", outcome="escape", reason=secret_reason,
+            participant_outcomes={str(npc.id): "fled", str(owner_pc.id): "standing"},
+        )
+        ended = db.get(Encounter, encounter.id)
+        owner_view = encounter_view(db, ended, ctx["owner"], is_owner=True)
+        assert owner_view["end_outcome"] == "escape"
+        assert owner_view["end_reason"] == secret_reason
+        assert owner_view["end_participant_outcomes"][str(npc.id)] == "fled"
+        player_view = encounter_view(db, ended, ctx["player"], is_owner=False)
+        assert player_view["end_outcome"] == "escape"
+        assert player_view["end_reason"] is None
+        assert secret_reason not in str(player_view)
+        assert str(npc.id) not in (player_view["end_participant_outcomes"] or {})
+        assert player_view["end_participant_outcomes"][str(owner_pc.id)] == "standing"
+
+
 def test_freeform_post_combat_interaction_still_available():
     fac, ctx = _fixture()
     with fac() as db:

@@ -470,6 +470,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
         payload["created_event_id"] = str(created_event.id)
         payload["created_event_sequence"] = created_event.sequence
     viewers_parts = []
+    hidden_ids: set[str] = set()
     for participant in list_participants(db, encounter.id):
         include_private = is_owner or (
             participant.controller_user_id is not None
@@ -479,7 +480,24 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
         if not include_private:
             item.pop("roll_request_id", None)
         viewers_parts.append(item)
+        # Issue #239: DM-authored end reason/fates may name hidden NPC fates
+        # (end_encounter staged effects are dm_private for this reason).
+        # Track hidden combatants so the non-owner projection below can
+        # redact their fate entries while keeping PC/public outcomes.
+        if (
+            participant.kind in ("npc", "monster")
+            and participant.stat_visibility == "dm_private"
+            and not include_private
+        ):
+            hidden_ids.add(str(participant.id))
     payload["participants"] = viewers_parts
+    if not is_owner:
+        payload["end_reason"] = None
+        outcomes = payload.get("end_participant_outcomes") or {}
+        if isinstance(outcomes, dict) and hidden_ids:
+            payload["end_participant_outcomes"] = {
+                pid: fate for pid, fate in outcomes.items() if str(pid) not in hidden_ids
+            }
     # Issue #231: durable turn/round/resource projection rides the same
     # snapshot so reconnects reconstruct mechanical state exactly. Lazy
     # import: turns.py owns these helpers and imports this module.
