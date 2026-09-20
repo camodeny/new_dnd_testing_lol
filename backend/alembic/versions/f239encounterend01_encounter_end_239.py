@@ -1,7 +1,7 @@
 """DM-controlled encounter end + post-combat hooks — issue #239 (additive).
 
 Revision ID: f239encounterend01
-Revises: a215npcstate01
+Revises: a214identity02
 
 Additive only: encounter end columns (outcome/reason/actor/operation/
 participant outcomes/duration/observability counters) plus
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "f239encounterend01"
-down_revision: Union[str, Sequence[str], None] = "a215npcstate01"
+down_revision: Union[str, Sequence[str], None] = "a214identity02"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
