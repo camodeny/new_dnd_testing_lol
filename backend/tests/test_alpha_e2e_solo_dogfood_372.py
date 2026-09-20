@@ -635,7 +635,8 @@ def await_committed_reply(
     turn_id: str,
     *,
     expected_reply_marker: str | None = "phase0-reply-",
-) -> str:
+    allow_silent: bool = False,
+) -> str | None:
     """Assert one logical turn has exactly one committed, durable DM result."""
     try:
         scn.note(stage)
@@ -662,6 +663,26 @@ def await_committed_reply(
             stage,
             f"attempt {attempt.id} not succeeded (status={attempt.status})",
         )
+        if attempt.stream_id is None and allow_silent:
+            contract = attempt.contract_snapshot or {}
+            scn.check(
+                contract.get("mode") == "silent",
+                stage,
+                f"attempt {attempt.id} has no stream but is not a silent result",
+                category="stream_persistence",
+                detail=format_commit_failure(
+                    turn_id=str(turn.id),
+                    attempt_id=str(attempt.id),
+                    stream_id=None,
+                    detail="streamless result was not an authorized silent contract",
+                ),
+            )
+            if str(turn.id) not in scn.ids["turn_ids"]:
+                scn.ids["turn_ids"].append(str(turn.id))
+            if str(attempt.id) not in scn.ids["attempt_ids"]:
+                scn.ids["attempt_ids"].append(str(attempt.id))
+            scn.mark_completed(STAGE_COMMIT)
+            return None
         scn.check(
             attempt.stream_id is not None,
             stage,
@@ -898,12 +919,14 @@ def run_phase0_solo_scenario(
     *,
     expected_reply_marker: str | None = "phase0-reply-",
     provider_calls=None,
+    allow_silent: bool = False,
 ) -> None:
     """Run the one Phase 0 scenario flow for fake and opt-in real AI.
 
-    Only the expected deterministic prose marker differs by mode. Setup,
-    execution, duplicate protection, reconnect, and continuation assertions
-    intentionally remain a single shared harness.
+    Deterministic and generative modes require narration for every turn.
+    Experimental decision mode may additionally accept a succeeded, persisted
+    ``silent`` contract without inventing a stream; all other structural,
+    reconnect, and continuation assertions remain shared.
     """
     # Setup: synthetic fixtures + authoritative select/ready.
     char_id = make_synthetic_character(scn)
@@ -919,9 +942,14 @@ def run_phase0_solo_scenario(
     outcome = drain_dm_execution(scn, "opening")
     scn.check_sweep(outcome, "opening")
     opening_text = await_committed_reply(
-        scn, "opening", opening_turn_id, expected_reply_marker=expected_reply_marker
+        scn,
+        "opening",
+        opening_turn_id,
+        expected_reply_marker=expected_reply_marker,
+        allow_silent=allow_silent,
     )
-    assert opening_text
+    if not allow_silent:
+        assert opening_text
     assert_single_result_per_submission(scn, "opening", 1)
 
     # Three freeform player turns, each with its committed DM reply.
@@ -933,11 +961,15 @@ def run_phase0_solo_scenario(
         turn_id = submitted["dm_turn"]["id"]
         outcome = drain_dm_execution(scn, stage)
         scn.check_sweep(outcome, stage)
-        stream_texts.append(
-            await_committed_reply(
-                scn, stage, turn_id, expected_reply_marker=expected_reply_marker
-            )
+        reply_text = await_committed_reply(
+            scn,
+            stage,
+            turn_id,
+            expected_reply_marker=expected_reply_marker,
+            allow_silent=allow_silent,
         )
+        if reply_text is not None:
+            stream_texts.append(reply_text)
         assert_ordering_invariants(scn, stage)
         assert_single_result_per_submission(scn, stage, 2 + index)
     scn.check(
@@ -974,13 +1006,15 @@ def run_phase0_solo_scenario(
     # once — history only projects player submissions, DM narration lives in
     # dm_messages keyed by stream id.
     dm_messages = after.get("dm_messages") or []
+    expected_visible_replies = len(scn.ids["stream_ids"])
     scn.check(
-        len(dm_messages) == 4,
+        len(dm_messages) == expected_visible_replies,
         "reconnect",
-        f"expected 4 committed DM replies, found {len(dm_messages)}",
+        f"expected {expected_visible_replies} committed DM replies, "
+        f"found {len(dm_messages)}",
     )
     scn.check(
-        len({m["id"] for m in dm_messages}) == 4,
+        len({m["id"] for m in dm_messages}) == expected_visible_replies,
         "reconnect",
         "duplicate DM messages after reconnect",
     )
@@ -1013,6 +1047,7 @@ def run_phase0_solo_scenario(
         "post-reconnect",
         submitted["dm_turn"]["id"],
         expected_reply_marker=expected_reply_marker,
+        allow_silent=allow_silent,
     )
     assert_ordering_invariants(scn, "post-reconnect", client=reconnected_client)
     assert_single_result_per_submission(
@@ -1036,7 +1071,18 @@ def run_phase0_solo_scenario(
     )
     scn.check(len(diag["turn_ids"]) == 5, "diagnostics", "turn ids incomplete")
     scn.check(len(diag["attempt_ids"]) == 5, "diagnostics", "attempt ids incomplete")
-    scn.check(len(diag["stream_ids"]) == 5, "diagnostics", "stream ids incomplete")
+    if allow_silent:
+        scn.check(
+            0 < len(diag["stream_ids"]) <= len(diag["attempt_ids"]),
+            "diagnostics",
+            "visible stream identifiers inconsistent with silent results",
+        )
+    else:
+        scn.check(
+            len(diag["stream_ids"]) == len(diag["attempt_ids"]),
+            "diagnostics",
+            "stream ids incomplete",
+        )
     if provider_calls is not None:
         # #373 observability: every AI role call was satisfied by a named fixture.
         satisfied = {call["fixture_step"] for call in provider_calls}
