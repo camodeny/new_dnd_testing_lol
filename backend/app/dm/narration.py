@@ -1166,6 +1166,8 @@ def execute_validated_turn(
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
     trace_id: str | None = None,
+    identity_decision_service: Any | None = None,
+    identity_session_factory: Any | None = None,
 ) -> ValidatedTurnResult:
     """Run a validated structured turn through narration to final commit.
 
@@ -1175,7 +1177,14 @@ def execute_validated_turn(
 
     1. ``stage_validated_attempt`` — persist staged effects attempt-local
        (no campaign-truth mutation).
-    2. ``stream_narration`` with a crash-atomic first-chunk boundary — deltas
+    2. Pre-narration identity resolution (issue #214) — decide ambiguous
+       ``new_entities`` identity AFTER contract normalization but BEFORE
+       the first visible chunk, and persist the attempt-local outcomes.
+       ``DEFER`` raises here with nothing visible persisted (freely
+       retryable); commit only revalidates/applies. No campaign lock is
+       held, so fail-soft telemetry may use ``identity_session_factory``
+       (defaults to the configured ``SessionLocal`` when available).
+    3. ``stream_narration`` with a crash-atomic first-chunk boundary — deltas
     stream from the provider, each incrementally gated and persisted
     durably via #197 BEFORE/with #198 realtime delivery. Chunk 0's row
     and ``mark_streaming_started`` (commit=False) share ONE atomic commit
@@ -1183,10 +1192,9 @@ def execute_validated_turn(
     (locks the input set at first visibility, so a crash can never leave
     visible narration on a still-prepared attempt); realtime delivery
     happens only after that commit returns.
-    3. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
-
+    4. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
     Failure semantics inherit the callees: pre-first-chunk failure
-    (generation/fidelity) leaves nothing persisted and is freely retryable
+    (generation/fidelity/identity-DEFER) leaves nothing persisted and is freely retryable
     with the same turn/attempt identity; post-first-chunk failure raises
     ``NarrationStreamError`` — the failed-visible partial stream is left
     intact and the attempt is marked failed-visible via
@@ -1213,6 +1221,34 @@ def execute_validated_turn(
         raise ValueError(f"Turn {turn_id} has non-UUID thread_id {turn.thread_id!r}") from exc
 
     staged = stage_validated_attempt(db, attempt_id, contract)
+
+    # Issue #214 — pre-narration bounded identity resolution. Decided here
+    # (after normalization/staging, before any visible chunk) so an
+    # ambiguous identity DEFERs with nothing durable/visible instead of
+    # stranding narration the later commit then refuses. Outcomes persist
+    # attempt-local; commit only revalidates/applies with no second call.
+    if getattr(contract, "new_entities", None):
+        from models.campaigns import Campaign as _Campaign
+
+        from app.world.service import resolve_new_entity_identities_pre_narration
+
+        _campaign = db.get(_Campaign, turn.campaign_id)
+        if _campaign is None:
+            raise ValueError(f"Campaign {turn.campaign_id} not found")
+        _factory = identity_session_factory
+        if _factory is None:
+            try:
+                from database import SessionLocal as _SessionLocal
+
+                _factory = _SessionLocal
+            except Exception:
+                _factory = None
+        resolve_new_entity_identities_pre_narration(
+            db, _campaign, turn, staged, contract,
+            identity_decision_service=identity_decision_service,
+            identity_session_factory=_factory,
+        )
+        staged = db.get(staged.__class__, attempt_id) or staged
 
     def _boundary_tx(db_: Session, stream_id_: uuid.UUID) -> None:
         # Flush-only: shares chunk 0's single atomic commit (no commit here).
