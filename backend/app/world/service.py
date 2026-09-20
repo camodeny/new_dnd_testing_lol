@@ -751,6 +751,7 @@ def promote_new_entities_from_contract(
             DEFER,
             KEEP_DISTINCT,
             NEW_ENTITY,
+            _candidate_label,
             build_identity_frame,
             create_entity_after_resolution,
             decide_identity,
@@ -771,13 +772,21 @@ def promote_new_entities_from_contract(
         if collision is not None and str(collision.id) not in {c.id for c in frame.candidates}:
             # Exact stable hit must stay a bounded candidate even when fuzzy
             # scoring misses it (e.g. alias/UUID reference). The model may
-            # still only choose among supplied candidates.
+            # still only choose among supplied candidates. Same enriched
+            # label as framed candidates so the hit stays distinguishable.
             from dataclasses import replace as _replace
 
             from app.decisions import CandidateRecord as _CandidateRecord
+            from models.world import WorldEntityAlias as _WorldEntityAlias
+            _collision_aliases = [
+                a.alias for a in db.execute(select(_WorldEntityAlias).where(
+                    _WorldEntityAlias.campaign_id == campaign.id,
+                    _WorldEntityAlias.entity_id == collision.id,
+                )).scalars()
+            ]
             extra = _CandidateRecord(
                 id=str(collision.id),
-                label=f"{collision.entity_type}: {collision.name}",
+                label=_candidate_label(collision, aliases=_collision_aliases),
                 source="world:identity_search",
                 payload_ref=str(collision.id),
             )

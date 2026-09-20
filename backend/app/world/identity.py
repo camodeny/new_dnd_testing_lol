@@ -131,6 +131,41 @@ def candidate_entities(
     return [item[2] for item in scored[:max(1, min(limit, 20))]]
 
 
+def _candidate_label(entity: WorldEntity, *, aliases: list[str]) -> str:
+    """Model-visible description with authorized disambiguating evidence.
+
+    Same-name candidates must stay distinguishable in the serialized
+    decision request (only IDs + descriptions cross the adapter
+    boundary). Location, audience-visible aliases, and provenance hints
+    travel with the label. Callers filter ``aliases`` to the frame's
+    audience first, so hidden aliases never reach non-authority frames.
+    """
+    label = f"{entity.entity_type}: {entity.name}"
+    hints: list[str] = []
+    details = entity.details or {}
+    location = details.get("location_ref")
+    if location and str(location).strip():
+        hints.append(f"location {str(location).strip()}"[:80])
+    seen: list[str] = []
+    for alias in sorted({a for a in aliases if a}):
+        if normalize_alias(alias) == normalize_alias(entity.name):
+            continue
+        if alias not in seen:
+            seen.append(alias)
+        if len(seen) >= 3:
+            break
+    if seen:
+        hints.append("also known as " + ", ".join(seen))
+    provenance = details.get("provenance_refs") or ()
+    if isinstance(provenance, (list, tuple)):
+        refs = [str(p) for p in provenance if str(p).strip()][:3]
+        if refs:
+            hints.append("known from " + ", ".join(refs))
+    if hints:
+        label += " (" + "; ".join(hints) + ")"
+    return label[:500]
+
+
 def identity_revision(db: Session, campaign: Campaign) -> str:
     """Fingerprint every identity-bearing row, not merely campaign revision."""
     entities = list(db.execute(_active_entities(db, campaign.id)).scalars())
@@ -156,8 +191,15 @@ def build_identity_frame(
     candidates = candidate_entities(db, campaign.id, name=name, entity_type=entity_type,
                                     location_ref=location_ref, provenance_refs=provenance_refs,
                                     is_authority=is_authority)
-    records = [CandidateRecord(id=str(e.id), label=f"{e.entity_type}: {e.name}",
-                               source="world:identity_search", payload_ref=str(e.id)) for e in candidates]
+    alias_rows = list(db.execute(select(WorldEntityAlias).where(
+        WorldEntityAlias.campaign_id == campaign.id)).scalars())
+    aliases_by_entity: dict[Any, list[str]] = {}
+    for alias_row in alias_rows:
+        if is_authority or alias_row.visibility not in {"private", "dm_only"}:
+            aliases_by_entity.setdefault(alias_row.entity_id, []).append(alias_row.alias)
+    records = [CandidateRecord(id=str(e.id), label=_candidate_label(
+        e, aliases=aliases_by_entity.get(e.id, [])),
+        source="world:identity_search", payload_ref=str(e.id)) for e in candidates]
     records.extend((
         CandidateRecord(id=NEW_ENTITY, label="Create a new canonical entity", source="world:identity_outcome"),
         CandidateRecord(id=KEEP_DISTINCT, label="Keep distinct from similar existing entities", source="world:identity_outcome"),

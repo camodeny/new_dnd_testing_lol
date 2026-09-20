@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base
 import models  # noqa: F401
-from app.decisions import DecisionError, DecisionService, record_fail_soft
+from app.decisions import DecisionError, DecisionService, record_fail_soft, to_decision_request
 from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
@@ -197,6 +197,42 @@ def test_keep_distinct_can_create_same_name_and_retry_is_idempotent():
         idempotency_key="identity:attempt:tmp", details={"location_ref": "south"})
     assert was_created is True and retry_created is False
     assert retried.id == created.id
+
+
+def test_same_name_candidates_carry_distinguishing_context_to_model():
+    db, campaign = setup_db()
+    make_entity(db, campaign, "The Guard", location_ref="north gate")
+    south = make_entity(db, campaign, "The Guard", location_ref="south gate")
+    add_alias(db, south, "Southerner", visibility="campaign")
+    frame = build_identity_frame(db, campaign, name="The Guard", entity_type="npc",
+                                 location_ref="south gate")
+    request = to_decision_request(frame)
+    real = [c for c in request.questions[0].candidates
+            if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    assert len(real) == 2
+    descriptions = {c.id: c.description or "" for c in real}
+    assert len(set(descriptions.values())) == 2
+    assert "south gate" in descriptions[str(south.id)]
+    assert "Southerner" in descriptions[str(south.id)]
+    assert any("north gate" in desc for desc in descriptions.values())
+
+
+def test_non_authority_frame_hides_secret_alias_in_labels():
+    db, campaign = setup_db()
+    merchant = make_entity(db, campaign, "Quiet Merchant", visibility="campaign")
+    add_alias(db, merchant, "Nightblade", visibility="dm_only")
+    player_frame = build_identity_frame(db, campaign, name="Quiet Merchant", entity_type="npc",
+                                        is_authority=False)
+    player_real = [c for c in player_frame.candidates
+                   if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    assert len(player_real) == 1
+    assert "Nightblade" not in player_real[0].label
+    authority_frame = build_identity_frame(db, campaign, name="Quiet Merchant", entity_type="npc",
+                                           is_authority=True)
+    authority_real = [c for c in authority_frame.candidates
+                      if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    assert len(authority_real) == 1
+    assert "Nightblade" in authority_real[0].label
 
 
 def test_locked_promotion_collects_telemetry_outbox_without_independent_write():
