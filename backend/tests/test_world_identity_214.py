@@ -235,6 +235,23 @@ def test_non_authority_frame_hides_secret_alias_in_labels():
     assert "Nightblade" in authority_real[0].label
 
 
+def test_keep_distinct_rejected_when_name_is_another_entity_alias():
+    db, campaign = setup_db()
+    mara_venn = make_entity(db, campaign, "Mara Venn")
+    add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
+    attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-alias",
+        "contract_snapshot": {"new_entities": [{
+            "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}})()
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    with pytest.raises(ValueError, match="alias"):
+        promote_new_entities_from_contract(
+            db, campaign, turn, attempt, identity_decision_service=service)
+    assert [row.id for row in db.query(type(mara_venn)).all()] == [mara_venn.id]
+    assert exact_identity(db, campaign.id, "Mara").id == mara_venn.id
+
+
 def test_locked_promotion_collects_telemetry_outbox_without_independent_write():
     from sqlalchemy import select
 

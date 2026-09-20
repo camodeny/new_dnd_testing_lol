@@ -98,6 +98,21 @@ def add_alias(
     return row
 
 
+def alias_owner(db: Session, campaign_id: uuid.UUID, name: Any) -> WorldEntity | None:
+    """Live canonical entity holding ``name`` as an exact alias, if any."""
+    normalized = normalize_alias(name)
+    if not normalized:
+        return None
+    row = db.execute(select(WorldEntityAlias).where(
+        WorldEntityAlias.campaign_id == campaign_id,
+        WorldEntityAlias.normalized_alias == normalized,
+    )).scalars().first()
+    if row is None:
+        return None
+    entity = db.get(WorldEntity, row.entity_id)
+    return entity if entity is not None and not entity.superseded_by_id else None
+
+
 def candidate_entities(
     db: Session, campaign_id: uuid.UUID, *, name: str, entity_type: str | None = None,
     location_ref: str | None = None, provenance_refs: tuple[str, ...] = (),
@@ -286,6 +301,17 @@ def create_entity_after_resolution(
     collision = exact_identity(db, campaign.id, name)
     if collision is not None and candidate.id != KEEP_DISTINCT:
         raise ValueError(f"new entity collides with canonical identity {collision.id}")
+    if candidate.id == KEEP_DISTINCT:
+        owner = alias_owner(db, campaign.id, name)
+        if owner is not None:
+            # The proposed canonical name is already another live entity's
+            # exact alias. Persisting it as a new canonical name would leave
+            # deterministic exact lookup (aliases win over canonical names)
+            # pointed at the wrong identity, so fail closed. Same
+            # canonical-name KEEP_DISTINCT (no alias owner) stays allowed.
+            raise ValueError(
+                f"new entity name {name!r} is already an alias of canonical identity {owner.id}"
+            )
     from app.world.service import create_entity_inline
     payload = dict(details or {})
     payload["identity_resolution"] = {
