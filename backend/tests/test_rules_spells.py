@@ -255,8 +255,9 @@ def test_cantrip_scaling_and_upcast_expressions():
     assert damage_expression_for_slot(get_spell_def("Fire Bolt"), None, character_level=5) == "2d10"
     assert damage_expression_for_slot(get_spell_def("Fireball"), 3) == "8d6"
     assert damage_expression_for_slot(get_spell_def("Fireball"), 4) == "9d6"
-    assert healing_expression_for_slot(get_spell_def("Cure Wounds"), 1, ability_modifier=3) == "1d8+3"
-    assert healing_expression_for_slot(get_spell_def("Cure Wounds"), 2, ability_modifier=3) == "2d8+3"
+    assert healing_expression_for_slot(get_spell_def("Cure Wounds"), 1, ability_modifier=3) == "2d8+3"
+    assert healing_expression_for_slot(get_spell_def("Cure Wounds"), 2, ability_modifier=3) == "4d8+3"
+    assert healing_expression_for_slot(get_spell_def("Healing Word"), 1, ability_modifier=3) == "2d4+3"
 
 
 # ── Staging: slot spend + concentration, idempotent ───────────────────────
@@ -461,11 +462,11 @@ def test_spell_damage_upcast_and_healing_hp_change():
 
     caster = FakeSheet(spellcasting_ability="wisdom", wisdom=16)  # +3
     receipt, change = resolve_spell_healing(
-        spell_name="Cure Wounds", slot_level=1, heal_rolls=[6],
+        spell_name="Cure Wounds", slot_level=1, heal_rolls=[6, 5],
         ability_modifier=3, current_hp=HitPoints(current=4, maximum=10, temporary=0),
         damage_id="heal-1", change_id="chg-1",
     )
-    assert receipt.final_total == 9  # 6 + 3
+    assert receipt.final_total == 14  # 6 + 5 + 3 (SRD 5.2.1: 2d8 + mod)
     assert change.after.current == 10  # capped at max
     assert change.kind == "heal"
     heal_effect = build_spell_heal_effect(

@@ -194,13 +194,13 @@ SUPPORTED_SPELLS: dict[str, SpellDef] = {
         _spell(
             "cure_wounds", "Cure Wounds", 1, "abjuration", "action", "SRD 5.2.1",
             ["healing"],
-            range_text="touch", healing_base="1d8", healing_upcast="1d8",
+            range_text="touch", healing_base="2d8", healing_upcast="2d8",
             duration="instantaneous",
         ),
         _spell(
             "healing_word", "Healing Word", 1, "abjuration", "bonus_action", "SRD 5.2.1",
             ["healing"],
-            range_ft=60, healing_base="1d4", healing_upcast="1d4",
+            range_ft=60, healing_base="2d4", healing_upcast="2d4",
             duration="instantaneous",
         ),
         _spell(
