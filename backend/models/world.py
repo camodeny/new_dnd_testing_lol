@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -70,6 +70,75 @@ class WorldEntity(Base):
             "source_attempt_id": str(self.source_attempt_id) if self.source_attempt_id else None,
             "operation_id": self.operation_id,
             "idempotency_key": self.idempotency_key,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class NPCState(Base):
+    """Optional progressive state for a canonical NPC identity.
+
+    The canonical name/status remains on :class:`WorldEntity`.  Incidental
+    NPCs need no row here; enrichment creates one without replacing identity.
+    Knowledge and relationships deliberately remain in their shared world
+    tables and are joined by services when a bounded projection requests them.
+    """
+
+    __tablename__ = "npc_states"
+    __table_args__ = (
+        Index("ix_npc_states_campaign_importance", "campaign_id", "importance"),
+        Index("ix_npc_states_campaign_location", "campaign_id", "location_entity_id"),
+        CheckConstraint("importance IN ('incidental','supporting','major')", name="ck_npc_states_importance"),
+        CheckConstraint("depth >= 0", name="ck_npc_states_depth_nonnegative"),
+        CheckConstraint("state_revision >= 1", name="ck_npc_states_revision_positive"),
+        CheckConstraint("campaign_revision >= 1", name="ck_npc_states_campaign_revision_positive"),
+    )
+
+    entity_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_entities.id", ondelete="CASCADE"), primary_key=True,
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    role: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    goals: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'"))
+    disposition: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'"))
+    resources: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list, server_default=text("'[]'"))
+    current_activity: Mapped[str | None] = mapped_column(Text, nullable=True)
+    location_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("world_entities.id", ondelete="SET NULL"), nullable=True,
+    )
+    location_name: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    importance: Mapped[str] = mapped_column(String(16), nullable=False, default="incidental", server_default="incidental")
+    depth: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    field_visibility: Mapped[dict | None] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'"))
+    state_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    campaign_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=False)
+    source_turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "entity_id": str(self.entity_id), "campaign_id": str(self.campaign_id),
+            "role": self.role, "goals": self.goals or [],
+            "disposition": self.disposition or {}, "resources": self.resources or [],
+            "current_activity": self.current_activity,
+            "location_entity_id": str(self.location_entity_id) if self.location_entity_id else None,
+            "location_name": self.location_name, "importance": self.importance,
+            "depth": self.depth, "field_visibility": self.field_visibility or {},
+            "state_revision": self.state_revision, "campaign_revision": self.campaign_revision,
+            "provenance": self.provenance or {},
+            "source_turn_id": str(self.source_turn_id) if self.source_turn_id else None,
+            "source_attempt_id": str(self.source_attempt_id) if self.source_attempt_id else None,
+            "source_event_id": str(self.source_event_id) if self.source_event_id else None,
+            "operation_id": self.operation_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
