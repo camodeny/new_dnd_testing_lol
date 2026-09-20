@@ -595,14 +595,23 @@ def publish_encounter_moved(db: Session, encounter, participant_id, *, move_id: 
     """
     try:
         from app.combat.maps import get_placement
-        from models.combat import EncounterParticipant
+        from models.combat import HIDDEN_ENTITY_VISIBILITIES, EncounterParticipant
+        from models.world import WorldEntity
 
         participant = db.get(EncounterParticipant, participant_id)
-        hidden = (
+        hidden = False
+        if (
             participant is not None
             and participant.kind in ("npc", "monster")
-            and participant.stat_visibility == "dm_private"
-        )
+            and participant.npc_entity_id is not None
+        ):
+            # Token hiding follows the source entity visibility signal, never
+            # stat_visibility (#230 forces stats dm_private for all NPCs).
+            entity = db.get(WorldEntity, participant.npc_entity_id)
+            hidden = (
+                entity is not None
+                and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES
+            )
         placement = None if hidden else get_placement(db, encounter.id, participant_id)
         campaign = db.get(Campaign, encounter.campaign_id)
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None

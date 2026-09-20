@@ -559,17 +559,21 @@ def test_reachable_read_is_safe_for_any_reader_and_reports_budget():
 # ── AI review round 1 (#404): hidden-token, ordering, redefine, dedupe ───────
 
 
-def _active_duo(db, ctx, *, owner_roll=1, goblin_roll=20):
-    """Two-token active encounter where the hidden goblin holds the turn."""
+def _active_duo(db, ctx, *, pc="owner_pc", actor="owner", pc_roll=1, goblin_roll=20,
+               operation_id=None):
+    """Two-token active encounter where the goblin holds the turn by default.
+
+    Pass pc_roll high / goblin_roll low to put the PC on turn instead.
+    """
     encounter, _ = start_encounter(
-        db, ctx["campaign_id"], operation_id=f"op-enc-duo-{uuid.uuid4().hex[:8]}",
+        db, ctx["campaign_id"], operation_id=operation_id or f"op-enc-duo-{uuid.uuid4().hex[:8]}",
         expected_revision=0,
         actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
         source_attempt_id=ctx["attempt_id"],
-        participants=[{"character_id": str(ctx["owner_pc"])},
+        participants=[{"character_id": str(ctx[pc])},
                       {"npc_entity_id": str(ctx["goblin_id"])}],
     )
-    owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+    pc_p = _pc(db, encounter.id, ctx[pc])
     goblin_p = db.execute(
         select(EncounterParticipant).where(
             EncounterParticipant.encounter_id == encounter.id,
@@ -577,24 +581,23 @@ def _active_duo(db, ctx, *, owner_roll=1, goblin_roll=20):
         )
     ).scalars().one()
     fulfill_human_initiative(
-        db, encounter.id, owner_p.id, actor_id=ctx["owner"],
-        payload={"source": "app", "raw_rolls": [owner_roll],
-                 "modifier": owner_p.initiative_modifier,
-                 "total": owner_roll + owner_p.initiative_modifier},
+        db, encounter.id, pc_p.id, actor_id=ctx[actor],
+        payload={"source": "app", "raw_rolls": [pc_roll],
+                 "modifier": pc_p.initiative_modifier,
+                 "total": pc_roll + pc_p.initiative_modifier},
     )
     roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=goblin_roll)
     db.refresh(encounter)
     assert encounter.status == "active"
-    assert encounter.active_participant_id == goblin_p.id
-    return encounter, owner_p, goblin_p
+    return encounter, pc_p, goblin_p
 
 
-def _duo_map(db, ctx, encounter, owner_p, goblin_p, **kwargs):
+def _duo_map(db, ctx, encounter, pc_p, goblin_p, **kwargs):
     revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
     defaults = {
         "actor_id": ctx["owner"], "width": 6, "height": 6,
         "terrain": [],
-        "placements": [{"participant_id": str(owner_p.id), "col": 0, "row": 0},
+        "placements": [{"participant_id": str(pc_p.id), "col": 0, "row": 0},
                        {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
         "expected_revision": revision,
         "operation_id": f"op-duo-map-{uuid.uuid4().hex[:8]}",
@@ -729,6 +732,7 @@ def test_hidden_mover_move_redacts_positions():
     try:
         with fac() as db:
             encounter, owner_p, goblin_p = _active_duo(db, ctx)
+            assert encounter.active_participant_id == goblin_p.id
             _duo_map(db, ctx, encounter, owner_p, goblin_p)
             move, _, event = _move(db, ctx, encounter, goblin_p, 4, 5,
                                    operation_id="op-hidden-move")
@@ -746,3 +750,108 @@ def test_hidden_mover_move_redacts_positions():
             assert moved[0]["payload"].get("position_redacted") is True
     finally:
         set_realtime_publisher(None)
+
+
+# ── AI review round 2 (#404): entity-visibility signal, shared events ────────
+
+
+def test_public_npc_token_stays_visible_despite_private_stats():
+    """Stat privacy (#230) is not token hiding: a campaign-visible NPC keeps
+    its token, reachable reads, and movement for non-owners."""
+    fac, ctx = _fixture()
+    with fac() as db:
+        guard = WorldEntity(campaign_id=ctx["campaign_id"], entity_type="npc",
+                            name="Town Guard", visibility="campaign",
+                            details={"initiative_modifier": 1, "dex_modifier": 1})
+        db.add(guard)
+        db.commit()
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-enc-guard", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+            source_attempt_id=ctx["attempt_id"],
+            participants=[{"character_id": str(ctx["owner_pc"])},
+                          {"npc_entity_id": str(guard.id)}],
+        )
+        owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+        guard_p = db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id,
+                EncounterParticipant.npc_entity_id == guard.id,
+            )
+        ).scalars().one()
+        fulfill_human_initiative(
+            db, encounter.id, owner_p.id, actor_id=ctx["owner"],
+            payload={"source": "app", "raw_rolls": [10],
+                     "modifier": owner_p.initiative_modifier,
+                     "total": 10 + owner_p.initiative_modifier},
+        )
+        roll_npc_initiative(db, encounter.id, guard_p.id, raw_d20=5)
+        # Stats stay DM-private per #230 even though the token is public.
+        assert guard_p.stat_visibility == "dm_private"
+        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+        ensure_map(
+            db, encounter.id, actor_id=ctx["owner"], width=6, height=6,
+            placements=[{"participant_id": str(owner_p.id), "col": 0, "row": 0},
+                        {"participant_id": str(guard_p.id), "col": 5, "row": 0}],
+            expected_revision=revision, operation_id="op-map-guard",
+        )
+        player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
+        assert any(p["participant_id"] == str(guard_p.id)
+                   for p in player_view["placements"])
+        seen = reachable_for(db, encounter.id, guard_p.id,
+                             viewer_id=ctx["player"], is_owner=False)
+        assert seen["from"] == {"col": 5, "row": 0}
+
+
+def test_shared_terrain_event_omits_hidden_stranded():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, owner_p, goblin_p = _active_duo(db, ctx)
+        _duo_map(db, ctx, encounter, owner_p, goblin_p)
+        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+        _, event = update_terrain(
+            db, encounter.id, actor_id=ctx["owner"],
+            zones=[{"kind": "blocked", "rect": {"col": 5, "row": 5, "width": 1, "height": 1}}],
+            expected_revision=revision, operation_id="op-event-strand",
+        )
+        # Thread-scoped history must not carry the hidden token's cell.
+        assert event.payload["stranded_placements"] == []
+        # Owner projection still flags it (ledger + owner views intact).
+        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"], is_owner=True)
+        assert any(s["participant_id"] == str(goblin_p.id)
+                   for s in owner_view["stranded_placements"])
+
+
+def test_non_owner_reachable_ignores_hidden_occupancy_and_probe_is_masked():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, player_p, goblin_p = _active_duo(
+            db, ctx, pc="player_pc", actor="player", pc_roll=20, goblin_roll=1,
+            operation_id="op-enc-probe",
+        )
+        assert encounter.active_participant_id == player_p.id
+        _duo_map(db, ctx, encounter, player_p, goblin_p)
+        # Owner's reachable folds every token; the non-owner shape is not
+        # carved by the hidden goblin at (5, 5).
+        owner_cells = {(c["col"], c["row"]) for c in reachable_for(
+            db, encounter.id, player_p.id, viewer_id=ctx["owner"], is_owner=True)["cells"]}
+        player_cells = {(c["col"], c["row"]) for c in reachable_for(
+            db, encounter.id, player_p.id, viewer_id=ctx["player"], is_owner=False)["cells"]}
+        assert (5, 5) not in owner_cells
+        assert (5, 5) in player_cells
+        # Probing the hidden cell as a non-owner fails generic-unreachable
+        # (never "occupied"), moves nothing, spends nothing.
+        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+        with pytest.raises(MapError, match="unreachable") as excinfo:
+            move_participant(
+                db, encounter.id, player_p.id, actor_id=ctx["player"],
+                to_col=5, to_row=5,
+                expected_turn_sequence=int(encounter.turn_sequence or 0),
+                expected_revision=revision, operation_id="op-probe-hidden",
+            )
+        assert excinfo.value.reason == "unreachable"
+        assert "occupied" not in str(excinfo.value).lower()
+        db.rollback()
+        assert (get_placement(db, encounter.id, player_p.id).col,
+                get_placement(db, encounter.id, player_p.id).row) == (0, 0)
+        assert get_turn_state_row(db, encounter.id, player_p.id).movement_remaining == 30

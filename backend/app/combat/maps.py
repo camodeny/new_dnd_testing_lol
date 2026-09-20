@@ -20,9 +20,10 @@ Code-owned authority (never delegated to models):
   ``update_terrain_inline`` for the DM turn-commit transaction owned by the
   dm lane). Every change bumps the map revision and emits
   ``encounter.map_updated``.
-- Projections strip DM-only terrain labels and hide ``dm_private`` NPC
-  tokens from non-owners (fog/hidden hook). Reconnects rebuild positions
-  and terrain from these rows via ``map_projection`` / the snapshot.
+- Projections strip DM-only terrain labels and hide hidden-entity NPC
+  tokens from non-owners (fog/hidden hook; token hiding follows the source
+  entity visibility signal, never #230 stat_visibility). Reconnects rebuild
+  positions and terrain from these rows via ``map_projection`` / the snapshot.
 
 Movement modes: only ``walk`` resolves against turn-state budgets at launch;
 the mode column and validation stay extensible for future modes.
@@ -164,17 +165,30 @@ def _next_zone_order(db: Session, map_id: uuid.UUID) -> int:
     return int(current or 0) + (1 if current is not None else 0)
 
 
-def _is_hidden_participant(participant: EncounterParticipant) -> bool:
-    """True for dm_private NPC/monster tokens hidden from non-owners.
+def _hidden_token_ids(db: Session, encounter_id: uuid.UUID) -> set[str]:
+    """Participant ids whose map tokens stay hidden from non-owners.
 
-    Single canonical hidden-token rule shared by map_projection,
-    reachable reads, stranded flags, and movement payloads.
+    Token hiding follows the source entity/map visibility signal — a
+    ``dm_only`` (or otherwise hidden-visibility) NPC/monster entity — and
+    NOT ``stat_visibility``: #230 forces ``stat_visibility=dm_private`` for
+    every NPC/monster because it protects combat *stats*, so ordinary
+    visible enemies must keep their tokens, reachable reads, and movement
+    (only their stats stay private). Tokens default to visible when the
+    entity row is missing.
     """
-    return (
-        participant is not None
-        and participant.kind in ("npc", "monster")
-        and participant.stat_visibility == "dm_private"
-    )
+    from models.combat import HIDDEN_ENTITY_VISIBILITIES
+    from models.world import WorldEntity
+
+    hidden: set[str] = set()
+    for participant in list_participants(db, encounter_id):
+        if participant.kind not in ("npc", "monster"):
+            continue
+        if participant.npc_entity_id is None:
+            continue
+        entity = db.get(WorldEntity, participant.npc_entity_id)
+        if entity is not None and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES:
+            hidden.add(str(participant.id))
+    return hidden
 
 
 def list_placements(db: Session, encounter_id: uuid.UUID) -> list[EncounterPlacement]:
@@ -222,11 +236,21 @@ def _zone_dicts(zones: list[EncounterTerrainZone]) -> list[dict]:
 
 
 def _occupied_cells(
-    db: Session, encounter_id: uuid.UUID, *, exclude_participant_id: uuid.UUID | None = None
+    db: Session, encounter_id: uuid.UUID,
+    *,
+    exclude_participant_id: uuid.UUID | None = None,
+    include_hidden: bool = True,
 ) -> set[tuple[int, int]]:
+    """Cells blocked by other tokens. Reader-facing reads pass
+    ``include_hidden=False`` for non-owners so hidden-token cells do not
+    shape the reachable set (movement commits always use the full
+    authoritative set)."""
+    hidden = set() if include_hidden else _hidden_token_ids(db, encounter_id)
     occupied: set[tuple[int, int]] = set()
     for placement in list_placements(db, encounter_id):
         if exclude_participant_id is not None and placement.participant_id == exclude_participant_id:
+            continue
+        if str(placement.participant_id) in hidden:
             continue
         occupied.add((int(placement.col), int(placement.row)))
     return occupied
@@ -689,6 +713,23 @@ def update_terrain(
 
     from app.campaigns.events import commit_campaign_mutation
 
+    def _terrain_payload() -> dict:
+        # The domain event is thread-scoped/shared history: stranded flags
+        # carry exact cells, so hidden-entity tokens are filtered here too
+        # (the owner reads full state via the ledger + projection).
+        hidden = _hidden_token_ids(db, encounter.id)
+        return {
+            "encounter_id": str(encounter.id),
+            "thread_id": encounter.thread_id,
+            "map_revision": int(encounter_map.revision or 1),
+            "zones_added": len(validated),
+            "zones_cleared": len(clear_ids),
+            "zone_count": holder["zone_count"],
+            "stranded_placements": [
+                s for s in holder["stranded"] if s["participant_id"] not in hidden
+            ],
+        }
+
     campaign_after, event = commit_campaign_mutation(
         db,
         campaign.id,
@@ -698,15 +739,7 @@ def update_terrain(
         actor_id=actor_id,
         mutate=_mutate,
         commit=False,
-        payload_builder=lambda: {
-            "encounter_id": str(encounter.id),
-            "thread_id": encounter.thread_id,
-            "map_revision": int(encounter_map.revision or 1),
-            "zones_added": len(validated),
-            "zones_cleared": len(clear_ids),
-            "zone_count": holder["zone_count"],
-            "stranded_placements": holder["stranded"],
-        },
+        payload_builder=_terrain_payload,
         outbox_event_type=MAP_UPDATED_EVENT,
         outbox_payload={
             "encounter_id": str(encounter.id),
@@ -826,10 +859,11 @@ def reachable_for(
 
     Read-only: safe to call before any move. Output carries coordinates and
     square costs only — never DM-only terrain labels — so it is safe to serve
-    to any encounter reader, with one boundary: a ``dm_private`` NPC/monster
+    to any encounter reader, with one boundary: a hidden-entity NPC/monster
     token's position (``from`` + reachable cells) is visible to the owner
     only. Non-owners querying another hidden token get 403 via
-    MapAuthorizationError; every other reader keeps working.
+    MapAuthorizationError, and hidden tokens do not carve non-owner
+    reachable shapes; every other reader keeps working.
     """
     mode = str(movement_mode or WALK_MODE).strip().lower()
     if mode not in MOVEMENT_MODES:
@@ -845,7 +879,7 @@ def reachable_for(
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise MapError("participant not found in this encounter", reason="no_placement")
-    if _is_hidden_participant(participant) and not is_owner:
+    if not is_owner and str(participant.id) in _hidden_token_ids(db, encounter.id):
         raise MapAuthorizationError(
             "Only the campaign owner may read a hidden token's reachable space"
         )
@@ -861,7 +895,13 @@ def reachable_for(
     started = time.perf_counter()
     max_squares = feet_to_squares(int(state.movement_remaining))
     zones = _zone_dicts(list_zones(db, encounter_map.id))
-    occupied = _occupied_cells(db, encounter.id, exclude_participant_id=participant.id)
+    # Visibility-aware occupancy: a non-owner's reachable shape must not be
+    # carved by tokens they cannot see (movement commits still enforce the
+    # full authoritative collision below).
+    occupied = _occupied_cells(
+        db, encounter.id, exclude_participant_id=participant.id,
+        include_hidden=is_owner,
+    )
     # Occupied cells deny entry; fold them as single-cell blocked overlays on
     # top of DM terrain (later wins, same as DM re-carves).
     overlays = list(zones) + [
@@ -1008,8 +1048,31 @@ def move_participant(
 
     max_squares = feet_to_squares(int(state.movement_remaining))
     zones = _zone_dicts(list_zones(db, encounter_map.id))
+    # Authoritative collision always uses the full occupancy set; only the
+    # *reported* reason is visibility-aware (see below).
     occupied = _occupied_cells(db, encounter.id, exclude_participant_id=participant.id)
     if goal in occupied:
+        occupant_id = next(
+            (str(p.participant_id) for p in list_placements(db, encounter.id)
+             if (int(p.col), int(p.row)) == goal),
+            None,
+        )
+        actor_is_owner = _is_owner(db, encounter.campaign_id, actor_id)
+        if (
+            occupant_id is not None
+            and not actor_is_owner
+            and occupant_id in _hidden_token_ids(db, encounter.id)
+        ):
+            # Masked: a non-owner probing a hidden token's cell learns
+            # nothing beyond a generic unreachable failure, while the
+            # collision is still enforced (nothing moves, nothing spends).
+            _log_rejection(encounter, participant, operation_id, "unreachable",
+                           started, from_cell, {"col": goal[0], "row": goal[1]})
+            raise MapError(
+                f"destination ({goal[0]}, {goal[1]}) is unreachable "
+                f"with {state.movement_remaining} ft remaining",
+                reason="unreachable",
+            )
         _log_rejection(encounter, participant, operation_id, "occupied", started, from_cell,
                         {"col": goal[0], "row": goal[1]})
         raise MapError(
@@ -1097,7 +1160,16 @@ def move_participant(
         # A hidden token's coordinates must not ride the shared/thread-scoped
         # event: non-owners get a position-free invalidation (the movement
         # ledger row keeps the authoritative cells for the owner/DM path).
-        if _is_hidden_participant(participant):
+        if str(participant.id) in _hidden_token_ids(db, encounter.id):
+            return {
+                "encounter_id": str(encounter.id),
+                "thread_id": encounter.thread_id,
+                "participant_id": str(participant.id),
+                "movement_mode": mode,
+                "position_redacted": True,
+                "turn_sequence": int(encounter.turn_sequence or 0),
+                "map_revision": int(encounter_map.revision or 1),
+            }
             return {
                 "encounter_id": str(encounter.id),
                 "thread_id": encounter.thread_id,
@@ -1120,7 +1192,7 @@ def move_participant(
             "map_revision": int(encounter_map.revision or 1),
         }
 
-    hidden_mover = _is_hidden_participant(participant)
+    hidden_mover = str(participant.id) in _hidden_token_ids(db, encounter.id)
     try:
         _, event = commit_campaign_mutation(
             db,
@@ -1244,9 +1316,11 @@ def map_projection(
 
     Viewer-aware privacy: DM-only terrain labels are stripped for
     non-owners (mechanical kind/rect stay — they govern shared movement),
-    and tokens of ``dm_private`` NPC/monster participants are hidden from
-    non-owners entirely (fog/hidden hook). The AI is the only DM: ownership
-    here means the campaign owner on the runtime path.
+    and tokens of hidden-entity NPC/monster participants are hidden from
+    non-owners entirely (fog/hidden hook). Token hiding follows the source
+    entity visibility signal, never ``stat_visibility`` (#230 stats-privacy
+    stays separate). The AI is the only DM: ownership here means the
+    campaign owner on the runtime path.
     """
     encounter_map = get_map(db, encounter.id)
     if encounter_map is None:
@@ -1256,12 +1330,13 @@ def map_projection(
         for z in list_zones(db, encounter_map.id)
     ]
     participants = {str(p.id): p for p in list_participants(db, encounter.id)}
+    hidden_ids = set() if is_owner else _hidden_token_ids(db, encounter.id)
     placements = []
     for placement in list_placements(db, encounter.id):
         participant = participants.get(str(placement.participant_id))
         if participant is None:
             continue
-        if not is_owner and _is_hidden_participant(participant):
+        if str(placement.participant_id) in hidden_ids:
             continue
         item = placement.to_dict()
         item["display_name"] = participant.display_name
@@ -1270,10 +1345,7 @@ def map_projection(
     stranded = _stranded_placements(db, encounter, encounter_map)
     if not is_owner:
         # A stranded flag carries the token's exact cell: hide it for
-        # dm_private NPC/monster tokens exactly like placements above.
-        hidden_ids = {
-            str(p.id) for p in participants.values() if _is_hidden_participant(p)
-        }
+        # hidden-entity tokens exactly like placements above.
         stranded = [s for s in stranded if s["participant_id"] not in hidden_ids]
     return {
         **encounter_map.to_dict(),
