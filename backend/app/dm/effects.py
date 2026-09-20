@@ -39,6 +39,10 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # Encounter selection references canonical identities only; stat
     # resolution is server-side, so announcing combat is party-visible.
     "start_encounter": "public",
+    # Encounter end (#239) defaults to dm_private (fail-closed): the
+    # DM-authored reason may reference hidden NPC fates, and the
+    # thread-scoped ended event + snapshot enforce their own read boundary.
+    "end_encounter": "dm_private",
     # Attack damage defaults to dm_private (fail-closed): the builder sets
     # explicit visibility per target, and a bare effect stays restricted.
     "apply_attack_damage": "dm_private",
@@ -502,6 +506,47 @@ def _handle_start_encounter(db: Session, campaign: Campaign, effect: dict[str, A
     logger.info(
         "effect start_encounter effect_id=%s encounter_id=%s participants=%s op=%s",
         effect.get("id"), encounter.id, encounter.participant_count, operation_key,
+    )
+
+
+@register("end_encounter")
+def _handle_end_encounter(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """End an authoritative encounter inside the turn-commit txn (issue #239).
+
+    Runs inside the outer ``commit_campaign_mutation``: a failed turn commit
+    rolls back the end transition, death writes, and hook rows, so failed
+    ends leave the encounter active rather than half-closed. The distinct
+    ``encounter.ended`` lifecycle event is staged by the turn-commit path in
+    the same outer transaction (mirroring the start_encounter staging).
+
+    Duplicate protection: a retried effect with the same idempotency key
+    against the already-ended encounter is a no-op returning the existing
+    row; a genuinely new end against an ended encounter fails closed.
+    """
+    import uuid as _uuid
+
+    from models.combat import Encounter as _Encounter
+
+    args = effect.get("arguments") or {}
+    try:
+        encounter_id = _uuid.UUID(str(args.get("encounter_id") or ""))
+    except ValueError:
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter_id must be a UUID")
+    encounter = db.get(_Encounter, encounter_id)
+    if encounter is None or str(encounter.campaign_id) != str(campaign.id):
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
+    operation_key = _resolve_effect_key(attempt, effect)
+
+    from app.combat.ending import EndEncounterError as _EndError
+    from app.combat.ending import end_encounter_inline as _end_inline
+
+    try:
+        encounter = _end_inline(db, campaign, encounter, args, operation_key)
+    except _EndError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} invalid encounter end: {exc}") from exc
+    logger.info(
+        "effect end_encounter effect_id=%s encounter_id=%s outcome=%s op=%s",
+        effect.get("id"), encounter.id, encounter.end_outcome, operation_key,
     )
 
 

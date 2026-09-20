@@ -42,6 +42,13 @@ from app.combat.turns import (
     end_turn,
     turn_projection,
 )
+from app.combat.ending import (
+    EndEncounterAuthorizationError,
+    EndEncounterError,
+    end_encounter,
+    list_end_followups,
+    process_end_followup,
+)
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.campaigns.events import RevisionConflictError
@@ -100,6 +107,7 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
         return
     try:
         from app.realtime.service import (
+            publish_encounter_ended,
             publish_encounter_ready,
             publish_encounter_started,
             publish_encounter_turn,
@@ -123,6 +131,8 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
             publish_encounter_turn(db, encounter, "skipped")
         if result.get("started_event") is not None:
             publish_encounter_turn(db, encounter, "started")
+        if result.get("encounter_ended_event") is not None:
+            publish_encounter_ended(db, encounter)
     except Exception:
         logger.warning("encounter post-commit publish skipped", exc_info=True)
 
@@ -357,7 +367,7 @@ def _turn_http_error(exc: Exception) -> HTTPException:
             status_code=409, detail=str(exc),
             headers={"X-Current-Turn-Sequence": str(exc.actual_sequence)},
         )
-    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError, MapAuthorizationError)):
+    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError, MapAuthorizationError, EndEncounterAuthorizationError)):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, CampaignArchivedError):
         return HTTPException(status_code=409, detail=str(exc))
@@ -763,4 +773,119 @@ def post_move(campaign_id: str, encounter_id: str, payload: dict, request: Reque
         ) from exc
     _publish_map_post_commit(db, result, str(encounter.id),
                              replayed=response.headers.get("X-Idempotent-Replay") == "true")
+    return result
+
+
+# ── DM-controlled encounter end + post-combat hooks — issue #239 ─────────────
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end")
+def post_end_encounter(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    # The AI is the only DM: ending runs on the campaign-owner path, never a
+    # separate human DM role.
+    require_owner(campaign, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+    for field in ("outcome", "reason"):
+        if not payload.get(field):
+            raise HTTPException(status_code=422, detail=f"{field} is required")
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit so the
+            # transition, death writes, hook rows, and ended event commit
+            # atomically — failures leave the encounter active, never
+            # half-closed.
+            updated, event, hooks = end_encounter(
+                db, encounter.id, actor_id=profile.id,
+                outcome=payload["outcome"], reason=payload["reason"],
+                participant_outcomes=payload.get("participant_outcomes"),
+                expected_revision=expected_revision, operation_id=key,
+                commit=False,
+            )
+            return {
+                "encounter": _viewer_view(db, updated, profile.id, is_owner=True),
+                "encounter_ended_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+                "followups": [h.to_dict() for h in hooks],
+            }
+        except Exception as exc:
+            raise _turn_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.end", scope_type="encounter", scope_id=encounter.id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_post_commit(
+        db, result,
+        replayed=response.headers.get("X-Idempotent-Replay") == "true",
+    )
+    return result
+
+
+@router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups")
+def read_end_followups(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    # Issue #239 privacy: hook results carry post-combat custody/death/loot
+    # detail (participant IDs) that can name hidden NPC fates — owner-only
+    # bookkeeping, matching the process endpoint below. Members converge via
+    # the redacted encounter view (public outcome) instead.
+    require_owner(campaign, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    return {
+        "encounter_id": str(encounter.id),
+        "status": encounter.status,
+        "followups": [h.to_dict() for h in list_end_followups(db, encounter.id)],
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups/process")
+def post_process_end_followup(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    hook_type = payload.get("hook_type")
+    if not hook_type:
+        raise HTTPException(status_code=422, detail="hook_type is required")
+    if payload.get("result") is None and payload.get("fail_reason") is None:
+        raise HTTPException(status_code=422, detail="result or fail_reason is required")
+    key = require_idempotency_key(request, payload.get("operation_id"))
+
+    def execute():
+        try:
+            # Flush-only under the idempotency guard. Hook completion/failure
+            # is a non-fictional ledger write (no revision bump); it never
+            # reopens or invalidates the ended encounter.
+            row = process_end_followup(
+                db, encounter.id, str(hook_type),
+                result=payload.get("result"),
+                fail_reason=payload.get("fail_reason"),
+                commit=False,
+            )
+            return {
+                "encounter": _viewer_view(db, encounter, profile.id, is_owner=True),
+                "followup": row.to_dict(),
+            }
+        except Exception as exc:
+            raise _turn_http_error(exc) from exc
+
+    result = execute_http_idempotent(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.end_followup", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     return result

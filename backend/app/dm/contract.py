@@ -282,6 +282,7 @@ STAGED_EFFECT_TYPES = (
     "upsert_relation",
     "complete_adventure",
     "start_encounter",
+    "end_encounter",
     "apply_attack_damage",
     "apply_condition",
     "apply_resource",
@@ -412,6 +413,47 @@ class StartEncounterArgs(StrictModel):
         for key in v:
             if key not in allowed:
                 raise ValueError(f"scene key {key!r} is not supported (location_entity_id, location_name, map_ref)")
+        return v
+
+
+class EndEncounterArgs(StrictModel):
+    """DM-declared encounter end — issue #239.
+
+    The DM ends structured initiative with an explicit outcome/reason pair;
+    per-participant fates are optional (default ``standing``). ``slain`` PC
+    outcomes persist as canonical PC deaths. Structured shape only — the
+    combat lane owns the transition, death writes, and hook seeding.
+    """
+    encounter_id: str = Field(min_length=1, max_length=160, description="Encounter UUID to end")
+    outcome: Literal["victory", "defeat", "surrender", "escape", "capture", "retreat", "negotiated_truce"] = Field(description="Fictional resolution category")
+    reason: str = Field(min_length=1, max_length=2000, description="Why the encounter ends")
+    participant_outcomes: dict[str, str] | None = Field(default=None, description="Participant id string to fate standing|slain|unconscious|surrendered|captured|fled|retreated")
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("encounter_id")
+    @classmethod
+    def _valid_encounter_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("encounter_id must be a UUID") from exc
+        return str(v)
+
+    @field_validator("participant_outcomes", mode="before")
+    @classmethod
+    def _validate_outcomes(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError("participant_outcomes must be an object")
+        allowed = {"standing", "slain", "unconscious", "surrendered", "captured", "fled", "retreated"}
+        for raw_pid, fate in v.items():
+            try:
+                uuid.UUID(str(raw_pid))
+            except ValueError as exc:
+                raise ValueError(f"participant_outcomes key {raw_pid!r} must be a UUID") from exc
+            if str(fate) not in allowed:
+                raise ValueError(f"participant outcome {fate!r} must be one of {sorted(allowed)}")
         return v
 
 
@@ -619,13 +661,13 @@ class UpdateMapPlacementArgs(StrictModel):
         return str(v)
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -673,6 +715,8 @@ class StagedEffect(StrictModel):
                 CompleteAdventureArgs.model_validate(args)
             elif t == "start_encounter":
                 StartEncounterArgs.model_validate(args)
+            elif t == "end_encounter":
+                EndEncounterArgs.model_validate(args)
             elif t == "apply_attack_damage":
                 ApplyAttackDamageArgs.model_validate(args)
             elif t == "apply_condition":

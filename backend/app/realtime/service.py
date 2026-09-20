@@ -217,6 +217,28 @@ def build_encounter_ready_event(encounter, *, revision: int | None = None) -> di
     }
 
 
+def build_encounter_ended_event(encounter, *, revision: int | None = None) -> dict[str, Any]:
+    """Projection for ``encounter.ended`` — issue #239.
+
+    Carries outcome/reason/rounds only — never hidden NPC HP breakdowns or
+    DM-only detail (members converge via the privacy-filtered snapshot).
+    """
+    return {
+        "type": "encounter.ended",
+        "event_id": f"encounter:{encounter.id}:ended",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "round": int(encounter.round or 1),
+        "revision": int(revision) if revision is not None else None,
+        "outcome": encounter.end_outcome,
+        "end_duration_ms": encounter.end_duration_ms,
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:ended",
+    }
+
+
 def build_encounter_turn_event(encounter, kind: str, *, revision: int | None = None) -> dict[str, Any]:
     """Projection for turn progression — issue #231.
 
@@ -560,6 +582,18 @@ def publish_encounter_turn(db: Session, encounter, kind: str) -> bool:
     except Exception as exc:
         _inc("publish_failures")
         logger.warning("publish_encounter_turn failed encounter_id=%s kind=%s error=%s", getattr(encounter, "id", "?"), kind, exc)
+        return False
+
+
+def publish_encounter_ended(db: Session, encounter) -> bool:
+    """Publish the ``encounter.ended`` projection (best-effort, post-commit)."""
+    try:
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(db, encounter, build_encounter_ended_event(encounter, revision=revision))
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_ended failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
 

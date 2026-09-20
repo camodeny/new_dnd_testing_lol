@@ -117,6 +117,8 @@ def _require_playable(db: Session, campaign_id: uuid.UUID) -> Campaign:
 
 
 def _active_or_raise(db: Session, encounter: Encounter) -> EncounterParticipant:
+    if encounter.status == "ended":
+        raise TurnError("encounter has ended; initiative is closed and turns are frozen")
     if encounter.status != "active" or encounter.active_participant_id is None:
         raise TurnError("no active turn: encounter initiative is not complete")
     participant = db.get(EncounterParticipant, encounter.active_participant_id)
@@ -324,6 +326,8 @@ def consume_resource(
     """
     encounter = _lock_encounter(db, encounter_id)
     _require_playable(db, encounter.campaign_id)
+    if encounter.status == "ended":
+        raise TurnError("encounter has ended; turn resources are frozen")
     try:
         expected_turn_sequence = int(expected_turn_sequence)
     except (TypeError, ValueError) as exc:
@@ -493,6 +497,8 @@ def cast_skip_vote(
         raise TurnError("expected_turn_sequence must be an integer") from exc
     if expected_turn_sequence != int(encounter.turn_sequence or 0):
         raise StaleTurnError(expected_turn_sequence, int(encounter.turn_sequence or 0))
+    if encounter.status == "ended":
+        raise TurnError("encounter has ended; initiative is closed and turns are frozen")
     if encounter.status != "active":
         raise TurnError("skip votes require an active encounter")
     if not _is_member(db, encounter.campaign_id, voter_id):
@@ -588,6 +594,8 @@ def end_turn(
     started = _now()
     encounter = _lock_encounter(db, encounter_id)
     campaign = _require_playable(db, encounter.campaign_id)
+    if encounter.status == "ended":
+        raise TurnError("encounter has ended; initiative is closed and turns are frozen")
     if encounter.status != "active":
         raise TurnError("no active turn to end: encounter initiative is not complete")
     try:

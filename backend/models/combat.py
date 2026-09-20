@@ -134,6 +134,21 @@ class Encounter(Base):
     invalid_attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     last_turn_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     last_end_turn_latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # ── Encounter end (issue #239) ──────────────────────────────────────
+    # DM-declared outcome/reason pair; participant outcomes keyed by
+    # participant id string; authoritative final snapshot lives in the
+    # ``encounter.ended`` domain event payload (canonical HP/conditions stay
+    # on sheets/entity details, never copied here).
+    end_outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    end_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ended_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True
+    )
+    end_operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    end_participant_outcomes: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    end_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    duplicate_end_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    followup_failure_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -174,6 +189,14 @@ class Encounter(Base):
             "invalid_attempt_count": int(self.invalid_attempt_count or 0),
             "last_turn_duration_ms": self.last_turn_duration_ms,
             "last_end_turn_latency_ms": self.last_end_turn_latency_ms,
+            "end_outcome": self.end_outcome,
+            "end_reason": self.end_reason,
+            "ended_by": str(self.ended_by) if self.ended_by else None,
+            "end_operation_id": self.end_operation_id,
+            "end_participant_outcomes": dict(self.end_participant_outcomes or {}),
+            "end_duration_ms": self.end_duration_ms,
+            "duplicate_end_count": int(self.duplicate_end_count or 0),
+            "followup_failure_count": int(self.followup_failure_count or 0),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -609,4 +632,82 @@ class EncounterMove(Base):
             "cost_feet": int(self.cost_feet),
             "path": list(self.path or []),
             "turn_sequence": int(self.turn_sequence or 0),
+        }
+
+
+# ── Post-combat consequence hooks — issue #239 ─────────────────────────────
+
+
+#: Durable post-combat follow-up hook types. Rows are created pending in the
+#: same transaction as the encounter end; normal campaign processing
+#: completes them (or records a failure) afterwards. A hook failure never
+#: reopens or invalidates the ended encounter.
+END_FOLLOWUP_HOOKS = (
+    "loot_availability",
+    "xp_progression",
+    "death_aftermath",
+    "custody_state",
+    "post_turn_consolidation",
+)
+
+END_FOLLOWUP_STATUSES = ("pending", "complete", "failed")
+
+
+class EncounterEndFollowup(Base):
+    """One durable post-combat consequence hook — issue #239.
+
+    Unique on (encounter_id, hook_type): a duplicate encounter-end command
+    replays the existing rows instead of duplicating rewards/events. Status
+    moves pending → complete (normal campaign processing recorded its
+    result) or pending → failed (downstream work failed; retryable via
+    re-processing). Completed rows stay completed: re-processing replays
+    the recorded result.
+    """
+
+    __tablename__ = "encounter_end_followups"
+    __table_args__ = (
+        UniqueConstraint("encounter_id", "hook_type", name="uq_end_followups_encounter_hook"),
+        CheckConstraint(
+            "hook_type IN ('loot_availability', 'xp_progression', 'death_aftermath', 'custody_state', 'post_turn_consolidation')",
+            name="ck_end_followups_hook_type",
+        ),
+        CheckConstraint(
+            "status IN ('pending', 'complete', 'failed')",
+            name="ck_end_followups_status",
+        ),
+        Index("ix_end_followups_encounter", "encounter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    hook_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    # Campaign-processing result (e.g. loot-search availability, awarded XP
+    # refs, custody roster). Failure detail lives in ``error``; ``result``
+    # stays null until completion.
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "campaign_id": str(self.campaign_id),
+            "hook_type": self.hook_type,
+            "status": self.status,
+            "result": dict(self.result) if self.result is not None else None,
+            "error": self.error,
+            "attempts": int(self.attempts or 0),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }

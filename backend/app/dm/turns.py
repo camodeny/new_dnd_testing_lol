@@ -1324,6 +1324,81 @@ def commit_turn(
             _enc.created_event_id = _lifecycle.id
             linked_encounter_ids.append(_enc.id)
         db.flush()
+    # Stage encounter.ended lifecycle semantics for encounters closed by this
+    # attempt's end_encounter effect (issue #239). Mirrors the start staging
+    # above: the turn commit IS the end's fictional mutation, so each
+    # inline-ended encounter without a staged event gets its own domain event
+    # + durable outbox hook in the same outer transaction. Fail-closed like
+    # the start path — an unstaged durable end must never commit. The API end
+    # path stages its own event immediately (ended_event_id set), so the
+    # IS NULL scope only catches inline ends from this commit.
+    linked_ended_ids: list[uuid.UUID] = []
+    _ended = db.execute(
+        select(_Encounter).where(
+            _Encounter.campaign_id == turn.campaign_id,
+            _Encounter.status == "ended",
+            _Encounter.ended_event_id.is_(None),
+        )
+    ).scalars().all()
+    if _ended:
+        from app.campaigns.events import commit_campaign_mutation as _commit_end_mutation
+        from app.combat.ending import build_final_snapshot as _final_snapshot
+        from app.combat.ending import list_end_followups as _end_hooks
+        from app.combat.service import ENCOUNTER_ENDED_EVENT as _ENCOUNTER_ENDED
+
+        for _enc in _ended:
+            _end_lifecycle = db.execute(
+                select(_DomainEvent).where(
+                    _DomainEvent.campaign_id == turn.campaign_id,
+                    _DomainEvent.operation_id == _enc.end_operation_id,
+                    _DomainEvent.event_type == _ENCOUNTER_ENDED,
+                )
+            ).scalars().first()
+            if _end_lifecycle is None:
+                _, _end_lifecycle = _commit_end_mutation(
+                    db,
+                    turn.campaign_id,
+                    expected_revision=int(campaign_after.revision or 0),
+                    event_type=_ENCOUNTER_ENDED,
+                    payload={
+                        "encounter_id": str(_enc.id),
+                        "thread_id": _enc.thread_id,
+                        "outcome": _enc.end_outcome,
+                        "reason": _enc.end_reason,
+                        "round": int(_enc.round or 1),
+                        "turn_sequence": int(_enc.turn_sequence or 0),
+                        "duration_ms": int(_enc.end_duration_ms or 0),
+                        "participant_outcomes": dict(_enc.end_participant_outcomes or {}),
+                        "followup_hooks": [h.hook_type for h in _end_hooks(db, _enc.id)],
+                        "final_state": _final_snapshot(db, _enc),
+                        "ended_by": str(_enc.ended_by) if _enc.ended_by else None,
+                    },
+                    operation_id=_enc.end_operation_id,
+                    # Issue #239 privacy: owner-only like the API path.
+                    # event.actor_id may be the player whose turn triggered
+                    # the DM effect; the ended payload carries DM-private
+                    # reason/fates, so the campaign owner (AI-DM path) must
+                    # own the event or members would see it as own-actor.
+                    actor_id=campaign_after.owner_id,
+                    visibility="dm_only",
+                    provenance={
+                        "source": "dm_effect",
+                        "turn_event_id": str(event.id),
+                        "attempt_id": str(attempt.id),
+                    },
+                    outbox_event_type=_ENCOUNTER_ENDED,
+                    outbox_payload={
+                        "encounter_id": str(_enc.id),
+                        "campaign_id": str(turn.campaign_id),
+                        "thread_id": _enc.thread_id,
+                        "outcome": _enc.end_outcome,
+                    },
+                    outbox_operation_id=f"encounter:{_enc.id}:ended",
+                    commit=False,
+                )
+            _enc.ended_event_id = _end_lifecycle.id
+            linked_ended_ids.append(_enc.id)
+        db.flush()
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
@@ -1383,6 +1458,20 @@ def commit_turn(
                     _publish_started(db, _row)
         except Exception as e:
             logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
+
+    # Post-commit encounter-ended realtime hook (issue #239). Same contract
+    # as the start hook above: durable outbox owns delivery, this is
+    # latency-only and never rolls back committed state.
+    if commit and linked_ended_ids:
+        try:
+            from app.realtime.service import publish_encounter_ended as _publish_ended
+
+            for _eid in linked_ended_ids:
+                _row = db.get(_EncounterPub, _eid)
+                if _row is not None:
+                    _publish_ended(db, _row)
+        except Exception as e:
+            logger.warning("dm_turn encounter-end post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
     # Post-commit #213 semantic-index hook for turn-path writes. Staged
     # assert_fact / upsert_relation effects (and JIT-promoted entities) use

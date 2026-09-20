@@ -865,7 +865,7 @@ def test_seed_flow_composes_inline_creation():
     db.close()
 
 
-def test_migration_chain_stays_linear_with_clocks_head():
+def test_migration_chain_stays_linear_single_head():
     from pathlib import Path
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -874,5 +874,7 @@ def test_migration_chain_stays_linear_with_clocks_head():
     config = Config(str(backend / "alembic.ini"))
     config.set_main_option("script_location", str(backend / "alembic"))
     script = ScriptDirectory.from_config(config)
-    assert script.get_heads() == ["a218clocks01"]
+    # Exactly one head (linear chain); the head moves on with each new
+    # migration, so never hardcode a specific revision here.
+    assert len(script.get_heads()) == 1
     assert script.get_revision("a218clocks01").down_revision == "a214identity02"
