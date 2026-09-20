@@ -374,3 +374,239 @@ class EncounterSkipVote(Base):
             "turn_sequence": int(self.turn_sequence or 0),
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+# ── Authoritative VTT map geometry — issue #232 ──────────────────────────────
+
+#: Launch-supported diagonal policy values. ``no_corner_cut`` (default) blocks
+#: diagonal steps that cut across a blocked orthogonal corner; the permissive
+#: variant allows them. Stored per map so the launch policy is auditable.
+DIAGONAL_POLICIES = ("no_corner_cut", "allow_corner_cut")
+
+#: Launch-supported terrain kinds. ``blocked`` denies entry; ``difficult``
+#: multiplies entry cost; ``open`` is an explicit override back to cost 1
+#: (lets DM-authored changes clear earlier zones without deleting rows).
+TERRAIN_KINDS = ("blocked", "difficult", "open")
+
+MAP_TERRAIN_VISIBILITIES = ("public", "dm_only")
+
+#: Launch-supported movement modes. Only ``walk`` resolves against turn-state
+#: budgets today; the column stays extensible for future modes.
+MOVEMENT_MODES = ("walk",)
+
+
+class EncounterMap(Base):
+    """Authoritative encounter grid geometry — issue #232.
+
+    One row per encounter: rectangular grid dimensions plus the deterministic
+    diagonal policy. Deliberately separate from generated background art: the
+    opaque ``background_art_ref`` never participates in legality math.
+    ``revision`` bumps on every geometry/terrain/placement mutation so
+    reconnects and projections can detect stale map reads.
+    """
+
+    __tablename__ = "encounter_maps"
+    __table_args__ = (
+        UniqueConstraint("encounter_id", name="uq_encounter_maps_encounter"),
+        CheckConstraint(
+            "diagonal_policy IN ('no_corner_cut', 'allow_corner_cut')",
+            name="ck_encounter_maps_diagonal_policy",
+        ),
+        Index("ix_encounter_maps_campaign", "campaign_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    diagonal_policy: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="no_corner_cut", server_default="no_corner_cut"
+    )
+    # Opaque background-art reference (generated image id/URL). Never read by
+    # geometry, pathing, or legality code — placement math uses width/height
+    # and terrain zones only.
+    background_art_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "campaign_id": str(self.campaign_id),
+            "width": int(self.width),
+            "height": int(self.height),
+            "diagonal_policy": self.diagonal_policy,
+            "background_art_ref": self.background_art_ref,
+            "revision": int(self.revision or 1),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EncounterTerrainZone(Base):
+    """One DM-authored terrain rectangle — issue #232.
+
+    Zones overlay the grid in explicit ``zone_order`` (later wins on
+    overlap) so a DM change can re-carve earlier terrain without rewriting
+    history. The ordinal is assigned at write time because same-transaction
+    rows share a ``created_at`` timestamp while random UUID ids carry no
+    author order. ``label`` is DM-authored prose and may stay ``dm_only``;
+    projections strip it for non-owners while keeping the mechanical effect.
+    """
+
+    __tablename__ = "encounter_terrain_zones"
+    __table_args__ = (
+        CheckConstraint("kind IN ('blocked', 'difficult', 'open')", name="ck_terrain_zones_kind"),
+        CheckConstraint(
+            "visibility IN ('public', 'dm_only')",
+            name="ck_terrain_zones_visibility",
+        ),
+        Index("ix_terrain_zones_map", "map_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    map_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounter_maps.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    rect_col: Mapped[int] = mapped_column(Integer, nullable=False)
+    rect_row: Mapped[int] = mapped_column(Integer, nullable=False)
+    rect_width: Mapped[int] = mapped_column(Integer, nullable=False)
+    rect_height: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Entry-cost multiplier for ``difficult`` (baseline 2); ignored for
+    # ``blocked``/``open``. Extensible per-zone tuning without new kinds.
+    cost_multiplier: Mapped[int] = mapped_column(Integer, nullable=False, default=2, server_default="2")
+    label: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="public", server_default="public")
+    # Explicit author order within a map: later zones win on overlap.
+    # Assigned at write time (authored-list index / running max + 1).
+    zone_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self, *, include_dm_label: bool = False):
+        value = {
+            "id": str(self.id),
+            "kind": self.kind,
+            "rect": {
+                "col": int(self.rect_col),
+                "row": int(self.rect_row),
+                "width": int(self.rect_width),
+                "height": int(self.rect_height),
+            },
+            "cost_multiplier": int(self.cost_multiplier),
+            "visibility": self.visibility,
+            "zone_order": int(self.zone_order or 0),
+        }
+        if include_dm_label:
+            value["label"] = self.label
+        return value
+
+
+class EncounterPlacement(Base):
+    """Durable token placement — issue #232.
+
+    One row per encounter participant: grid cell coordinates. Null row means
+    the participant has no token on the map yet (e.g. map initialized before
+    they were placed). Positions are authoritative backend state — reconnects
+    rebuild from these rows, never from narration.
+    """
+
+    __tablename__ = "encounter_placements"
+    __table_args__ = (
+        UniqueConstraint("encounter_id", "participant_id", name="uq_placements_encounter_participant"),
+        Index("ix_placements_encounter", "encounter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounter_participants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    col: Mapped[int] = mapped_column(Integer, nullable=False)
+    row: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "participant_id": str(self.participant_id),
+            "col": int(self.col),
+            "row": int(self.row),
+        }
+
+
+class EncounterMove(Base):
+    """Durable movement ledger — issue #232.
+
+    One row per committed move, unique on (encounter_id, operation_id): a
+    duplicate command replays the recorded outcome instead of moving or
+    spending twice. The row pins the turn sequence so a stale retry from an
+    older turn can never double-spend a later budget.
+    """
+
+    __tablename__ = "encounter_moves"
+    __table_args__ = (
+        UniqueConstraint("encounter_id", "operation_id", name="uq_moves_encounter_operation"),
+        Index("ix_moves_encounter", "encounter_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    encounter_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    participant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("encounter_participants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    movement_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="walk", server_default="walk")
+    from_col: Mapped[int] = mapped_column(Integer, nullable=False)
+    from_row: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_col: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_row: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_squares: Mapped[int] = mapped_column(Integer, nullable=False)
+    cost_feet: Mapped[int] = mapped_column(Integer, nullable=False)
+    path: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    turn_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "encounter_id": str(self.encounter_id),
+            "participant_id": str(self.participant_id),
+            "operation_id": self.operation_id,
+            "movement_mode": self.movement_mode,
+            "from": {"col": int(self.from_col), "row": int(self.from_row)},
+            "to": {"col": int(self.to_col), "row": int(self.to_row)},
+            "cost_squares": int(self.cost_squares),
+            "cost_feet": int(self.cost_feet),
+            "path": list(self.path or []),
+            "turn_sequence": int(self.turn_sequence or 0),
+        }

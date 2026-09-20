@@ -563,13 +563,69 @@ class ApplyDeathSaveArgs(StrictModel):
         return str(v)
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs
+class UpdateMapTerrainArgs(StrictModel):
+    """DM-authored terrain change — issue #232.
+
+    Staged on a DM turn and promoted atomically through the #206
+    turn-commit transaction. Structural shape is validated here; the
+    combat lane owns geometry legality (bounds, kinds, zone UUIDs) at
+    promotion time via ``update_terrain_inline``.
+    """
+    encounter_id: str = Field(min_length=1, max_length=160, description="Encounter UUID owning the map")
+    zones: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
+    clear_zone_ids: list[str] = Field(default_factory=list, max_length=64)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("encounter_id")
+    @classmethod
+    def _valid_encounter_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("encounter_id must be a UUID") from exc
+        return str(v)
+
+    @field_validator("clear_zone_ids")
+    @classmethod
+    def _valid_clear_ids(cls, v: list[str]) -> list[str]:
+        for item in v:
+            try:
+                uuid.UUID(str(item))
+            except ValueError as exc:
+                raise ValueError("clear_zone_ids entries must be UUIDs") from exc
+        return v
+
+
+class UpdateMapPlacementArgs(StrictModel):
+    """DM-authored token-placement change — issue #232.
+
+    Staged on a DM turn and promoted atomically through the #206
+    turn-commit transaction. Structural shape is validated here; the
+    combat lane owns placement legality (known participants, bounds,
+    blocked cells, uniqueness) at promotion time via
+    ``update_placements_inline``.
+    """
+    encounter_id: str = Field(min_length=1, max_length=160, description="Encounter UUID owning the map")
+    placements: list[dict[str, Any]] = Field(min_length=1, max_length=64)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("encounter_id")
+    @classmethod
+    def _valid_encounter_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("encounter_id must be a UUID") from exc
+        return str(v)
+
+
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -627,6 +683,10 @@ class StagedEffect(StrictModel):
                 ApplyConcentrationArgs.model_validate(args)
             elif t == "apply_death_save":
                 ApplyDeathSaveArgs.model_validate(args)
+            elif t == "update_map_terrain":
+                UpdateMapTerrainArgs.model_validate(args)
+            elif t == "update_map_placement":
+                UpdateMapPlacementArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation
