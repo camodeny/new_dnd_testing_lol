@@ -1,7 +1,7 @@
 """authoritative map geometry, terrain, placements, movement ledger — issue #232 (additive).
 
 Revision ID: f232mapgeom01
-Revises: f231turnprog01
+Revises: e2130a17c213
 
 Additive only: encounter_maps (one grid row per encounter) plus
 encounter_terrain_zones (DM-authored terrain rectangles),
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "f232mapgeom01"
-down_revision: Union[str, Sequence[str], None] = "f231turnprog01"
+down_revision: Union[str, Sequence[str], None] = "e2130a17c213"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
