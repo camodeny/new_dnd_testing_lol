@@ -589,6 +589,14 @@ def create_entity_authoritative(
         mutate=_mutate,
     )
     entity = db.get(WorldEntity, holder["entity_id"])
+    try:  # Best-effort #213 async-index hook; never breaks canon commits.
+        from app.world import semantic as _semantic
+
+        _semantic.note_authoritative_write(db, campaign_id, [("world_entity", holder["entity_id"])])
+        if event is not None and getattr(event, "id", None) is not None:
+            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
+    except Exception:
+        pass
     return entity, event
 
 
@@ -659,6 +667,14 @@ def set_scene_authoritative(
         mutate=_mutate,
     )
     scene = db.get(CampaignCurrentScene, campaign_id)
+    try:  # Best-effort #213 async-index hook; never breaks canon commits.
+        from app.world import semantic as _semantic
+
+        _semantic.note_authoritative_write(db, campaign_id, [("scene", campaign_id)])
+        if event is not None and getattr(event, "id", None) is not None:
+            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
+    except Exception:
+        pass
     return scene, event
 
 
