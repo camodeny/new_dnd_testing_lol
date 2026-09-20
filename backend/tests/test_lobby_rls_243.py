@@ -108,9 +108,18 @@ def test_lobby_topic_authorizes_members_and_denies_outsiders():
                 "$$ SELECT current_setting('app.test_uid', true)::uuid $$"
             ))
             conn.execute(
-                text("INSERT INTO profiles (id) VALUES (:id) "
+                text("INSERT INTO auth.users (id) VALUES (:id) "
                      "ON CONFLICT (id) DO NOTHING"),
                 [{"id": owner_id}, {"id": member_id}, {"id": outsider_id}],
+            )
+            conn.execute(
+                text("INSERT INTO profiles (id, email) VALUES (:id, :email) "
+                     "ON CONFLICT (id) DO NOTHING"),
+                [
+                    {"id": owner_id, "email": f"rls243-owner-{owner_id.hex[:8]}@example.com"},
+                    {"id": member_id, "email": f"rls243-member-{member_id.hex[:8]}@example.com"},
+                    {"id": outsider_id, "email": f"rls243-outsider-{outsider_id.hex[:8]}@example.com"},
+                ],
             )
             conn.execute(
                 text("INSERT INTO campaigns (id, owner_id, name) "
@@ -182,5 +191,9 @@ def test_lobby_topic_authorizes_members_and_denies_outsiders():
             )
             conn.execute(
                 text("DELETE FROM profiles WHERE id IN (:a, :b, :c)"),
+                {"a": owner_id, "b": member_id, "c": outsider_id},
+            )
+            conn.execute(
+                text("DELETE FROM auth.users WHERE id IN (:a, :b, :c)"),
                 {"a": owner_id, "b": member_id, "c": outsider_id},
             )
