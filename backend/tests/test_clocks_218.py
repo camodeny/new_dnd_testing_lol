@@ -719,6 +719,31 @@ def test_stale_apply_preserves_progress_carry(monkeypatch):
     db.close()
 
 
+def test_clock_lifecycle_events_are_not_evidence():
+    _F, db, c, *_ = _setup()
+    clock = _mkclock(db, c, advancement_criteria={"kind": "deterministic"})
+    created = db.execute(select(CampaignDomainEvent).where(
+        CampaignDomainEvent.event_type == "clock.created")).scalars().one()
+    seq = int(created.sequence)
+    # A range holding only the clock's own creation event advances nothing:
+    # lifecycle bookkeeping is not gameplay evidence, even unfiltered.
+    out = C.consolidate_clocks_for_range(db, c.id, seq, seq, [created],
+                                         decision_service=DecisionService(_NeverCall()))
+    res = out["results"][0]
+    assert res["outcome"] == "no_change" and res["evidence_count"] == 0
+    fresh = db.get(CampaignClock, clock.id)
+    assert int(fresh.progress) == 0 and int(fresh.progress_carry) == 0
+    assert int(fresh.evaluated_through_sequence) == seq
+    assert _clock_events(db, "clock.advanced") == []
+    # Genuine gameplay in a later range still advances the unfiltered clock.
+    lo, hi = _play(db, c, 1)
+    out2 = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                          decision_service=DecisionService(_NeverCall()))
+    assert out2["results"][0]["outcome"] == "advanced"
+    assert int(db.get(CampaignClock, clock.id).progress) == 1
+    db.close()
+
+
 def test_duplicate_retry_never_advances_twice():
     _F, db, c, *_ = _setup()
     clock = _mkclock(db, c, threshold=6)

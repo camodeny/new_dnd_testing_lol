@@ -110,6 +110,12 @@ CLOCK_RETIRED_EVENT = "clock.retired"
 # Bound on evidence refs serialized into one decision state payload.
 MAX_EVIDENCE_REFS = 25
 
+# Clock lifecycle bookkeeping shares the campaign sequence with gameplay
+# but is never gameplay evidence (see collect_evidence).
+CLOCK_LIFECYCLE_EVENT_TYPES = frozenset({
+    CLOCK_CREATED_EVENT, CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT, CLOCK_RETIRED_EVENT,
+})
+
 register_policy(DecisionClassPolicy(
     decision_class=CLOCK_DECISION_CLASS,
     # Conservative posture for story-consequential pressure calls: a
@@ -496,13 +502,21 @@ def collect_evidence(
     """Split range events into (matching, total-relevant) evidence.
 
     ``event_types`` filters candidacy; an empty filter admits every event
-    type and the ``match`` clause alone decides. Matching ignores event
-    visibility: post-turn evaluation runs in the authority lane, so
-    DM-private gameplay can advance hidden clocks without disclosure.
+    type and the ``match`` clause alone decides. Clock lifecycle events
+    (``clock.created/advanced/completed/retired``) never qualify: they are
+    this feature's own bookkeeping in the same campaign sequence, not
+    committed gameplay, so counting them would let a clock tick on its own
+    creation. Matching ignores event visibility: post-turn evaluation runs
+    in the authority lane, so DM-private gameplay can advance hidden
+    clocks without disclosure.
     """
     event_types = tuple(criteria.get("event_types") or ())
     match = dict(criteria.get("match") or {})
-    matching = [e for e in events if event_matches(e, event_types=event_types, match=match)]
+    matching = [
+        e for e in events
+        if str(e.event_type or "") not in CLOCK_LIFECYCLE_EVENT_TYPES
+        and event_matches(e, event_types=event_types, match=match)
+    ]
     return matching, len(matching)
 
 
