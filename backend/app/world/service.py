@@ -593,6 +593,8 @@ def create_entity_authoritative(
         from app.world import semantic as _semantic
 
         _semantic.note_authoritative_write(db, campaign_id, [("world_entity", holder["entity_id"])])
+        if event is not None and getattr(event, "id", None) is not None:
+            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
     except Exception:
         pass
     return entity, event
@@ -669,6 +671,8 @@ def set_scene_authoritative(
         from app.world import semantic as _semantic
 
         _semantic.note_authoritative_write(db, campaign_id, [("scene", campaign_id)])
+        if event is not None and getattr(event, "id", None) is not None:
+            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
     except Exception:
         pass
     return scene, event

@@ -1387,7 +1387,8 @@ def commit_turn(
         try:
             from app.world import semantic as _semantic
 
-            _semantic.note_turn_committed(db, turn.campaign_id, turn.id, attempt.id)
+            _semantic.note_turn_committed(
+                db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
         except Exception as e:
             logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
 

@@ -184,11 +184,14 @@ def _note_semantic_write(
     entries: list[tuple[str, Any]],
     *,
     prior: tuple[str, Any] | None = None,
+    event_id: Any | None = None,
 ) -> None:
     """Best-effort #213 async-index hook for authoritative relation/fact writes.
 
     Lazy import avoids the semantic→knowledge import cycle; never raises so
-    derived index work cannot break canon commits.
+    derived index work cannot break canon commits. The committing domain
+    event is a declared semantic source too, so it is enqueued alongside
+    the record when the caller passes its id.
     """
     try:
         from app.world import semantic as _semantic
@@ -198,6 +201,9 @@ def _note_semantic_write(
             _semantic.note_supersession(db, campaign_id, prior, replacement)
         else:
             _semantic.note_authoritative_write(db, campaign_id, entries)
+        if event_id is not None:
+            _semantic.note_authoritative_write(
+                db, campaign_id, [("domain_event", event_id)])
     except Exception:
         pass
 
@@ -1268,7 +1274,8 @@ def create_relation_authoritative(
         provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
         mutate=_mutate,
     )
-    _note_semantic_write(db, campaign_id, [("world_relation", holder["relation_id"])])
+    _note_semantic_write(db, campaign_id, [("world_relation", holder["relation_id"])],
+                         event_id=getattr(event, "id", None))
     return db.get(WorldRelation, holder["relation_id"]), event
 
 
@@ -1342,6 +1349,7 @@ def supersede_relation_authoritative(
     _note_semantic_write(
         db, campaign_id, [("world_relation", holder["relation_id"])],
         prior=("world_relation", prior_relation_id),
+        event_id=getattr(event, "id", None),
     )
     return db.get(WorldRelation, holder["relation_id"]), event
 
@@ -1417,7 +1425,8 @@ def create_fact_authoritative(
         provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
         mutate=_mutate,
     )
-    _note_semantic_write(db, campaign_id, [("world_fact", holder["fact_id"])])
+    _note_semantic_write(db, campaign_id, [("world_fact", holder["fact_id"])],
+                         event_id=getattr(event, "id", None))
     return db.get(WorldFact, holder["fact_id"]), event
 
 
@@ -1491,5 +1500,6 @@ def supersede_fact_authoritative(
     _note_semantic_write(
         db, campaign_id, [("world_fact", holder["fact_id"])],
         prior=("world_fact", prior_fact_id),
+        event_id=getattr(event, "id", None),
     )
     return db.get(WorldFact, holder["fact_id"]), event

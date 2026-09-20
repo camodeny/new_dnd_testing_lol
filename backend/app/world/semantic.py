@@ -383,6 +383,15 @@ def _authoritative_source_version(record: Any, source_type: str) -> str:
             return f"r{int(getattr(record, 'revision', 0) or 0)}"
         except (TypeError, ValueError):
             pass
+    if source_type == "domain_event":
+        # Matches the authoritative event packet (``seq{sequence}`` in
+        # retrieval.py): CampaignDomainEvent has neither ``version`` nor
+        # ``updated_at``, so the generic fallback would store "1" while
+        # evidence references report the sequence.
+        try:
+            return f"seq{int(getattr(record, 'sequence', 0) or 0)}"
+        except (TypeError, ValueError):
+            pass
     return retrieval_mod._version_of(record)
 
 
@@ -785,9 +794,21 @@ def request_semantic_index(
                         error="awaiting_async_index",
                     ))
                 elif existing.status == "active":
-                    existing.status = "stale"
-                    existing.error = "awaiting_async_index"
-                    db.add(existing)
+                    if (
+                        source_version is not None
+                        and existing.source_version == source_version
+                    ):
+                        # Unchanged source: the valid vector keeps serving.
+                        # The version-aware job id below intentionally
+                        # duplicates the already-completed job, so staling
+                        # here would leave the row stale forever (the
+                        # ledger returns the cached hit without running the
+                        # handler). Only stale on an actual version change.
+                        pass
+                    else:
+                        existing.status = "stale"
+                        existing.error = "awaiting_async_index"
+                        db.add(existing)
                 db.commit()
             except Exception as exc:
                 try:
@@ -870,6 +891,8 @@ def note_turn_committed(
     campaign_id: Any,
     turn_id: Any,
     attempt_id: Any | None = None,
+    *,
+    event_id: Any | None = None,
 ) -> dict[str, int]:
     """Post-commit hook for staged DM-turn writes (issue #213 review round 1).
 
@@ -880,13 +903,16 @@ def note_turn_committed(
     AFTER the turn commit, with the committed session: it collects the
     turn's facts/relations/entities (attempt-scoped, falling back to the
     turn) and routes creates through :func:`note_authoritative_write` and
-    version successors through :func:`note_supersession`.
+    version successors through :func:`note_supersession`. The turn record
+    itself and its domain event are declared semantic sources too, so they
+    are enqueued from the already-available IDs.
 
     Publishing/enqueueing must never happen inside the turn transaction
     (the queue adapter publishes immediately, outside the DB txn), hence
     this post-commit boundary. Never raises.
     """
-    counts = {"entities": 0, "relations": 0, "facts": 0}
+    counts = {"entities": 0, "relations": 0, "facts": 0,
+              "source_turns": 0, "domain_events": 0}
     if db is None:
         return counts
     try:
@@ -956,6 +982,25 @@ def note_turn_committed(
             key = {"world_entity": "entities", "world_relation": "relations",
                    "world_fact": "facts"}[stype]
             counts[key] = len(rows)
+        if tid is not None:
+            try:
+                request_semantic_index(db, cid, "source_turn", tid)
+                counts["source_turns"] = 1
+            except Exception as exc:
+                logger.warning(
+                    "world_semantic_turn_note_failed source_type=source_turn error=%s",
+                    exc,
+                )
+        if event_id is not None:
+            try:
+                eid = retrieval_mod._coerce_uuid(event_id, field_name="event_id")
+                request_semantic_index(db, cid, "domain_event", eid)
+                counts["domain_events"] = 1
+            except Exception as exc:
+                logger.warning(
+                    "world_semantic_turn_note_failed source_type=domain_event error=%s",
+                    exc,
+                )
     except Exception as exc:
         logger.warning("world_semantic_turn_note_failed error=%s", exc)
     return counts

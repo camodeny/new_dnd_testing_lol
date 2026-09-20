@@ -404,10 +404,13 @@ def test_semantic_stats_observability():
     index_source_record(db, cid, "world_fact", fact.id)
     stats = get_semantic_stats(db, cid)
     assert stats["active"] == 1
-    assert stats["total"] == 1
+    # The authoritative write also enqueued its domain event (stale
+    # placeholder awaiting async index) — derived work stays observable.
+    assert stats["stale"] == 1
+    assert stats["total"] == 2
     mark_stale(db, cid, "world_fact", fact.id)
     stats = get_semantic_stats(db, cid)
-    assert stats["active"] == 0 and stats["stale"] == 1
+    assert stats["active"] == 0 and stats["stale"] == 2
 
 
 def test_all_supported_source_types_index_and_resolve():
@@ -684,18 +687,23 @@ def test_committed_turn_staged_effects_become_searchable():
     assert len(rels) == 1 and len(facts) == 1
 
     # The committed turn's inline writes published async index work
-    # (placeholders) even though they bypassed the *_authoritative hooks.
+    # (placeholders) even though they bypassed the *_authoritative hooks —
+    # including the turn record itself and its domain event, which are
+    # declared semantic sources too.
     placeholders = db.execute(
         select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
     ).scalars().all()
     assert {(p.source_type, str(p.source_id)) for p in placeholders} >= {
-        ("world_relation", str(rels[0].id)), ("world_fact", str(facts[0].id))}
+        ("world_relation", str(rels[0].id)), ("world_fact", str(facts[0].id)),
+        ("source_turn", str(turn.id)), ("domain_event", str(event.id))}
     assert all(p.status == "stale" for p in placeholders)
 
-    # Driving the worker handler indexes both records; exact-text search
+    # Driving the worker handler indexes each record; exact-text search
     # resolves each back to its authoritative row.
     for source_type, source_id in (("world_relation", rels[0].id),
-                                   ("world_fact", facts[0].id)):
+                                   ("world_fact", facts[0].id),
+                                   ("source_turn", turn.id),
+                                   ("domain_event", event.id)):
         envelope = new_envelope(
             job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
             aggregate_id=cid, operation_id=f"op-turn-idx-{source_type}",
@@ -706,13 +714,67 @@ def test_committed_turn_staged_effects_become_searchable():
                      "embedding_version": DEFAULT_VERSION},
         )
         result = handle_world_semantic_index(envelope, db)
-        assert result["status"] == "active"
+        assert result["status"] == "active", source_type
     for source_type, record in (("world_relation", rels[0]),
                                 ("world_fact", facts[0])):
         query = build_source_text(db, source_type, record)
         outcome = semantic_search(db, cid, query, owner, dm_internal=True)
         assert outcome.status == SEM_OK, source_type
         assert outcome.packets[0].source_id == str(record.id), source_type
+    turn_record = db.get(__import__("models.dm", fromlist=["DmTurn"]).DmTurn, turn.id)
+    turn_query = build_source_text(db, "source_turn", turn_record)
+    turn_outcome = semantic_search(db, cid, turn_query, owner, dm_internal=True)
+    assert turn_outcome.status == SEM_OK
+    assert turn_outcome.packets[0].source_id == str(turn.id)
+
+
+def test_authoritative_write_enqueues_its_domain_event():
+    Fac, cid, _owner, _player, _ = _setup()
+    db = Fac()
+    fact, event = create_fact_authoritative(
+        db, cid, 0, content="The bridge has fallen.",
+        epistemic_state="confirmed", visibility="campaign",
+        operation_id="op-sem-evt")
+    assert event is not None
+    # The committing domain event is a declared semantic source: its async
+    # index placeholder exists alongside the record's.
+    rows = {str(r.source_id): r for r in db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
+    ).scalars().all()}
+    assert str(fact.id) in rows
+    assert str(event.id) in rows
+    assert rows[str(event.id)].source_type == "domain_event"
+    # The worker indexes the event under the authoritative seq version.
+    envelope = new_envelope(
+        job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
+        aggregate_id=cid, operation_id="op-sem-evt-idx",
+        idempotency_key=f"semidx-evt-test:{event.id}",
+        payload={"campaign_id": str(cid), "source_type": "domain_event",
+                 "source_id": str(event.id),
+                 "embedding_model": DEFAULT_MODEL,
+                 "embedding_version": DEFAULT_VERSION},
+    )
+    result = handle_world_semantic_index(envelope, db)
+    assert result["status"] == "active"
+    assert result["source_version"] == f"seq{int(event.sequence)}"
+
+
+def test_domain_event_embedding_version_matches_evidence_packet():
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    _fact, event = create_fact_authoritative(
+        db, cid, 0, content="The bridge has fallen.",
+        epistemic_state="confirmed", visibility="campaign",
+        operation_id="op-sem-evtver")
+    row = index_source_record(db, cid, "domain_event", event.id)
+    assert row is not None and row.status == "active"
+    # Embedding row version and resolved evidence packet version agree.
+    assert row.source_version == f"seq{int(event.sequence)}"
+    query = build_source_text(db, "domain_event", event)
+    outcome = semantic_search(db, cid, query, owner, dm_internal=True)
+    assert outcome.status == SEM_OK
+    assert outcome.packets[0].source_id == str(event.id)
+    assert outcome.packets[0].source_version == row.source_version
 
 
 def test_same_id_version_change_rebuilds_new_worker_job():
@@ -770,6 +832,15 @@ def test_same_id_version_change_rebuilds_new_worker_job():
     assert row is not None and row.status == "active"
     assert row.source_version == result2["source_version"]
 
-    # Same-version re-request stays idempotent (ledger duplicate, no re-run).
+    # Same-version re-request stays idempotent (ledger duplicate, no re-run)
+    # and — crucially — leaves the valid vector serving instead of
+    # stranding it stale: the duplicate job returns the cached hit without
+    # invoking the handler, so staling here would never be repaired.
     jid3 = request_semantic_index(db, cid, "scene", cid)
     assert jid3 == jid2
+    result3, duplicate3 = _run(jid3)
+    assert duplicate3 is True
+    assert result3["status"] == "active"
+    db.refresh(row)
+    assert row.status == "active"
+    assert row.source_version == result2["source_version"]
