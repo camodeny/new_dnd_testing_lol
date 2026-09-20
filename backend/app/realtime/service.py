@@ -242,6 +242,49 @@ def build_encounter_turn_event(encounter, kind: str, *, revision: int | None = N
     }
 
 
+def build_encounter_map_event(encounter, *, map_revision: int | None = None, revision: int | None = None) -> dict[str, Any]:
+    """Projection for ``encounter.map_updated`` — issue #232.
+
+    Carries geometry dimensions, policy, and revision only — never DM-only
+    terrain labels or hidden token positions (members converge via the
+    privacy-filtered snapshot projection).
+    """
+    return {
+        "type": "encounter.map_updated",
+        "event_id": f"encounter:{encounter.id}:map:{int(map_revision or 0)}",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "revision": int(revision) if revision is not None else None,
+        "map_revision": int(map_revision or 0),
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:map:{int(map_revision or 0)}",
+    }
+
+
+def build_encounter_moved_event(encounter, participant_id, *, to: dict | None = None, revision: int | None = None) -> dict[str, Any]:
+    """Projection for ``encounter.moved`` — issue #232.
+
+    Carries the moved token's destination only; budgets and hidden state stay
+    in the snapshot projection.
+    """
+    return {
+        "type": "encounter.moved",
+        "event_id": f"encounter:{encounter.id}:moved:{participant_id}:{int(encounter.turn_sequence or 0)}",
+        "encounter_id": str(encounter.id),
+        "campaign_id": str(encounter.campaign_id),
+        "thread_id": str(encounter.thread_id),
+        "status": encounter.status,
+        "revision": int(revision) if revision is not None else None,
+        "turn_sequence": int(encounter.turn_sequence or 0),
+        "participant_id": str(participant_id),
+        "to": dict(to or {}),
+        "timestamp": _utcnow_iso(),
+        "dedupe_key": f"{encounter.id}:moved:{participant_id}:{int(encounter.turn_sequence or 0)}",
+    }
+
+
 # ── publisher abstraction ───────────────────────────────────────────────────
 
 class RealtimePublisher:
@@ -497,7 +540,6 @@ def publish_encounter_ready(db: Session, encounter) -> bool:
 
 def publish_encounter_turn(db: Session, encounter, kind: str) -> bool:
     """Publish a turn progression projection (best-effort, post-commit).
-
     ``kind`` is ``started`` / ``ended`` / ``skipped``. Same durability
     contract as the lifecycle publishers: the outbox row committed with the
     mutation is the guaranteed hook; this is latency-only with stable event
@@ -512,6 +554,50 @@ def publish_encounter_turn(db: Session, encounter, kind: str) -> bool:
     except Exception as exc:
         _inc("publish_failures")
         logger.warning("publish_encounter_turn failed encounter_id=%s kind=%s error=%s", getattr(encounter, "id", "?"), kind, exc)
+        return False
+
+
+def publish_encounter_map(db: Session, encounter) -> bool:
+    """Publish the ``encounter.map_updated`` projection (best-effort, post-commit)."""
+    try:
+        from app.combat.maps import get_map
+
+        encounter_map = get_map(db, encounter.id)
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(
+            db, encounter,
+            build_encounter_map_event(
+                encounter,
+                map_revision=int(encounter_map.revision or 1) if encounter_map else 0,
+                revision=revision,
+            ),
+        )
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_map failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
+        return False
+
+
+def publish_encounter_moved(db: Session, encounter, participant_id) -> bool:
+    """Publish the ``encounter.moved`` projection (best-effort, post-commit)."""
+    try:
+        from app.combat.maps import get_placement
+
+        placement = get_placement(db, encounter.id, participant_id)
+        campaign = db.get(Campaign, encounter.campaign_id)
+        revision = int(campaign.revision) if campaign and campaign.revision is not None else None
+        return _publish_encounter_event(
+            db, encounter,
+            build_encounter_moved_event(
+                encounter, participant_id,
+                to={"col": int(placement.col), "row": int(placement.row)} if placement else {},
+                revision=revision,
+            ),
+        )
+    except Exception as exc:
+        _inc("publish_failures")
+        logger.warning("publish_encounter_moved failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
 

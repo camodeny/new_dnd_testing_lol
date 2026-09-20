@@ -1,5 +1,5 @@
 """HTTP transport for the authoritative encounter lifecycle — issue #230,
-turn progression — issue #231."""
+turn progression — issue #231, map geometry/movement — issue #232."""
 import logging
 import uuid
 
@@ -8,6 +8,16 @@ from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign, require_owner
 from app.campaigns.service import CampaignArchivedError
+from app.combat.maps import (
+    MapAuthorizationError,
+    MapError,
+    ensure_map,
+    get_map,
+    map_projection,
+    move_participant,
+    reachable_for,
+    update_terrain,
+)
 from app.combat.service import (
     EncounterAlreadyActiveError,
     EncounterAuthorizationError,
@@ -347,11 +357,11 @@ def _turn_http_error(exc: Exception) -> HTTPException:
             status_code=409, detail=str(exc),
             headers={"X-Current-Turn-Sequence": str(exc.actual_sequence)},
         )
-    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError)):
+    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError, MapAuthorizationError)):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, CampaignArchivedError):
         return HTTPException(status_code=409, detail=str(exc))
-    if isinstance(exc, (TurnError, EncounterError)):
+    if isinstance(exc, (TurnError, EncounterError, MapError)):
         message = str(exc)
         status = 409 if any(
             token in message for token in ("status", "already", "advanced", "pending", "blocking")
@@ -530,4 +540,224 @@ def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, re
         command_type="encounter.consume", scope_type="encounter_participant", scope_id=participant_id,
         payload=payload, execute=execute,
     )
+    return result
+
+
+# ── Map geometry / terrain / movement — issue #232 ───────────────────────────
+
+
+def _map_http_error(exc: Exception) -> HTTPException:
+    """Map deterministic movement failures to transport status (never 500)."""
+    if isinstance(exc, StaleTurnError):
+        return HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Turn-Sequence": str(exc.actual_sequence)},
+        )
+    if isinstance(exc, (MapAuthorizationError, TurnAuthorizationError, EncounterAuthorizationError)):
+        return HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, CampaignArchivedError):
+        return HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, (MapError, TurnError, EncounterError)):
+        return HTTPException(status_code=422, detail=str(exc))
+    if isinstance(exc, RevisionConflictError):
+        return HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        )
+    return HTTPException(status_code=422, detail=str(exc))
+
+
+def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, replayed: bool = False) -> None:
+    """Best-effort map/movement realtime delivery after the outer commit."""
+    if replayed:
+        return
+    try:
+        from app.realtime.service import publish_encounter_map, publish_encounter_moved
+
+        encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
+        if encounter is None:
+            return
+        if result.get("map_event") is not None:
+            publish_encounter_map(db, encounter)
+        if result.get("move") is not None:
+            publish_encounter_moved(
+                db, encounter, uuid.UUID(str(result["move"]["participant_id"]))
+            )
+    except Exception:
+        logger.warning("map post-commit publish skipped", exc_info=True)
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map", status_code=201)
+def init_encounter_map(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+    if payload.get("width") is None or payload.get("height") is None:
+        raise HTTPException(status_code=422, detail="width and height are required")
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit.
+            encounter_map, event = ensure_map(
+                db, encounter.id, actor_id=profile.id,
+                width=payload["width"], height=payload["height"],
+                diagonal_policy=payload.get("diagonal_policy") or "no_corner_cut",
+                background_art_ref=payload.get("background_art_ref"),
+                terrain=payload.get("terrain") or [],
+                placements=payload.get("placements"),
+                expected_revision=expected_revision,
+                operation_id=key, commit=False,
+            )
+            return {
+                "map": map_projection(db, encounter, viewer_id=profile.id, is_owner=True),
+                "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
+            }
+        except Exception as exc:
+            raise _map_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.map_init", scope_type="encounter", scope_id=encounter.id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_map_post_commit(db, result, str(encounter.id),
+                             replayed=response.headers.get("X-Idempotent-Replay") == "true")
+    return result
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/terrain")
+def change_encounter_terrain(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit.
+            encounter_map, event = update_terrain(
+                db, encounter.id, actor_id=profile.id,
+                zones=payload.get("zones") or [],
+                clear_zone_ids=payload.get("clear_zone_ids") or [],
+                expected_revision=expected_revision,
+                operation_id=key, commit=False,
+            )
+            return {
+                "map": map_projection(db, encounter, viewer_id=profile.id, is_owner=True),
+                "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
+            }
+        except Exception as exc:
+            raise _map_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.terrain_change", scope_type="encounter", scope_id=encounter.id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_map_post_commit(db, result, str(encounter.id),
+                             replayed=response.headers.get("X-Idempotent-Replay") == "true")
+    return result
+
+
+@router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map")
+def read_encounter_map(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    projection = map_projection(
+        db, encounter, viewer_id=profile.id,
+        is_owner=campaign.owner_id == profile.id,
+    )
+    if projection is None:
+        raise HTTPException(status_code=404, detail="Encounter has no map yet")
+    return {"encounter_id": str(encounter.id), "map": projection}
+
+
+@router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/reachable")
+def read_reachable(campaign_id: str, encounter_id: str, participant_id: str, request: Request, movement_mode: str = "walk", db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    try:
+        return reachable_for(
+            db, encounter.id, _id(participant_id, "participant id"),
+            movement_mode=movement_mode,
+        )
+    except Exception as exc:
+        raise _map_http_error(exc) from exc
+
+
+@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/move")
+def post_move(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
+    participant_raw = payload.get("participant_id")
+    if not participant_raw:
+        raise HTTPException(status_code=422, detail="participant_id is required")
+    participant_id = _id(str(participant_raw), "participant id")
+    destination = payload.get("to") or {}
+    if destination.get("col") is None or destination.get("row") is None:
+        raise HTTPException(status_code=422, detail="to.col and to.row are required")
+    if payload.get("expected_turn_sequence") is None:
+        raise HTTPException(status_code=400, detail="expected_turn_sequence is required")
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    expected_revision = _require_revision(payload)
+
+    def execute():
+        try:
+            # Flush-only: the outer idempotent command owns the commit so the
+            # placement write, budget debit, ledger insert, and moved event
+            # commit atomically.
+            move, updated, event = move_participant(
+                db, encounter.id, participant_id, actor_id=profile.id,
+                to_col=destination["col"], to_row=destination["row"],
+                movement_mode=payload.get("movement_mode") or "walk",
+                expected_turn_sequence=payload["expected_turn_sequence"],
+                expected_revision=expected_revision,
+                operation_id=key, commit=False,
+            )
+            return {
+                "move": move.to_dict(),
+                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "moved_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+            }
+        except Exception as exc:
+            raise _map_http_error(exc) from exc
+
+    try:
+        result = execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=key,
+            command_type="encounter.move", scope_type="encounter_participant", scope_id=participant_id,
+            payload=payload, execute=execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+    _publish_map_post_commit(db, result, str(encounter.id),
+                             replayed=response.headers.get("X-Idempotent-Replay") == "true")
     return result

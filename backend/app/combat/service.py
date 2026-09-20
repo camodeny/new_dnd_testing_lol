@@ -491,6 +491,17 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
     except Exception:
         logger.warning("encounter turn projection skipped", exc_info=True)
         payload["turn"] = None
+    # Issue #232: authoritative map/placement projection rides the same
+    # snapshot so reconnects reconstruct positions and terrain exactly.
+    try:
+        from app.combat.maps import map_projection
+
+        payload["map"] = map_projection(
+            db, encounter, viewer_id=viewer_id, is_owner=is_owner
+        )
+    except Exception:
+        logger.warning("encounter map projection skipped", exc_info=True)
+        payload["map"] = None
     return payload
 
 
@@ -523,6 +534,10 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
 THREAD_SCOPED_EVENT_TYPES = frozenset({
     ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT,
     TURN_STARTED_EVENT, TURN_ENDED_EVENT, TURN_SKIPPED_EVENT,
+    # Issue #232: movement/map mutations inherit the encounter's source
+    # thread under the same read boundary (literals avoid a maps import
+    # cycle; canonical names live in app.combat.maps).
+    "encounter.map_updated", "encounter.moved",
 })
 
 
