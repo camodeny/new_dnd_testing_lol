@@ -593,7 +593,12 @@ def build_narration_judge_evidence(
 ) -> Any:
     """Assemble code-owned judge evidence from a narration + contract.
 
-    Public claim texts ground supported content, player-declaration texts
+    Supported public content is drawn from the same audience-safe
+    projection the deterministic renderer may emit (public beat claim
+    texts plus text-bearing public fields: speaker names, roll reason /
+    label, open choice, clarify question, safe prelude, table-chat
+    intent) — so the unsupported-addition/secrecy questions never see
+    legitimate renderer output as unsupported. Player-declaration texts
     ground verbatim PC attribution, secret strings (DM-authorized,
     server-side judge use only) ground restricted material, and PC tokens
     ground agency attribution. Never imports decision internals at module
@@ -604,6 +609,52 @@ def build_narration_judge_evidence(
     public_claims = [
         c.text for b in contract.beats for c in b.claims if c.visibility == "public"
     ]
+    try:
+        projection = build_narration_projection(contract)
+    except Exception:
+        projection = None
+    if isinstance(projection, dict):
+        # Mirror render_deterministic_narration's allowed public inputs so
+        # the judge support set equals the renderer-allowed set.
+        for beat in projection.get("beats") or []:
+            name = beat.get("speaker_public_name")
+            if isinstance(name, str) and name.strip():
+                public_claims.append(name.strip())
+        roll = projection.get("roll_request")
+        if isinstance(roll, dict):
+            for key in ("reason_public", "label"):
+                value = roll.get(key)
+                if isinstance(value, str) and value.strip():
+                    public_claims.append(value.strip())
+        for key in (
+            "open_player_choice",
+            "clarify_question",
+            "safe_prelude",
+            "table_chat_intent",
+        ):
+            value = projection.get(key)
+            if isinstance(value, str) and value.strip():
+                public_claims.append(value.strip())
+    else:  # projection unavailable: fall back to direct contract fields
+        for beat in contract.beats:
+            if getattr(beat, "speaker_public_name", None):
+                public_claims.append(str(beat.speaker_public_name).strip())
+        roll_request = getattr(contract, "roll_request", None)
+        if roll_request is not None:
+            for value in (
+                getattr(roll_request, "reason_public", None),
+                getattr(roll_request, "label", None),
+            ):
+                if isinstance(value, str) and value.strip():
+                    public_claims.append(value.strip())
+        for value in (
+            getattr(contract, "open_player_choice", None),
+            getattr(contract, "clarify_question", None),
+            getattr(contract, "safe_prelude", None),
+            getattr(contract, "table_chat_intent", None),
+        ):
+            if isinstance(value, str) and value.strip():
+                public_claims.append(value.strip())
     declarations = [
         c.text
         for b in contract.beats

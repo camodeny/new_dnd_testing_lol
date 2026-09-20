@@ -663,3 +663,44 @@ def test_narration_shadow_failure_never_raises_or_blocks():
     )
     # No service configured: no-op, deterministic pass stands.
     check_narration_fidelity_or_raise(narration, contract)
+
+
+def test_narration_judge_evidence_includes_non_claim_projection_fields():
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+    from app.dm.narration import build_narration_judge_evidence
+
+    contract = normalize_contract({
+        "contract_version": CONTRACT_VERSION,
+        "mode": "await_roll",
+        "reason": "uncertain footing",
+        "beats": [{
+            "id": "beat_1",
+            "type": "narration",
+            "claims": [{
+                "text": "Loose stones cover the ledge ahead.",
+                "claim_kind": "roll_instruction",
+                "origin": "dm_adjudication",
+                "visibility": "public",
+            }],
+        }],
+        "roll_request": {
+            "request_id": "roll_1",
+            "roll_kind": "check",
+            "ability_or_skill": "Acrobatics",
+            "label": "Acrobatics check",
+            "advantage_state": "normal",
+            "reason_public": "The ledge looks treacherous and demands care.",
+        },
+        "open_player_choice": "What do you do?",
+    })
+    evidence = build_narration_judge_evidence(
+        "Loose stones cover the ledge ahead. The ledge looks treacherous "
+        "and demands care. [Acrobatics check] What do you do?",
+        contract,
+    )
+    # The deterministic renderer may emit the roll reason/label and the open
+    # choice; the judge must see them as supported, not as additions.
+    assert "Loose stones cover the ledge ahead." in evidence.public_claim_texts
+    assert "The ledge looks treacherous and demands care." in evidence.public_claim_texts
+    assert "Acrobatics check" in evidence.public_claim_texts
+    assert "What do you do?" in evidence.public_claim_texts
