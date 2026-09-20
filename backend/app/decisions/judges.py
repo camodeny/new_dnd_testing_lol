@@ -95,11 +95,13 @@ JUDGE_DIRECTIVES = frozenset(
 # beats x 5 claims = 40 claims max, plus speaker names, roll reason/label,
 # and top-level public fields; contract-derived restricted strings likewise)
 # so a valid full-contract narration is never silently truncated before the
-# semantic questions run.
+# semantic questions run. The candidate bound covers the full bounded
+# narratable output (40 claims x 800 chars plus renderer-emitted public
+# fields) so tail violations stay visible to the judge.
 MAX_EVIDENCE_CLAIMS = 56
 MAX_EVIDENCE_CANON = 8
 MAX_EVIDENCE_SECRETS = 64
-MAX_EVIDENCE_TEXT_CHARS = 4000
+MAX_EVIDENCE_TEXT_CHARS = 40000
 
 
 def _truncate(text: str, limit: int = MAX_EVIDENCE_TEXT_CHARS) -> str:

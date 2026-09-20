@@ -114,13 +114,23 @@ def test_request_fans_out_one_call_over_shared_candidate_state():
 
 def test_evidence_bounds_lists_and_text():
     evidence = build_evidence(
-        "x" * 9000,
+        "x" * 50000,
         public_claim_texts=[f"claim {i}" for i in range(200)],
         secret_texts=[f"secret {i}" for i in range(200)],
     )
-    assert len(evidence.candidate_text) <= 4001
+    assert len(evidence.candidate_text) <= 40001
     assert len(evidence.public_claim_texts) == 56
     assert len(evidence.secret_texts) == 64
+
+
+def test_candidate_tail_stays_visible_to_judges():
+    # A valid long narration must reach the judge intact: truncating the
+    # candidate at 4,000 chars would hide a tail violation the deterministic
+    # fidelity checks still inspect.
+    marker = "the émigré ledger"
+    candidate = "x" * 5000 + " " + marker + " " + "y" * 500
+    evidence = build_evidence(candidate)
+    assert marker in evidence.candidate_text
 
 
 def test_evidence_preserves_full_contract_scale_claims_and_secrets():
