@@ -1,7 +1,7 @@
 """Shared OOC lobby chat thread — issue #243 (additive).
 
 Revision ID: f243lobby01
-Revises: a215npcstate01
+Revises: a214identity02
 
 Additive only:
 - widens ``ck_campaign_threads_type`` to admit ``'lobby'`` (the shared
@@ -20,7 +20,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "f243lobby01"
-down_revision: Union[str, Sequence[str], None] = "a215npcstate01"
+down_revision: Union[str, Sequence[str], None] = "a214identity02"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
