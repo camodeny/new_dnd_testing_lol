@@ -553,15 +553,24 @@ def advance_amount(selected_id: str) -> int | None:
     return int(match.group(1))
 
 
-def legal_outcome_ids(clock: CampaignClock) -> list[str]:
+def legal_outcome_ids(
+    clock: CampaignClock, *, has_advancement_evidence: bool = True,
+    has_completion_evidence: bool = False,
+) -> list[str]:
     """Only the legal next outcomes for the clock's current stage.
 
     - ``NO_CHANGE`` and ``DEFER`` (explicit open-adjudication) always,
       except a clock already at its threshold must complete, not linger;
     - ``ADVANCE_1..ADVANCE_k`` capped by criteria ``max_advance`` and the
-      remaining ticks to the threshold;
-    - ``COMPLETE`` when the threshold is already met, ticks could finish
-      the clock this evaluation, or judged completion criteria exist.
+      remaining ticks to the threshold — only when advancement evidence
+      satisfying the advancement criteria is present, so a confident model
+      can never advance a clock over an empty evidence set;
+    - ``COMPLETE`` when the threshold is already met (mechanical), when
+      ticks could finish the clock this evaluation *and* advancement
+      evidence is present, or when judged completion criteria exist *and*
+      completion evidence satisfying the completion prefilters is present.
+      Completion filters are never borrowed from the advancement criteria:
+      unrelated advancement evidence alone cannot legalize COMPLETE.
     """
     if clock.status not in CLOCK_EVALUABLE_STATUSES:
         return [NO_CHANGE, DEFER]
@@ -573,10 +582,13 @@ def legal_outcome_ids(clock: CampaignClock) -> list[str]:
     except (TypeError, ValueError):
         raise ValueError(f"clock {clock.id} has non-integer max_advance")
     remaining = int(clock.threshold) - int(clock.progress or 0)
+    could_finish = int(clock.progress or 0) + min(max_advance, remaining) >= int(clock.threshold)
     ids = [NO_CHANGE]
-    for amount in range(1, min(max_advance, remaining) + 1):
-        ids.append(f"ADVANCE_{amount}")
-    if clock.completion_criteria or int(clock.progress or 0) + min(max_advance, remaining) >= int(clock.threshold):
+    if has_advancement_evidence:
+        for amount in range(1, min(max_advance, remaining) + 1):
+            ids.append(f"ADVANCE_{amount}")
+    judged_complete = bool(clock.completion_criteria) and has_completion_evidence
+    if (could_finish and has_advancement_evidence) or judged_complete:
         ids.append(COMPLETE)
     ids.append(DEFER)
     return ids
@@ -612,6 +624,8 @@ def _candidate_risk(outcome_id: str) -> tuple[str, bool]:
 def build_clock_frame(
     clock: CampaignClock, *, evidence: list[dict[str, Any]], evidence_total: int,
     from_sequence: int, to_sequence: int, is_authority: bool = True,
+    has_advancement_evidence: bool | None = None,
+    has_completion_evidence: bool = False,
 ) -> DecisionFrame:
     """Build the versioned decision frame for one clock evaluation.
 
@@ -619,8 +633,19 @@ def build_clock_frame(
     application rejects the decision as stale. Non-authority frames redact
     the hidden name, criteria mechanics, and restricted evidence — hidden
     clock details never enter unauthorized decision inputs.
+
+    The candidate set is evidence-gated: ``ADVANCE_*`` requires advancement
+    evidence and judged ``COMPLETE`` requires completion evidence, so the
+    judge can only select transitions the evidence actually supports. When
+    ``has_advancement_evidence`` is omitted it is derived from
+    ``evidence_total`` (the advancement match count).
     """
-    outcome_ids = legal_outcome_ids(clock)
+    if has_advancement_evidence is None:
+        has_advancement_evidence = int(evidence_total or 0) > 0
+    outcome_ids = legal_outcome_ids(
+        clock, has_advancement_evidence=has_advancement_evidence,
+        has_completion_evidence=has_completion_evidence,
+    )
     records = []
     for outcome_id in outcome_ids:
         risk, reversible = _candidate_risk(outcome_id)
@@ -776,9 +801,10 @@ def apply_clock_outcome(
 
     Raises :class:`ClockStaleError` when the clock revision moved since the
     frame was enumerated, and ``ValueError`` (fail closed) on illegal
-    outcomes or invalid evidence refs. NO_CHANGE advances only the
-    idempotency watermark; advancement/completion commit a domain event
-    under campaign revision ordering.
+    outcomes, invalid evidence refs, or advancement/completion selected
+    with no evidence satisfying the relevant criteria. NO_CHANGE advances
+    only the idempotency watermark; advancement/completion commit a domain
+    event under campaign revision ordering.
     """
     cid = _uuid(campaign_id, "campaign_id")
     clock = get_clock_strict(db, cid, _uuid(clock_id, "clock_id"))
@@ -788,7 +814,26 @@ def apply_clock_outcome(
         raise ClockStaleError(clock.id, frame.state_revision, clock.revision)
     _validate_evidence_refs(db, cid, list(evidence_refs or []),
                             from_sequence=from_sequence, to_sequence=to_sequence)
-    legal_ids = legal_outcome_ids(clock)
+    has_evidence = bool(evidence_refs)
+    amount = advance_amount(selected_id)
+    completing = selected_id == COMPLETE
+    if (not completing and amount is None and selected_id not in (NO_CHANGE, DEFER)
+            and not is_escape_id(selected_id)):
+        raise ValueError(f"clock {clock.id} outcome {selected_id!r} is not a legal transition")
+    if amount is not None and amount <= 0:
+        raise ValueError(f"clock {clock.id} advancement amount must be positive")
+    if amount is not None and not has_evidence:
+        raise ValueError(
+            f"clock {clock.id} advancement requires evidence satisfying its criteria"
+        )
+    if completing and not has_evidence and int(clock.progress or 0) < int(clock.threshold):
+        raise ValueError(
+            f"clock {clock.id} completion requires evidence satisfying its criteria"
+        )
+    legal_ids = legal_outcome_ids(
+        clock, has_advancement_evidence=has_evidence,
+        has_completion_evidence=has_evidence,
+    )
     if (
         selected_id == COMPLETE
         and COMPLETE not in legal_ids
@@ -821,10 +866,9 @@ def apply_clock_outcome(
 
     amount = advance_amount(selected_id)
     completing = selected_id == COMPLETE
-    if not completing and amount is None:
+    if (not completing and amount is None and selected_id not in (NO_CHANGE, DEFER)
+            and not is_escape_id(selected_id)):
         raise ValueError(f"clock {clock.id} outcome {selected_id!r} is not a legal transition")
-    if amount is not None and amount <= 0:
-        raise ValueError(f"clock {clock.id} advancement amount must be positive")
 
     expected_revision = int(clock.revision or 1)
     holder: dict[str, Any] = {}
@@ -981,10 +1025,28 @@ def evaluate_clock_for_range(
         return applied
 
     # Semantic path: the model judges only among the legal outcomes.
+    # Completion evidence is collected against the completion criteria
+    # alone — never borrowed from the advancement prefilter — and the
+    # frame offers ADVANCE_* / judged COMPLETE only when the matching
+    # evidence set is non-empty. Completion-only events join the frame so
+    # the judge can verify the completion it is asked to consider.
+    completion_matching: list[CampaignDomainEvent] = []
+    completion_total = 0
+    completion_criteria = clock.completion_criteria or None
+    if completion_criteria:
+        completion_matching, completion_total = collect_evidence(
+            window, dict(completion_criteria))
+    seen_ids = {str(e.id) for e in matching}
+    frame_events = list(matching) + [e for e in completion_matching if str(e.id) not in seen_ids]
+    frame_refs = evidence_refs(frame_events)
+    frame_total = total + sum(1 for e in completion_matching if str(e.id) not in seen_ids)
+    completion_refs = evidence_refs(completion_matching)
     frame = build_clock_frame(
-        clock, evidence=refs, evidence_total=total,
+        clock, evidence=frame_refs, evidence_total=frame_total,
         from_sequence=from_sequence, to_sequence=to_sequence,
         is_authority=is_authority,
+        has_advancement_evidence=total > 0,
+        has_completion_evidence=completion_total > 0,
     )
     service = decision_service or DecisionService()
     decision = decide_clock(clock, frame, service, campaign_id=campaign.id,
@@ -999,9 +1061,11 @@ def evaluate_clock_for_range(
                 "path": "decision", "directive": decision.directive,
                 "failure": decision.failure, "telemetry": trace}
     try:
+        judged_complete = decision.selected_id == COMPLETE and completion_total > 0
         applied = apply_clock_outcome(
             db, campaign.id, clock.id, frame=frame,
-            selected_id=decision.selected_id, evidence_refs=refs,
+            selected_id=decision.selected_id,
+            evidence_refs=completion_refs if judged_complete else refs,
             from_sequence=from_sequence, to_sequence=to_sequence,
             operation_id=operation_id,
         )
@@ -1011,7 +1075,7 @@ def evaluate_clock_for_range(
         return {**base, "evaluated": False, "reason": "stale_revision_skipped",
                 "revision": int(fresh.revision or 1),
                 "evidence_count": total, "path": "decision", "telemetry": trace}
-    applied["evidence_count"] = total
+    applied["evidence_count"] = completion_total if judged_complete else total
     applied["path"] = "decision"
     applied["directive"] = decision.directive
     applied["evaluated"] = True

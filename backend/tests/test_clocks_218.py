@@ -300,6 +300,39 @@ def test_model_cannot_invent_transition_amount():
     db.close()
 
 
+def test_semantic_advance_suppressed_without_matching_evidence():
+    _F, db, c, *_ = _setup()
+    clock = _mkclock(db, c, threshold=4,
+                     advancement_criteria={"kind": "semantic",
+                                           "event_types": ["game.combat"]})
+    # The range holds only game.play: no event satisfies the prefilter, so
+    # ADVANCE_* must not be offered and a confident ADVANCE_1 fails closed.
+    assert C.legal_outcome_ids(clock, has_advancement_evidence=False) == ["NO_CHANGE", "DEFER"]
+    lo, hi = _play(db, c, 2, etype="game.play")
+    out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                         decision_service=_scripted("ADVANCE_1"))
+    res = out["results"][0]
+    assert res["outcome"] == "deferred" and res["failure"] is not None
+    fresh = db.get(CampaignClock, clock.id)
+    assert int(fresh.progress) == 0 and int(fresh.evaluated_through_sequence) == hi
+    assert _clock_events(db, "clock.advanced") == []
+    assert _clock_events(db, "clock.completed") == []
+    db.close()
+
+
+def test_apply_rejects_advance_without_evidence():
+    _F, db, c, *_ = _setup()
+    clock = _mkclock(db, c, advancement_criteria={"kind": "semantic"})
+    lo, hi = _play(db, c, 1)
+    frame = C.build_clock_frame(clock, evidence=[], evidence_total=0,
+                                from_sequence=lo, to_sequence=hi)
+    assert "ADVANCE_1" not in {cd.id for cd in frame.candidates}
+    with pytest.raises(ValueError, match="advancement requires evidence"):
+        C.apply_clock_outcome(db, c.id, clock.id, frame=frame, selected_id="ADVANCE_1",
+                              evidence_refs=[], from_sequence=lo, to_sequence=hi)
+    db.close()
+
+
 def test_telemetry_persisted_fail_soft():
     F, db, c, *_ = _setup()
     _mkclock(db, c, advancement_criteria={"kind": "semantic"})
@@ -466,6 +499,60 @@ def test_semantic_complete_candidate():
     fresh = db.get(CampaignClock, clock.id)
     assert fresh.status == "completed" and int(fresh.progress) == 6
     assert fresh.resolution["reason"] == "criteria_met"
+    db.close()
+
+
+def test_semantic_complete_requires_completion_evidence():
+    _F, db, c, *_ = _setup()
+
+    def _mkvoteclock(**kw):
+        params = {"name": "Coup", "threshold": 6,
+                  "advancement_criteria": {"kind": "semantic", "max_advance": 1},
+                  "completion_criteria": {"kind": "semantic",
+                                          "description": "the council swears fealty",
+                                          "event_types": ["council.vote"]},
+                  "status": "active", "provenance": {"source": "test"}}
+        params.update(kw)
+        row, _event = C.create_clock_authoritative(db, c.id, _rev(db, c), **params)
+        return row
+
+    # Mismatched range: only game.play events, so the council.vote completion
+    # filter admits nothing — COMPLETE is not offered and fails closed even
+    # though advancement evidence exists.
+    clock = _mkvoteclock()
+    lo, hi = _play(db, c, 1, etype="game.play")
+    out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                         decision_service=_scripted("COMPLETE"))
+    res = out["results"][0]
+    assert res["outcome"] == "deferred" and res["failure"] is not None
+    assert int(db.get(CampaignClock, clock.id).progress) == 0
+    assert _clock_events(db, "clock.completed") == []
+    db.close()
+
+
+def test_semantic_complete_offered_on_completion_evidence():
+    _F, db, c, *_ = _setup()
+    clock = _mkclock(db, c, threshold=6,
+                     advancement_criteria={"kind": "semantic", "max_advance": 1},
+                     completion_criteria={"kind": "semantic",
+                                          "description": "the council swears fealty",
+                                          "event_types": ["council.vote"]})
+    # Ticks alone could not finish the clock (max_advance 1 of 6 remaining):
+    # COMPLETE is legal only via the matching council.vote evidence.
+    lo, hi = _play(db, c, 1, etype="council.vote")
+    adapter = FakeDecisionAdapter(answers={QUESTION: "COMPLETE"})
+    out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                         decision_service=DecisionService(adapter))
+    res = out["results"][0]
+    assert res["outcome"] == "completed"
+    assert res["directive"] == "primer_advisory"
+    assert res["evidence_count"] == 1
+    assert "COMPLETE" in res["telemetry"]["candidate_ids"]
+    fresh = db.get(CampaignClock, clock.id)
+    assert fresh.status == "completed" and int(fresh.progress) == 6
+    assert fresh.resolution["reason"] == "criteria_met"
+    done = _clock_events(db, "clock.completed")
+    assert len(done) == 1 and done[0].payload["evidence"][0]["event_type"] == "council.vote"
     db.close()
 
 
