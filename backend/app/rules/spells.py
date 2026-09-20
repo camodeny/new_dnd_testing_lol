@@ -722,10 +722,13 @@ def validate_spell_cast(
         pattern = ",".join(definition.patterns)
 
         # Known / prepared from existing sheet data — fail closed.
+        # Castability comes from the normalized prepared set: string
+        # shorthand and dicts without an explicit ``prepared: false`` count
+        # as castable, while ``prepared: false`` entries are known but not
+        # castable. A decision model can never make an illegal action legal.
         known = _holder_spells(holder, caster_kind)
         display = str(spell_name).strip().lower()
         known_names = [definition.name.lower(), definition.key.replace("_", " "), definition.key]
-        in_lists = any(n in known.cantrips or n in known.spells for n in known_names) or display in known.prepared
         if not known.lists_present:
             raise SpellError(
                 "spell_not_known",
@@ -733,7 +736,15 @@ def validate_spell_cast(
                 field="spell",
                 details={"spell": definition.name},
             )
-        if not in_lists:
+        castable = any(n in known.prepared for n in known_names) or display in known.prepared
+        if not castable:
+            if any(n in known.cantrips or n in known.spells for n in known_names):
+                raise SpellError(
+                    "spell_not_prepared",
+                    f"spell {definition.name!r} is known but not prepared",
+                    field="spell",
+                    details={"spell": definition.name},
+                )
             raise SpellError(
                 "spell_not_known",
                 f"spell {definition.name!r} is not on the known/prepared list",
@@ -930,7 +941,13 @@ def stage_spell_cast(
     except ValueError:
         raise SpellError("invalid_target", "caster_id must be a UUID", field="caster_id") from None
 
-    mutation_id = _derived_id(cid, "mut")
+    # Slot spend and concentration start are two distinct logical rules-state
+    # mutations, so each gets its own stable mutation ID: the canonical
+    # #227 preflight rejects two state effects sharing one mutation ID as a
+    # would-be double-apply. Both derive from cast_id, so a duplicate retry
+    # still stages identical records and replays instead of double-applying.
+    slot_mutation_id = _derived_id(cid, "mut-slot")
+    conc_mutation_id = _derived_id(cid, "mut-conc")
     staged: list[dict[str, Any]] = []
 
     # Slot spend — staged, never consumed before a valid resolution exists
@@ -941,7 +958,7 @@ def stage_spell_cast(
         staged.append(
             build_resource_effect(
                 effect_id=_derived_id(cid, "slot"),
-                mutation_id=mutation_id,
+                mutation_id=slot_mutation_id,
                 target_kind=caster_kind,
                 target_id=str(caster_id),
                 op="spend",
@@ -958,7 +975,7 @@ def stage_spell_cast(
         staged.append(
             build_concentration_effect(
                 effect_id=_derived_id(cid, "conc"),
-                mutation_id=mutation_id,
+                mutation_id=conc_mutation_id,
                 target_kind=caster_kind,
                 target_id=str(caster_id),
                 op=validation.concentration_op,  # type: ignore[arg-type]

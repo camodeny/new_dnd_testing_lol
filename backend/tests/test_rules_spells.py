@@ -161,6 +161,13 @@ def test_validate_spell_not_on_list_rejected():
     assert exc.value.code == "spell_not_known"
 
 
+def test_validate_explicitly_unprepared_spell_rejected():
+    sheet = wizard_sheet(spells=[{"name": "Fireball", "prepared": False}])
+    with pytest.raises(SpellError) as exc:
+        validate_spell_cast(sheet, "Fireball")
+    assert exc.value.code == "spell_not_prepared"
+
+
 def test_validate_missing_spell_lists_fails_closed():
     with pytest.raises(SpellError) as exc:
         validate_spell_cast(FakeSheet(spells=None, cantrips=None), "Fire Bolt")
@@ -277,6 +284,27 @@ def test_stage_leveled_spell_spends_slot_and_concentration():
     assert slot_eff["arguments"]["resource"] is None
     assert slot_eff["arguments"]["slot_level"] == 1
     assert slot_eff["arguments"]["target_id"] == caster_id
+
+
+def test_stage_leveled_concentration_cast_passes_duplicate_mutation_preflight():
+    # Bless stages a slot spend AND a concentration start: the canonical #227
+    # preflight rejects two state effects sharing one mutation ID, so the
+    # staged pair must carry distinct stable mutation IDs.
+    from app.dm.effects import _reject_duplicate_state_mutations
+
+    cleric = FakeSheet(
+        spells=["Bless"], spell_slots={"1": {"max": 4, "used": 0}},
+        spellcasting_ability="wisdom", wisdom=16,
+    )
+    v = validate_spell_cast(cleric, "Bless")
+    staged = stage_spell_cast(v, cast_id="cast-mut", caster_kind="pc", caster_id=str(uuid.uuid4()))
+    assert len(staged.staged_effects) == 2
+    mutation_ids = [e["arguments"]["mutation_id"] for e in staged.staged_effects]
+    assert len(set(mutation_ids)) == 2
+    _reject_duplicate_state_mutations(staged.staged_effects)  # must not raise
+    # Duplicate retry stages identical records (idempotent replay).
+    retry = stage_spell_cast(v, cast_id="cast-mut", caster_kind="pc", caster_id=staged.staged_effects[0]["arguments"]["target_id"])
+    assert retry.staged_effects == staged.staged_effects
 
 
 def test_stage_invalid_validation_rejected_before_commit():
