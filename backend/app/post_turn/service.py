@@ -9,10 +9,12 @@ Transport: triggers enqueue through the transactional outbox (#190) with the
 run id as outbox/job id; the relay publishes to the queue and the worker
 executes idempotently via WorkerExecution fencing (#191).
 
-The actual memory/clock/repair contents of a post-turn patch are out of
-scope — consolidation here validates the range against the immutable
-campaign sequence, preserves visibility metadata on read, and records the
-processed span. Content builders plug in later behind ``consolidate_fn``.
+The memory/repair contents of a post-turn patch remain out of scope —
+consolidation here validates the range against the immutable campaign
+sequence, preserves visibility metadata on read, evaluates criteria-driven
+campaign clocks (issue #218), and records the processed span. Further
+content builders plug in later behind ``consolidate_fn`` (which bypasses
+the built-in clock phase and owns its content explicitly).
 """
 
 from __future__ import annotations
@@ -375,6 +377,8 @@ def run_post_turn_range(
     operation_id: str | None = None,
     consolidate_fn: Callable[[list[CampaignDomainEvent]], dict] | None = None,
     commit: bool = True,
+    clock_decision_service=None,
+    clock_telemetry_factory=None,
 ) -> dict:
     """Consolidate one range and advance the checkpoint (convergent).
 
@@ -551,6 +555,18 @@ def run_post_turn_range(
         else:
             # Placeholder consolidation (content out of scope): record span.
             patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
+            # Issue #218 — criteria-driven clocks are required consolidation:
+            # a clock-processing failure raises here so the run fails and the
+            # checkpoint stays put for cumulative retry. Custom
+            # consolidate_fn callers own their content and opt out.
+            from app.world.clocks import consolidate_clocks_for_range
+
+            patch["clocks"] = consolidate_clocks_for_range(
+                db, campaign_id, effective_from, to_sequence, events,
+                decision_service=clock_decision_service,
+                session_factory=clock_telemetry_factory,
+                operation_id=operation_id,
+            )
         if not isinstance(patch, dict):
             raise RuntimeError("consolidate_fn must return a dict")
 
@@ -637,7 +653,7 @@ def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
             f"post_turn.process payload run_id {raw_run} does not match envelope job_id {job_id}"
         )
 
-    def _run(session: Session) -> dict:
+    def _run(session: Session, *, telemetry_factory=None) -> dict:
         run = session.get(PostTurnRun, job_id if isinstance(job_id, uuid.UUID) else uuid.UUID(str(job_id)))
         if run is None:
             raise ValueError(f"post-turn run {job_id} not found; refusing to execute without a durable run")
@@ -649,6 +665,7 @@ def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
         return run_post_turn_range(
             session, run.campaign_id, run.from_sequence, run.to_sequence,
             run_id=run.id, operation_id=getattr(envelope, "operation_id", None),
+            clock_telemetry_factory=telemetry_factory,
         )
 
     if db is not None:
@@ -658,7 +675,9 @@ def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
     if SessionLocal is None:
         raise RuntimeError("SessionLocal is not configured")
     with SessionLocal() as session:
-        return _run(session)
+        # Production worker owns its session factory: decision telemetry
+        # persists on short independent transactions, fail-soft by design.
+        return _run(session, telemetry_factory=SessionLocal)
 
 
 def register_post_turn_worker() -> None:

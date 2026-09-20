@@ -591,6 +591,120 @@ class WorldFactEntityRef(Base):
     )
 
 
+# ── Issue #218: durable campaign clocks / pressures ───────────────────────────
+
+# Clock lifecycle. Only ``active``/``ticking`` rows are evaluated post-turn;
+# ``pending`` awaits its pressure becoming live (e.g. seeded for a later
+# adventure), ``dormant`` is paused but resumable, ``completed``/``retired``
+# are terminal.
+CLOCK_STATUSES = frozenset({
+    "pending", "active", "ticking", "dormant", "completed", "retired",
+})
+
+# Statuses eligible for post-turn criteria evaluation.
+CLOCK_EVALUABLE_STATUSES = frozenset({"active", "ticking"})
+
+# Terminal statuses: never evaluated, never advanced.
+CLOCK_TERMINAL_STATUSES = frozenset({"completed", "retired"})
+
+# Disclosure vocabulary mirrors world entities: ordinary campaign members see
+# ``public``/``campaign``; ``private``/``dm_only`` stay with the AI-DM-side
+# authority (plus explicit grants, which clocks do not use).
+CLOCK_VISIBILITIES = frozenset({"public", "campaign", "private", "dm_only"})
+
+
+class CampaignClock(Base):
+    """Durable directional pressure with explicit advancement/completion criteria.
+
+    A clock advances only when committed gameplay evidence satisfies its
+    configured criteria (issue #218). ``progress``/``threshold`` count ticks;
+    ``stages`` optionally names milestone ticks. ``advancement_criteria``
+    selects the evaluation path (deterministic event-count matching vs.
+    bounded semantic judgment); ``completion_criteria``/``completion_effect``
+    declare how completion is judged and what later world consequences may
+    consume. ``revision`` is optimistic concurrency for stale-decision
+    rejection; ``evaluated_through_sequence`` is the per-clock idempotency
+    watermark over the immutable domain-event sequence.
+    """
+
+    __tablename__ = "campaign_clocks"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "idempotency_key",
+            name="uq_campaign_clocks_campaign_idempotency",
+        ),
+        Index("ix_campaign_clocks_campaign_status", "campaign_id", "status"),
+        CheckConstraint("progress >= 0", name="ck_campaign_clocks_progress_nonnegative"),
+        CheckConstraint("threshold >= 1", name="ck_campaign_clocks_threshold_positive"),
+        CheckConstraint("progress_carry >= 0", name="ck_campaign_clocks_carry_nonnegative"),
+        CheckConstraint("revision >= 1", name="ck_campaign_clocks_revision_positive"),
+        CheckConstraint("evaluated_through_sequence >= 0", name="ck_campaign_clocks_evaluated_nonnegative"),
+        CheckConstraint(
+            "status IN ('pending','active','ticking','dormant','completed','retired')",
+            name="ck_campaign_clocks_status",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    threshold: Mapped[int] = mapped_column(Integer, nullable=False)
+    stages: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    advancement_criteria: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    completion_criteria: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    completion_effect: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="dm_only", server_default="dm_only")
+    provenance: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    resolution: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Fractional deterministic carry: matching events below ``required_count``
+    # that must not be dropped when the watermark advances past them.
+    progress_carry: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    evaluated_through_sequence: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    source_turn_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "name": self.name,
+            "status": self.status,
+            "progress": self.progress,
+            "threshold": self.threshold,
+            "stages": list(self.stages or []),
+            "advancement_criteria": dict(self.advancement_criteria or {}),
+            "completion_criteria": dict(self.completion_criteria or {}),
+            "completion_effect": dict(self.completion_effect or {}),
+            "visibility": self.visibility,
+            "provenance": dict(self.provenance or {}),
+            "resolution": dict(self.resolution or {}),
+            "progress_carry": self.progress_carry,
+            "revision": self.revision,
+            "evaluated_through_sequence": self.evaluated_through_sequence,
+            "source_turn_id": str(self.source_turn_id) if self.source_turn_id else None,
+            "source_attempt_id": str(self.source_attempt_id) if self.source_attempt_id else None,
+            "source_event_id": str(self.source_event_id) if self.source_event_id else None,
+            "operation_id": self.operation_id,
+            "idempotency_key": self.idempotency_key,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 # ── Issue #213: rebuildable semantic index over authoritative sources ─────────
 
 # Source types eligible for async semantic indexing. Each row points at one
