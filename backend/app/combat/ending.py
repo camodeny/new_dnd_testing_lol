@@ -524,6 +524,12 @@ def end_encounter(
         mutate=_mutate,
         commit=False,
         payload_builder=_payload,
+        # Issue #239 privacy: the DM-authored reason and per-participant
+        # fates may name hidden NPC outcomes (end_encounter staged effects
+        # are dm_private for the same reason). Owner-only visibility keeps
+        # the full payload for owner/audit reads while member feeds
+        # (public-or-own-actor) converge via the redacted encounter view.
+        visibility="dm_only",
         outbox_event_type=ENCOUNTER_ENDED_EVENT,
         outbox_payload={
             "encounter_id": str(encounter.id),

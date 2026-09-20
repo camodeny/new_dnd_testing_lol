@@ -514,6 +514,38 @@ def test_non_owner_end_projection_redacts_reason_and_hidden_fates():
         assert player_view["end_participant_outcomes"][str(owner_pc.id)] == "standing"
 
 
+def test_ended_event_hidden_from_member_history():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter = _ready_party(db, ctx, with_npc=True, operation_id="op-start-evh")
+        npc = db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id,
+                EncounterParticipant.npc_entity_id == ctx["goblin_id"],
+            )
+        ).scalars().one()
+        secret_reason = "The hidden ambusher slips away with the stolen seal."
+        _, event, _ = _end(
+            db, ctx, encounter, expected_revision=_revision(db, ctx),
+            operation_id="op-end-evh", outcome="escape", reason=secret_reason,
+            participant_outcomes={str(npc.id): "fled"},
+        )
+        assert event.visibility == "dm_only"
+        assert event.actor_id == ctx["owner"]
+        # Owner and audit reads retain the full payload.
+        assert list_campaign_events(db, ctx["campaign_id"]) != []
+        owner_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
+        assert any(
+            e.event_type == ENCOUNTER_ENDED_EVENT and e.id == event.id
+            for e in owner_feed
+        )
+        # Thread members without ownership get no ended event — the secret
+        # reason and hidden fate are not recoverable through history.
+        member_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
+        assert all(e.event_type != ENCOUNTER_ENDED_EVENT for e in member_feed)
+        assert secret_reason not in str([e.payload for e in member_feed])
+
+
 def test_freeform_post_combat_interaction_still_available():
     fac, ctx = _fixture()
     with fac() as db:

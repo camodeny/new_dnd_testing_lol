@@ -1374,7 +1374,13 @@ def commit_turn(
                         "ended_by": str(_enc.ended_by) if _enc.ended_by else None,
                     },
                     operation_id=_enc.end_operation_id,
-                    actor_id=event.actor_id,
+                    # Issue #239 privacy: owner-only like the API path.
+                    # event.actor_id may be the player whose turn triggered
+                    # the DM effect; the ended payload carries DM-private
+                    # reason/fates, so the campaign owner (AI-DM path) must
+                    # own the event or members would see it as own-actor.
+                    actor_id=campaign_after.owner_id,
+                    visibility="dm_only",
                     provenance={
                         "source": "dm_effect",
                         "turn_event_id": str(event.id),
