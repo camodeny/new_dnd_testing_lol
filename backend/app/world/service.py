@@ -730,6 +730,15 @@ def promote_new_entities_from_contract(
             location_ref = getattr(raw, "location_ref", None)
         if not temp_id:
             raise ValueError("new_entities proposal missing temp_id")
+        # Committed proposals never bypass canonical identity. Exact stable
+        # refs/names/aliases are deterministic and therefore must not fall
+        # through to a semantic model or create a duplicate row.
+        from app.world.identity import exact_identity
+        collision = exact_identity(db, campaign.id, public_name)
+        if collision is not None:
+            raise ValueError(
+                f"new entity {temp_id!r} collides with canonical identity {collision.id}"
+            )
         entity, _ = create_entity_inline(
             db, campaign,
             entity_type=kind,
