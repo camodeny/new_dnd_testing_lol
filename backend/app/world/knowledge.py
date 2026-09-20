@@ -178,6 +178,30 @@ def _normalize_idempotency_key(value: Any) -> str | None:
     return key
 
 
+def _note_semantic_write(
+    db: Session,
+    campaign_id: Any,
+    entries: list[tuple[str, Any]],
+    *,
+    prior: tuple[str, Any] | None = None,
+) -> None:
+    """Best-effort #213 async-index hook for authoritative relation/fact writes.
+
+    Lazy import avoids the semantic→knowledge import cycle; never raises so
+    derived index work cannot break canon commits.
+    """
+    try:
+        from app.world import semantic as _semantic
+
+        if prior is not None:
+            replacement = entries[0] if entries else None
+            _semantic.note_supersession(db, campaign_id, prior, replacement)
+        else:
+            _semantic.note_authoritative_write(db, campaign_id, entries)
+    except Exception:
+        pass
+
+
 def _normalize_grants(value: Any) -> dict:
     if value is None:
         return {}
@@ -1244,6 +1268,7 @@ def create_relation_authoritative(
         provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
         mutate=_mutate,
     )
+    _note_semantic_write(db, campaign_id, [("world_relation", holder["relation_id"])])
     return db.get(WorldRelation, holder["relation_id"]), event
 
 
@@ -1313,6 +1338,10 @@ def supersede_relation_authoritative(
         visibility_builder=_visibility,
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
+    )
+    _note_semantic_write(
+        db, campaign_id, [("world_relation", holder["relation_id"])],
+        prior=("world_relation", prior_relation_id),
     )
     return db.get(WorldRelation, holder["relation_id"]), event
 
@@ -1388,6 +1417,7 @@ def create_fact_authoritative(
         provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
         mutate=_mutate,
     )
+    _note_semantic_write(db, campaign_id, [("world_fact", holder["fact_id"])])
     return db.get(WorldFact, holder["fact_id"]), event
 
 
@@ -1457,5 +1487,9 @@ def supersede_fact_authoritative(
         visibility_builder=_visibility,
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
+    )
+    _note_semantic_write(
+        db, campaign_id, [("world_fact", holder["fact_id"])],
+        prior=("world_fact", prior_fact_id),
     )
     return db.get(WorldFact, holder["fact_id"]), event

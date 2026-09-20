@@ -491,3 +491,78 @@ class WorldFactEntityRef(Base):
     entity_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("world_entities.id"), nullable=False, primary_key=True,
     )
+
+
+# ── Issue #213: rebuildable semantic index over authoritative sources ─────────
+
+# Source types eligible for async semantic indexing. Each row points at one
+# canonical record; embeddings are derived and never truth.
+SEMANTIC_SOURCE_TYPES = frozenset({
+    "world_entity",
+    "world_relation",
+    "world_fact",
+    "domain_event",
+    "source_turn",
+    "scene",
+})
+
+# Lifecycle of one embedding row. Only ``active`` rows participate in search;
+# ``stale`` rows await rebuild, ``superseded`` rows point at replaced sources.
+SEMANTIC_INDEX_STATUSES = frozenset({"active", "stale", "superseded", "failed"})
+
+
+class WorldEmbedding(Base):
+    """Rebuildable pgvector-backed semantic index — issue #213.
+
+    One row per (campaign, source record, embedding model/version). The
+    ``embedding`` column holds the vector natively (``vector(1536)``) on
+    Postgres hosts with the pgvector extension and JSON text otherwise (same
+    branch pattern as ``rules_embeddings``); ``embedding_text`` always holds
+    the portable JSON snapshot used by the graceful-degradation search path.
+    Similarity scores are derived ranking metadata — the authoritative record
+    (``source_type``/``source_id``/``source_version``) remains the evidence.
+    """
+
+    __tablename__ = "world_embeddings"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "source_type", "source_id",
+            "embedding_model", "embedding_version",
+            name="uq_world_embeddings_source_model",
+        ),
+        Index("ix_world_embeddings_campaign_status", "campaign_id", "status"),
+        Index("ix_world_embeddings_campaign_source", "campaign_id", "source_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    source_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    source_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_model: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedding_version: Mapped[str] = mapped_column(String(32), nullable=False, default="1", server_default="1")
+    embedding: Mapped[str | None] = mapped_column(Text, nullable=True)
+    embedding_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    error: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "source_type": self.source_type,
+            "source_id": str(self.source_id),
+            "source_version": self.source_version,
+            "embedding_model": self.embedding_model,
+            "embedding_version": self.embedding_version,
+            "status": self.status,
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }

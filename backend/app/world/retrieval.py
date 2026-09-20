@@ -67,6 +67,7 @@ WORLD_TOOL_NAMES = frozenset({
     "query_world_timeline",
     "lookup_source_turn",
     "query_character_knowledge",
+    "search_campaign_memory",
 })
 
 # Outcome statuses. ``not_found`` / ``defer`` / ``no_match`` are explicit
@@ -2093,6 +2094,14 @@ def handle_query_character_knowledge(req: Any, audience: Any, db: Any = None) ->
     return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
 
 
+def handle_search_campaign_memory(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
+    """Semantic recall over the #213 derived index (lazy import: semantic.py
+    imports this module for its authorization gates and packet builders)."""
+    from app.world.semantic import handle_search_campaign_memory as _semantic_handler
+
+    return _semantic_handler(req, audience, db)
+
+
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "lookup_world_entity": handle_lookup_world_entity,
     "traverse_world_relations": handle_traverse_world_relations,
@@ -2100,4 +2109,5 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "query_world_timeline": handle_query_world_timeline,
     "lookup_source_turn": handle_lookup_source_turn,
     "query_character_knowledge": handle_query_character_knowledge,
+    "search_campaign_memory": handle_search_campaign_memory,
 }
