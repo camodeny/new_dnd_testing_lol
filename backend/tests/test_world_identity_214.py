@@ -235,19 +235,38 @@ def test_non_authority_frame_hides_secret_alias_in_labels():
     assert "Nightblade" in authority_real[0].label
 
 
+def test_exact_alias_and_uuid_proposals_reuse_owner_without_model_call():
+    db, campaign = setup_db()
+    mara_venn = make_entity(db, campaign, "Mara Venn")
+    add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
+    service = DecisionService(FakeDecisionAdapter(answers={}))
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    alias_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-alias",
+        "contract_snapshot": {"new_entities": [{
+            "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}})()
+    reused = promote_new_entities_from_contract(
+        db, campaign, turn, alias_attempt, identity_decision_service=service)
+    assert reused[0].id == mara_venn.id
+    uuid_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-uuid",
+        "contract_snapshot": {"new_entities": [{
+            "temp_id": "tmp-uuid", "kind": "npc", "public_name": str(mara_venn.id)}]}})()
+    reused_uuid = promote_new_entities_from_contract(
+        db, campaign, turn, uuid_attempt, identity_decision_service=service)
+    assert reused_uuid[0].id == mara_venn.id
+    assert service.adapter.calls == []
+    assert [row.id for row in db.query(type(mara_venn)).all()] == [mara_venn.id]
+    assert exact_identity(db, campaign.id, "Mara").id == mara_venn.id
+
+
 def test_keep_distinct_rejected_when_name_is_another_entity_alias():
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
     add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
-    attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-alias",
-        "contract_snapshot": {"new_entities": [{
-            "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}})()
-    turn = type("Turn", (), {"id": uuid.uuid4()})()
-    service = DecisionService(FakeDecisionAdapter(
-        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    frame = build_identity_frame(db, campaign, name="Mara", entity_type="npc")
     with pytest.raises(ValueError, match="alias"):
-        promote_new_entities_from_contract(
-            db, campaign, turn, attempt, identity_decision_service=service)
+        create_entity_after_resolution(
+            db, campaign, frame, KEEP_DISTINCT, entity_type="npc", name="Mara",
+            idempotency_key="identity:attempt:alias-guard")
     assert [row.id for row in db.query(type(mara_venn)).all()] == [mara_venn.id]
     assert exact_identity(db, campaign.id, "Mara").id == mara_venn.id
 

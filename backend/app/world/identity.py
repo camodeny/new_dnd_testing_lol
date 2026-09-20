@@ -44,18 +44,26 @@ def _active_entities(db: Session, campaign_id: uuid.UUID):
     )
 
 
-def exact_identity(db: Session, campaign_id: uuid.UUID, reference: Any) -> WorldEntity | None:
-    """Resolve a stable UUID, canonical name, or alias without an AI call."""
+def exact_identity_match(db: Session, campaign_id: uuid.UUID, reference: Any) -> tuple[WorldEntity | None, str | None]:
+    """Deterministic match plus how it matched: ``"uuid"``, ``"alias"``, or ``"name"``.
+
+    ``(None, None)`` when nothing resolves. UUID/alias hits are stable
+    refs that must reuse the owner without any model call; only exact
+    canonical-name collisions may enter bounded resolution (where
+    ``KEEP_DISTINCT`` is legal).
+    """
     raw = str(reference or "").strip()
     if not raw:
-        return None
+        return None, None
     try:
         entity_id = uuid.UUID(raw)
     except ValueError:
         entity_id = None
     if entity_id:
         entity = db.get(WorldEntity, entity_id)
-        return entity if entity and entity.campaign_id == campaign_id and not entity.superseded_by_id else None
+        if entity and entity.campaign_id == campaign_id and not entity.superseded_by_id:
+            return entity, "uuid"
+        return None, None
     normalized = normalize_alias(raw)
     alias = db.execute(select(WorldEntityAlias).where(
         WorldEntityAlias.campaign_id == campaign_id,
@@ -63,10 +71,16 @@ def exact_identity(db: Session, campaign_id: uuid.UUID, reference: Any) -> World
     )).scalars().first()
     if alias:
         entity = db.get(WorldEntity, alias.entity_id)
-        return entity if entity and not entity.superseded_by_id else None
+        return (entity, "alias") if entity and not entity.superseded_by_id else (None, None)
     matches = list(db.execute(_active_entities(db, campaign_id)).scalars())
     exact = [e for e in matches if normalize_alias(e.name) == normalized]
-    return exact[0] if len(exact) == 1 else None
+    return (exact[0], "name") if len(exact) == 1 else (None, None)
+
+
+def exact_identity(db: Session, campaign_id: uuid.UUID, reference: Any) -> WorldEntity | None:
+    """Resolve a stable UUID, canonical name, or alias without an AI call."""
+    entity, _ = exact_identity_match(db, campaign_id, reference)
+    return entity
 
 
 def add_alias(

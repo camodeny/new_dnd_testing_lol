@@ -744,9 +744,10 @@ def promote_new_entities_from_contract(
         if existing_retry is not None:
             promoted.append(existing_retry)
             continue
-        # Committed proposals never bypass canonical identity. Exact stable
-        # refs/names/aliases are deterministic and therefore must not fall
-        # through to a semantic model or create a duplicate row.
+        # Committed proposals never bypass canonical identity. Stable
+        # UUID/alias refs reuse their owner above without a model call;
+        # an exact canonical-name hit enters the bounded frame below where
+        # only policy-approved KEEP_DISTINCT (or reuse) may proceed.
         from app.world.identity import (
             DEFER,
             KEEP_DISTINCT,
@@ -755,9 +756,16 @@ def promote_new_entities_from_contract(
             build_identity_frame,
             create_entity_after_resolution,
             decide_identity,
-            exact_identity,
+            exact_identity_match,
         )
-        collision = exact_identity(db, campaign.id, public_name)
+        collision, match_kind = exact_identity_match(db, campaign.id, public_name)
+        if collision is not None and match_kind in {"uuid", "alias"}:
+            # Deterministic stable ref: the proposal IS the existing
+            # canonical entity. Reuse it with zero model calls — aliases
+            # can never reach KEEP_DISTINCT creation, so the frame has
+            # nothing legal left to decide.
+            promoted.append(collision)
+            continue
         location_value = (
             location_ref if isinstance(location_ref, dict)
             else (location_ref.model_dump(mode="json") if hasattr(location_ref, "model_dump") else location_ref)
