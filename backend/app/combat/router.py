@@ -837,6 +837,11 @@ def post_end_encounter(campaign_id: str, encounter_id: str, payload: dict, reque
 def read_end_followups(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
+    # Issue #239 privacy: hook results carry post-combat custody/death/loot
+    # detail (participant IDs) that can name hidden NPC fates — owner-only
+    # bookkeeping, matching the process endpoint below. Members converge via
+    # the redacted encounter view (public outcome) instead.
+    require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     return {

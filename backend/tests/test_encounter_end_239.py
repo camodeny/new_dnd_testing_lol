@@ -734,3 +734,65 @@ def test_encounter_ended_observability_counters():
                 select(EncounterParticipant).where(
                     EncounterParticipant.encounter_id == encounter.id)).scalars().all()
         }
+
+
+def test_http_end_followups_owner_only(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter = _ready_party(db, ctx, with_npc=True, operation_id="op-start-fol")
+        npc = db.execute(
+            select(EncounterParticipant).where(
+                EncounterParticipant.encounter_id == encounter.id,
+                EncounterParticipant.npc_entity_id == ctx["goblin_id"],
+            )
+        ).scalars().one()
+        _end(
+            db, ctx, encounter, expected_revision=_revision(db, ctx),
+            operation_id="op-end-fol", outcome="surrender",
+            reason="The goblin yields.",
+            participant_outcomes={str(npc.id): "surrendered"},
+        )
+        process_end_followup(
+            db, encounter.id, "custody_state",
+            result={"captives": [str(npc.id)], "held_by": "party"},
+        )
+        db.commit()
+        encounter_id = str(encounter.id)
+        campaign_id = str(ctx["campaign_id"])
+        owner_id, player_id = str(ctx["owner"]), str(ctx["player"])
+        npc_id = str(npc.id)
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        as_owner = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups",
+            headers={"x-test-user": owner_id},
+        )
+        assert as_owner.status_code == 200, as_owner.text
+        custody = next(
+            h for h in as_owner.json()["followups"] if h["hook_type"] == "custody_state"
+        )
+        assert custody["result"]["captives"] == [npc_id]
+        as_player = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups",
+            headers={"x-test-user": player_id},
+        )
+        assert as_player.status_code == 403, as_player.text
+        assert npc_id not in as_player.text
+    finally:
+        app.dependency_overrides.clear()
