@@ -77,9 +77,60 @@ def test_obvious_duplicate_jit_proposal_rejected_and_retry_stays_idempotent():
     attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op", "contract_snapshot": {
         "new_entities": [{"temp_id": "tmp", "kind": "npc", "public_name": "mara venn"}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
-    with pytest.raises(ValueError, match="collides"):
-        promote_new_entities_from_contract(db, campaign, turn, attempt)
+    # Exact hit now enters the bounded frame instead of raising upfront.
+    # DEFER fails closed with no insert.
+    defer_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": DEFER}))
+    with pytest.raises(ValueError, match="deferred"):
+        promote_new_entities_from_contract(
+            db, campaign, turn, attempt, identity_decision_service=defer_service)
     assert exact_identity(db, campaign.id, "Mara Venn").id == original.id
+    # Plain NEW_ENTITY against an exact collision also fails closed.
+    new_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": NEW_ENTITY}))
+    with pytest.raises(ValueError, match="collides"):
+        promote_new_entities_from_contract(
+            db, campaign, turn, attempt, identity_decision_service=new_service)
+    assert [row.id for row in db.query(type(original)).all()] == [original.id]
+    # Selecting the canonical entity reuses it without inserting.
+    reuse_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": str(original.id)}))
+    reused = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=reuse_service)
+    assert reused[0].id == original.id
+    assert [row.id for row in db.query(type(original)).all()] == [original.id]
+
+
+def test_exact_same_name_distinct_context_keep_distinct_via_promotion():
+    db, campaign = setup_db()
+    north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
+    south_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-south",
+        "contract_snapshot": {"new_entities": [{
+            "temp_id": "tmp-south", "kind": "npc", "public_name": "The Guard",
+            "location_ref": "south gate"}]}})()
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    # DEFER on the exact same name creates nothing.
+    defer_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": DEFER}))
+    with pytest.raises(ValueError, match="deferred"):
+        promote_new_entities_from_contract(
+            db, campaign, turn, south_attempt, identity_decision_service=defer_service)
+    rows = db.query(type(north_guard)).all()
+    assert [row.id for row in rows] == [north_guard.id]
+    # Policy-approved KEEP_DISTINCT persists the same-name distinct entity.
+    keep_service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, south_attempt, identity_decision_service=keep_service)
+    assert promoted[0].name == "The Guard"
+    assert promoted[0].id != north_guard.id
+    assert promoted[0].details["identity_resolution"]["outcome"] == KEEP_DISTINCT
+    assert len(keep_service.adapter.calls) == 1
+    # Duplicate retry returns the same row idempotently without another decision.
+    retried = promote_new_entities_from_contract(
+        db, campaign, turn, south_attempt, identity_decision_service=keep_service)
+    assert retried[0].id == promoted[0].id
+    assert len(keep_service.adapter.calls) == 1
 
 
 def test_real_promotion_path_near_name_requires_bounded_outcome():

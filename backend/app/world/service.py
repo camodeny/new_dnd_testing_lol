@@ -751,10 +751,6 @@ def promote_new_entities_from_contract(
             exact_identity,
         )
         collision = exact_identity(db, campaign.id, public_name)
-        if collision is not None:
-            raise ValueError(
-                f"new entity {temp_id!r} collides with canonical identity {collision.id}"
-            )
         location_value = (
             location_ref if isinstance(location_ref, dict)
             else (location_ref.model_dump(mode="json") if hasattr(location_ref, "model_dump") else location_ref)
@@ -766,6 +762,20 @@ def promote_new_entities_from_contract(
                                                    str(attempt_id) if attempt_id else None))),
             is_authority=True,
         )
+        if collision is not None and str(collision.id) not in {c.id for c in frame.candidates}:
+            # Exact stable hit must stay a bounded candidate even when fuzzy
+            # scoring misses it (e.g. alias/UUID reference). The model may
+            # still only choose among supplied candidates.
+            from dataclasses import replace as _replace
+
+            from app.decisions import CandidateRecord as _CandidateRecord
+            extra = _CandidateRecord(
+                id=str(collision.id),
+                label=f"{collision.entity_type}: {collision.name}",
+                source="world:identity_search",
+                payload_ref=str(collision.id),
+            )
+            frame = _replace(frame, candidates=(extra, *frame.candidates))
         domain_candidates = {
             candidate.id for candidate in frame.candidates
             if candidate.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}
@@ -789,6 +799,13 @@ def promote_new_entities_from_contract(
             selected_id = NEW_ENTITY
         if selected_id == DEFER:
             raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+        if collision is not None and selected_id == NEW_ENTITY:
+            # Exact canonical collision: only policy-approved KEEP_DISTINCT
+            # (same-name distinct entity) or reuse of the canonical entity
+            # may proceed. Plain NEW_ENTITY fails closed with no insert.
+            raise ValueError(
+                f"new entity {temp_id!r} collides with canonical identity {collision.id}"
+            )
         entity, _ = create_entity_after_resolution(
             db, campaign, frame, selected_id,
             entity_type=kind,
