@@ -859,3 +859,73 @@ def test_non_owner_preview_and_commit_share_hidden_occupancy():
         assert (5, 5) not in _occupied_cells(db, encounter.id,
                                              exclude_participant_id=player_p.id,
                                              include_hidden=False)
+
+
+def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision():
+    """DM staged-effect registration (#232 blocker): a staged
+    update_map_terrain effect promotes through the #206 turn-commit
+    pipeline and bumps the map revision."""
+    from datetime import datetime, timezone
+
+    from app.dm.contract import normalize_contract
+    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from models.dm import DMStream, DMStreamChunk
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, participant = _active_solo(db, ctx)
+        _map(db, ctx, encounter, participant)
+        assert get_map(db, encounter.id).revision == 1
+
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
+            character_id=ctx["owner_pc"],
+            raw_content="Thorns erupt across the treeline!",
+            segments=[{"type": "ic", "text": "Thorns erupt across the treeline!"}],
+            thread_id=ctx["thread_id"],
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], ctx["thread_id"])
+        db.commit()
+        contract = normalize_contract({
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond",
+            "reason": "dm reshapes terrain",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{"text": "Thorns erupt!", "claim_kind": "observation",
+                            "origin": "dm_adjudication"}],
+            }],
+            "staged_effects": [{
+                "id": "terrain-1", "effect_type": "update_map_terrain",
+                "arguments": {
+                    "encounter_id": str(encounter.id),
+                    "zones": [{"kind": "difficult",
+                               "rect": {"col": 1, "row": 0, "width": 3, "height": 10}}],
+                },
+            }],
+        })
+        stage_validated_attempt(db, attempt.id, contract)
+        stream = DMStream(
+            id=uuid.uuid4(), campaign_id=turn.campaign_id,
+            thread_id=uuid.UUID(str(turn.thread_id)),
+            turn_id=str(turn.id), attempt_id=str(attempt.id),
+            status="streaming", audience=turn.audience,
+        )
+        db.add(stream)
+        db.flush()
+        text = "Thorns erupt across the treeline!"
+        db.add(DMStreamChunk(
+            id=uuid.uuid4(), stream_id=stream.id, sequence=0,
+            text=text, byte_length=len(text.encode()),
+        ))
+        stream.first_chunk_at = datetime.now(timezone.utc)
+        stream.chunk_count = 1
+        db.flush()
+        mark_streaming_started(db, turn.id, attempt.id, stream.id)
+        commit_turn_with_effects(db, turn.id, attempt.id)
+
+        encounter_map = get_map(db, encounter.id)
+        assert encounter_map.revision == 2
+        move, _, _ = _move(db, ctx, encounter, participant, 2, 0)
+        assert move.cost_squares == 4
