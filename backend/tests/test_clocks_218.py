@@ -690,6 +690,35 @@ def test_stale_skip_preserves_sibling_clock_work(monkeypatch):
     db.close()
 
 
+def test_stale_apply_preserves_progress_carry(monkeypatch):
+    _F, db, c, *_ = _setup()
+    clock = _mkclock(db, c, threshold=5,
+                     advancement_criteria={"kind": "deterministic", "event_types": ["game.play"],
+                                           "required_count": 3})
+    lo, hi = _play(db, c, 2)
+    out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
+                                         decision_service=DecisionService(_NeverCall()))
+    assert out["results"][0]["outcome"] == "no_change"
+    assert int(db.get(CampaignClock, clock.id).progress_carry) == 2
+    # One more matching event would complete the third tick — but the apply
+    # goes stale, so the rejected tick must not consume the accumulated carry.
+    real_apply = C.apply_clock_outcome
+    monkeypatch.setattr(C, "apply_clock_outcome",
+                        lambda *a, **k: (_ for _ in ()).throw(C.ClockStaleError("x", 1, 2)))
+    lo2, hi2 = _play(db, c, 1)
+    out2 = C.consolidate_clocks_for_range(db, c.id, lo2, hi2, _range(db, c, lo2, hi2),
+                                          decision_service=DecisionService(_NeverCall()))
+    res = out2["results"][0]
+    assert res["evaluated"] is False and res["reason"] == "stale_revision_skipped"
+    fresh = db.get(CampaignClock, clock.id)
+    assert int(fresh.progress) == 0
+    assert int(fresh.progress_carry) == 2
+    assert int(fresh.evaluated_through_sequence) == hi
+    assert _clock_events(db, "clock.advanced") == []
+    monkeypatch.undo()
+    db.close()
+
+
 def test_duplicate_retry_never_advances_twice():
     _F, db, c, *_ = _setup()
     clock = _mkclock(db, c, threshold=6)

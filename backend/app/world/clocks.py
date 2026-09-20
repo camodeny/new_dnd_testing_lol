@@ -1001,6 +1001,7 @@ def evaluate_clock_for_range(
                     "progress": int(clock.progress or 0), "carry": available,
                     "evidence_count": total, "evaluated_through": to_sequence,
                     "path": "deterministic"}
+        carry_before = int(clock.progress_carry or 0)
         clock.progress_carry = available - ticks * required
         outcome_id = f"ADVANCE_{ticks}"
         try:
@@ -1018,7 +1019,10 @@ def evaluate_clock_for_range(
             # No rollback here: a stale clock wrote nothing of its own, and
             # isolation belongs to the caller's savepoint (consolidation
             # evaluates each clock inside one) so sibling clocks' flushed
-            # watermarks survive the skip.
+            # watermarks survive the skip. The carry deduction above must be
+            # undone first: the rejected tick consumed no evidence, so the
+            # accumulated carry survives for the next evaluation.
+            clock.progress_carry = carry_before
             fresh = get_clock_strict(db, campaign.id, clock.id)
             return {**base, "evaluated": False, "reason": "stale_revision_skipped",
                     "revision": int(fresh.revision or 1)}
