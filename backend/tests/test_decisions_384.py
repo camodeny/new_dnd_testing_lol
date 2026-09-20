@@ -524,3 +524,142 @@ def test_regenerate_fallback_for_non_repair_non_safety_questions():
         deterministic_passed=True, attempts_used=2, policy=policy,
     )
     assert late.directive == JUDGE_ESCALATE
+
+
+# --- confidence regression: selected-class probability ------------------------
+
+
+def test_clean_judge_records_carry_selected_class_confidence():
+    verdict, _ = run_judges(
+        _service(_clean_answers(probability=0.05)),
+        _evidence(),
+        deterministic_passed=True,
+    )
+    assert verdict.directive == JUDGE_PASS
+    records = build_judge_records(
+        verdict, provider="fake-decision", model="fake-decision-model-v1",
+        mode=ACTIVE, trace_id="t",
+    )
+    for record in records:
+        assert record.selected_id == "clean"
+        # P(violation)=0.05 means 0.95 confidence in the clean selection.
+        assert record.confidence == pytest.approx(0.95)
+        assert record.probabilities == {"violation": 0.05, "clean": 0.95}
+
+
+def test_violation_judge_records_carry_violation_confidence():
+    answers = _clean_answers()
+    answers[JUDGE_PC_AGENCY] = 0.9
+    verdict, _ = run_judges(
+        _service(answers), _evidence(), deterministic_passed=True,
+    )
+    records = build_judge_records(
+        verdict, provider="fake-decision", model="fake-decision-model-v1",
+        mode=ACTIVE, trace_id="t",
+    )
+    by_q = {r.question_id: r for r in records}
+    assert by_q[JUDGE_PC_AGENCY].selected_id == "violation"
+    assert by_q[JUDGE_PC_AGENCY].confidence == pytest.approx(0.9)
+    assert by_q[JUDGE_UNSUPPORTED_ADDITION].selected_id == "clean"
+    assert by_q[JUDGE_UNSUPPORTED_ADDITION].confidence == pytest.approx(0.95)
+
+
+# --- narration fidelity shadow wiring ----------------------------------------
+
+
+def _narration_contract():
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+
+    return normalize_contract({
+        "contract_version": CONTRACT_VERSION,
+        "mode": "respond",
+        "reason": "story continuation",
+        "beats": [{
+            "id": "beat_1",
+            "type": "narration",
+            "claims": [{
+                "text": "Lyra studies the cracked vault door.",
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "visibility": "public",
+            }],
+        }],
+    })
+
+
+def test_narration_shadow_judge_runs_without_changing_deterministic_pass():
+    from app.dm.narration import (
+        build_narration_judge_evidence,
+        check_narration_fidelity_or_raise,
+        shadow_judge_narration,
+    )
+
+    contract = _narration_contract()
+    narration = "Lyra studies the cracked vault door."
+    evidence = build_narration_judge_evidence(narration, contract)
+    assert evidence.candidate_text.startswith("Lyra studies")
+    assert evidence.public_claim_texts == ("Lyra studies the cracked vault door.",)
+
+    factory = _setup()
+    verdict = shadow_judge_narration(
+        narration,
+        contract,
+        [],
+        judge_service=_service(_clean_answers()),
+        judge_session_factory=factory,
+        trace_id="trace-384-narr",
+    )
+    assert verdict is not None and verdict.directive == JUDGE_PASS
+    with factory() as db:
+        rows = db.query(DecisionTelemetry).all()
+        assert len(rows) == 5
+        assert {r.mode for r in rows} == {SHADOW}
+
+    # The production gate still passes deterministically with shadow on.
+    check_narration_fidelity_or_raise(
+        narration,
+        contract,
+        judge_service=_service(_clean_answers()),
+        judge_session_factory=None,
+    )
+
+
+def test_narration_deterministic_failure_stays_final_despite_judge_pass():
+    from app.dm.narration import (
+        NarrationFidelityError,
+        check_narration_fidelity_or_raise,
+    )
+
+    contract = _narration_contract()
+    # Unsupported number: deterministic fidelity must reject even though the
+    # semantic judge is scripted fully clean.
+    narration = "Lyra studies the cracked vault door and finds 999 gold."
+    with pytest.raises(NarrationFidelityError):
+        check_narration_fidelity_or_raise(
+            narration,
+            contract,
+            judge_service=_service(_clean_answers(probability=0.0)),
+            judge_session_factory=None,
+        )
+
+
+def test_narration_shadow_failure_never_raises_or_blocks():
+    from app.dm.narration import (
+        check_narration_fidelity_or_raise,
+        shadow_judge_narration,
+    )
+
+    contract = _narration_contract()
+    narration = "Lyra studies the cracked vault door."
+    assert (
+        shadow_judge_narration(
+            narration,
+            contract,
+            [],
+            judge_service=_service({}),  # unscripted: decision call fails
+            judge_session_factory=None,
+        )
+        is None
+    )
+    # No service configured: no-op, deterministic pass stands.
+    check_narration_fidelity_or_raise(narration, contract)

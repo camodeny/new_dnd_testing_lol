@@ -801,8 +801,8 @@ def build_judge_records(
     """Assemble one calibration record per answered judge question.
 
     Pure (no I/O): binary noul outcomes are stored as
-    ``clean``/``violation`` selections with the violation probability as
-    confidence, so per-role calibration summaries measure whether judge
+    ``clean``/``violation`` selections with the selected-class probability
+    as confidence, so per-role calibration summaries measure whether judge
     confidence is calibrated. Only stable IDs, versions, and numbers are
     retained — candidate text, claim/secret evidence, and instructions
     never enter a record.
@@ -815,6 +815,10 @@ def build_judge_records(
     for question_id, finding in verdict.findings.items():
         selected = "violation" if finding.failed else "clean"
         probability = finding.probability
+        # Confidence is the selected-class probability: P(violation) for a
+        # violation selection, 1 - P(violation) for a clean selection. A
+        # clean result with P(violation)=0.05 is 0.95 confident, not 0.05.
+        confidence = probability if finding.failed else 1.0 - probability
         records.append(
             DecisionRecord(
                 decision_class=roles(question_id),
@@ -830,7 +834,7 @@ def build_judge_records(
                 },
                 runner_up_id="clean" if finding.failed else "violation",
                 margin=abs(probability - (1.0 - probability)),
-                confidence=probability,
+                confidence=confidence,
                 latency_ms=latency_ms,
                 cost_usd=cost_usd,
                 trace_id=trace_id or "",
