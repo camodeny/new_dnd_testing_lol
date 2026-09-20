@@ -181,9 +181,14 @@ class IdentityDecision:
 
 def decide_identity(
     db: Session, campaign: Campaign, frame: DecisionFrame, service: DecisionService,
-    *, session_factory: Any = None,
+    *, session_factory: Any = None, record_outbox: list | None = None,
 ) -> IdentityDecision:
-    """Run, policy-check, revalidate, and record one bounded identity choice."""
+    """Run, policy-check, revalidate, and record one bounded identity choice.
+
+    Telemetry never opens an independent write while the caller holds the
+    campaign lock: pass ``record_outbox`` to collect the record for a
+    post-commit flush instead of ``session_factory`` on locked paths.
+    """
     try:
         response = service.decide(to_decision_request(frame))
     except Exception:
@@ -195,12 +200,15 @@ def decide_identity(
     revalidate_for_execution(frame, result.selected_id, identity_revision(db, current), legal_ids=legal_ids)
     verdict = evaluate_execution(frame, result.selected_id, result.probabilities,
                                  result.confidence, verified=True)
-    if session_factory is not None:
+    if record_outbox is not None or session_factory is not None:
         record = build_record(frame, result, verdict, provider=response.provider,
                               model=response.model or "unknown", mode=ACTIVE,
                               trace_id=response.trace_id, operation_id=response.operation_id,
                               campaign_id=campaign.id, latency_ms=response.latency_ms, verified=True)
-        record_fail_soft(session_factory, record)
+        if record_outbox is not None:
+            record_outbox.append(record)
+        else:
+            record_fail_soft(session_factory, record)
     selected = result.selected_id if verdict.directive == DIRECT_EXECUTE else DEFER
     return IdentityDecision(selected, verdict.directive, frame)
 

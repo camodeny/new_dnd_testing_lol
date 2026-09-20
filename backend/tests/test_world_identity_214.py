@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base
 import models  # noqa: F401
-from app.decisions import DecisionError, DecisionService
+from app.decisions import DecisionError, DecisionService, record_fail_soft
 from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
@@ -197,3 +197,36 @@ def test_keep_distinct_can_create_same_name_and_retry_is_idempotent():
         idempotency_key="identity:attempt:tmp", details={"location_ref": "south"})
     assert was_created is True and retry_created is False
     assert retried.id == created.id
+
+
+def test_locked_promotion_collects_telemetry_outbox_without_independent_write():
+    from sqlalchemy import select
+
+    from models.reliability import DecisionTelemetry
+
+    db, campaign = setup_db()
+    make_entity(db, campaign, "The Guard", location_ref="north gate")
+    attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-lock",
+        "contract_snapshot": {"new_entities": [{
+            "temp_id": "tmp-lock", "kind": "npc", "public_name": "The Guard",
+            "location_ref": "south gate"}]}})()
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+
+    def _exploding_factory():
+        raise AssertionError("no independent telemetry session while campaign lock is held")
+
+    outbox: list = []
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=service,
+        identity_session_factory=_exploding_factory, identity_telemetry_outbox=outbox)
+    assert promoted[0].name == "The Guard"
+    assert len(outbox) == 1
+    assert outbox[0].selected_id == KEEP_DISTINCT
+    # Post-commit flush persists the deferred record fail-soft on its own session.
+    flush_factory = sessionmaker(bind=db.get_bind(), expire_on_commit=False)
+    for record in outbox:
+        assert record_fail_soft(flush_factory, record) is not None
+    rows = db.execute(select(DecisionTelemetry)).scalars().all()
+    assert [row.selected_id for row in rows] == [KEEP_DISTINCT]

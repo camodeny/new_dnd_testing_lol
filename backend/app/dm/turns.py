@@ -1085,6 +1085,12 @@ def commit_turn(
     # the effect targeted the implicit current adventure.
     resolved_adventure: dict[str, str] = {}
 
+    # JIT identity decision records collected inside the locked revision
+    # transaction and flushed only after commit (issue #214): persisting
+    # decision_telemetry on an independent session while the campaign row
+    # is FOR UPDATE-locked would stall on the parent FK lock.
+    identity_telemetry_outbox: list = []
+
     def _mutate_with_effects(campaign):
         # Apply caller-provided mutate first
         if mutate is not None:
@@ -1121,7 +1127,9 @@ def commit_turn(
         try:
             from app.world.service import promote_new_entities_from_contract
 
-            promoted = promote_new_entities_from_contract(db, campaign, turn, attempt)
+            promoted = promote_new_entities_from_contract(
+                db, campaign, turn, attempt,
+                identity_telemetry_outbox=identity_telemetry_outbox)
             if promoted:
                 base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
                 base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
@@ -1391,6 +1399,22 @@ def commit_turn(
                 db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
         except Exception as e:
             logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
+
+    # Post-commit identity-telemetry flush (issue #214). Records collected
+    # during locked JIT promotion persist only now that the campaign lock
+    # is released and the entities are durable. Fail-soft: never breaks
+    # the committed turn. Skipped when the caller owns the transaction
+    # (commit=False), mirroring the hooks above.
+    if commit and identity_telemetry_outbox:
+        try:
+            from app.decisions import record_fail_soft as _record_fail_soft
+
+            from database import SessionLocal as _SessionLocal
+
+            for _record in identity_telemetry_outbox:
+                _record_fail_soft(_SessionLocal, _record)
+        except Exception as e:
+            logger.warning("dm_turn identity telemetry flush skipped turn_id=%s error=%s", turn.id, e)
 
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "

@@ -692,6 +692,7 @@ def promote_new_entities_from_contract(
     *,
     identity_decision_service: Any | None = None,
     identity_session_factory: Any | None = None,
+    identity_telemetry_outbox: list | None = None,
 ) -> list[WorldEntity]:
     """Promote ``new_entities`` proposals to durable canonical identity.
 
@@ -700,6 +701,11 @@ def promote_new_entities_from_contract(
     half-created authority. Each proposal gets a stable idempotency key per
     (attempt, temp_id) → committed exactly once; duplicate retry returns the
     existing row.
+
+    Telemetry never opens an independent session while the campaign lock is
+    held: pass ``identity_telemetry_outbox`` to collect decision records
+    for a post-commit flush. ``identity_session_factory`` remains only for
+    unlocked callers; locked paths must leave it None.
     """
     snapshot = getattr(attempt, "contract_snapshot", None) or {}
     if isinstance(snapshot, dict):
@@ -784,12 +790,10 @@ def promote_new_entities_from_contract(
             if identity_decision_service is None:
                 from app.decisions import DecisionService
                 identity_decision_service = DecisionService()
-            if identity_session_factory is None:
-                from database import SessionLocal
-                identity_session_factory = SessionLocal
             decision = decide_identity(
                 db, campaign, frame, identity_decision_service,
                 session_factory=identity_session_factory,
+                record_outbox=identity_telemetry_outbox,
             )
             selected_id = decision.selected_id
         else:
