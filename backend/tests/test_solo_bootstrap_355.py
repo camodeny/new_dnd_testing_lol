@@ -119,7 +119,8 @@ def test_solo_bootstrap_starts_active_table_with_opening_turn(api):
         threads = db.execute(
             select(CampaignThread).where(CampaignThread.campaign_id == cid)
         ).scalars().all()
-        assert len(threads) == 1
+        # Issue #243 — shared game thread plus the preserved OOC lobby thread.
+        assert {t.thread_type for t in threads} == {"campaign", "lobby"}
         turns = db.execute(
             select(DmTurn).where(DmTurn.campaign_id == cid)
         ).scalars().all()
@@ -147,7 +148,7 @@ def test_solo_bootstrap_duplicate_start_is_idempotent(api):
         turn_count = db.scalar(
             select(func.count()).select_from(DmTurn).where(DmTurn.campaign_id == cid)
         )
-        assert thread_count == 1
+        assert thread_count == 2  # shared game thread + OOC lobby thread (#243)
         assert turn_count == 1
 
 

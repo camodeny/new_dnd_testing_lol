@@ -137,6 +137,18 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
             created_by=profile.id,
         )
     )
+    # Shared pre-start OOC lobby chat thread — issue #243. Eager so lobby
+    # chat GET stays retrieval-only for fresh campaigns; older campaigns
+    # lazily converge on first lobby chat access.
+    db.add(
+        CampaignThread(
+            id=uuid_lib.uuid4(),
+            campaign_id=camp.id,
+            thread_type="lobby",
+            title="Lobby",
+            created_by=profile.id,
+        )
+    )
     db.commit()
     db.refresh(camp)
     return {"campaign": camp.to_dict()}
@@ -174,6 +186,16 @@ def quick_create_campaign(payload: dict, request: Request, db: Session = Depends
             campaign_id=camp.id,
             thread_type="campaign",
             title="Campaign",
+            created_by=profile.id,
+        )
+    )
+    # Shared pre-start OOC lobby chat thread — issue #243 (see create_campaign).
+    db.add(
+        _CampaignThread(
+            id=uuid_lib.uuid4(),
+            campaign_id=camp.id,
+            thread_type="lobby",
+            title="Lobby",
             created_by=profile.id,
         )
     )
@@ -852,11 +874,18 @@ def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends
         .where(CampaignInvite.campaign_id == cid)
         .order_by(CampaignInvite.created_at.asc())
     ).scalars().all()
+    # Shared OOC lobby chat thread id (issue #243) — read-only discovery, no
+    # creation here so the lobby projection stays side-effect-free. The full
+    # chat snapshot lives behind GET .../lobby/chat.
+    from app.runtime.threads import get_lobby_thread as _get_lobby_thread
+
+    _lobby_thread = _get_lobby_thread(db, cid)
     return {
         "campaign": camp.to_dict(),
         "members": [_member_lobby_projection(db, camp, m) for m in member_list],
         "eligibility": eligibility,
         "launch_locked": is_launch_locked(camp.status),
+        "lobby_thread_id": str(_lobby_thread.id) if _lobby_thread else None,
         # Joined vs outstanding invited state — issue #242. Outstanding =
         # usable active invites. Revoked/expired history stays owner-only;
         # members receive only currently usable rows (still without bearer
@@ -871,6 +900,162 @@ def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends
             if invite_usability(inv)[0]
         ),
     }
+
+
+@router.get("/api/campaigns/{campaign_id}/lobby/chat")
+def get_lobby_chat(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Lobby OOC snapshot — issue #243.
+
+    Durable read projection for refresh/reconnect: the lobby thread plus its
+    ordered OOC history and the private Realtime channel to subscribe to.
+    Members only; removed/non-member users get 403. Ensures the lobby thread
+    (mirroring the runtime GET-submissions precedent) so pre-existing
+    campaigns converge without a dedicated migration backfill.
+    """
+    from app.campaigns.auth import authorized_campaign
+    from app.campaigns.lobby_chat import list_lobby_messages
+    from app.realtime.channels import live_table_channel
+    from app.runtime.threads import (
+        ThreadAuthorizationError,
+        ThreadNotFoundError,
+        assert_can_read_thread,
+        get_or_create_lobby_thread,
+    )
+
+    profile = resolve_profile(request, db)
+    camp = authorized_campaign(db, campaign_id, profile.id)
+    thread = get_or_create_lobby_thread(db, camp.id, created_by=profile.id)
+    db.commit()
+    try:
+        assert_can_read_thread(db, camp.id, thread.id, profile.id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except ThreadAuthorizationError as exc:
+        logger.info(
+            "lobby_chat read denied campaign_id=%s user_id=%s",
+            camp.id, profile.id,
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    messages = list_lobby_messages(db, camp.id, thread)
+    logger.info(
+        "lobby_chat snapshot campaign_id=%s user_id=%s thread_id=%s message_count=%s",
+        camp.id, profile.id, thread.id, len(messages),
+    )
+    return {
+        "thread": thread.to_dict(),
+        "messages": messages,
+        "channel": live_table_channel(camp.id, thread.id),
+        "campaign_status": camp.status,
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/lobby/chat", status_code=201)
+def post_lobby_chat(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Post one OOC lobby message — issue #243.
+
+    Member-only, idempotent (``Idempotency-Key`` header or ``operation_id``),
+    writable only while pre-start (``lobby``/``starting``). The message is
+    forced OOC and stored via the shared submission infrastructure, then
+    projected best-effort to Realtime. This endpoint deliberately never
+    coordinates a forward DM turn, bumps the campaign revision, appends
+    domain events, or touches clocks/world state.
+    """
+    from app.campaigns.auth import authorized_campaign
+    from app.campaigns.lobby_chat import (
+        LobbyChatStatusError,
+        LobbyChatValidationError,
+        post_lobby_message,
+    )
+    from app.runtime.threads import (
+        ThreadAuthorizationError,
+        assert_can_write_thread,
+        get_or_create_lobby_thread,
+    )
+
+    profile = resolve_profile(request, db)
+    camp = authorized_campaign(db, campaign_id, profile.id)
+    try:
+        from app.campaigns.lobby_chat import require_lobby_chat_writable
+
+        require_lobby_chat_writable(camp)
+    except LobbyChatStatusError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    thread = get_or_create_lobby_thread(db, camp.id, created_by=profile.id)
+    db.commit()
+    try:
+        assert_can_write_thread(db, camp.id, thread.id, profile.id)
+    except ThreadAuthorizationError as exc:
+        logger.info(
+            "lobby_chat write denied campaign_id=%s user_id=%s",
+            camp.id, profile.id,
+        )
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    try:
+        from app.campaigns.lobby_chat import validate_lobby_chat_payload
+
+        content = validate_lobby_chat_payload(payload)
+    except LobbyChatValidationError as exc:
+        logger.info("lobby_chat rejected campaign_id=%s reason=validation", camp.id)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    idempotency_key = require_idempotency_key(
+        request, str(payload.get("operation_id") or "").strip() or None
+    )
+
+    def _execute():
+        submission, stored_segments = post_lobby_message(
+            db, campaign=camp, user_id=profile.id, content=content,
+        )
+        return {
+            "thread": get_or_create_lobby_thread(db, camp.id, created_by=profile.id).to_dict(),
+            "message": submission.to_dict(stored_segments),
+            "campaign_status": camp.status,
+        }
+
+    result = execute_http_idempotent(
+        db,
+        response,
+        actor_id=profile.id,
+        idempotency_key=idempotency_key,
+        command_type="lobby_chat.post",
+        scope_type="campaign_lobby",
+        scope_id=f"{camp.id}:{thread.id}",
+        payload=payload,
+        execute=_execute,
+    )
+    # Live-table Realtime projection — best-effort after authoritative commit.
+    # Never rolls back DB on publish failure (#198 failure/recovery); the
+    # snapshot GET above is the durable recovery path.
+    try:
+        from uuid import UUID as _UUID
+
+        from models.threads import PlayerSubmission as _PlayerSubmission
+        from models.threads import PlayerSubmissionSegment as _PlayerSubmissionSegment
+
+        msg = result.get("message") if isinstance(result, dict) else None
+        if msg and msg.get("id"):
+            db_sub = db.get(_PlayerSubmission, _UUID(str(msg["id"])))
+            if db_sub is not None:
+                segs = (
+                    db.query(_PlayerSubmissionSegment)
+                    .filter_by(submission_id=db_sub.id)
+                    .order_by(_PlayerSubmissionSegment.position)
+                    .all()
+                )
+                from app.realtime.service import publish_submission_created
+
+                publish_submission_created(db, db_sub, segments=segs)
+    except Exception as exc:
+        logger.warning(
+            "lobby_chat realtime publish guard failed campaign_id=%s thread_id=%s error=%s",
+            camp.id, thread.id, exc,
+        )
+    return result
 
 
 @router.put("/api/campaigns/{campaign_id}/members/me/character")

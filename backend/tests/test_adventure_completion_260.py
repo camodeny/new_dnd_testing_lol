@@ -844,7 +844,10 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
         db.add(Profile(id=member_id, email="member@example.com"))
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
         thread_id = db.execute(
-            select(CampaignThread).where(CampaignThread.campaign_id == uuid.UUID(cid))
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == uuid.UUID(cid),
+                CampaignThread.thread_type == "campaign",  # shared game thread, not lobby (#243)
+            )
         ).scalars().one().id
         db.add(DmTurn(id=turn_id, campaign_id=uuid.UUID(cid), thread_id=str(thread_id),
                       audience="campaign", status="streaming", source_revision=0,

@@ -248,6 +248,27 @@ def coordinate_turn(
         raise ValueError(f"Campaign {campaign_id} not found")
     tid = str(thread_id)
 
+    # Issue #243 — fail closed on the lobby OOC thread. Lobby chat is
+    # non-fictional table talk and must never assemble a forward DM turn.
+    # The lobby chat endpoint never calls the coordinator and the gameplay
+    # submission endpoint refuses lobby threads; this guard covers any other
+    # (present or future) caller that resolves a lobby thread id.
+    try:
+        from models.threads import CampaignThread as _CampaignThread
+
+        _tid_uuid = uuid.UUID(tid)
+    except (ValueError, AttributeError, TypeError):
+        _tid_uuid = None
+    if _tid_uuid is not None:
+        _thread = db.get(_CampaignThread, _tid_uuid)
+        if _thread is not None and _thread.thread_type == "lobby":
+            logger.warning(
+                "dm_turn coordination refused campaign_id=%s thread_id=%s reason=lobby_thread",
+                campaign_id,
+                tid,
+            )
+            return None
+
     # Short serialization: acquire stable campaign row lock BEFORE collecting
     # authoritative unresolved set, so a concurrent committer's submissions
     # are visible after we acquire the lock (Postgres READ COMMITTED).
