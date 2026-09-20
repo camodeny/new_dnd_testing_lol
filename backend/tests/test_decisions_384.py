@@ -115,12 +115,37 @@ def test_request_fans_out_one_call_over_shared_candidate_state():
 def test_evidence_bounds_lists_and_text():
     evidence = build_evidence(
         "x" * 9000,
-        public_claim_texts=[f"claim {i}" for i in range(40)],
-        secret_texts=[f"secret {i}" for i in range(40)],
+        public_claim_texts=[f"claim {i}" for i in range(200)],
+        secret_texts=[f"secret {i}" for i in range(200)],
     )
     assert len(evidence.candidate_text) <= 4001
-    assert len(evidence.public_claim_texts) == 12
-    assert len(evidence.secret_texts) == 8
+    assert len(evidence.public_claim_texts) == 56
+    assert len(evidence.secret_texts) == 64
+
+
+def test_evidence_preserves_full_contract_scale_claims_and_secrets():
+    # A valid v1 contract (8 beats x 5 claims = 40 claims) plus projection
+    # fields must reach the judge intact: truncating to 12/8 would label
+    # claim 13+ unsupported and hide secret 9+ from the secrecy question.
+    claims = [f"claim {i}" for i in range(40)] + [
+        "Vera",
+        "The ledge looks treacherous and demands care.",
+        "Acrobatics check",
+        "What do you do?",
+    ]
+    secrets = [f"restricted fact {i}" for i in range(20)]
+    evidence = build_evidence(
+        "candidate",
+        public_claim_texts=claims,
+        declaration_texts=[f"declaration {i}" for i in range(20)],
+        secret_texts=secrets,
+    )
+    assert len(evidence.public_claim_texts) == 44
+    assert "claim 39" in evidence.public_claim_texts
+    assert "What do you do?" in evidence.public_claim_texts
+    assert len(evidence.declaration_texts) == 20
+    assert len(evidence.secret_texts) == 20
+    assert "restricted fact 19" in evidence.secret_texts
 
 
 # --- pass / harmless observation --------------------------------------------

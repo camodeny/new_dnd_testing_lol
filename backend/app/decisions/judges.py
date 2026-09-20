@@ -91,9 +91,14 @@ JUDGE_DIRECTIVES = frozenset(
 )
 
 # Evidence truncation bounds keep judge prompts bounded and reviewable.
-MAX_EVIDENCE_CLAIMS = 12
+# Claim/secret caps cover the already-bounded v1 narration contract (8
+# beats x 5 claims = 40 claims max, plus speaker names, roll reason/label,
+# and top-level public fields; contract-derived restricted strings likewise)
+# so a valid full-contract narration is never silently truncated before the
+# semantic questions run.
+MAX_EVIDENCE_CLAIMS = 56
 MAX_EVIDENCE_CANON = 8
-MAX_EVIDENCE_SECRETS = 8
+MAX_EVIDENCE_SECRETS = 64
 MAX_EVIDENCE_TEXT_CHARS = 4000
 
 
