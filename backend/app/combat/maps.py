@@ -138,11 +138,43 @@ def get_map(db: Session, encounter_id: uuid.UUID) -> EncounterMap | None:
 
 
 def list_zones(db: Session, map_id: uuid.UUID) -> list[EncounterTerrainZone]:
+    # Explicit author order first: same-transaction rows share a server
+    # timestamp while UUID ids carry no author order, so (created_at, id)
+    # alone can reorder overlapping zones arbitrarily.
     return list(db.execute(
         select(EncounterTerrainZone)
         .where(EncounterTerrainZone.map_id == map_id)
-        .order_by(EncounterTerrainZone.created_at.asc(), EncounterTerrainZone.id.asc())
+        .order_by(
+            EncounterTerrainZone.zone_order.asc(),
+            EncounterTerrainZone.created_at.asc(),
+            EncounterTerrainZone.id.asc(),
+        )
     ).scalars().all())
+
+
+def _next_zone_order(db: Session, map_id: uuid.UUID) -> int:
+    """Running max zone_order + 1 so appended batches extend author order."""
+    from sqlalchemy import func as sa_func
+
+    current = db.execute(
+        select(sa_func.max(EncounterTerrainZone.zone_order)).where(
+            EncounterTerrainZone.map_id == map_id
+        )
+    ).scalar()
+    return int(current or 0) + (1 if current is not None else 0)
+
+
+def _is_hidden_participant(participant: EncounterParticipant) -> bool:
+    """True for dm_private NPC/monster tokens hidden from non-owners.
+
+    Single canonical hidden-token rule shared by map_projection,
+    reachable reads, stranded flags, and movement payloads.
+    """
+    return (
+        participant is not None
+        and participant.kind in ("npc", "monster")
+        and participant.stat_visibility == "dm_private"
+    )
 
 
 def list_placements(db: Session, encounter_id: uuid.UUID) -> list[EncounterPlacement]:
@@ -302,6 +334,38 @@ def _validate_placements_args(
     return resolved
 
 
+def _revalidate_preserved_placements(
+    db: Session,
+    encounter: Encounter,
+    encounter_map: EncounterMap,
+    zones: list[EncounterTerrainZone],
+    preserved: dict[str, tuple[int, int]],
+) -> dict[str, tuple[int, int]]:
+    """Revalidate carried-over positions against replacement geometry/terrain.
+
+    A geometry redefine without explicit placements keeps every current
+    token where it stands. Cells pushed out of bounds reject the redefine
+    (a token cannot strand off-grid); cells newly covered by blocking
+    terrain are kept as stranded (movement *out* stays legal, same as
+    :func:`update_terrain`). Rows for participants no longer in the
+    encounter are dropped.
+    """
+    participants = {str(p.id) for p in list_participants(db, encounter.id)}
+    width, height = int(encounter_map.width), int(encounter_map.height)
+    kept: dict[str, tuple[int, int]] = {}
+    for participant_id, (col, row) in preserved.items():
+        if participant_id not in participants:
+            continue
+        if not (0 <= col < width and 0 <= row < height):
+            raise MapError(
+                f"preserved placement for {participant_id} at ({col}, {row}) "
+                f"is outside the replacement {width}x{height} geometry",
+                reason="out_of_bounds",
+            )
+        kept[participant_id] = (col, row)
+    return kept
+
+
 def _default_placements(
     db: Session,
     encounter: Encounter,
@@ -438,6 +502,14 @@ def ensure_map(
 
     def _mutate(locked: Campaign) -> None:
         nonlocal existing
+        redefining = existing is not None
+        # Snapshot current positions BEFORE the delete below: re-defining
+        # geometry/art/terrain without explicit placements must preserve
+        # (and revalidate) authoritative positions, never silently reseed.
+        preserved: dict[str, tuple[int, int]] = {}
+        if redefining and placements is None:
+            for row in list_placements(db, encounter.id):
+                preserved[str(row.participant_id)] = (int(row.col), int(row.row))
         encounter_map = existing
         if encounter_map is None:
             encounter_map = EncounterMap(
@@ -466,17 +538,23 @@ def ensure_map(
             db.flush()
             _bump_map_revision(encounter_map)
         zone_rows: list[EncounterTerrainZone] = []
-        for fields in validated_zones:
+        for index, fields in enumerate(validated_zones):
             zone_rows.append(EncounterTerrainZone(
                 id=uuid.uuid4(),
                 map_id=encounter_map.id,
                 encounter_id=encounter.id,
                 campaign_id=encounter.campaign_id,
+                zone_order=index,
                 **fields,
             ))
         db.add_all(zone_rows)
         db.flush()
-        explicit = _validate_placements_args(db, encounter, encounter_map, zone_rows, placements)
+        if placements is None and redefining:
+            explicit = _revalidate_preserved_placements(
+                db, encounter, encounter_map, zone_rows, preserved
+            )
+        else:
+            explicit = _validate_placements_args(db, encounter, encounter_map, zone_rows, placements)
         full = _default_placements(db, encounter, encounter_map, zone_rows, keep=explicit)
         for participant_id, (col, row) in full.items():
             db.add(EncounterPlacement(
@@ -593,12 +671,14 @@ def update_terrain(
                 EncounterTerrainZone.map_id == encounter_map.id,
                 EncounterTerrainZone.id.in_(clear_ids),
             ).delete(synchronize_session=False)
-        for fields in validated:
+        base_order = _next_zone_order(db, encounter_map.id)
+        for index, fields in enumerate(validated):
             db.add(EncounterTerrainZone(
                 id=uuid.uuid4(),
                 map_id=encounter_map.id,
                 encounter_id=encounter.id,
                 campaign_id=encounter.campaign_id,
+                zone_order=base_order + index,
                 **fields,
             ))
         db.flush()
@@ -690,12 +770,14 @@ def update_terrain_inline(
             EncounterTerrainZone.map_id == encounter_map.id,
             EncounterTerrainZone.id.in_(parsed_clear),
         ).delete(synchronize_session=False)
-    for fields in validated:
+    base_order = _next_zone_order(db, encounter_map.id)
+    for index, fields in enumerate(validated):
         db.add(EncounterTerrainZone(
             id=uuid.uuid4(),
             map_id=encounter_map.id,
             encounter_id=encounter.id,
             campaign_id=encounter.campaign_id,
+            zone_order=base_order + index,
             **fields,
         ))
     db.flush()
@@ -737,12 +819,17 @@ def reachable_for(
     participant_id: uuid.UUID,
     *,
     movement_mode: str = WALK_MODE,
+    viewer_id: uuid.UUID | None = None,
+    is_owner: bool = False,
 ) -> dict:
     """Reachable cells + cheapest costs for a participant's remaining budget.
 
     Read-only: safe to call before any move. Output carries coordinates and
     square costs only — never DM-only terrain labels — so it is safe to serve
-    to any encounter reader.
+    to any encounter reader, with one boundary: a ``dm_private`` NPC/monster
+    token's position (``from`` + reachable cells) is visible to the owner
+    only. Non-owners querying another hidden token get 403 via
+    MapAuthorizationError; every other reader keeps working.
     """
     mode = str(movement_mode or WALK_MODE).strip().lower()
     if mode not in MOVEMENT_MODES:
@@ -758,6 +845,10 @@ def reachable_for(
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise MapError("participant not found in this encounter", reason="no_placement")
+    if _is_hidden_participant(participant) and not is_owner:
+        raise MapAuthorizationError(
+            "Only the campaign owner may read a hidden token's reachable space"
+        )
     placement = get_placement(db, encounter.id, participant.id)
     if placement is None:
         raise MapError("participant has no token placement", reason="no_placement")
@@ -1002,6 +1093,34 @@ def move_participant(
 
     from app.campaigns.events import commit_campaign_mutation
 
+    def _moved_payload() -> dict:
+        # A hidden token's coordinates must not ride the shared/thread-scoped
+        # event: non-owners get a position-free invalidation (the movement
+        # ledger row keeps the authoritative cells for the owner/DM path).
+        if _is_hidden_participant(participant):
+            return {
+                "encounter_id": str(encounter.id),
+                "thread_id": encounter.thread_id,
+                "participant_id": str(participant.id),
+                "movement_mode": mode,
+                "position_redacted": True,
+                "turn_sequence": int(encounter.turn_sequence or 0),
+                "map_revision": int(encounter_map.revision or 1),
+            }
+        return {
+            "encounter_id": str(encounter.id),
+            "thread_id": encounter.thread_id,
+            "participant_id": str(participant.id),
+            "movement_mode": mode,
+            "from": {"col": from_cell[0], "row": from_cell[1]},
+            "to": {"col": goal[0], "row": goal[1]},
+            "cost_squares": cost_squares,
+            "cost_feet": cost_feet,
+            "turn_sequence": int(encounter.turn_sequence or 0),
+            "map_revision": int(encounter_map.revision or 1),
+        }
+
+    hidden_mover = _is_hidden_participant(participant)
     try:
         _, event = commit_campaign_mutation(
             db,
@@ -1012,25 +1131,14 @@ def move_participant(
             actor_id=actor_id,
             mutate=_mutate,
             commit=False,
-            payload_builder=lambda: {
-                "encounter_id": str(encounter.id),
-                "thread_id": encounter.thread_id,
-                "participant_id": str(participant.id),
-                "movement_mode": mode,
-                "from": {"col": from_cell[0], "row": from_cell[1]},
-                "to": {"col": goal[0], "row": goal[1]},
-                "cost_squares": cost_squares,
-                "cost_feet": cost_feet,
-                "turn_sequence": int(encounter.turn_sequence or 0),
-                "map_revision": int(encounter_map.revision or 1),
-            },
+            payload_builder=_moved_payload,
             outbox_event_type=MOVED_EVENT,
             outbox_payload={
                 "encounter_id": str(encounter.id),
                 "campaign_id": str(encounter.campaign_id),
                 "thread_id": encounter.thread_id,
                 "participant_id": str(participant.id),
-                "to": {"col": goal[0], "row": goal[1]},
+                **({} if hidden_mover else {"to": {"col": goal[0], "row": goal[1]}}),
             },
             outbox_operation_id=operation_id,
         )
@@ -1075,7 +1183,7 @@ def move_participant(
     if commit:
         from app.realtime.service import publish_encounter_moved
 
-        publish_encounter_moved(db, encounter, participant.id)
+        publish_encounter_moved(db, encounter, participant.id, move_id=str(move.id))
     return move, encounter, event
 
 
@@ -1153,21 +1261,25 @@ def map_projection(
         participant = participants.get(str(placement.participant_id))
         if participant is None:
             continue
-        if (
-            not is_owner
-            and participant.kind in ("npc", "monster")
-            and participant.stat_visibility == "dm_private"
-        ):
+        if not is_owner and _is_hidden_participant(participant):
             continue
         item = placement.to_dict()
         item["display_name"] = participant.display_name
         item["kind"] = participant.kind
         placements.append(item)
+    stranded = _stranded_placements(db, encounter, encounter_map)
+    if not is_owner:
+        # A stranded flag carries the token's exact cell: hide it for
+        # dm_private NPC/monster tokens exactly like placements above.
+        hidden_ids = {
+            str(p.id) for p in participants.values() if _is_hidden_participant(p)
+        }
+        stranded = [s for s in stranded if s["participant_id"] not in hidden_ids]
     return {
         **encounter_map.to_dict(),
         "zones": zones,
         "placements": placements,
-        "stranded_placements": _stranded_placements(db, encounter, encounter_map),
+        "stranded_placements": stranded,
     }
 
 

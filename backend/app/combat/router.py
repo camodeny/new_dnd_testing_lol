@@ -581,7 +581,8 @@ def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, re
             publish_encounter_map(db, encounter)
         if result.get("move") is not None:
             publish_encounter_moved(
-                db, encounter, uuid.UUID(str(result["move"]["participant_id"]))
+                db, encounter, uuid.UUID(str(result["move"]["participant_id"])),
+                move_id=result["move"].get("id"),
             )
     except Exception:
         logger.warning("map post-commit publish skipped", exc_info=True)
@@ -703,6 +704,8 @@ def read_reachable(campaign_id: str, encounter_id: str, participant_id: str, req
         return reachable_for(
             db, encounter.id, _id(participant_id, "participant id"),
             movement_mode=movement_mode,
+            viewer_id=profile.id,
+            is_owner=campaign.owner_id == profile.id,
         )
     except Exception as exc:
         raise _map_http_error(exc) from exc

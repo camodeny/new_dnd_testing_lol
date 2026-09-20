@@ -554,3 +554,195 @@ def test_reachable_read_is_safe_for_any_reader_and_reports_budget():
         assert result["map_revision"] == 1
         # No DM-only detail leaks through the coordinate/cost shape.
         assert all(set(c) == {"col", "row", "cost_squares", "cost_feet"} for c in result["cells"])
+
+
+# ── AI review round 1 (#404): hidden-token, ordering, redefine, dedupe ───────
+
+
+def _active_duo(db, ctx, *, owner_roll=1, goblin_roll=20):
+    """Two-token active encounter where the hidden goblin holds the turn."""
+    encounter, _ = start_encounter(
+        db, ctx["campaign_id"], operation_id=f"op-enc-duo-{uuid.uuid4().hex[:8]}",
+        expected_revision=0,
+        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+        source_attempt_id=ctx["attempt_id"],
+        participants=[{"character_id": str(ctx["owner_pc"])},
+                      {"npc_entity_id": str(ctx["goblin_id"])}],
+    )
+    owner_p = _pc(db, encounter.id, ctx["owner_pc"])
+    goblin_p = db.execute(
+        select(EncounterParticipant).where(
+            EncounterParticipant.encounter_id == encounter.id,
+            EncounterParticipant.npc_entity_id == ctx["goblin_id"],
+        )
+    ).scalars().one()
+    fulfill_human_initiative(
+        db, encounter.id, owner_p.id, actor_id=ctx["owner"],
+        payload={"source": "app", "raw_rolls": [owner_roll],
+                 "modifier": owner_p.initiative_modifier,
+                 "total": owner_roll + owner_p.initiative_modifier},
+    )
+    roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=goblin_roll)
+    db.refresh(encounter)
+    assert encounter.status == "active"
+    assert encounter.active_participant_id == goblin_p.id
+    return encounter, owner_p, goblin_p
+
+
+def _duo_map(db, ctx, encounter, owner_p, goblin_p, **kwargs):
+    revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+    defaults = {
+        "actor_id": ctx["owner"], "width": 6, "height": 6,
+        "terrain": [],
+        "placements": [{"participant_id": str(owner_p.id), "col": 0, "row": 0},
+                       {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
+        "expected_revision": revision,
+        "operation_id": f"op-duo-map-{uuid.uuid4().hex[:8]}",
+    }
+    defaults.update(kwargs)
+    return ensure_map(db, encounter.id, **defaults)
+
+
+def test_hidden_npc_reachable_denied_for_non_owner():
+    from app.combat.maps import MapAuthorizationError
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, owner_p, goblin_p = _active_duo(db, ctx)
+        _duo_map(db, ctx, encounter, owner_p, goblin_p)
+        # Owner reads the hidden token's reachable space.
+        seen = reachable_for(db, encounter.id, goblin_p.id,
+                             viewer_id=ctx["owner"], is_owner=True)
+        assert seen["from"] == {"col": 5, "row": 5}
+        # Non-owner probing the hidden token gets 403, not coordinates.
+        with pytest.raises(MapAuthorizationError):
+            reachable_for(db, encounter.id, goblin_p.id,
+                          viewer_id=ctx["player"], is_owner=False)
+        # Ordinary PC reads still work for any thread reader.
+        pc_seen = reachable_for(db, encounter.id, owner_p.id,
+                                viewer_id=ctx["player"], is_owner=False)
+        assert pc_seen["from"] == {"col": 0, "row": 0}
+
+
+def test_hidden_stranded_placements_filtered_for_non_owner():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, owner_p, goblin_p = _active_duo(db, ctx)
+        _duo_map(db, ctx, encounter, owner_p, goblin_p)
+        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+        update_terrain(
+            db, encounter.id, actor_id=ctx["owner"],
+            zones=[{"kind": "blocked", "rect": {"col": 5, "row": 5, "width": 1, "height": 1},
+                    "label": "Secret pit", "visibility": "dm_only"}],
+            expected_revision=revision, operation_id="op-strand-hidden",
+        )
+        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"], is_owner=True)
+        assert any(s["participant_id"] == str(goblin_p.id)
+                   for s in owner_view["stranded_placements"])
+        player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
+        # The stranded flag carries the exact cell: hidden tokens stay out.
+        assert all(s["participant_id"] != str(goblin_p.id)
+                   for s in player_view["stranded_placements"])
+
+
+def test_overlapping_zones_preserve_authored_order():
+    from app.combat.maps import list_zones
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, participant = _active_solo(db, ctx)
+        _map(db, ctx, encounter, participant, width=3, height=1, terrain=[
+            {"kind": "blocked", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
+            {"kind": "open", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
+        ])
+        # Same-transaction rows share created_at: only the explicit ordinal
+        # keeps authored order deterministic on read-back.
+        zones = list_zones(db, get_map(db, encounter.id).id)
+        assert [z.kind for z in zones] == ["blocked", "open"]
+        assert [int(z.zone_order or 0) for z in zones] == [0, 1]
+        # Later-wins semantics hold through the persisted read path.
+        move, _, _ = _move(db, ctx, encounter, participant, 2, 0)
+        assert (move.to_col, move.to_row) == (2, 0)
+
+
+def test_map_redefine_without_placements_preserves_positions():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, participant = _active_solo(db, ctx)
+        encounter_map, _ = _map(db, ctx, encounter, participant)
+        assert encounter_map.revision == 1
+        _move(db, ctx, encounter, participant, 3, 0, operation_id="op-preserve-move")
+        # Redefine geometry/art without placements: position survives.
+        kept, _ = _map(db, ctx, encounter, participant,
+                       background_art_ref="gen-art-2", placements=None,
+                       operation_id="op-redefine-keep")
+        assert kept.revision == 2
+        assert (get_placement(db, encounter.id, participant.id).col,
+                get_placement(db, encounter.id, participant.id).row) == (3, 0)
+        # A shrink that would push the token off-grid rejects instead.
+        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
+        with pytest.raises(MapError, match="outside the replacement") as excinfo:
+            ensure_map(db, encounter.id, actor_id=ctx["owner"], width=2, height=2,
+                       placements=None, expected_revision=revision,
+                       operation_id="op-redefine-shrink")
+        assert excinfo.value.reason == "out_of_bounds"
+        db.rollback()
+        assert (get_placement(db, encounter.id, participant.id).col,
+                get_placement(db, encounter.id, participant.id).row) == (3, 0)
+
+
+def test_two_moves_same_turn_have_distinct_realtime_event_ids():
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        build_encounter_moved_event,
+        dedupe_events,
+        set_realtime_publisher,
+    )
+    fac, ctx = _fixture()
+    pub = InMemoryRealtimePublisher()
+    set_realtime_publisher(pub)
+    try:
+        with fac() as db:
+            encounter, participant = _active_solo(db, ctx)
+            _map(db, ctx, encounter, participant)
+            first, _, _ = _move(db, ctx, encounter, participant, 1, 0,
+                                operation_id="op-rt-move-1")
+            second, _, _ = _move(db, ctx, encounter, participant, 2, 0,
+                                 operation_id="op-rt-move-2")
+            moved = [r for r in pub.published if r["event"] == "encounter.moved"]
+            assert len(moved) == 2
+            ids = [m["payload"]["event_id"] for m in moved]
+            assert ids[0] != ids[1]
+            assert ids[0].endswith(str(first.id)) and ids[1].endswith(str(second.id))
+            # The realtime deduper must keep both same-turn moves.
+            assert len(dedupe_events([m["payload"] for m in moved])) == 2
+            # Legacy callers without a move id keep the turn-scoped key.
+            legacy = build_encounter_moved_event(encounter, participant.id)
+            assert legacy["event_id"].endswith(f"{int(encounter.turn_sequence or 0)}")
+    finally:
+        set_realtime_publisher(None)
+
+
+def test_hidden_mover_move_redacts_positions():
+    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    fac, ctx = _fixture()
+    pub = InMemoryRealtimePublisher()
+    set_realtime_publisher(pub)
+    try:
+        with fac() as db:
+            encounter, owner_p, goblin_p = _active_duo(db, ctx)
+            _duo_map(db, ctx, encounter, owner_p, goblin_p)
+            move, _, event = _move(db, ctx, encounter, goblin_p, 4, 5,
+                                   operation_id="op-hidden-move")
+            # Authoritative state still commits exactly.
+            assert (move.to_col, move.to_row) == (4, 5)
+            assert (get_placement(db, encounter.id, goblin_p.id).col,
+                    get_placement(db, encounter.id, goblin_p.id).row) == (4, 5)
+            # Durable thread-scoped event carries no hidden coordinates.
+            assert "from" not in event.payload and "to" not in event.payload
+            assert event.payload.get("position_redacted") is True
+            # Shared realtime payload is a position-free invalidation.
+            moved = [r for r in pub.published if r["event"] == "encounter.moved"]
+            assert len(moved) == 1
+            assert moved[0]["payload"]["to"] == {}
+            assert moved[0]["payload"].get("position_redacted") is True
+    finally:
+        set_realtime_publisher(None)

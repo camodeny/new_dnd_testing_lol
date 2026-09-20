@@ -56,6 +56,9 @@ def upgrade() -> None:
         sa.Column("cost_multiplier", sa.Integer(), nullable=False, server_default="2"),
         sa.Column("label", sa.String(160), nullable=True),
         sa.Column("visibility", sa.String(16), nullable=False, server_default="public"),
+        # Explicit author order: later zones win on overlap. Same-transaction
+        # rows share created_at while UUID ids carry no author order.
+        sa.Column("zone_order", sa.Integer(), nullable=False, server_default="0"),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.CheckConstraint("kind IN ('blocked', 'difficult', 'open')", name="ck_terrain_zones_kind"),
         sa.CheckConstraint(

@@ -263,15 +263,21 @@ def build_encounter_map_event(encounter, *, map_revision: int | None = None, rev
     }
 
 
-def build_encounter_moved_event(encounter, participant_id, *, to: dict | None = None, revision: int | None = None) -> dict[str, Any]:
+def build_encounter_moved_event(encounter, participant_id, *, to: dict | None = None, revision: int | None = None, move_id: str | None = None) -> dict[str, Any]:
     """Projection for ``encounter.moved`` — issue #232.
 
     Carries the moved token's destination only; budgets and hidden state stay
-    in the snapshot projection.
+    in the snapshot projection. ``move_id`` (the movement-ledger row id)
+    keeps every move in one turn a distinct event: without it, incremental
+    moves by the same participant share an event id and the realtime
+    deduper drops all but the first as duplicates.
     """
+    # Per-move identity when known; the legacy turn-scoped key stays as the
+    # fallback so older callers keep stable ids.
+    move_suffix = str(move_id) if move_id else f"{int(encounter.turn_sequence or 0)}"
     return {
         "type": "encounter.moved",
-        "event_id": f"encounter:{encounter.id}:moved:{participant_id}:{int(encounter.turn_sequence or 0)}",
+        "event_id": f"encounter:{encounter.id}:moved:{participant_id}:{move_suffix}",
         "encounter_id": str(encounter.id),
         "campaign_id": str(encounter.campaign_id),
         "thread_id": str(encounter.thread_id),
@@ -281,7 +287,7 @@ def build_encounter_moved_event(encounter, participant_id, *, to: dict | None = 
         "participant_id": str(participant_id),
         "to": dict(to or {}),
         "timestamp": _utcnow_iso(),
-        "dedupe_key": f"{encounter.id}:moved:{participant_id}:{int(encounter.turn_sequence or 0)}",
+        "dedupe_key": f"{encounter.id}:moved:{participant_id}:{move_suffix}",
     }
 
 
@@ -579,22 +585,36 @@ def publish_encounter_map(db: Session, encounter) -> bool:
         return False
 
 
-def publish_encounter_moved(db: Session, encounter, participant_id) -> bool:
-    """Publish the ``encounter.moved`` projection (best-effort, post-commit)."""
+def publish_encounter_moved(db: Session, encounter, participant_id, *, move_id: str | None = None) -> bool:
+    """Publish the ``encounter.moved`` projection (best-effort, post-commit).
+
+    Hidden ``dm_private`` NPC/monster movers publish a position-free
+    invalidation (no destination cell) so the shared thread channel never
+    leaks a hidden token's coordinates; members converge via the
+    privacy-filtered snapshot projection.
+    """
     try:
         from app.combat.maps import get_placement
+        from models.combat import EncounterParticipant
 
-        placement = get_placement(db, encounter.id, participant_id)
+        participant = db.get(EncounterParticipant, participant_id)
+        hidden = (
+            participant is not None
+            and participant.kind in ("npc", "monster")
+            and participant.stat_visibility == "dm_private"
+        )
+        placement = None if hidden else get_placement(db, encounter.id, participant_id)
         campaign = db.get(Campaign, encounter.campaign_id)
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
-        return _publish_encounter_event(
-            db, encounter,
-            build_encounter_moved_event(
-                encounter, participant_id,
-                to={"col": int(placement.col), "row": int(placement.row)} if placement else {},
-                revision=revision,
-            ),
+        payload = build_encounter_moved_event(
+            encounter, participant_id,
+            to={"col": int(placement.col), "row": int(placement.row)} if placement else {},
+            revision=revision,
+            move_id=move_id,
         )
+        if hidden:
+            payload["position_redacted"] = True
+        return _publish_encounter_event(db, encounter, payload)
     except Exception as exc:
         _inc("publish_failures")
         logger.warning("publish_encounter_moved failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)

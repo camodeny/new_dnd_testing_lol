@@ -455,10 +455,12 @@ class EncounterMap(Base):
 class EncounterTerrainZone(Base):
     """One DM-authored terrain rectangle — issue #232.
 
-    Zones overlay the grid in creation order (later rows win on overlap) so a
-    DM change can re-carve earlier terrain without rewriting history.
-    ``label`` is DM-authored prose and may stay ``dm_only``; projections
-    strip it for non-owners while keeping the mechanical effect.
+    Zones overlay the grid in explicit ``zone_order`` (later wins on
+    overlap) so a DM change can re-carve earlier terrain without rewriting
+    history. The ordinal is assigned at write time because same-transaction
+    rows share a ``created_at`` timestamp while random UUID ids carry no
+    author order. ``label`` is DM-authored prose and may stay ``dm_only``;
+    projections strip it for non-owners while keeping the mechanical effect.
     """
 
     __tablename__ = "encounter_terrain_zones"
@@ -491,6 +493,9 @@ class EncounterTerrainZone(Base):
     cost_multiplier: Mapped[int] = mapped_column(Integer, nullable=False, default=2, server_default="2")
     label: Mapped[str | None] = mapped_column(String(160), nullable=True)
     visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="public", server_default="public")
+    # Explicit author order within a map: later zones win on overlap.
+    # Assigned at write time (authored-list index / running max + 1).
+    zone_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     def to_dict(self, *, include_dm_label: bool = False):
@@ -505,6 +510,7 @@ class EncounterTerrainZone(Base):
             },
             "cost_multiplier": int(self.cost_multiplier),
             "visibility": self.visibility,
+            "zone_order": int(self.zone_order or 0),
         }
         if include_dm_label:
             value["label"] = self.label
