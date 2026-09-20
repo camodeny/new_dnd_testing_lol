@@ -7,14 +7,12 @@ import pytest
 
 from app.rules.attacks import defender_from_sheet
 from app.rules.spells import (
-    APPLY_SPELL_HEAL_EFFECT,
     ActionEconomy,
     SpellError,
     SpellLedger,
     apply_spell_consequence,
     build_spell_condition_effect,
     build_spell_damage_effect,
-    build_spell_heal_effect,
     cantrip_dice_count,
     damage_expression_for_slot,
     fallback_for_spell,
@@ -469,11 +467,9 @@ def test_spell_damage_upcast_and_healing_hp_change():
     assert receipt.final_total == 14  # 6 + 5 + 3 (SRD 5.2.1: 2d8 + mod)
     assert change.after.current == 10  # capped at max
     assert change.kind == "heal"
-    heal_effect = build_spell_heal_effect(
-        effect_id="heal-eff-1", target_kind="pc", target_id=str(uuid.uuid4()), hp_change=change,
-    )
-    assert heal_effect["effect_type"] == APPLY_SPELL_HEAL_EFFECT
-    assert heal_effect["arguments"]["hit_points_current"] == 10
+    # Healing has no staged commit shape in #228: it resolves purely via
+    # resolve_spell_healing; the staged-effect form arrives with the later
+    # integration lane that registers its contract/registry handler.
 
 
 # ── Resolution: concentration + condition ─────────────────────────────────

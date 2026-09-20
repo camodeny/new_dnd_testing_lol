@@ -67,7 +67,8 @@ from app.rules.mechanics import (  # noqa: F401
     query_speed,
     query_spellcasting,
 )
-from app.rules.state import (  # noqa: F401    APPLY_CONCENTRATION_EFFECT,
+from app.rules.state import (  # noqa: F401
+    APPLY_CONCENTRATION_EFFECT,
     APPLY_CONDITION_EFFECT,
     APPLY_DEATH_SAVE_EFFECT,
     APPLY_RESOURCE_EFFECT,
@@ -124,7 +125,6 @@ from app.rules.state import (  # noqa: F401    APPLY_CONCENTRATION_EFFECT,
     update_condition,
 )
 from app.rules.spells import (  # noqa: F401
-    APPLY_SPELL_HEAL_EFFECT,
     SPELL_CAST_EVENT,
     SUPPORTED_SPELL_NAMES,
     SUPPORTED_SPELLS,
@@ -140,7 +140,6 @@ from app.rules.spells import (  # noqa: F401
     apply_spell_consequence,
     build_spell_condition_effect,
     build_spell_damage_effect,
-    build_spell_heal_effect,
     cantrip_dice_count,
     damage_expression_for_slot,
     fallback_for_spell,

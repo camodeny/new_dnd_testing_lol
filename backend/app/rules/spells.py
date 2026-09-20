@@ -55,12 +55,6 @@ logger = logging.getLogger(__name__)
 
 SPELLS_VERSION = "spells_v1"
 
-# Staged spell-cast effect type for healing: healing has no dedicated #206
-# handler, so the deterministic HP patch rides the turn-commit transaction
-# alongside the staged slot spend (applied atomically, never narrated first).
-# The patch is code-built only — never provider output.
-APPLY_SPELL_HEAL_EFFECT = "apply_spell_heal"
-
 
 # ── Errors ────────────────────────────────────────────────────────────────
 
@@ -872,8 +866,10 @@ class StagedSpellCast(StrictModel):
 
     ``staged_effects`` are #206-registry-compatible effect records (slot
     spend via ``apply_resource``, concentration via ``apply_concentration``,
-    conditions via ``apply_condition``, damage via ``apply_attack_damage``,
-    healing via the code-built ``apply_spell_heal`` patch). All IDs derive
+    conditions via ``apply_condition``, damage via ``apply_attack_damage``).
+    Healing stays a pure resolution primitive (:func:`resolve_spell_healing`)
+    until the integration lane registers its staged commit shape — no staged
+    record is emitted for healing here. All IDs derive
     deterministically from ``cast_id`` so a duplicate retry stages identical
     records and replays instead of double-applying. ``resolution_plan``
     tells the caller which #225/#226 resolvers to run for the effect shape.
@@ -1352,48 +1348,6 @@ def build_spell_condition_effect(
     except ValueError as exc:
         code = getattr(exc, "code", "invalid_effect")
         raise SpellError(code, str(exc), field=getattr(exc, "field", None), details=dict(getattr(exc, "details", {}))) from exc
-
-
-def build_spell_heal_effect(
-    *,
-    effect_id: str,
-    target_kind: CasterKind,
-    target_id: str,
-    hp_change: Any,
-    visibility: str = "dm_private",
-) -> dict[str, Any]:
-    """Code-built staged healing patch for resolved spell healing.
-
-    Healing has no #206 damage-handler lane (that lane only subtracts HP),
-    so the deterministic ``HPChange`` (already computed by code-owned
-    :func:`app.rules.attacks.heal_damage`) rides the turn-commit transaction
-    as a code-built patch — applied atomically with the staged slot spend,
-    never narrated before commit, never provider-authorable.
-    """
-    if not _CAST_ID_RE.fullmatch(effect_id or "") or len(effect_id) > 48:
-        raise SpellError("invalid_effect_id", "effect_id must match [A-Za-z0-9_-]+ (1-48 chars)", field="effect_id")
-    if target_kind not in ("pc", "npc"):
-        raise SpellError("invalid_target", f"target_kind must be pc/npc, got {target_kind!r}", field="target_kind")
-    try:
-        import uuid as _uuid
-
-        _uuid.UUID(str(target_id))
-    except ValueError:
-        raise SpellError("invalid_target", "target_id must be a UUID", field="target_id") from None
-    change = hp_change.model_dump(mode="json") if hasattr(hp_change, "model_dump") else dict(hp_change)
-    after = (change.get("after") or {})
-    return {
-        "id": effect_id,
-        "effect_type": APPLY_SPELL_HEAL_EFFECT,
-        "arguments": {
-            "target_kind": target_kind,
-            "target_id": str(target_id),
-            "hit_points_current": (after.get("current") if isinstance(after, dict) else None),
-            "hit_points_temp": (after.get("temporary") if isinstance(after, dict) else None),
-            "hp_change": change,
-            "visibility": visibility,
-        },
-    }
 
 
 # ── Duplicate-application guard ───────────────────────────────────────────
