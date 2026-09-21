@@ -333,6 +333,37 @@ def test_resummarization_converges_rather_than_drifts():
     assert after.rebuild_count == rebuilds + 1
 
 
+def test_convergence_does_not_broaden_verified_visibility():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1}, visibility="public")
+    e2 = _commit(db, c, payload={"n": 2, "note": "secret"}, visibility="dm_only")
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e2.sequence,
+        visibility="dm_only", provider=_good_provider,
+        decision_service=_scripted(SUPPORTED),
+    )
+    assert out["status"] == "current"
+    row = _row(db, c, e1.sequence, e2.sequence)
+    assert row.visibility == "dm_only"
+
+    # Same range, unchanged sources, broader scope: must NOT take the
+    # convergence fast path — the widening cap rejects, and the row keeps
+    # its verified visibility instead of leaking to member-facing context.
+    out2 = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e2.sequence,
+        visibility="campaign", provider=_good_provider,
+        decision_service=_scripted(SUPPORTED),
+    )
+    assert out2["status"] == "failed"
+    assert out2["reason"] == "deterministic_rejection"
+    assert any("visibility_widening" in f for f in out2["failures"])
+    assert out2.get("converged") is not True
+    db.refresh(row)
+    assert row.status == "failed"
+    assert row.visibility == "dm_only"
+    assert get_valid_summaries_for_context(db, c.id, dm_internal=True) == []
+
+
 # ── Repair invalidation + rebuild ────────────────────────────────────────────
 
 def test_repair_invalidates_and_rebuilds_affected_summaries():

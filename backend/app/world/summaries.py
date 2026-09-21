@@ -666,14 +666,19 @@ def consolidate_summary_for_range(
 
     row, _created = _get_or_create_row(
         db, campaign.id, from_sequence, to_sequence, visibility)
-    row.visibility = visibility
+    prior_visibility = row.visibility
     prior_prose = row.prose
     if operation_id is not None:
         row.operation_id = operation_id[:128]
 
-    # Convergent re-summarization: unchanged sources + already current stays
-    # current (rebuild counted, version untouched) — no drift, no dup rows.
-    if row.status == "current" and row.source_hash == source_hash:
+    # Convergent re-summarization: unchanged sources + already current under
+    # the SAME visibility stays current (rebuild counted, version untouched)
+    # — no drift, no dup rows. A broader re-request must NOT inherit this
+    # fast path: rows are reused by campaign/scope/range, so converging
+    # across visibilities would promote prose verified under a narrower
+    # scope to member-facing context without any revalidation.
+    if (row.status == "current" and row.source_hash == source_hash
+            and row.visibility == visibility):
         row.rebuild_count = int(row.rebuild_count or 0) + 1
         row.error = None
         if commit:
@@ -688,6 +693,12 @@ def consolidate_summary_for_range(
         )
         return {"status": "current", "converged": True,
                 "version": row.version, "summary_id": str(row.id)}
+
+    # Re-scoping takes the normal path: the requested visibility is applied
+    # here (after the converge check) and only persists on non-failure
+    # outcomes — a rejected re-scope never leaves a broadened visibility
+    # behind on the row.
+    row.visibility = visibility
 
     generate = provider or default_stub_provider
     feedback: str | None = None
@@ -705,6 +716,7 @@ def consolidate_summary_for_range(
             )
         except Exception as exc:
             row.status = "failed"
+            row.visibility = prior_visibility
             row.error = f"generation_failed: {type(exc).__name__}: {exc}"[:2000]
             row.source_hash = source_hash
             row.source_revision = to_sequence
@@ -736,6 +748,7 @@ def consolidate_summary_for_range(
             # Deterministic rejection wins regardless of any semantic judge
             # output — the judge is not even consulted on this draft.
             row.status = "failed"
+            row.visibility = prior_visibility
             row.prose = prose[:MAX_PROSE_CHARS]
             row.claims = []
             row.claim_count = 0
@@ -820,6 +833,7 @@ def consolidate_summary_for_range(
             )
             if attempt >= max(0, int(max_regenerations)):
                 row.status = "failed"
+                row.visibility = prior_visibility
                 row.prose = prose[:MAX_PROSE_CHARS]
                 row.error = (
                     f"unsupported_claims_rejected: {'; '.join(unsupported)}"
