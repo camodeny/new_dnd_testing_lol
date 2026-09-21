@@ -92,7 +92,10 @@ def test_valid_involuntary_consequence_passes():
     r = validate_contract(c, pkt, known_entity_ids={"char:elara"})
     assert r.passed, [v.code for v in r.violations]
 
-    # Correct modeling for other imposed consequences is npc actor with pc as target, not pc actor
+    # Correct modeling for other imposed consequences is npc actor with pc as target, not pc actor.
+    # The knowledge lane covers the guard's acquaintance with Elara (#251).
+    know = ContextRecord(record_id="knowledge:npc:guard", value={"character_id": "", "subject_entity_id": "npc:guard", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k1", "target_kind": "entity", "target_id": "char:elara", "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}, sources=[SourceRef(source_type="world_entity", source_id="npc:guard", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="dm_only", use="adjudication_only")
+    pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PLAYER_INPUTS: [rec], LaneName.KNOWLEDGE_VISIBILITY: [know]}, extra_status={LaneName.KNOWLEDGE_VISIBILITY: "authoritative"})
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Guard shoves Elara prone", "claim_kind": "observation", "origin": "dm_adjudication", "actor_ref": {"type": "npc", "id": "npc:guard"}, "target_refs": [{"type": "character", "id": "char:elara"}], "trigger_refs": ["s1"]}]}])
     r2 = validate_contract(c2, pkt, known_entity_ids={"npc:guard", "char:elara"})
     assert r2.passed

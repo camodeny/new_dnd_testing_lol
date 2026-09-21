@@ -212,15 +212,38 @@ def test_npc_utterance_without_knowledge_rejected():
     assert result.violations[0].code == "npc_utterance_without_knowledge"
 
 
-def test_npc_utterance_with_knowledge_or_learning_source_passes():
+def test_npc_utterance_with_knowledge_or_transfer_passes():
     target = str(uuid.uuid4())
     pkt = _knowledge_packet(subject_id="npc:vera", target_id=target)
     assert KnowledgeValidator().validate(_utterance("npc:vera", target), pkt).passed
-    # In-turn learning source excuses the utterance.
+    # An unrelated trigger does NOT teach: unknown target still fails.
     pkt2 = _knowledge_packet(subject_id="npc:vera", target_id=str(uuid.uuid4()))
-    taught = _utterance("npc:vera", str(uuid.uuid4()),
-                        evidence_refs=["submission:s1"], trigger_refs=[])
-    assert KnowledgeValidator().validate(taught, pkt2).passed
+    other = str(uuid.uuid4())
+    prompted = _utterance("npc:vera", other, evidence_refs=["submission:s1"],
+                          trigger_refs=["submission:s1"])
+    result = KnowledgeValidator().validate(prompted, pkt2)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_without_knowledge"
+    # A matching in-turn transfer IS the learning source: passes.
+    vera_id = str(uuid.uuid4())
+    taught = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "npc_dialogue",
+                    "speaker_ref": {"type": "npc", "id": vera_id},
+                    "speaker_public_name": "Vera",
+                    "truth_status": "truthful",
+                    "claims": [{"text": "I know all about that place.",
+                                "claim_kind": "npc_utterance",
+                                "origin": "dm_adjudication", "visibility": "public",
+                                "actor_ref": {"type": "npc", "id": vera_id},
+                                "topic_refs": [{"type": "location", "id": other}]}]}],
+         "staged_effects": [{"id": "eff-tell-1", "effect_type": "transfer_knowledge",
+                             "arguments": {"subject_kind": "npc",
+                                           "subject_entity_id": vera_id,
+                                           "target_kind": "entity",
+                                           "target_entity_id": other}}]})
+    pkt3 = _knowledge_packet(subject_id=vera_id, target_id=str(uuid.uuid4()))
+    assert KnowledgeValidator().validate(taught, pkt3).passed
 
 
 def test_validator_skips_unresolvable_or_unrelated():
