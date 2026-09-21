@@ -362,8 +362,9 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         if (ev.type === 'projection.invalidated') {
           // Issue #250: visibility expanded/contracted — reload the
           // visibility-safe snapshot so per-player surfaces converge. The
-          // payload names the grantee (grantee_user_id) but carries no
-          // secret content; a missed event still converges via revision.
+          // event is audience-neutral (revision only, no grantee or secret
+          // metadata); every subscriber refetches its own filtered view.
+          // A missed event still converges via revision.
           void fetchSnapshotAndAdopt(true)
         }
       }

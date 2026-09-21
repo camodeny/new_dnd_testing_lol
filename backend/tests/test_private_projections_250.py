@@ -320,40 +320,37 @@ def test_maps_blind_without_visible_encounter(ctx):
 
 
 def test_invalidation_event_carries_no_secrets(ctx):
+    """Review #418 round 2: shared-thread broadcast must be audience-neutral —
+    no grantee, no target kind, no grant/revoke direction."""
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        ev = build_projection_invalidated_event(
-            camp, thread_id=ctx["thread_id"], target_kind="fact",
-            transition="granted", grantee_user_id=ctx["alice"],
-        )
+        ev = build_projection_invalidated_event(camp, thread_id=ctx["thread_id"])
         assert ev["type"] == "projection.invalidated"
-        assert ev["grantee_user_id"] == str(ctx["alice"])
-        assert ev["transition"] == "granted"
-        assert "moth" not in str(ev)
-        with pytest.raises(ValueError):
-            build_projection_invalidated_event(
-                camp, target_kind="fact", transition="exploded",
-                grantee_user_id=ctx["alice"],
-            )
-        with pytest.raises(ValueError):
-            build_projection_invalidated_event(
-                camp, target_kind="party", transition="granted",
-                grantee_user_id=ctx["alice"],
-            )
-        # Publish path: best-effort, never raises, no secret content.
+        assert set(ev) == {
+            "type", "event_id", "campaign_id", "thread_id",
+            "revision", "timestamp", "dedupe_key",
+        }
+        blob = str(ev)
+        assert str(ctx["alice"]) not in blob
+        assert str(ctx["bob"]) not in blob
+        assert "granted" not in blob and "revoked" not in blob
+        assert "fact" not in blob.replace("projection-invalidated", "").replace("invalidated", "")
+        assert "moth" not in blob
+        # Publish path: best-effort, never raises, stays neutral.
         mem = InMemoryRealtimePublisher()
         set_realtime_publisher(mem)
         try:
             ok = publish_projection_invalidated(
-                db, camp, thread_id=ctx["thread_id"], target_kind="fact",
-                transition="granted", grantee_user_id=ctx["alice"],
+                db, camp, thread_id=ctx["thread_id"],
             )
             assert ok is True
             assert len(mem.published) == 1
             payload = mem.published[0]["payload"]
             assert payload["type"] == "projection.invalidated"
-            assert "moth" not in str(payload)
+            assert "grantee_user_id" not in payload
+            assert "target_kind" not in payload
+            assert "transition" not in payload
         finally:
             set_realtime_publisher(None)
     finally:
@@ -368,13 +365,13 @@ def test_invalidation_fanout_targets_grantee_threads(ctx):
         set_realtime_publisher(mem)
         try:
             sent = publish_projection_invalidated_for_grantee(
-                db, camp, target_kind="entity", transition="revoked",
-                grantee_user_id=ctx["alice"],
+                db, camp, grantee_user_id=ctx["alice"],
             )
             assert sent >= 1
             for rec in mem.published:
-                assert rec["payload"]["grantee_user_id"] == str(ctx["alice"])
-                assert rec["payload"]["transition"] == "revoked"
+                # Grantee id resolves threads only; never serialized.
+                assert str(ctx["alice"]) not in str(rec["payload"])
+                assert rec["payload"]["type"] == "projection.invalidated"
         finally:
             set_realtime_publisher(None)
     finally:
@@ -405,8 +402,8 @@ def test_authoritative_grant_and_revoke_publish_invalidation(ctx):
             grants = [r for r in mem.published
                       if r["payload"]["type"] == "projection.invalidated"]
             assert len(grants) == 1
-            assert grants[0]["payload"]["transition"] == "granted"
-            assert grants[0]["payload"]["grantee_user_id"] == str(ctx["bob"])
+            # Audience-neutral: no grantee, kind, or direction on the wire.
+            assert str(ctx["bob"]) not in str(grants[0]["payload"])
             assert "moth" not in str(grants[0]["payload"])
 
             rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
@@ -417,9 +414,8 @@ def test_authoritative_grant_and_revoke_publish_invalidation(ctx):
                 grantee_user_id=ctx["bob"],
             )
             assert revoked is True
-            revokes = [r for r in mem.published
-                       if r["payload"].get("transition") == "revoked"]
-            assert len(revokes) == 1
+            assert len([r for r in mem.published
+                        if r["payload"]["type"] == "projection.invalidated"]) == 2
 
             # No-op revoke (nothing active) changes nothing and stays silent.
             before = len(mem.published)

@@ -692,14 +692,13 @@ def grant_visibility_authoritative(
     )
     row = db.get(WorldVisibilityGrant, holder["grant_id"])
     # Issue #250: a committed grant expands someone's projection — publish
-    # the secret-free invalidation post-commit so clients reload. Best
+    # the audience-neutral invalidation post-commit so clients reload. Best
     # effort: never breaks the authoritative commit.
     try:
         from app.realtime.service import publish_projection_invalidated_for_grantee
 
         publish_projection_invalidated_for_grantee(
-            db, campaign_after, target_kind=target_kind, transition="granted",
-            grantee_user_id=grantee_user_id,
+            db, campaign_after, grantee_user_id=grantee_user_id,
         )
     except Exception:
         pass
@@ -742,13 +741,12 @@ def revoke_visibility_authoritative(
     revoked = bool(holder.get("revoked"))
     if revoked:
         # Issue #250: a committed revoke contracts someone's projection —
-        # publish the secret-free invalidation post-commit. Best effort.
+        # publish the audience-neutral invalidation post-commit. Best effort.
         try:
             from app.realtime.service import publish_projection_invalidated_for_grantee
 
             publish_projection_invalidated_for_grantee(
-                db, campaign_after, target_kind=target_kind, transition="revoked",
-                grantee_user_id=grantee_user_id,
+                db, campaign_after, grantee_user_id=grantee_user_id,
             )
         except Exception:
             pass

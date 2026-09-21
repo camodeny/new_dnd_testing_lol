@@ -184,38 +184,32 @@ def build_projection_invalidated_event(
     campaign: Campaign,
     *,
     thread_id: uuid.UUID | str | None = None,
-    target_kind: str = "",
-    transition: str = "",
-    grantee_user_id: uuid.UUID | str | None = None,
     revision: int | None = None,
 ) -> dict[str, Any]:
     """Projection invalidation for visibility expansion/contraction — issue #250.
 
     Emitted (post-commit, best-effort) when a ``WorldVisibilityGrant`` is
     created or revoked so affected clients reload their per-player
-    projections via a visibility-safe snapshot. Payload carries NO secret
-    content: no record ids, no fact/entity content — only the target kind,
-    the transition direction, the grantee (so clients can ignore events for
-    other users), and the revision to reload at.
+    projections via a visibility-safe snapshot.
+
+    Audience-neutral by design: thread channels are authorized per thread,
+    not per user, so this payload carries NO user-specific or
+    secret-visibility metadata — no grantee, no target kind, no
+    grant/revoke direction, no record ids, no content. Just
+    type/campaign/thread/revision. Every subscriber quietly refetches its
+    own filtered snapshot; a missed event still converges because the
+    campaign revision advanced with the grant/revoke commit.
     """
-    kind = str(target_kind or "").strip().lower()
-    if kind not in ("fact", "relation", "entity", "knowledge"):
-        raise ValueError("target_kind must be one of fact, relation, entity, knowledge")
-    trans = str(transition or "").strip().lower()
-    if trans not in ("granted", "revoked"):
-        raise ValueError("transition must be 'granted' or 'revoked'")
     rev = int(revision) if revision is not None else int(campaign.revision or 0)
+    tid = str(thread_id) if thread_id else None
     return {
         "type": "projection.invalidated",
-        "event_id": f"projection-invalidated:{campaign.id}:{kind}:{trans}:{grantee_user_id}:{rev}",
+        "event_id": f"projection-invalidated:{campaign.id}:{tid or 'campaign'}:{rev}",
         "campaign_id": str(campaign.id),
-        "thread_id": str(thread_id) if thread_id else None,
-        "target_kind": kind,
-        "transition": trans,
-        "grantee_user_id": str(grantee_user_id) if grantee_user_id else None,
+        "thread_id": tid,
         "revision": rev,
         "timestamp": _utcnow_iso(),
-        "dedupe_key": f"{campaign.id}:{kind}:{trans}:{grantee_user_id}:{rev}",
+        "dedupe_key": f"{campaign.id}:projection-invalidated:{tid or 'campaign'}:{rev}",
     }
 
 
@@ -566,15 +560,12 @@ def publish_projection_invalidated(
     campaign: Campaign,
     *,
     thread_id: uuid.UUID | str,
-    target_kind: str = "",
-    transition: str = "",
-    grantee_user_id: uuid.UUID | str | None = None,
 ) -> bool:
-    """Publish a projection invalidation to one thread channel.
+    """Publish an audience-neutral projection invalidation to one thread channel.
 
     Call AFTER db.commit() — failure leaves authoritative state intact.
-    Payload carries no secret content (see builder). The event tells the
-    grantee (and only the grantee acts on it) to reload via the
+    Payload carries no user-specific or secret-visibility metadata (see
+    builder). The event tells subscribers to reload via the
     visibility-safe snapshot; a missed event still converges because the
     campaign revision advanced with the grant/revoke commit.
     """
@@ -582,12 +573,7 @@ def publish_projection_invalidated(
         revision = int(campaign.revision) if campaign.revision is not None else None
         channel = live_table_channel(campaign.id, thread_id)
         payload = build_projection_invalidated_event(
-            campaign,
-            thread_id=thread_id,
-            target_kind=target_kind,
-            transition=transition,
-            grantee_user_id=grantee_user_id,
-            revision=revision,
+            campaign, thread_id=thread_id, revision=revision,
         )
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
@@ -601,17 +587,16 @@ def publish_projection_invalidated_for_grantee(
     db: Session,
     campaign: Campaign,
     *,
-    target_kind: str = "",
-    transition: str = "",
     grantee_user_id: uuid.UUID | str | None = None,
     max_threads: int = 20,
 ) -> int:
     """Publish invalidation to every thread the grantee can read — issue #250.
 
     Convenience wrapper for visibility grant/revoke commit paths: resolves
-    the grantee's readable threads and publishes one invalidation per
-    thread (bounded). Returns the count of successful publishes. Never
-    raises. Call AFTER db.commit().
+    the grantee's readable threads and publishes one audience-neutral
+    invalidation per thread (bounded). The grantee id is used ONLY for
+    thread resolution and is never serialized into any payload. Returns
+    the count of successful publishes. Never raises. Call AFTER db.commit().
     """
     try:
         from app.runtime.threads import list_threads_for_user
@@ -627,11 +612,7 @@ def publish_projection_invalidated_for_grantee(
     sent = 0
     for thread in list(threads or [])[: max(1, int(max_threads or 20))]:
         thread_id = getattr(thread, "id", thread)
-        if publish_projection_invalidated(
-            db, campaign, thread_id=thread_id,
-            target_kind=target_kind, transition=transition,
-            grantee_user_id=grantee_user_id,
-        ):
+        if publish_projection_invalidated(db, campaign, thread_id=thread_id):
             sent += 1
     return sent
 

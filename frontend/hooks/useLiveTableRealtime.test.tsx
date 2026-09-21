@@ -338,12 +338,9 @@ describe('useLiveTableRealtime snapshot fallback', () => {
       entry!.handler({
         payload: {
           type: 'projection.invalidated',
-          event_id: 'projection-invalidated:c1:fact:granted:u2:2',
+          event_id: 'projection-invalidated:c1:t1:2',
           campaign_id: 'c1',
           thread_id: 't1',
-          target_kind: 'fact',
-          transition: 'granted',
-          grantee_user_id: 'u2',
           revision: 2,
         },
       })
