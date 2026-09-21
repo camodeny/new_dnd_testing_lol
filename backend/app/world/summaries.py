@@ -142,7 +142,15 @@ class SummaryDraft:
 
 
 class SummaryProvider(Protocol):
-    """Injectable prose generator. Never authorizes; only proposes text."""
+    """Injectable prose generator. Never authorizes; only proposes text.
+
+    ``evidence`` is the visibility-filtered source snapshot: domain-event
+    excerpts (``kind == "domain_event"`` with ``sequence``/``event_type``)
+    plus current record excerpts (``kind`` ``world_fact``/``world_relation``
+    with ``record_id``/``status``/``epistemic_state``/``content_excerpt``,
+    including terminal retractions as explicit markers). Providers must
+    tolerate mixed item shapes — select by ``kind``.
+    """
 
     def __call__(
         self,
@@ -170,6 +178,7 @@ def default_stub_provider(
     sentences = [
         f"Sequence {item['sequence']} records {item['event_type']}."
         for item in evidence
+        if item.get("kind", "domain_event") == "domain_event"
     ]
     prose = f"Campaign events {from_sequence}-{to_sequence}: " + " ".join(sentences)
     return SummaryDraft(
@@ -251,6 +260,7 @@ def _evidence_excerpt(events: list[CampaignDomainEvent]) -> list[dict[str, Any]]
     out: list[dict[str, Any]] = []
     for event in events:
         out.append({
+            "kind": "domain_event",
             "sequence": event.sequence,
             "event_type": event.event_type,
             "visibility": event.visibility,
@@ -645,7 +655,14 @@ def consolidate_summary_for_range(
     events = _load_range(db, campaign.id, from_sequence, to_sequence)
     facts, relations = _range_records(db, campaign.id, {e.id for e in events})
     source_hash = _source_hash(events, facts, relations)
-    evidence = _evidence_excerpt(events)
+    # Generation and verification share one visibility-filtered snapshot:
+    # after an inline repair the generator sees the corrected records (and
+    # explicit retraction markers), so a rebuild can regenerate corrected
+    # prose instead of merely failing stale prose.
+    allowed_facts, allowed_relations = _allowed_records(
+        facts, relations, visibility)
+    record_excerpts = _record_excerpts(allowed_facts, allowed_relations)
+    evidence = _evidence_excerpt(events) + record_excerpts
 
     row, _created = _get_or_create_row(
         db, campaign.id, from_sequence, to_sequence, visibility)
@@ -767,9 +784,6 @@ def consolidate_summary_for_range(
                     "claim_count": len(validated), "summary_id": str(row.id)}
 
         allowed = _allowed_evidence(events, visibility)
-        allowed_facts, allowed_relations = _allowed_records(
-            facts, relations, visibility)
-        record_excerpts = _record_excerpts(allowed_facts, allowed_relations)
         unsupported: list[str] = []
         uncertain: list[str] = []
         for claim in validated:
