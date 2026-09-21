@@ -86,6 +86,30 @@ _SEED_PRESSURES = (
 #: Difficulty shapes situation pressure (tighter clock), never rules.
 _DIFFICULTY_THRESHOLD = {"easy": 6, "medium": 5, "hard": 4, "deadly": 3}
 
+# ── DM-private hook classification ──────────────────────────────────────────
+# Private lore content informs the seed ONLY through a coarse hook kind
+# label: deterministic keyword classification over the lore text. Different
+# lore produces different DM-restricted hook state, while no raw lore
+# substring ever enters canon, payloads, logs, or responses. Labels are
+# fixed vocabulary so they carry no recoverable content.
+
+_HOOK_KINDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("oath", ("oath", "swear", "vow", "promise")),
+    ("debt", ("debt", "owe", "creditor", "ledger", "borrowed")),
+    ("loss", ("murder", "killed", "dead", "grave", "mourning", "lost")),
+    ("hidden_foe", ("enemy", "hunt", "revenge", "rival", "assassin")),
+    ("secret_kin", ("brother", "sister", "father", "mother", "daughter", "son", "family")),
+    ("quest", ("search", "seek", "find", "recover", "artifact", "map")),
+)
+
+
+def _classify_hook_kind(content: str) -> str:
+    lowered = str(content or "").lower()
+    for kind, keywords in _HOOK_KINDS:
+        if any(kw in lowered for kw in keywords):
+            return kind
+    return "past"
+
 
 class WorldSeedError(ValueError):
     """Seed eligibility/validation failure — mapped to 409 at the boundary."""
@@ -194,8 +218,10 @@ def build_seed_spec(
     )
     premise = f"{grounding}. {situation}"
 
-    # Lore shapes DM-private hooks only as metadata (character + version) —
-    # raw lore content is NEVER copied into the spec.
+    # Lore shapes DM-private hooks as (character, version, kind) metadata —
+    # raw lore content is NEVER copied into the spec. The kind label is a
+    # coarse content-derived signal, so different lore seeds different
+    # DM-restricted hook state without leaking recoverable content.
     lore_by_char = {str(entry.get("character_id")): entry for entry in (lore_bundle or [])}
     hooks = []
     for pc in pcs:
@@ -205,7 +231,7 @@ def build_seed_spec(
                 "character_id": str(pc["character_id"]),
                 "character_name": str(pc["character_name"]),
                 "lore_version": int(entry.get("version") or 0),
-                "kind": "backstory_hook",
+                "kind": _classify_hook_kind(entry.get("content")),
             })
 
     spec = {
@@ -229,6 +255,7 @@ def build_seed_spec(
             "faction": f"{faction_name} {faction_summary}",
             "pressure": f"{pressure_name} {pressure_desc}",
             "situation": situation, "premise": premise, "grounding": grounding,
+            "hooks": " ".join(h.get("kind", "") for h in hooks),
         },
         phrases, source="generated",
     )
@@ -414,6 +441,11 @@ def run_world_seed(
         required_pc_ids=required_pc_ids,
     )
 
+    # Lore-presence counts stay server-side only: they never enter the
+    # public event payload or the HTTP projection, so one player's lore
+    # presence is not inferable from another player's visible output (#244).
+    lore_consumed = len(lore_bundle)
+
     holder: dict = {}
     from_status = str(campaign.status)
 
@@ -482,11 +514,13 @@ def run_world_seed(
         hook_fact_by_char: dict[str, str] = {}
         hook_count = 0
         for idx, hook in enumerate(spec["hooks"]):
-            # Metadata reference only — raw lore content never enters canon.
+            # Kind-labeled metadata reference only — raw lore content never
+            # enters canon; the kind makes lore differences visible to the
+            # DM without exposing recoverable text.
             hook_fact, _ = create_fact_inline(
                 db, locked,
                 content=(
-                    f"Unrevealed backstory hook for {hook['character_name']} "
+                    f"Unrevealed {hook['kind']} hook for {hook['character_name']} "
                     f"(private lore v{hook['lore_version']}); the DM may surface it through play."
                 ),
                 epistemic_state="confirmed", visibility="dm_only", provenance=prov,
@@ -574,8 +608,6 @@ def run_world_seed(
             "npc_count": len(holder.get("npc_ids") or []),
             "character_count": len(holder.get("character_ids") or []),
             "clock_id": holder.get("clock_id"),
-            "hook_count": holder.get("hook_count", 0),
-            "lore_consumed": len(get_seed_lore_bundle(db, campaign_id=campaign.id)),
             "candidates_tried": candidates_tried,
             "seed": WORLD_SEED_TAG,
         },
@@ -589,10 +621,11 @@ def run_world_seed(
     )
     db.refresh(campaign_after)
     logger.info(
-        "world_seed staged campaign_id=%s status=%s location=%s npcs=%s clock=%s candidates=%s revision=%s",
+        "world_seed staged campaign_id=%s status=%s location=%s npcs=%s clock=%s candidates=%s hooks=%s lore=%s revision=%s",
         campaign.id, campaign_after.status, spec["location"]["name"],
         len(holder.get("npc_ids") or []), holder.get("clock_id"),
-        candidates_tried, campaign_after.revision,
+        candidates_tried, holder.get("hook_count", 0), lore_consumed,
+        campaign_after.revision,
     )
     snapshot = _seeded_snapshot(db, campaign_after, replayed=False)
     snapshot["seed"].update({
@@ -604,14 +637,18 @@ def run_world_seed(
         ],
         "faction": {"entity_id": holder.get("faction_id"), "name": spec["faction"]["name"]},
         "clock": {"id": holder.get("clock_id"), "name": spec["pressure"]["name"]},
-        "hook_count": holder.get("hook_count", 0),
         "scene": holder.get("scene"),
     })
     return snapshot
 
 
 def _seeded_snapshot(db: Session, campaign, *, replayed: bool) -> dict:
-    """Secret-free seed snapshot (converged replay or fresh seed base)."""
+    """Secret-free seed snapshot (converged replay or fresh seed base).
+
+    Lore-presence counts are deliberately absent: they stay in server-side
+    logs only, so one player's private lore is not inferable from shared
+    or owner-visible seed output.
+    """
     from app.campaigns.service import compute_start_eligibility
     from models.campaigns import CampaignMember
     from models.world import CampaignClock, CampaignCurrentScene
@@ -626,20 +663,12 @@ def _seeded_snapshot(db: Session, campaign, *, replayed: bool) -> dict:
         _select(CampaignClock).where(CampaignClock.campaign_id == campaign.id)
     ).scalars().all()
     clocks = list(clocks)
-    lore_presence: dict[str, bool] = {}
-    try:
-        from app.campaigns.party_lore import list_lore_presence
-
-        lore_presence = list_lore_presence(db, campaign_id=campaign.id)
-    except Exception:
-        lore_presence = {}
     snapshot_seed: dict = {
         "contract_version": WORLD_SEED_CONTRACT_VERSION,
         "tag": WORLD_SEED_TAG,
         "replayed": replayed,
         "clock_count": len(clocks),
         "scene_present": scene is not None,
-        "lore_consumed": len(lore_presence),
         "eligibility": eligibility,
     }
     if clocks:

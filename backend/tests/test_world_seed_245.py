@@ -198,7 +198,10 @@ def test_world_seed_private_lore_hook_no_leak(api):
     assert response.status_code == 200, response.text
     assert secret not in response.text
     assert "midnight-oath-xyz" not in response.text
-    assert response.json()["seed"]["hook_count"] == 1
+    seed = response.json()["seed"]
+    # Lore presence must not surface in owner-visible output either.
+    assert "hook_count" not in seed
+    assert "lore_consumed" not in seed
 
     with factory() as db:
         cid = uuid.UUID(campaign["id"])
@@ -211,6 +214,8 @@ def test_world_seed_private_lore_hook_no_leak(api):
         hook_facts = [f for f in facts if f.visibility == "dm_only"]
         assert hook_facts, "expected a DM-private lore hook fact"
         assert any("v3" in (f.content or "") for f in hook_facts)
+        # Lore content informs the DM-private hook kind without copying text.
+        assert any("oath" in (f.content or "") for f in hook_facts)
         knowledge = db.execute(
             select(WorldKnowledge).where(WorldKnowledge.campaign_id == cid)
         ).scalars().all()
@@ -234,8 +239,73 @@ def test_world_seed_abandoned_lore_excluded(api):
 
     response = _seed(client, campaign["id"], "op-seed-abandoned")
     assert response.status_code == 200, response.text
-    assert response.json()["seed"]["hook_count"] == 0
+    assert "hook_count" not in response.json()["seed"]
     assert "never-seeded" not in response.text
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        facts = db.execute(
+            select(WorldFact).where(WorldFact.campaign_id == cid)
+        ).scalars().all()
+        assert not [f for f in facts if "Unrevealed" in (f.content or "")]
+
+
+def test_world_seed_member_lore_invisible_in_public_output(api):
+    """Another player's lore presence must not change owner-visible output."""
+    from models.campaigns import CampaignDomainEvent
+
+    client, factory, actor, owner_id, member_id, _ = api
+
+    def _seeded_campaign(key_suffix: str, with_member_lore: bool) -> dict:
+        campaign = _create(client, required_players=2, name=f"Lore invis {key_suffix}")
+        with factory() as db:
+            db.add(CampaignMember(
+                campaign_id=uuid.UUID(campaign["id"]), user_id=member_id,
+            ))
+            db.commit()
+        chars = _ready_lobby(factory, campaign["id"], [owner_id, member_id])
+        if with_member_lore:
+            member_char = chars[str(member_id)]
+            with factory() as db:
+                db.add(CampaignCharacterLore(
+                    campaign_id=uuid.UUID(campaign["id"]),
+                    character_id=member_char.id, user_id=member_id,
+                    content="I owe a blood debt to the Saltrow moneylender crimson-ledger-99",
+                    visibility="private", version=1,
+                ))
+                db.commit()
+        response = _seed(client, campaign["id"], f"op-seed-invis-{key_suffix}")
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    plain = _seeded_campaign("plain", with_member_lore=False)
+    lored = _seeded_campaign("lored", with_member_lore=True)
+
+    # Public projection shape is identical with or without member lore.
+    assert set(lored["seed"].keys()) == set(plain["seed"].keys())
+    assert "crimson-ledger-99" not in json.dumps(lored)
+    assert "blood debt" not in json.dumps(lored)
+
+    with factory() as db:
+        event = db.execute(
+            select(CampaignDomainEvent).where(
+                CampaignDomainEvent.event_type == "world.seeded_245"
+            ).order_by(CampaignDomainEvent.sequence.desc())
+        ).scalars().first()
+        assert event is not None
+        assert event.visibility == "public"
+        payload_text = json.dumps(event.payload or {})
+        assert "crimson-ledger-99" not in payload_text
+        assert "hook_count" not in payload_text
+        assert "lore_consumed" not in payload_text
+        # The DM-private hook still exists with a content-derived kind.
+        facts = db.execute(select(WorldFact)).scalars().all()
+        debt_hooks = [
+            f for f in facts
+            if f.visibility == "dm_only" and "debt hook" in (f.content or "")
+        ]
+        assert debt_hooks, "expected a DM-private debt hook fact"
+        for f in facts:
+            assert "crimson-ledger-99" not in (f.content or "")
 
 
 def test_world_seed_difficulty_shapes_pressure(api):
