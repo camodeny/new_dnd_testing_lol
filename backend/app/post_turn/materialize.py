@@ -840,7 +840,7 @@ def _apply_npc_state(
     entity = _resolve_required_ref(db, campaign.id, data.get("entity_ref"), assertion=assertion, role="entity_ref")
     if entity is None:
         return {"outcome": "deferred", "reason": "unresolvable_entity_ref"}
-    run_stamp = f"{from_sequence}-{to_sequence}"
+    run_stamp = f"{from_sequence}-{to_sequence}:{assertion.category}:{assertion.key}"
     existing = get_npc_state(db, campaign.id, entity.id)
     if existing is not None and (existing.provenance or {}).get("post_turn_run") == run_stamp:
         return {"outcome": "duplicate", "entity_id": str(entity.id)}
@@ -860,10 +860,13 @@ def _apply_npc_state(
     row = apply_npc_state_inline(
         db, campaign, entity.id, new_revision=int(campaign.revision or 1),
         provenance={
+            "source": "post_turn_materialize",
             "post_turn_run": run_stamp,
             "source_sequence": assertion.source_sequence,
         },
         source_event_id=assertion.source_event_id,
+        source_turn_id=assertion.source_turn_id,
+        source_attempt_id=assertion.source_attempt_id,
         operation_id=operation_id,
         **updates,
     )
@@ -1138,7 +1141,12 @@ def materialize_range(
 
     ordered = sorted(
         candidates,
-        key=lambda a: (WRITE_CATEGORIES.index(a.category), a.key),
+        # Category grouping preserves write dependencies (entities before
+        # relations/facts); within a category, committed chronology wins
+        # so the latest committed value is final current state.
+        key=lambda a: (WRITE_CATEGORIES.index(a.category),
+                       a.source_sequence if a.source_sequence is not None else 0,
+                       a.key),
     )
     for assertion in ordered:
         record: dict[str, Any] = {
@@ -1191,24 +1199,26 @@ def materialize_range(
                     # Generated content reaches confirmed only through an
                     # explicit SUPPORTED verdict — never by default.
                     pass
+            # Every assertion must resolve to a real in-range source event —
+            # grants included: bounded verification can never override a
+            # deterministic provenance failure. Grants ARE explicit
+            # disclosure, so only they skip the widening cap itself.
+            source_event = (
+                events_by_id.get(assertion.source_event_id)
+                if assertion.source_event_id is not None else None
+            )
+            if source_event is None:
+                if assertion.mechanical:
+                    raise MaterializeError(
+                        f"{assertion.category}/{assertion.key}: missing "
+                        f"source event for provenance"
+                    )
+                record["outcome"] = "rejected"
+                record["reason"] = "invalid_provenance: unknown source event"
+                rejected.append(record)
+                outcomes.append(record)
+                continue
             if assertion.category != "visibility_grants":
-                # Grants ARE explicit disclosure; every other write must not
-                # widen its cited source event without a same-range reveal.
-                source_event = (
-                    events_by_id.get(assertion.source_event_id)
-                    if assertion.source_event_id is not None else None
-                )
-                if source_event is None:
-                    if assertion.mechanical:
-                        raise MaterializeError(
-                            f"{assertion.category}/{assertion.key}: missing "
-                            f"source event for provenance"
-                        )
-                    record["outcome"] = "rejected"
-                    record["reason"] = "invalid_provenance: unknown source event"
-                    rejected.append(record)
-                    outcomes.append(record)
-                    continue
                 try:
                     enforce_visibility_cap(
                         assertion, source_event, disclosures)

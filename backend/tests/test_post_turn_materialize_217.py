@@ -784,3 +784,101 @@ def test_provider_missing_provenance_is_rejected():
     assert summary["rejected"] == 1
     assert summary["outcomes"][0]["reason"].startswith("invalid_provenance")
     assert list_facts(db, c.id) == []
+
+
+# ── Round-5: NPC state materializes with provenance ────────────────────────
+
+def test_npc_state_hint_applies_with_source_marker():
+    from app.world.npcs import get_npc_state
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "entities", "key": "arn", "visibility": "campaign",
+         "data": {"name": "Arn", "entity_type": "npc"}},
+        {"category": "npc_state", "key": "arn-mood", "visibility": "campaign",
+         "data": {"entity_ref": "Arn", "current_activity": "Keeping watch.",
+                  "disposition": {"mood": "wary"}}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["npc_state"] == 1
+    entity = db.execute(select(WorldEntity).where(
+        WorldEntity.campaign_id == c.id, WorldEntity.name == "Arn")).scalars().first()
+    row = get_npc_state(db, c.id, entity.id)
+    assert row is not None
+    assert row.current_activity == "Keeping watch."
+    assert (row.provenance or {}).get("source") == "post_turn_materialize"
+
+
+def test_two_npc_updates_same_range_both_apply():
+    from app.world.npcs import get_npc_state
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "entities", "key": "arn", "visibility": "campaign",
+         "data": {"name": "Arn", "entity_type": "npc"}},
+        {"category": "npc_state", "key": "first", "visibility": "campaign",
+         "data": {"entity_ref": "Arn", "current_activity": "Keeping watch."}},
+        {"category": "npc_state", "key": "second", "visibility": "campaign",
+         "data": {"entity_ref": "Arn", "current_activity": "Sounding the alarm."}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["npc_state"] == 2
+    entity = db.execute(select(WorldEntity).where(
+        WorldEntity.campaign_id == c.id, WorldEntity.name == "Arn")).scalars().first()
+    row = get_npc_state(db, c.id, entity.id)
+    assert row.current_activity == "Sounding the alarm."
+
+
+# ── Round-5: grants require real provenance ────────────────────────────────
+
+def test_supported_grant_with_missing_provenance_creates_nothing():
+    from app.world.epistemics import list_active_grants
+    from app.world.knowledge import create_fact_inline
+    from models.campaigns import CampaignMember
+    _F, db, c = _setup()
+    reader = uuid.uuid4()
+    db.add(Profile(id=reader, email="reader@x.com"))
+    db.add(CampaignMember(campaign_id=c.id, user_id=reader))
+    db.flush()
+    fact, _ = create_fact_inline(
+        db, c, content="Secret map.", epistemic_state="confirmed",
+        visibility="dm_only", operation_id="seed", idempotency_key="seed-map")
+    db.flush()
+    event = _commit(db, c, payload={"n": 1})
+    events = _range(db, c, event.sequence, event.sequence)
+    orphan = [{"category": "visibility_grants", "key": "orphan-grant",
+               "visibility": "dm_only",
+               "data": {"target_kind": "fact", "target_ref": str(fact.id),
+                        "grantee_user_id": str(reader)}}]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=_scripted(SUPPORTED),
+        candidate_provider=lambda evts: (orphan, {"role": "gen", "model": "m"}),
+    )
+    assert summary["rejected"] == 1
+    assert summary["outcomes"][0]["reason"].startswith("invalid_provenance")
+    assert list_active_grants(db, c.id, "fact", fact.id) == []
+
+
+# ── Round-5: same-category writes follow committed chronology ──────────────
+
+def test_scene_updates_apply_in_source_order_not_key_order():
+    from app.world.service import get_current_scene
+    _F, db, c = _setup()
+    first = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "scene", "key": "zulu", "visibility": "campaign",
+         "data": {"scene_patch": {"fictional_time": "dawn"}}}]})
+    second = _commit(db, c, payload={"n": 2, "post_turn_materialize": [
+        {"category": "scene", "key": "alpha", "visibility": "campaign",
+         "data": {"scene_patch": {"fictional_time": "dusk"}}}]})
+    out = run_post_turn_range(
+        db, c.id, first.sequence, second.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["scene"] == 2
+    assert get_current_scene(db, c.id).fictional_time == "dusk"
