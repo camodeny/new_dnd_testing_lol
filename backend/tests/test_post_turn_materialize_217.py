@@ -906,3 +906,69 @@ def test_verification_sees_only_cited_source_event():
     assert len(adapter.calls) == 1
     evidence = adapter.calls[0]["state"]["evidence"]
     assert [e["sequence"] for e in evidence] == [public_event.sequence]
+
+
+# ── Round-7: KEEP_DISTINCT pairs are never triplicated ──────────────────────
+
+def test_promoted_keep_distinct_proposal_is_recognized():
+    """A turn-promoted proposal (jit-keyed row) compiles to nothing."""
+    from app.world.service import _stable_jit_key
+    _F, db, c = _setup()
+    first, _ = create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-mira-1")
+    db.flush()
+    turn_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    rev = _rev(db, c)
+    from models.dm import DmTurn, DmTurnAttempt
+    db.add(DmTurn(id=turn_id, campaign_id=c.id, thread_id="thread-1",
+                  source_revision=rev, status="succeeded"))
+    db.add(DmTurnAttempt(id=attempt_id, turn_id=turn_id, attempt_number=1,
+                         campaign_id=c.id, thread_id="thread-1",
+                         source_revision=rev, input_set_revision=0,
+                         status="succeeded", staged_effects=[],
+                         contract_snapshot={"new_entities": [{
+                             "temp_id": "tmp_npc_1", "kind": "npc",
+                             "public_name": "Mira",
+                             "public_summary": "A second Mira."}]}))
+    db.flush()
+    # Simulate the commit-time KEEP_DISTINCT promotion of that proposal.
+    db.add(WorldEntity(
+        campaign_id=c.id, entity_type="npc", name="Mira",
+        visibility="campaign",
+        idempotency_key=_stable_jit_key(attempt_id, "tmp_npc_1")))
+    db.flush()
+    _c, event = commit_campaign_mutation(
+        db, c.id, rev, event_type="dm.turn_committed",
+        payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
+                 "submission_ids": [], "mode": "respond"},
+        operation_id=f"turn-{turn_id}")
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["proposed"] == 0
+    assert _entity_names(db, c).count("Mira") == 2
+
+
+def test_hint_multi_name_match_defers_through_identity():
+    _F, db, c = _setup()
+    create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed-1", idempotency_key="seed-mira-1")
+    create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed-2", idempotency_key="seed-mira-2")
+    db.flush()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "entities", "key": "mira3", "visibility": "campaign",
+         "data": {"name": "Mira", "entity_type": "npc"}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["deferred"] == 1
+    assert _entity_names(db, c).count("Mira") == 2

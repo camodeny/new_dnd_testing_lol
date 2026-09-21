@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.decisions import (
@@ -51,6 +52,7 @@ from app.decisions import (
 )
 from app.observability.tracing import structured_log
 from models.campaigns import Campaign, CampaignDomainEvent
+from models.world import WorldEntity
 
 logger = logging.getLogger(__name__)
 
@@ -429,6 +431,7 @@ def compile_committed_candidates(
         if not isinstance(proposals, list):
             raise MaterializeError(
                 f"event {event.sequence}: contract new_entities must be a list")
+        from app.world.service import _stable_jit_key
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 raise MaterializeError(
@@ -437,6 +440,21 @@ def compile_committed_candidates(
             if not isinstance(name, str) or not name.strip():
                 raise MaterializeError(
                     f"event {event.sequence}: entity proposal is missing a name")
+            temp_id = str(proposal.get("temp_id") or "").strip()
+            if temp_id:
+                # Promotion at turn commit is keyed per (attempt, temp_id):
+                # a live row under that key means this proposal already
+                # went through #214 (including KEEP_DISTINCT, which
+                # legitimately shares its name). Re-emitting it would
+                # split the duplicate into a third entity.
+                jit_key = _stable_jit_key(attempt.id, temp_id)
+                promoted = db.execute(select(WorldEntity).where(
+                    WorldEntity.campaign_id == campaign.id,
+                    WorldEntity.idempotency_key == jit_key,
+                )).scalars().first()
+                if promoted is not None and not promoted.superseded_by_id:
+                    counts["already_committed"] += 1
+                    continue
             entity, _ = resolve_entity_ref(db, campaign.id, name.strip())
             if entity is not None:
                 continue  # Promoted at commit; reuse, never duplicate.
@@ -637,6 +655,17 @@ def _idempotency_key(
     return f"pt217-{assertion.category}-{digest}"
 
 
+def _canonical_name_count(db: Session, campaign_id: uuid.UUID, name: str) -> int:
+    """Live canonical entities sharing one normalized name."""
+    from app.world.identity import normalize_alias
+    normalized = normalize_alias(name)
+    rows = db.execute(select(WorldEntity).where(
+        WorldEntity.campaign_id == campaign_id,
+        WorldEntity.superseded_by_id.is_(None),
+    )).scalars().all()
+    return sum(1 for e in rows if normalize_alias(e.name) == normalized)
+
+
 def _apply_entity(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int,
@@ -700,7 +729,7 @@ def _apply_entity(
         })
     if entity is None:
         collision = exact_identity(db, campaign.id, name)
-        if collision is None:
+        if collision is None and _canonical_name_count(db, campaign.id, name) == 0:
             created, is_new = create_entity_inline(
                 db, campaign, entity_type=str(entity_type).strip().lower(),
                 name=name.strip(), summary=data.get("summary"),
@@ -715,7 +744,8 @@ def _apply_entity(
                 "outcome": "applied" if is_new else "duplicate",
                 "entity_id": str(created.id), "via": "created",
             })
-    # Ambiguous: exact canonical-name collision — route through #214.
+    # Ambiguous: exact canonical-name collision (single or KEEP_DISTINCT
+    # multi-match) — route through #214.
     frame = build_identity_frame(
         db, campaign, name=name.strip(),
         entity_type=str(entity_type).strip().lower(),
