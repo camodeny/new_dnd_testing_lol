@@ -829,3 +829,80 @@ def test_idempotent_replay_survives_later_pause(open_api):
                         headers={"Idempotency-Key": str(uuid.uuid4())})
     assert fresh.status_code == 409
     assert fresh.json()["detail"]["code"] == "ai_paused_capacity"
+
+
+# ── 20. paused pending turn refuses expansion, still merges when funded ──────
+
+def test_paused_pending_turn_refuses_expansion():
+    Fac, cid, owner, _p2, _char, tid = _setup()
+    db = Fac()
+    _fund(db, cid, 100)
+    first, turn, _attempt = _submit_and_coordinate(Fac, cid, owner, tid, text="first")
+    assert db.get(DmTurn, turn.id).status == "pending"
+    # Exhaustion lands before first visible stream output.
+    _spend(db, cid, 1.00, tag="pendingpause")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["allowed"] is False
+    db2 = Fac()
+    late = accept_submission(db2, campaign_id=cid, user_id=owner, raw_content="second voice",
+                             segments=[{"type": "ic", "text": "second voice"}], thread_id=tid)
+    db2.commit()
+    db2.close()
+    # The genuinely new submission is refused — not merged into the owed turn.
+    db3 = Fac()
+    with pytest.raises(CapacityPausedError):
+        coordinate_turn(db3, cid, tid)
+    db3.rollback()
+    # Sanity: with capacity available the same expansion still supersedes.
+    _fund(db3, cid, 500, key="added-pending", entry_type="added_funds")
+    merged, _new_attempt = coordinate_turn(db3, cid, tid)
+    assert set(merged.submission_ids) == {str(first.id), str(late.id)}
+    db3.rollback()
+    db3.close()
+
+
+# ── 21. pause decision exposes only the authorized thread's owed rolls ───────
+
+def test_pause_decision_scopes_owed_rolls_to_authorized_thread():
+    from app.rolls.service import request_rolls
+    from app.runtime.threads import get_or_create_private_gameplay_thread
+
+    Fac, cid, owner, p2, char, tid = _setup()
+    db = Fac()
+    _fund(db, cid, 100)
+    p2_char = Character(id=uuid.uuid4(), owner_id=p2, name="Second Hero")
+    db.add(p2_char)
+    db.commit()
+    # Another member's private AI-DM thread with a pending owed roll.
+    dm_thread, _ = get_or_create_private_gameplay_thread(
+        db, campaign_id=cid, created_by=p2, private_kind="dm",
+        participant_ids=[], title="Private with AI DM",
+    )
+    dm_tid = str(dm_thread.id)
+    accept_submission(db, campaign_id=cid, user_id=p2, raw_content="I listen",
+                      segments=[{"type": "ic", "text": "I listen"}], thread_id=dm_tid)
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, dm_tid)
+    request_rolls(db, campaign_id=cid, turn_id=turn.id, attempt_id=attempt.id, requests=[{
+        "request_key": "hidden-roll-1", "requested_user_id": p2, "character_id": p2_char.id,
+        "roll_kind": "check", "ability_or_skill": "perception", "label": "Spot",
+        "advantage_state": "normal", "reason_public": "The AI DM calls for a check",
+        "dc_private": None,
+    }])
+    db.commit()
+    _spend(db, cid, 1.00, tag="rollscope")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["allowed"] is False
+    # Owner's own shared thread has no owed work: the pause decision must not
+    # reveal the hidden roll activity from p2's private thread.
+    with pytest.raises(CapacityPausedError) as excinfo:
+        require_new_ai_work(db, cid, tid)
+    owed = excinfo.value.decision["owed"]
+    assert owed["pending_roll_count"] == 0
+    assert owed["accepted_submission_ids"] == []
+    assert owed["active_turns"] == []
+    assert owed["has_owed"] is False
+    # ... while the owning thread still sees its owed roll.
+    assert describe_owed_work(db, cid, dm_tid)["pending_roll_count"] == 1
+    db.rollback()
+    db.close()

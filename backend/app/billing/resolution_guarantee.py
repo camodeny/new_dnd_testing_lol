@@ -151,6 +151,8 @@ def describe_owed_work(
         PlayerRollRequest.campaign_id == campaign_id,
         PlayerRollRequest.status == "pending",
     )
+    if thread_id is not None:
+        roll_q = roll_q.where(PlayerRollRequest.thread_id == str(thread_id))
     pending_rolls = int(db.execute(roll_q).scalar() or 0)
 
     checkpoint = db.get(PostTurnCheckpoint, campaign_id)

@@ -441,6 +441,15 @@ def coordinate_turn(
         )
         return active, cur  # type: ignore[return-value]
 
+    # The input set would expand pre-stream with genuinely new submissions.
+    # While AI-paused this is NEW AI work — not completion of the
+    # already-accepted turn — so refuse with the #254 draft-safe boundary
+    # instead of superseding. Covers both expansion paths below (with and
+    # without a prior attempt).
+    from app.billing.resolution_guarantee import require_new_ai_work as _require_new_ai_work
+
+    _require_new_ai_work(db, campaign_id, tid)
+
     # Input set expanded pre-stream — must supersede old attempt, create new one.
     # Lock current attempt for CAS
     cur_attempt = None
