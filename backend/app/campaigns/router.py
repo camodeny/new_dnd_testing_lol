@@ -38,6 +38,7 @@ from app.deps.idempotency import execute_http_idempotent, require_idempotency_ke
 from database import get_db
 import app.adventures.service  # noqa: F401 — registers the adventure.closing worker
 from models.campaigns import Campaign
+from models.campaigns import CampaignCharacterLore
 from models.campaigns import CampaignInvite
 from models.campaigns import CampaignMember
 from models.profiles import Profile
@@ -880,12 +881,24 @@ def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends
     from app.runtime.threads import get_lobby_thread as _get_lobby_thread
 
     _lobby_thread = _get_lobby_thread(db, cid)
+    from app.campaigns.party_lore import build_party_composition
+
+    # Public party composition — issue #244. Derived from the same public
+    # member projections above; never includes private lore content.
+    try:
+        _party = build_party_composition(db, member_list)
+    except Exception as exc:
+        # Projection failure must not expose private fallback data — fail
+        # with the error, never a secret-bearing payload.
+        logger.warning("party_composition failed campaign_id=%s error=%s", cid, exc)
+        raise HTTPException(status_code=500, detail="Party composition unavailable")
     return {
         "campaign": camp.to_dict(),
         "members": [_member_lobby_projection(db, camp, m) for m in member_list],
         "eligibility": eligibility,
         "launch_locked": is_launch_locked(camp.status),
         "lobby_thread_id": str(_lobby_thread.id) if _lobby_thread else None,
+        "party_composition": _party,
         # Joined vs outstanding invited state — issue #242. Outstanding =
         # usable active invites. Revoked/expired history stays owner-only;
         # members receive only currently usable rows (still without bearer
@@ -1349,6 +1362,281 @@ def set_own_readiness(
             db, response, actor_id=profile.id, idempotency_key=idempotency_key,
             command_type="campaign.member.readiness",
             scope_type="campaign_member", scope_id=f"{cid}:{profile.id}",
+            payload=payload,
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.get("/api/campaigns/{campaign_id}/party-composition")
+def get_party_composition(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Public party composition — issue #244 (members only, side-effect-free)."""
+    from app.campaigns.party_lore import build_party_composition
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
+    return {"party_composition": build_party_composition(db, list(members))}
+
+
+@router.get("/api/campaigns/{campaign_id}/party-advice")
+def get_party_advice(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Advisory party gaps/overlap for the character creator — issue #244.
+
+    Pure function of the public composition. Advisory only: the response
+    carries ``enforced: False`` and routers never reject a character choice
+    based on it.
+    """
+    from app.campaigns.party_lore import build_party_advice, build_party_composition
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
+    composition = build_party_composition(db, list(members))
+    return {"advice": build_party_advice(composition)}
+
+
+@router.get("/api/campaigns/{campaign_id}/characters/{character_id}/lore")
+def get_character_lore(campaign_id: str, character_id: str, request: Request, db: Session = Depends(get_db)):
+    """Read own private setup lore — issue #244.
+
+    Fail-closed: another player's row (even for the campaign owner) returns
+    404 with no existence leak. Reads survive the start transition.
+    """
+    from app.campaigns.party_lore import LoreAuthorizationError, get_own_lore
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    try:
+        row = get_own_lore(db, campaign_id=cid, character_id=char_id, user_id=profile.id)
+    except LoreAuthorizationError:
+        raise HTTPException(status_code=404, detail="Character lore not found")
+    return {"lore": row.to_dict(include_content=True)}
+
+
+@router.put("/api/campaigns/{campaign_id}/characters/{character_id}/lore")
+def put_character_lore(
+    campaign_id: str,
+    character_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Create/update own private setup lore — issue #244.
+
+    Lobby-only, idempotent, versioned (retries bump nothing when content is
+    identical). Logs/observability record only lengths/versions, never raw
+    secret content.
+    """
+    from models.characters import Character
+
+    from app.campaigns.party_lore import (
+        LoreStatusError,
+        LoreValidationError,
+        require_lore_writable,
+        validate_lore_content,
+    )
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    try:
+        content = validate_lore_content(payload)
+    except LoreValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only your own character's lore can be edited")
+    try:
+        require_lore_writable(camp)
+    except LoreStatusError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _mutate(locked: Campaign):
+        from models.characters import Character as _Character
+
+        try:
+            require_lore_writable(locked)
+        except LoreStatusError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        fresh = db.get(_Character, char_id)
+        if fresh is None or fresh.owner_id != profile.id:
+            raise HTTPException(status_code=403, detail="Only your own character's lore can be edited")
+        existing = db.execute(
+            select(CampaignCharacterLore).where(
+                CampaignCharacterLore.campaign_id == cid,
+                CampaignCharacterLore.character_id == char_id,
+            )
+        ).scalars().first()
+        if existing is not None:
+            if existing.user_id != profile.id:
+                raise HTTPException(status_code=404, detail="Character lore not found")
+            if existing.content != content:
+                existing.content = content
+                existing.version = int(existing.version or 1) + 1
+        else:
+            db.add(CampaignCharacterLore(
+                campaign_id=cid, character_id=char_id, user_id=profile.id,
+                content=content, version=1,
+            ))
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db, cid, expected_revision,
+            event_type="campaign.character_lore_updated",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"character_id": str(char_id)},
+            payload={"character_id": str(char_id), "content_length": len(content)},
+            mutate=_mutate,
+            commit=False,
+        )
+        row = db.execute(
+            select(CampaignCharacterLore).where(
+                CampaignCharacterLore.campaign_id == cid,
+                CampaignCharacterLore.character_id == char_id,
+            )
+        ).scalars().first()
+        logger.info(
+            "character_lore updated campaign_id=%s actor_id=%s character_id=%s version=%s content_length=%s revision=%s",
+            cid, profile.id, char_id,
+            row.version if row else None, len(content), campaign_after.revision,
+        )
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "lore": row.to_dict(include_content=True) if row else None,
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.character.lore.put",
+            scope_type="campaign_character_lore", scope_id=f"{cid}:{char_id}:{profile.id}",
+            payload={**payload, "content_length": len(content)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.delete("/api/campaigns/{campaign_id}/characters/{character_id}/lore")
+def delete_character_lore(
+    campaign_id: str,
+    character_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Remove own private setup lore before start — issue #244 (idempotent)."""
+    from app.campaigns.party_lore import LoreStatusError, require_lore_writable
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    try:
+        require_lore_writable(camp)
+    except LoreStatusError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    def _mutate(locked: Campaign):
+        try:
+            require_lore_writable(locked)
+        except LoreStatusError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        existing = db.execute(
+            select(CampaignCharacterLore).where(
+                CampaignCharacterLore.campaign_id == cid,
+                CampaignCharacterLore.character_id == char_id,
+            )
+        ).scalars().first()
+        if existing is None:
+            return
+        if existing.user_id != profile.id:
+            raise HTTPException(status_code=404, detail="Character lore not found")
+        db.delete(existing)
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db, cid, expected_revision,
+            event_type="campaign.character_lore_deleted",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"character_id": str(char_id)},
+            payload={"character_id": str(char_id)},
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "character_lore deleted campaign_id=%s actor_id=%s character_id=%s revision=%s",
+            cid, profile.id, char_id, campaign_after.revision,
+        )
+        return {"ok": True, "campaign": campaign_after.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.character.lore.delete",
+            scope_type="campaign_character_lore", scope_id=f"{cid}:{char_id}:{profile.id}",
             payload=payload,
             execute=_execute,
         )

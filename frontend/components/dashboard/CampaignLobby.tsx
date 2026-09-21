@@ -3,7 +3,7 @@
 import { useState, useCallback, useEffect } from 'react'
 import Modal from '@/components/common/Modal'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
-import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, User } from '@/types'
+import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyAdvice, PartyComposition, User } from '@/types'
 
 interface CampaignLobbyProps {
   campaign: Campaign
@@ -59,6 +59,16 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [owned, setOwned] = useState<Character[]>([])
   const [selectedId, setSelectedId] = useState('')
   const [charModalOpen, setCharModalOpen] = useState(false)
+  // Public party composition + advisory gaps (#244). Composition comes from
+  // the lobby payload; advice is fetched on demand for the creator.
+  const [composition, setComposition] = useState<PartyComposition | null>(null)
+  const [advice, setAdvice] = useState<PartyAdvice | null>(null)
+  // Private setup lore (#244): the player's own secret notes for the DM.
+  // Never rendered for other players; the owner sees nothing here.
+  const [lore, setLore] = useState('')
+  const [loreSaved, setLoreSaved] = useState(false)
+  const [loreBusy, setLoreBusy] = useState(false)
+  const [loreError, setLoreError] = useState('')
   const [invitesModalOpen, setInvitesModalOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [lobbyError, setLobbyError] = useState('')
@@ -70,6 +80,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       setEligibility(data.eligibility ?? null)
       setRevision((current) => data.campaign?.revision ?? current)
       setLaunchLocked(Boolean(data.launch_locked))
+      setComposition((data as { party_composition?: PartyComposition }).party_composition ?? null)
       // Joined vs outstanding invited state (#242). Non-owners receive
       // masked email hints only — never raw addresses.
       if (Array.isArray((data as { invites?: CampaignInvite[] }).invites)) {
@@ -233,6 +244,55 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     }
   }, [busy, campaign.id, revision, refreshLobby])
 
+  // Private setup lore (#244): load own lore when the selected character
+  // changes; save/delete are lobby-only and fail closed for others.
+  useEffect(() => {
+    if (!myCharId) { setLore(''); setLoreSaved(false); return }
+    membersApi.getCharacterLore(campaign.id, myCharId)
+      .then((data) => { setLore((data.lore as { content?: string }).content ?? ''); setLoreSaved(true) })
+      .catch(() => { setLore(''); setLoreSaved(false) })
+  }, [campaign.id, myCharId])
+
+  const handleSaveLore = useCallback(async () => {
+    if (!myCharId || loreBusy || launchLocked) return
+    setLoreBusy(true)
+    setLoreError('')
+    try {
+      await membersApi.putCharacterLore(campaign.id, myCharId, revision, lore, newKey())
+      setLoreSaved(true)
+      await refreshLobby()
+    } catch (err) {
+      await refreshLobby()
+      setLoreError((err as Error).message)
+    } finally {
+      setLoreBusy(false)
+    }
+  }, [myCharId, loreBusy, launchLocked, campaign.id, revision, lore, refreshLobby])
+
+  const handleDeleteLore = useCallback(async () => {
+    if (!myCharId || loreBusy || launchLocked) return
+    setLoreBusy(true)
+    setLoreError('')
+    try {
+      await membersApi.deleteCharacterLore(campaign.id, myCharId, revision, newKey())
+      setLore('')
+      setLoreSaved(false)
+      await refreshLobby()
+    } catch (err) {
+      await refreshLobby()
+      setLoreError((err as Error).message)
+    } finally {
+      setLoreBusy(false)
+    }
+  }, [myCharId, loreBusy, launchLocked, campaign.id, revision, refreshLobby])
+
+  const handleLoadAdvice = useCallback(async () => {
+    try {
+      const data = await membersApi.getPartyAdvice(campaign.id)
+      setAdvice(data.advice)
+    } catch { /* advisory only */ }
+  }, [campaign.id])
+
   const handleBegin = useCallback(async () => {
     if (busy || launchLocked || !isOwner || !eligibility?.eligible) return
     setBusy(true)
@@ -328,7 +388,55 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                 </div>
               ))}
             </div>
+            {/* Public party composition (#244): class/role coverage only. */}
+            {composition && (
+              <div style={{ marginTop: 12, fontSize: '0.78rem', color: 'var(--ink-faint)' }}>
+                <span>Party: {composition.ready_count}/{composition.size} ready</span>
+                {Object.entries(composition.class_counts ?? {}).map(([cls, n]) => (
+                  <span key={cls} style={{ marginLeft: 8 }}>{cls} × {n}</span>
+                ))}
+                <button type="button" onClick={() => void handleLoadAdvice()} style={{ marginLeft: 12 }} aria-label="Get party advice">
+                  Party advice
+                </button>
+              </div>
+            )}
+            {advice && (
+              <ul style={{ marginTop: 8, fontSize: '0.78rem' }}>
+                {advice.suggestions.map((s, i) => <li key={i}>{s}</li>)}
+              </ul>
+            )}
           </section>
+
+          {/* Private character lore (#244): your secrets for the DM only. */}
+          {myCharId && !launchLocked && (
+            <section className="lobby-lore-section" aria-label="Private character lore">
+              <div className="lobby-section-header">
+                <span className="lobby-section-label">
+                  <i className="bi bi-incognito" aria-hidden="true" /> Private lore (only you + DM)
+                </span>
+              </div>
+              <textarea
+                value={lore}
+                onChange={(e) => setLore(e.target.value)}
+                placeholder="Secrets, backstory hooks, personal goals — hidden from the party and the host"
+                rows={4}
+                maxLength={4000}
+                style={{ width: '100%' }}
+                aria-label="Private character lore"
+              />
+              {loreError && <div style={{ color: 'var(--danger)', fontSize: '0.75rem' }}>{loreError}</div>}
+              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                <button type="button" onClick={() => void handleSaveLore()} disabled={loreBusy} aria-label="Save private lore">
+                  {loreSaved ? 'Update private lore' : 'Save private lore'}
+                </button>
+                {loreSaved && (
+                  <button type="button" onClick={() => void handleDeleteLore()} disabled={loreBusy} aria-label="Delete private lore">
+                    Delete
+                  </button>
+                )}
+              </div>
+            </section>
+          )}
 
           {/* Invite section — issue #242 */}
           <section className="lobby-invite-section">

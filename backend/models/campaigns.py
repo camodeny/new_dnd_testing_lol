@@ -134,6 +134,57 @@ class CampaignMember(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class CampaignCharacterLore(Base):
+    """Private character setup lore — issue #244.
+
+    One row per (campaign, character): the controlling player's private
+    backstory/secrets shared with the DM (the AI runtime) during setup.
+    Visibility is ``private`` semantics per #211: readable by the owning
+    player only (plus DM-internal seed consumption via
+    ``get_seed_lore_bundle``); the campaign owner gets nothing implicit —
+    owner reads of another player's row fail closed (404, no existence
+    leak). Public party-composition projections must never include content.
+    """
+
+    __tablename__ = "campaign_character_lore"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "character_id", name="uq_character_lore_campaign_character"),
+        Index("ix_character_lore_campaign", "campaign_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self, *, include_content: bool = False):
+        d = {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "character_id": str(self.character_id),
+            "user_id": str(self.user_id),
+            "version": self.version,
+            "has_content": bool(self.content),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_content:
+            d["content"] = self.content
+        return d
+
+
 class CampaignInvite(Base):
     """Shareable lobby invitation — issue #242.
 

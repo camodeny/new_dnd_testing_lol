@@ -84,6 +84,43 @@ export interface LobbyEligibility {
   blockers: string[]
 }
 
+// Public party composition — issue #244. Explicitly public fields only;
+// private character lore is never part of this projection.
+export interface PartyCompositionEntry {
+  user_id: string
+  is_ready: boolean
+  character_id: string | null
+  character_name: string | null
+  race: string | null
+  classes: string[]
+  level: number | null
+}
+
+export interface PartyComposition {
+  size: number
+  ready_count: number
+  class_counts: Record<string, number>
+  members: PartyCompositionEntry[]
+}
+
+export interface PartyAdvice {
+  suggestions: string[]
+  class_counts: Record<string, number>
+  enforced: false
+}
+
+export interface CharacterLore {
+  id: string
+  campaign_id: string
+  character_id: string
+  user_id: string
+  version: number
+  has_content: boolean
+  content?: string
+  created_at?: string | null
+  updated_at?: string | null
+}
+
 // Lobby invitations — issue #242. Owner list entries carry the full
 // record; lobby projections mask emails for non-owners; lookup returns
 // only the minimal safe pre-membership metadata.
