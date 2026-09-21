@@ -143,6 +143,31 @@ def test_hidden_data_absent_not_masked(ctx):
         db.close()
 
 
+def test_visible_record_fields_survive_member_sanitization(ctx):
+    """Review #418 round 5: envelope stripping must not corrupt visible
+    records — a legitimate `total` inside item details survives."""
+    db = _db(ctx)
+    try:
+        camp = db.get(Campaign, ctx["campaign_id"])
+        _world.create_entity_inline(
+            db, camp, entity_type="item", name="Visible Rope",
+            visibility="campaign",
+            details={"total": 5, "length_ft": 50, "denied": "no entry here"},
+            operation_id="op-rope-250",
+        )
+        db.commit()
+        view = build_surfaces_for_viewer(db, camp, ctx["alice"])
+        assert view["items"]["visible"] == 1
+        record = view["items"]["records"][0]
+        assert record["details"] == {"total": 5, "length_ft": 50, "denied": "no entry here"}
+        # ...while the envelope itself carries no denied metadata.
+        assert "denied" not in view["items"]
+        assert "denied_reasons" not in view["items"]
+        assert "total" not in view["items"]
+    finally:
+        db.close()
+
+
 def test_hidden_records_do_not_change_unauthorized_serialized_view(ctx):
     """Review #418 round 4: adding hidden records must not change an
     unauthorized viewer's serialized surfaces — no count/class inference."""

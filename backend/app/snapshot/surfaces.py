@@ -61,16 +61,17 @@ _ENTITY_SCAN_LIMIT = 200
 _DENIED_METADATA_KEYS = ("total", "denied", "denied_reasons")
 
 
-def _strip_denied_metadata(node: Any) -> None:
-    """Remove denied-record metadata in place (records/visible stay)."""
+def _strip_envelope(node: Any) -> None:
+    """Remove denied-record metadata from one projection envelope in place.
+
+    Envelope-only by design (review #418 round 5): entries under
+    ``records`` are visible authorized data and may legitimately contain
+    fields named ``total``/``denied`` (e.g. inside arbitrary
+    ``WorldEntity.details`` JSONB) — those must survive untouched.
+    """
     if isinstance(node, dict):
         for key in _DENIED_METADATA_KEYS:
             node.pop(key, None)
-        for value in node.values():
-            _strip_denied_metadata(value)
-    elif isinstance(node, list):
-        for value in node:
-            _strip_denied_metadata(value)
 
 
 def _empty_surface(reason: str | None = None) -> dict[str, Any]:
@@ -292,9 +293,13 @@ def build_surfaces_for_viewer(
 
     if not is_authority:
         # Ordinary members must not infer hidden-record counts/classes:
-        # denied metadata stays server-side (logs below), never serialized.
-        for key in ("knowledge", "clues", "items", "shops"):
-            _strip_denied_metadata(surfaces[key])
+        # denied metadata stays server-side (logs above), never serialized.
+        # Envelope-only: visible records keep their own fields intact.
+        for envelope in (
+            knowledge, knowledge.get("facts"), knowledge.get("relations"),
+            clues, items, shops,
+        ):
+            _strip_envelope(envelope)
 
     logger.info(
         "surfaces built campaign_id=%s authority=%s knowledge_visible=%s knowledge_denied=%s items_visible=%s items_denied=%s shops_visible=%s shops_denied=%s maps_visible=%s clocks=%s",
