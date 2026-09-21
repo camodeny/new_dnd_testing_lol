@@ -281,12 +281,13 @@ def _source_hash(
         )
     for fact in facts:
         digest.update(
-            f"fact:{fact.id}:{fact.version}:{fact.visibility}:"
+            f"fact:{fact.id}:{fact.version}:{fact.status}:{fact.visibility}:"
             f"{hashlib.sha256(str(fact.content or '').encode()).hexdigest()}|".encode()
         )
     for relation in relations:
         digest.update(
-            f"relation:{relation.id}:{relation.version}:{relation.visibility}:"
+            f"relation:{relation.id}:{relation.version}:{relation.status}:"
+            f"{relation.visibility}:"
             f"{relation.relation_type}:{relation.subject_entity_id}:"
             f"{relation.object_entity_id or relation.object_label}|".encode()
         )
@@ -296,37 +297,43 @@ def _source_hash(
 def _range_records(
     db: Session, campaign_id: uuid.UUID, event_ids: set[Any],
 ) -> tuple[list[Any], list[Any]]:
-    """Active facts/relations citing range events (repair-sensitive sources).
+    """Latest source-linked record versions (repair-sensitive sources).
 
-    Only ``active`` versions: a supersede swaps the row the next snapshot
-    sees, so repaired truth — not the pre-repair row — feeds the hash and
-    the verifier. Records without an in-range source event are out of scope
-    for the range and excluded.
+    ``active`` rows plus terminal ``retracted`` rows: supersession only ever
+    replaces an active prior, so a ``superseded`` row always has a successor
+    (active or retracted) representing the chain, while a ``retracted`` row
+    is terminal — excluding it would hide the retcon and let a rebuild
+    re-verify stale prose against pre-repair event evidence alone. Records
+    without an in-range source event are out of scope and excluded.
     """
     from models.world import WorldFact, WorldRelation
 
     if not event_ids:
         return [], []
+    latest = ("active", "retracted")
     facts = list(db.execute(select(WorldFact).where(
         WorldFact.campaign_id == campaign_id,
-        WorldFact.status == "active",
+        WorldFact.status.in_(latest),
         WorldFact.source_event_id.in_(event_ids),
     )).scalars().all())
     relations = list(db.execute(select(WorldRelation).where(
         WorldRelation.campaign_id == campaign_id,
-        WorldRelation.status == "active",
+        WorldRelation.status.in_(latest),
         WorldRelation.source_event_id.in_(event_ids),
     )).scalars().all())
     return facts, relations
 
 
 def _record_excerpts(facts: Any, relations: Any) -> list[dict[str, Any]]:
+    """Verifier excerpts exposing lifecycle so retractions can't support claims."""
     out: list[dict[str, Any]] = []
     for fact in facts:
         out.append({
             "kind": "world_fact",
             "record_id": str(fact.id),
             "visibility": fact.visibility,
+            "status": fact.status,
+            "epistemic_state": getattr(fact, "epistemic_state", None),
             "content_excerpt": str(fact.content or "")[:MAX_EVIDENCE_EXCERPT],
         })
     for relation in relations:
@@ -334,6 +341,8 @@ def _record_excerpts(facts: Any, relations: Any) -> list[dict[str, Any]]:
             "kind": "world_relation",
             "record_id": str(relation.id),
             "visibility": relation.visibility,
+            "status": relation.status,
+            "epistemic_state": getattr(relation, "epistemic_state", None),
             "content_excerpt": (
                 f"{relation.subject_entity_id} {relation.relation_type} "
                 f"{relation.object_entity_id or relation.object_label}"

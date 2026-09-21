@@ -629,19 +629,23 @@ def test_unsupported_tail_past_span_bound_rejects_draft():
 # ── Repair changes verifier evidence ─────────────────────────────────────────
 
 class _EvidenceAwareAdapter(FakeDecisionAdapter):
-    """Judges the vault claim against the supplied evidence excerpts."""
+    """Judges the vault claim against live vs. retracted evidence excerpts."""
 
     def execute(self, request, *, model, timeout):
         data = super().execute(request, model=model, timeout=timeout)
         claim = ((request.state.get("claim") or {}).get("text") or "").lower()
-        excerpts = " ".join(
-            str(item.get("payload_excerpt") or item.get("content_excerpt") or "")
-            for item in request.state.get("evidence") or []
-        ).lower()
-        consistent = ("empty" in claim) == (
-            "empty" in excerpts and "full" not in excerpts)
+        live_text, dead_text = [], []
+        for item in request.state.get("evidence") or []:
+            text = str(
+                item.get("payload_excerpt") or item.get("content_excerpt") or ""
+            ).lower()
+            (dead_text if item.get("status") == "retracted" else live_text).append(text)
+        live, dead = " ".join(live_text), " ".join(dead_text)
+        key = "empty"  # distinctive claim content for these tests
+        supported_live = key in claim and key in live and "full" not in live
+        contradicted = "full" in live or (key in claim and key in dead)
         data["answers"][SUMMARY_QUESTION_ID] = (
-            SUPPORTED if consistent else UNSUPPORTED
+            SUPPORTED if (supported_live and not contradicted) else UNSUPPORTED
         )
         return data
 
@@ -698,6 +702,66 @@ def test_repair_to_contradictory_fact_cannot_restore_old_claim():
     assert any(
         item.get("kind") == "world_fact"
         and "full" in str(item.get("content_excerpt") or "")
+        for item in seen
+    )
+    db.refresh(row)
+    assert row.status == "failed"
+    assert row.source_hash != hash_before
+    assert get_valid_summaries_for_context(db, c.id, dm_internal=True) == []
+
+
+def test_retracted_fact_cannot_restore_old_claim():
+    _F, db, c = _setup()
+    # The event payload itself still asserts the old content: without the
+    # retraction marker in verifier evidence, the old claim would verify.
+    e1 = _commit(db, c, payload={"n": 1, "note": "the vault is empty"})
+    fact, _ = create_fact_inline(
+        db, db.get(Campaign, c.id), content="The vault is empty.",
+        visibility="campaign", operation_id="vault-1",
+        idempotency_key="retract-fact-1", source_event_id=e1.id,
+    )
+    db.commit()
+
+    def vault_empty(evidence, **kw):
+        return SummaryDraft(prose="The vault is empty.")
+
+    def aware_service():
+        return DecisionService(_EvidenceAwareAdapter(answers={}))
+
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        visibility="campaign", provider=vault_empty,
+        decision_service=aware_service(),
+    )
+    assert out["status"] == "current"
+    row = _row(db, c, e1.sequence, e1.sequence)
+    hash_before = row.source_hash
+
+    # Terminal retraction: no active version remains, but the retracted row
+    # must still reach the verifier as a retraction marker.
+    supersede_fact_inline(
+        db, db.get(Campaign, c.id), fact.id,
+        new_status="retracted", operation_id="vault-2",
+        idempotency_key="retract-fact-2",
+    )
+    db.commit()
+    db.refresh(row)
+    assert row.status == "stale"
+
+    rebuild_adapter = _EvidenceAwareAdapter(answers={})
+    outcomes = rebuild_stale_summaries(
+        db, c.id, provider=vault_empty,
+        decision_service=DecisionService(rebuild_adapter))
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "failed"
+    assert outcomes[0]["reason"] == "unsupported_claims_rejected"
+    seen = [
+        item for call in rebuild_adapter.calls
+        for item in call["state"].get("evidence") or []
+    ]
+    assert any(
+        item.get("kind") == "world_fact"
+        and item.get("status") == "retracted"
         for item in seen
     )
     db.refresh(row)
