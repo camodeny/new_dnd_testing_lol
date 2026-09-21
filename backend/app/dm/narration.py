@@ -1355,6 +1355,25 @@ class ValidatedTurnResult:
     event: Any
 
 
+def derive_knowledge_speaker_scope(contract: DmTurnContractV1) -> set[str]:
+    """NPC subjects whose unknown facts scope the secrecy judge (#251).
+
+    Mirrors the deterministic ``KnowledgeValidator`` boundary: NPC-attributed
+    ``npc_utterance``/``observation``/``world_fact`` claims are
+    knowledge-bearing for their speaker. Pure (no I/O) — callers resolve
+    the IDs against campaign entities when deriving restricted texts.
+    """
+    return {
+        str(claim.actor_ref.id).strip()
+        for beat in (contract.beats or [])
+        for claim in (beat.claims or [])
+        if claim.claim_kind in ("npc_utterance", "observation", "world_fact")
+        and claim.actor_ref is not None
+        and getattr(claim.actor_ref, "type", None) == "npc"
+        and str(claim.actor_ref.id or "").strip()
+    }
+
+
 def execute_validated_turn(
     db: Session,
     *,
@@ -1478,13 +1497,7 @@ def execute_validated_turn(
 
             from app.world.epistemics import collect_subject_restricted_fact_texts
 
-            _speakers = {
-                str(claim.actor_ref.id).strip()
-                for beat in (contract.beats or [])
-                for claim in (beat.claims or [])
-                if claim.claim_kind == "npc_utterance" and claim.actor_ref is not None
-                and str(claim.actor_ref.id or "").strip()
-            }
+            _speakers = derive_knowledge_speaker_scope(contract)
             if _speakers:
                 _campaign = db.get(_Campaign, turn.campaign_id)
                 if _campaign is not None:

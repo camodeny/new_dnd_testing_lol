@@ -806,6 +806,8 @@ class KnowledgeValidator:
                 for ref in (list(claim.target_refs or []) + list(claim.topic_refs or []))
                 if _norm_id(ref.id)
             ]
+            if claim.location_ref is not None and _norm_id(claim.location_ref.id):
+                refs.append(_norm_id(claim.location_ref.id))
             if not refs:
                 continue
             # Explicit in-turn learning source excuses the utterance: the

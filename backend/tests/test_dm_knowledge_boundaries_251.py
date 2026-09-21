@@ -542,3 +542,43 @@ def test_stream_narration_forwards_knowledge_scope_to_shadow_judge(monkeypatch):
         knowledge_restricted_texts={"The vault combination is 12-34-56."})
     assert result.completed
     assert "The vault combination is 12-34-56." in captured["secrets"]
+
+
+def test_validator_checks_location_ref():
+    """An unknown location referenced only via location_ref still fails."""
+    target = str(uuid.uuid4())
+    pkt = _knowledge_packet(subject_id="npc:vera", target_id=str(uuid.uuid4()))
+    contract = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "npc_dialogue",
+                    "speaker_ref": {"type": "npc", "id": "npc:vera"},
+                    "speaker_public_name": "Vera",
+                    "truth_status": "truthful",
+                    "claims": [{"text": "Meet me at the old mill.", "claim_kind": "npc_utterance",
+                                "origin": "dm_adjudication", "visibility": "public",
+                                "actor_ref": {"type": "npc", "id": "npc:vera"},
+                                "location_ref": {"type": "location", "id": target}}]}]})
+    result = KnowledgeValidator().validate(contract, pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_without_knowledge"
+    assert result.violations[0].details["unknown"] == [target]
+
+
+def test_speaker_scope_covers_npc_actions():
+    """Derivation matches the validator: NPC observations/world_facts count."""
+    from app.dm.narration import derive_knowledge_speaker_scope
+
+    npc_id = str(uuid.uuid4())
+    contract = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "narration", "claims": [
+             {"text": "Vera pockets the signet ring.", "claim_kind": "observation",
+              "origin": "dm_adjudication", "visibility": "public",
+              "actor_ref": {"type": "npc", "id": npc_id},
+              "target_refs": [{"type": "object", "id": str(uuid.uuid4())}]},
+             {"text": "The room is quiet.", "claim_kind": "observation",
+              "origin": "dm_adjudication", "visibility": "public"},
+             {"text": "Elara declares she waits.", "claim_kind": "player_declaration",
+              "origin": "player_transcript",
+              "actor_ref": {"type": "character", "id": "char:elara"}}]}]})
+    assert derive_knowledge_speaker_scope(contract) == {npc_id}
