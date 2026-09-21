@@ -223,6 +223,9 @@ def test_integration_sweep_failure_reports_stage_and_ids(scn, phase0_provider, t
 
     diag.begin_stage("opening")
     opening = start_production_play(scn, operation_key="phase0-374-start")
+    # Live-table opening turns resume here once #246 lands (seed stops at
+    # ``starting`` with no opening turn to drain).
+    pytest.skip("opening-turn integration requires #246 (campaign seeds to starting)")
     outcome = drain_dm_execution(scn, "opening")
     assert not outcome.get("failed"), outcome
     await_committed_reply(scn, "opening", opening["dm_turn"]["id"])
