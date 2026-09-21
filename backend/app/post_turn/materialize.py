@@ -1108,9 +1108,19 @@ def materialize_range(
             # self-mark as mechanical to bypass bounded verification.
             # Generation proposes; bounded decisions verify (#379).
             assertion.mechanical = False
-            if assertion.source_event_id is None:
-                assertion.source_event_id = events[0].id if events else None
-                assertion.source_sequence = events[0].sequence if events else from_sequence
+            # Generated candidates must cite their actual in-range source
+            # event: defaulting to the first event would launder private
+            # evidence through an unrelated public event and defeat the
+            # visibility cap. Missing/foreign provenance rejects the
+            # candidate below instead of failing the range.
+            seq = raw.get("source_sequence")
+            source = next((e for e in events if e.sequence == seq), None)
+            if source is None:
+                assertion.source_event_id = None
+                assertion.source_sequence = seq if isinstance(seq, int) else None
+            else:
+                assertion.source_event_id = source.id
+                assertion.source_sequence = source.sequence
             _append_unique(candidates, assertion, from_sequence)
         generation_trace.update({
             "role": (gen_trace or {}).get("role", "generative-candidate"),
@@ -1137,7 +1147,20 @@ def materialize_range(
             "source_sequence": assertion.source_sequence,
         }
         try:
-            needs_verdict = not assertion.mechanical and assertion.category != "entities"
+            # Every generated (non-mechanical) assertion is verified —
+            # entities included: verification judges evidential support
+            # first, then #214 identity handling gates entity creation.
+            # With no decision service configured the range runs
+            # deterministic-only and generated candidates defer fail-safe
+            # without touching any model adapter.
+            needs_verdict = not assertion.mechanical
+            if needs_verdict and decision_service is None:
+                verification_tally["deferred"] += 1
+                record["outcome"] = "deferred"
+                record["reason"] = "no_decision_service"
+                deferred.append(record)
+                outcomes.append(record)
+                continue
             if needs_verdict:
                 frame = build_verification_frame(
                     assertion, events, from_sequence=from_sequence, to_sequence=to_sequence,
@@ -1182,7 +1205,7 @@ def materialize_range(
                             f"source event for provenance"
                         )
                     record["outcome"] = "rejected"
-                    record["reason"] = "missing_source_event"
+                    record["reason"] = "invalid_provenance: unknown source event"
                     rejected.append(record)
                     outcomes.append(record)
                     continue

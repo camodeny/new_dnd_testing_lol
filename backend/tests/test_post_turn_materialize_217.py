@@ -235,21 +235,22 @@ def test_ambiguous_same_name_defers_without_decision_service():
         decision_service=None,
         candidate_provider=lambda evts: (
             [{"category": "entities", "key": "mira2", "visibility": "campaign",
-              "mechanical": False,
+              "mechanical": False, "source_sequence": seed_event.sequence,
               "data": {"name": "Mira", "entity_type": "npc"}}],
             {"role": "test-generator", "model": "test-model"},
         ),
     )
     assert summary["deferred"] == 1
-    assert summary["outcomes"][0]["reason"] == "duplicate_identity_no_decision_service"
+    assert summary["outcomes"][0]["reason"] == "no_decision_service"
     assert _entity_names(db, c).count("Mira") == 1
 
 
 # ── Bounded verification: reject / defer ───────────────────────────────────
 
-def _generated_fact_candidate():
+def _generated_fact_candidate(seq):
     return [{"category": "facts", "key": "gen", "visibility": "campaign",
-             "mechanical": False, "epistemic_state": "claimed",
+             "mechanical": False, "source_sequence": seq,
+             "epistemic_state": "claimed",
              "data": {"content": "The model invents a hidden vault."}}]
 
 
@@ -260,7 +261,7 @@ def test_generated_candidate_rejected_as_unsupported():
     summary = materialize_range(
         db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
         decision_service=_scripted(UNSUPPORTED),
-        candidate_provider=lambda evts: (_generated_fact_candidate(), {"role": "gen", "model": "m"}),
+        candidate_provider=lambda evts: (_generated_fact_candidate(event.sequence), {"role": "gen", "model": "m"}),
     )
     assert summary["rejected"] == 1
     assert summary["outcomes"][0]["outcome"] == "rejected"
@@ -281,7 +282,7 @@ def test_generated_candidate_deferred_and_range_still_consumes():
     summary = materialize_range(
         db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
         decision_service=_scripted(DEFER),
-        candidate_provider=lambda evts: (_generated_fact_candidate(), {"role": "gen", "model": "m"}),
+        candidate_provider=lambda evts: (_generated_fact_candidate(event.sequence), {"role": "gen", "model": "m"}),
     )
     assert summary["deferred"] == 1
     assert list_facts(db, c.id) == []
@@ -293,7 +294,8 @@ def test_positive_verdict_cannot_override_deterministic_failure():
     event = _commit(db, c, payload={"n": 1})
     events = _range(db, c, event.sequence, event.sequence)
     bad = [{"category": "relations", "key": "bad", "visibility": "campaign",
-            "mechanical": False, "epistemic_state": "confirmed",
+            "mechanical": False, "source_sequence": event.sequence,
+            "epistemic_state": "confirmed",
             "data": {"subject_ref": "Nobody Here", "relation_type": "knows",
                      "object_label": "Nothing"}}]
     summary = materialize_range(
@@ -572,7 +574,8 @@ def test_generated_widening_is_rejected_not_applied():
     event = _commit(db, c, payload={"n": 1}, visibility="dm_only")
     events = _range(db, c, event.sequence, event.sequence)
     wide = [{"category": "facts", "key": "wide", "visibility": "campaign",
-             "mechanical": False, "epistemic_state": "claimed",
+             "mechanical": False, "source_sequence": event.sequence,
+             "epistemic_state": "claimed",
              "data": {"content": "A secret made public."}}]
     summary = materialize_range(
         db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
@@ -615,7 +618,8 @@ def test_provider_mechanical_claim_still_requires_verdict():
     event = _commit(db, c, payload={"n": 1})
     events = _range(db, c, event.sequence, event.sequence)
     sneaky = [{"category": "facts", "key": "sneaky", "visibility": "campaign",
-               "mechanical": True, "epistemic_state": "confirmed",
+               "mechanical": True, "source_sequence": event.sequence,
+               "epistemic_state": "confirmed",
                "data": {"content": "Provider invents canon."}}]
     summary = materialize_range(
         db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
@@ -692,3 +696,91 @@ def test_compiler_entity_links_back_to_committed_turn():
     assert row is not None
     assert row.source_turn_id == turn_id
     assert row.source_attempt_id == attempt_id
+
+
+# ── Round-4: generated entities are verified too ───────────────────────────
+
+def test_generated_entity_unsupported_is_not_created():
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1})
+    events = _range(db, c, event.sequence, event.sequence)
+    invented = [{"category": "entities", "key": "invented",
+                 "visibility": "campaign",
+                 "source_sequence": event.sequence,
+                 "data": {"name": "Invented Imp", "entity_type": "npc"}}]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=_scripted(UNSUPPORTED),
+        candidate_provider=lambda evts: (invented, {"role": "gen", "model": "m"}),
+    )
+    assert summary["rejected"] == 1
+    assert summary["verification"]["unsupported"] == 1
+    assert _entity_names(db, c) == []
+
+
+def test_generated_entity_supported_still_passes_identity_gate():
+    _F, db, c = _setup()
+    existing, _ = create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed-mira", idempotency_key="seed-mira")
+    db.flush()
+    event = _commit(db, c, payload={"n": 1})
+    events = _range(db, c, event.sequence, event.sequence)
+    dupe = [{"category": "entities", "key": "dupe", "visibility": "campaign",
+             "source_sequence": event.sequence,
+             "data": {"name": "Mira", "entity_type": "npc"}}]
+    service = DecisionService(FakeDecisionAdapter(answers={
+        MATERIALIZE_QUESTION_ID: SUPPORTED,
+        IDENTITY_QUESTION_ID: str(existing.id),
+    }))
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=service,
+        candidate_provider=lambda evts: (dupe, {"role": "gen", "model": "m"}),
+    )
+    assert summary["verification"]["supported"] == 1
+    assert _entity_names(db, c).count("Mira") == 1
+
+
+# ── Round-4: private evidence cannot launder through a public event ────────
+
+def test_mixed_visibility_range_keeps_private_evidence_private():
+    _F, db, c = _setup()
+    public_event = _commit(db, c, payload={"n": 1}, visibility="public")
+    private_event = _commit(db, c, payload={"n": 2}, visibility="dm_only")
+    events = _range(db, c, public_event.sequence, private_event.sequence)
+    candidates = [
+        {"category": "facts", "key": "pub-fact", "visibility": "campaign",
+         "source_sequence": public_event.sequence, "epistemic_state": "claimed",
+         "data": {"content": "Public knowledge."}},
+        {"category": "facts", "key": "priv-fact", "visibility": "campaign",
+         "source_sequence": private_event.sequence, "epistemic_state": "claimed",
+         "data": {"content": "Private secret."}},
+    ]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events,
+        public_event.sequence, private_event.sequence,
+        decision_service=_scripted(SUPPORTED),
+        candidate_provider=lambda evts: (candidates, {"role": "gen", "model": "m"}),
+    )
+    assert summary["applied"]["facts"] == 1
+    assert summary["rejected"] == 1
+    contents = sorted(f.content for f in list_facts(db, c.id))
+    assert contents == ["Public knowledge."]
+
+
+def test_provider_missing_provenance_is_rejected():
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1})
+    events = _range(db, c, event.sequence, event.sequence)
+    orphan = [{"category": "facts", "key": "orphan", "visibility": "campaign",
+               "epistemic_state": "claimed",
+               "data": {"content": "No source cited."}}]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=_scripted(SUPPORTED),
+        candidate_provider=lambda evts: (orphan, {"role": "gen", "model": "m"}),
+    )
+    assert summary["rejected"] == 1
+    assert summary["outcomes"][0]["reason"].startswith("invalid_provenance")
+    assert list_facts(db, c.id) == []
