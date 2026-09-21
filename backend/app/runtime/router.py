@@ -148,7 +148,13 @@ def create_player_submission(
         from app.dm.turns import get_active_turn
 
         _active = get_active_turn(db, campaign.id, thread_id_str)
-        if _active is None or str(_active.status) not in ("pending", "awaiting_roll"):
+        # Direct player conversations never invoke the AI DM (coordination is
+        # skipped below), so the capacity gate does not apply to them — this
+        # non-AI surface stays usable while AI work is paused (#254).
+        _is_direct = thread is not None and thread.private_kind == "direct"
+        if not _is_direct and (
+            _active is None or str(_active.status) not in ("pending", "awaiting_roll")
+        ):
             require_new_ai_work(db, campaign.id, thread_id_str)
     except CapacityPausedError as exc:
         raise HTTPException(

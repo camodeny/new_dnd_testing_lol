@@ -229,15 +229,24 @@ def evaluate_new_work(
     thread_id: str | None = None,
     *,
     now: datetime | None = None,
+    on_policy_error: str = "allow",
 ) -> dict:
     """Decide whether a NEW AI obligation may start (read-only).
 
     Returns a decision dict with ``allowed`` plus the aggregate inputs
-    (cost/timing/entitlement only). Failure posture: a policy-evaluation
-    error errs toward allowing owed/new work and alerts via warning log —
-    an already accepted obligation is never abandoned by a broken meter.
+    (cost/timing/entitlement only).
+
+    Failure posture: a policy-evaluation error never abandons already accepted
+    work — owed continuations bypass this gate by construction, and the
+    default ``on_policy_error="allow"`` (observability/state-hook paths) errs
+    toward allowing while alerting via warning log. ``on_policy_error="deny"``
+    fails closed for new obligations: ``require_new_ai_work`` uses it so a
+    broken meter cannot authorize fresh AI work.
     """
     from app.observability.tracing import structured_log
+
+    if on_policy_error not in ("allow", "deny"):
+        raise ValueError("on_policy_error must be 'allow' or 'deny'")
 
     moment = now or datetime.now(timezone.utc)
     try:
@@ -245,9 +254,10 @@ def evaluate_new_work(
     except Exception as exc:
         logger.warning(
             "resolution_guarantee policy_error campaign_id=%s error=%s "
-            "posture=fail_open_for_owed_work",
+            "posture=%s",
             campaign_id,
             exc,
+            "fail_closed_for_new_work" if on_policy_error == "deny" else "fail_open_for_owed_work",
         )
         structured_log(
             logger,
@@ -255,8 +265,20 @@ def evaluate_new_work(
             "resolution.policy_error",
             campaign_id=str(campaign_id),
             error=str(exc)[:300],
-            posture="fail_open_for_owed_work",
+            posture="fail_closed_for_new_work" if on_policy_error == "deny" else "fail_open_for_owed_work",
         )
+        if on_policy_error == "deny":
+            return {
+                "allowed": False,
+                "reason": "policy_error_fail_closed_for_new_work",
+                "ai_paused": True,
+                "grace_active": False,
+                "policy_error": str(exc)[:300],
+                "funded_cents": None,
+                "consumed_cents": None,
+                "remaining_cents": None,
+                "overage_allowance_cents": 0,
+            }
         return {
             "allowed": True,
             "reason": "policy_error_fail_open_for_owed_work",
@@ -337,9 +359,11 @@ def require_new_ai_work(
 
     Returns the allow-decision (with ``owed`` context attached) for
     observability. Owed continuations must not call this — they proceed
-    unconditionally via their lifecycle paths.
+    unconditionally via their lifecycle paths. A policy-evaluation error
+    fails closed here (a broken meter authorizes no fresh AI work) while
+    owed continuations remain ungated.
     """
-    decision = evaluate_new_work(db, campaign_id, thread_id, now=now)
+    decision = evaluate_new_work(db, campaign_id, thread_id, now=now, on_policy_error="deny")
     if not decision["allowed"]:
         decision["owed"] = describe_owed_work(db, campaign_id, thread_id)
         raise CapacityPausedError(campaign_id, decision)

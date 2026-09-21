@@ -515,3 +515,176 @@ def test_grace_config_is_policy_not_story(monkeypatch):
     monkeypatch.setenv("RESOLUTION_GRACE_OVERAGE_PCT", "10")
     assert guarantee.grace_overage_cents(1000) == 100
     assert guarantee.grace_overage_cents(0) == 0  # no funding → no overage
+
+
+# ── 15. paused awaiting-roll refuses new submissions ─────────────────────────
+
+def test_paused_awaiting_roll_refuses_new_submission():
+    from app.dm.turns import TurnConflictError
+    from app.rolls.service import request_rolls
+
+    Fac, cid, owner, _p2, char, tid = _setup()
+    db = Fac()
+    _fund(db, cid, 100)
+    _sub, turn, attempt = _submit_and_coordinate(Fac, cid, owner, tid)
+    turn_id, attempt_id = turn.id, attempt.id
+    db = Fac()
+    request_rolls(db, campaign_id=cid, turn_id=turn_id, attempt_id=attempt_id, requests=[{
+        "request_key": "await-roll-1", "requested_user_id": owner, "character_id": char,
+        "roll_kind": "check", "ability_or_skill": "perception", "label": "Spot",
+        "advantage_state": "normal", "reason_public": "The AI DM calls for a check",
+        "dc_private": None,
+    }])
+    db.commit()
+    assert db.get(DmTurn, turn_id).status == "awaiting_roll"
+    # Exhaustion lands while the owed turn awaits its roll.
+    _spend(db, cid, 1.00, tag="awaitpause")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["allowed"] is False
+    # A second submission is storable (the endpoint pre-check exempts
+    # awaiting_roll as potentially mergeable) ...
+    db2 = Fac()
+    accept_submission(db2, campaign_id=cid, user_id=owner, raw_content="late arrival",
+                      segments=[{"type": "ic", "text": "late arrival"}], thread_id=tid)
+    db2.commit()
+    db2.close()
+    # ... but coordination refuses new AI work instead of deferring it as
+    # accepted future work.
+    db3 = Fac()
+    with pytest.raises(CapacityPausedError):
+        coordinate_turn(db3, cid, tid)
+    db3.rollback()
+    # Sanity: with capacity available the same shape still defers via
+    # TurnConflictError (normal deferred-work behavior, unchanged).
+    _fund(db3, cid, 500, key="added-await", entry_type="added_funds")
+    with pytest.raises(TurnConflictError):
+        coordinate_turn(db3, cid, tid)
+    db3.rollback()
+    db3.close()
+
+
+# ── 16. policy failure fails closed for new work, owed still completes ───────
+
+def test_policy_failure_fails_closed_for_new_work(monkeypatch):
+    from app.billing import ledger as ledger_mod
+
+    Fac, cid, owner, _p2, _char, tid = _setup()
+    db = Fac()
+    _fund(db, cid, 100)
+    _sub, turn, attempt = _submit_and_coordinate(Fac, cid, owner, tid)
+    turn_id, attempt_id = turn.id, attempt.id
+    db.close()
+
+    def _boom(db, campaign_id):
+        raise RuntimeError("meter is down")
+
+    monkeypatch.setattr(ledger_mod, "get_capacity_summary", _boom)
+    db = Fac()
+    # Observability path still errs toward availability for owed work ...
+    decision = evaluate_new_work(db, cid, tid)
+    assert decision["allowed"] is True
+    assert decision["reason"] == "policy_error_fail_open_for_owed_work"
+    # ... but enforcement refuses NEW obligations on a broken meter.
+    with pytest.raises(CapacityPausedError) as excinfo:
+        require_new_ai_work(db, cid, tid)
+    assert excinfo.value.decision["reason"] == "policy_error_fail_closed_for_new_work"
+    db.rollback()
+    # The owed turn is still owed and still committable.
+    assert is_owed_turn(db, turn_id) is True
+    stream = _stream(db, cid, tid, db.get(DmTurn, turn_id), db.get(DmTurnAttempt, attempt_id))
+    db.commit()
+    mark_streaming_started(db, turn_id, attempt_id, stream_id=stream.id)
+    done, _att, _ev = commit_turn(db, turn_id, attempt_id)
+    assert done.status == "succeeded"
+    db.close()
+
+
+# ── 17. direct-thread submissions stay usable while AI work is paused ────────
+
+@pytest.fixture
+def paused_direct_api(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.auth.service import TEST_USER_ID
+    from app.runtime.threads import get_or_create_private_gameplay_thread
+    from database import get_db
+    from main import app
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    campaign_id = uuid.uuid4()
+    peer_id = uuid.uuid4()
+    with factory() as db:
+        db.add_all([
+            Profile(id=TEST_USER_ID, email="player@example.com"),
+            Profile(id=peer_id, email="peer@example.com"),
+            Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Paused table"),
+            CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"),
+            CampaignMember(campaign_id=campaign_id, user_id=peer_id, role="player"),
+        ])
+        db.commit()
+        record_entry(db, campaign_id=campaign_id, entry_type="allocation",
+                     amount_cents=100, idempotency_key="direct-fund-1")
+        db.commit()
+    # Exhaust capacity with no DM response yet → AI-paused, no grace.
+    with factory() as db:
+        from datetime import datetime as _dt, timezone as _tz
+        trace_id = f"trace-254-direct-{uuid.uuid4().hex[:8]}"
+        db.add(OperationTrace(trace_id=trace_id, operation_id="op-direct",
+                              campaign_id=campaign_id, submitted_at=_dt.now(_tz.utc)))
+        db.flush()
+        run = AIRun(trace_id=trace_id, operation_id="op-direct", logical_operation="narrate",
+                    role="ai_dm", provider="test", model="m", attempt=1,
+                    classification="primary", billable=True, status="succeeded",
+                    started_at=_dt.now(_tz.utc), completed_at=_dt.now(_tz.utc), cost_usd=1.00)
+        db.add(run)
+        db.flush()
+        record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
+        db.commit()
+        thread, _ = get_or_create_private_gameplay_thread(
+            db, campaign_id=campaign_id, created_by=TEST_USER_ID,
+            private_kind="direct", participant_ids=[peer_id],
+            title="Private player conversation",
+        )
+        direct_id = str(thread.id)
+        db.commit()
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    app.dependency_overrides[get_db] = override_db
+    try:
+        yield TestClient(app), factory, campaign_id, direct_id
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_direct_thread_submission_usable_while_paused(paused_direct_api):
+    client, _factory, campaign_id, direct_id = paused_direct_api
+    body = {"content": "Quiet word between us",
+            "segments": [{"type": "ooc", "text": "Quiet word between us"}],
+            "thread_id": direct_id}
+    response = client.post(
+        f"/api/campaigns/{campaign_id}/submissions",
+        json=body,
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert response.status_code == 201
+    assert "dm_turn" not in response.json()  # no AI work started
+    # The AI surface on the shared thread stays paused.
+    main_body = {"content": "I advance",
+                 "segments": [{"type": "ic", "text": "I advance"}]}
+    paused = client.post(
+        f"/api/campaigns/{campaign_id}/submissions",
+        json=main_body,
+        headers={"Idempotency-Key": str(uuid.uuid4())},
+    )
+    assert paused.status_code == 409
+    assert paused.json()["detail"]["code"] == "ai_paused_capacity"

@@ -241,6 +241,8 @@ def coordinate_turn(
     Raises:
         TurnConflictError: if a streaming/failed_visible turn blocks new turns.
         StreamBoundaryError: if new submissions would alter a post-stream input set.
+        CapacityPausedError: if extra unresolved input would start new AI work
+            while the campaign is AI-paused (issue #254).
     """
     start_wait = time.monotonic()
     campaign = db.get(Campaign, campaign_id)
@@ -394,6 +396,18 @@ def coordinate_turn(
     if active.status in BLOCKING_TURN_STATUSES:
         active_ids = set(active.submission_ids or [])
         new_ids = [str(s.id) for s in unresolved]
+        if set(new_ids) != active_ids:
+            # Extra unresolved input while blocked: once the block clears this
+            # would start NEW AI work (the endpoint defers it as accepted
+            # future work). Enforce the #254 new-work boundary inside this
+            # serialized path so a paused campaign refuses with a draft-safe
+            # 409 instead of durably accepting. Identical input sets are owed
+            # continuations of the blocking turn and stay ungated. This also
+            # covers the pending→awaiting-roll race between the endpoint
+            # pre-check and this coordination.
+            from app.billing.resolution_guarantee import require_new_ai_work
+
+            require_new_ai_work(db, campaign_id, tid)
         if set(new_ids) == active_ids:
             cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
             if cur is None:
