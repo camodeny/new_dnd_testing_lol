@@ -133,42 +133,43 @@ def create_player_submission(
         request, str(payload.get("operation_id") or "").strip() or None
     )
 
-    # Issue #254 — capacity boundary before a NEW AI obligation. When this
-    # submission would start fresh AI work (no active owed turn to merge
-    # into pre-stream), an AI-paused campaign refuses with a machine-readable
-    # state hook; the client keeps the unsent text as an editable local
-    # draft. Merging into an existing owed turn, and all owed continuations
-    # (rolls, streaming, commit, post-turn), always proceed.
-    try:
-        from app.billing.resolution_guarantee import (
-            CapacityPausedError,
-            capacity_state_payload,
-            require_new_ai_work,
-        )
-        from app.dm.turns import get_active_turn
-
-        _active = get_active_turn(db, campaign.id, thread_id_str)
-        # Direct player conversations never invoke the AI DM (coordination is
-        # skipped below), so the capacity gate does not apply to them — this
-        # non-AI surface stays usable while AI work is paused (#254).
-        _is_direct = thread is not None and thread.private_kind == "direct"
-        if not _is_direct and (
-            _active is None or str(_active.status) not in ("pending", "awaiting_roll")
-        ):
-            require_new_ai_work(db, campaign.id, thread_id_str)
-    except CapacityPausedError as exc:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "ai_paused_capacity",
-                "message": str(exc),
-                "retryable": True,
-                "draft_safe": True,
-                "capacity_state": exc.decision,
-            },
-        ) from exc
-
     def _execute():
+        # Issue #254 — capacity boundary before a NEW AI obligation. This runs
+        # only on first execution: idempotent retries replay the committed
+        # result via the idempotency record without re-gating, so already
+        # accepted work is never refused as though it were new. When this
+        # submission would start fresh AI work (no active owed turn to merge
+        # into pre-stream), an AI-paused campaign refuses with a
+        # machine-readable state hook; the client keeps the unsent text as an
+        # editable local draft. Merging into an existing owed turn, and all
+        # owed continuations (rolls, streaming, commit, post-turn), proceed.
+        try:
+            from app.billing.resolution_guarantee import (
+                CapacityPausedError as _CapPausedPre,
+                require_new_ai_work,
+            )
+            from app.dm.turns import get_active_turn
+
+            _active = get_active_turn(db, campaign.id, thread_id_str)
+            # Direct player conversations never invoke the AI DM (coordination
+            # is skipped below), so the capacity gate does not apply to them
+            # — this non-AI surface stays usable while AI work is paused.
+            _is_direct = thread is not None and thread.private_kind == "direct"
+            if not _is_direct and (
+                _active is None or str(_active.status) not in ("pending", "awaiting_roll")
+            ):
+                require_new_ai_work(db, campaign.id, thread_id_str)
+        except _CapPausedPre as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ai_paused_capacity",
+                    "message": str(exc),
+                    "retryable": True,
+                    "draft_safe": True,
+                    "capacity_state": exc.decision,
+                },
+            ) from exc
         try:
             submission = accept_submission(
                 db,
@@ -226,9 +227,10 @@ def create_player_submission(
                 exc,
             )
         except _CapPaused as exc:
-            # Lost a capacity race between the pre-check and coordination:
-            # nothing is accepted (outer transaction rolls back) so the
-            # client keeps its local draft and retries after capacity returns.
+            # Lost a capacity race between the first-execution pre-check above
+            # and serialized coordination: nothing is accepted (outer
+            # transaction rolls back) so the client keeps its local draft and
+            # retries after capacity returns.
             logger.info(
                 "player_submission rejected campaign_id=%s thread_id=%s reason=ai_paused_capacity",
                 campaign.id,

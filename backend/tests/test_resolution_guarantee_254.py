@@ -742,3 +742,90 @@ def test_direct_thread_activity_not_owed_and_not_exposed():
     assert direct_tid not in blob and str(whisper.id) not in blob
     assert "accepted_submission_count" not in blob
     db.close()
+
+
+# ── 19. idempotent replay survives a later pause ─────────────────────────────
+
+@pytest.fixture
+def open_api(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from app.auth.service import TEST_USER_ID
+    from database import get_db
+    from main import app
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    campaign_id = uuid.uuid4()
+    with factory() as db:
+        db.add_all([
+            Profile(id=TEST_USER_ID, email="player@example.com"),
+            Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Replay table"),
+            CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"),
+        ])
+        db.commit()
+        record_entry(db, campaign_id=campaign_id, entry_type="allocation",
+                     amount_cents=100, idempotency_key="replay-fund-1")
+        db.commit()
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    app.dependency_overrides[get_db] = override_db
+    try:
+        yield TestClient(app), factory, campaign_id
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_idempotent_replay_survives_later_pause(open_api):
+    client, factory, campaign_id = open_api
+    key = str(uuid.uuid4())
+    body = {"content": "I advance",
+            "segments": [{"type": "ic", "text": "I advance"}]}
+    headers = {"Idempotency-Key": key}
+    first = client.post(f"/api/campaigns/{campaign_id}/submissions", json=body, headers=headers)
+    assert first.status_code == 201
+    sub_id = first.json()["submission"]["id"]
+    turn_id = uuid.UUID(first.json()["dm_turn"]["id"])
+    attempt_id = uuid.UUID(first.json()["dm_attempt"]["id"])
+    # The accepted turn completes, then exhaustion lands past grace.
+    with factory() as db:
+        turn, attempt = db.get(DmTurn, turn_id), db.get(DmTurnAttempt, attempt_id)
+        stream = _stream(db, campaign_id, turn.thread_id, turn, attempt)
+        db.commit()
+        mark_streaming_started(db, turn_id, attempt_id, stream_id=stream.id)
+        commit_turn(db, turn_id, attempt_id)
+    with factory() as db:
+        from datetime import datetime as _dt, timezone as _tz
+        trace_id = f"trace-254-replay-{uuid.uuid4().hex[:8]}"
+        db.add(OperationTrace(trace_id=trace_id, operation_id="op-replay",
+                              campaign_id=campaign_id, submitted_at=_dt.now(_tz.utc)))
+        db.flush()
+        run = AIRun(trace_id=trace_id, operation_id="op-replay", logical_operation="narrate",
+                    role="ai_dm", provider="test", model="m", attempt=1,
+                    classification="primary", billable=True, status="succeeded",
+                    started_at=_dt.now(_tz.utc), completed_at=_dt.now(_tz.utc), cost_usd=5.00)
+        db.add(run)
+        db.flush()
+        record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
+        db.commit()
+    with factory() as db:
+        assert evaluate_new_work(db, campaign_id)["allowed"] is False
+    # Same key+payload replays the committed result — not a pause refusal.
+    replay = client.post(f"/api/campaigns/{campaign_id}/submissions", json=body, headers=headers)
+    assert replay.status_code == 201
+    assert replay.headers.get("x-idempotent-replay") == "true"
+    assert replay.json()["submission"]["id"] == sub_id
+    # Genuinely new work (fresh key) is still refused while paused.
+    fresh = client.post(f"/api/campaigns/{campaign_id}/submissions", json=body,
+                        headers={"Idempotency-Key": str(uuid.uuid4())})
+    assert fresh.status_code == 409
+    assert fresh.json()["detail"]["code"] == "ai_paused_capacity"
