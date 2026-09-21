@@ -293,6 +293,13 @@ def coordinate_turn(
 
     # No active turn → create new logical turn from all unresolved submissions.
     if active is None:
+        # Issue #254 — capacity boundary before a NEW AI obligation. Owed
+        # continuations (active-turn expansion below, roll fulfillment,
+        # streaming, commit, post-turn) always proceed; only starting fresh
+        # AI work is gated. Read-only: duplicate calls grant nothing twice.
+        from app.billing.resolution_guarantee import require_new_ai_work
+
+        require_new_ai_work(db, campaign_id, tid)
         sub_ids = [str(s.id) for s in unresolved]
         window_start = min(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
         window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
