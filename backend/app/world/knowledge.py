@@ -208,6 +208,46 @@ def _note_semantic_write(
         pass
 
 
+def _note_summary_repair(
+    db: Session,
+    campaign_id: Any,
+    prior: Any,
+    *,
+    reason: str,
+) -> None:
+    """Best-effort #219 hook: a supersede/repair invalidates affected summaries.
+
+    Lazy import avoids a knowledge→summaries import cycle at module load;
+    never raises so derived invalidation cannot break canon commits. When
+    the prior row cites a committed source sequence, only overlapping
+    summaries go stale; otherwise the campaign's live summaries all go
+    stale (fail-closed direction: never leave a summary over repaired
+    sources marked current).
+    """
+    try:
+        from app.world import summaries as _summaries
+
+        lo = hi = None
+        seq = (prior.provenance or {}).get("source_sequence") if isinstance(
+            getattr(prior, "provenance", None), dict) else None
+        event_id = getattr(prior, "source_event_id", None)
+        if event_id is not None:
+            try:
+                from models.campaigns import CampaignDomainEvent as _Event
+
+                event = db.get(_Event, event_id)
+                if event is not None and event.campaign_id == campaign_id:
+                    seq = int(event.sequence)
+            except Exception:
+                pass
+        if isinstance(seq, int):
+            lo = hi = seq
+        _summaries.note_source_repair(
+            db, campaign_id, from_sequence=lo, to_sequence=hi, reason=reason)
+    except Exception:
+        pass
+
+
 def _normalize_grants(value: Any) -> dict:
     if value is None:
         return {}
@@ -919,6 +959,10 @@ def supersede_relation_inline(
             campaign_id=str(campaign.id), relation_id=str(row.id),
             prior=prior.epistemic_state, current=epistemic,
         )
+    _note_summary_repair(
+        db, campaign.id, prior,
+        reason=f"source_superseded:relation:{prior.id}",
+    )
     return row, True
 
 
@@ -1193,6 +1237,10 @@ def supersede_fact_inline(
             campaign_id=str(campaign.id), fact_id=str(row.id),
             prior=prior.epistemic_state, current=epistemic,
         )
+    _note_summary_repair(
+        db, campaign.id, prior,
+        reason=f"source_superseded:fact:{prior.id}",
+    )
     return row, True
 
 

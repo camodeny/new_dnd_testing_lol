@@ -637,6 +637,12 @@ def run_post_turn_range(
             db.commit()
         logger.info("post_turn consolidated campaign=%s %s-%s run=%s",
                     campaign_id, from_sequence, to_sequence, run.id if run else "-")
+        _best_effort_running_summary(
+            db, campaign_id, to_sequence,
+            decision_service=clock_decision_service,
+            session_factory=clock_telemetry_factory,
+            commit=commit,
+        )
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
     except Exception as exc:
@@ -782,6 +788,43 @@ def mark_post_turn_skipped(
 
 
 # ── Observability ──────────────────────────────────────────────────────────
+
+
+def _best_effort_running_summary(
+    db: Session,
+    campaign_id: uuid.UUID,
+    to_sequence: int,
+    *,
+    decision_service=None,
+    session_factory=None,
+    commit: bool = True,
+) -> None:
+    """Issue #219 — refresh the running summary over the processed prefix.
+
+    Independently retryable derived work: any failure is swallowed (with a
+    rollback of the summary-only transaction) so it never threatens the
+    already-committed checkpoint advancement or authoritative state above.
+    """
+    try:
+        from app.world import summaries as _summaries
+
+        campaign = db.get(Campaign, campaign_id)
+        if campaign is None:
+            return
+        _summaries.consolidate_summary_for_range(
+            db, campaign, 1, int(to_sequence),
+            decision_service=decision_service,
+            session_factory=session_factory,
+            operation_id=f"post-turn-summary:1-{to_sequence}",
+            commit=commit,
+        )
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning("post_turn running summary failed campaign=%s error=%s",
+                       campaign_id, exc)
 
 
 def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
