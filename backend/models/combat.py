@@ -483,7 +483,9 @@ class EncounterTerrainZone(Base):
     history. The ordinal is assigned at write time because same-transaction
     rows share a ``created_at`` timestamp while random UUID ids carry no
     author order. ``label`` is DM-authored prose and may stay ``dm_only``;
-    projections strip it for non-owners while keeping the mechanical effect.
+    ``dm_only`` zones are omitted from non-owner projections entirely
+    (kind/rect/label all absent, issue #250) while the server keeps
+    enforcing their mechanical effect in commit geometry.
     """
 
     __tablename__ = "encounter_terrain_zones"

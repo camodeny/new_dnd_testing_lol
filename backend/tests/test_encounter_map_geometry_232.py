@@ -524,8 +524,9 @@ def test_projection_hides_dm_labels_and_hidden_npc_tokens():
         assert len(owner_view["placements"]) == 2
 
         player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
-        assert "label" not in player_view["zones"][0]  # DM-only label never leaks
-        assert player_view["zones"][0]["kind"] == "blocked"  # mechanics stay shared
+        # Issue #250 supersedes shared-mechanics visibility: dm_only zones
+        # are omitted entirely for non-owners (kind/rect/label all absent).
+        assert player_view["zones"] == []
         kinds = [p["kind"] for p in player_view["placements"]]
         assert "npc" not in kinds and "monster" not in kinds  # hidden token hook
         assert len(player_view["placements"]) == 1

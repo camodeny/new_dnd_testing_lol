@@ -428,6 +428,21 @@ def build_live_table_snapshot(
             )
             raise SnapshotProjectionError("Failed to project encounter state") from exc
 
+        # Issue #250 — per-player secret-state projections. Each surface
+        # fails closed independently inside the builder; an unexpected
+        # builder-level failure must not deny reconnect, so fall back to an
+        # empty error-marked dict rather than raising.
+        try:
+            from app.snapshot.surfaces import build_surfaces_for_viewer
+
+            surfaces_projection = build_surfaces_for_viewer(db, campaign, viewer_id)
+        except Exception as exc:
+            logger.warning(
+                "snapshot surfaces projection failed campaign_id=%s viewer_id=%s error=%s",
+                campaign_id, viewer_id, exc,
+            )
+            surfaces_projection = {"error": "projection_failed"}
+
         snapshot: dict[str, Any] = {
             "campaign": campaign.to_dict(),
             "revision": revision,
@@ -458,7 +473,7 @@ def build_live_table_snapshot(
             "dm_messages": dm_messages,
             "roll_requests": roll_requests,
             "encounter": encounter_projection,
-            "surfaces": {},
+            "surfaces": surfaces_projection,
             "extensions": {},
             "reconciliation": {
                 "snapshot_revision": revision,

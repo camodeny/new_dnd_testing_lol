@@ -302,4 +302,62 @@ describe('useLiveTableRealtime snapshot fallback', () => {
     })
     container.remove()
   })
+
+  it('subscribes to projection.invalidated and reloads the snapshot on it', async () => {
+    const SURFACES = { clues: { records: [{ id: 'fact-1' }], visible: 1 } }
+    mockedFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/realtime/authorize')) return {}
+      if (url.includes('/snapshot')) return { ...SNAPSHOT, surfaces: SURFACES }
+      throw new Error(`unexpected ${url}`)
+    })
+    const registrations: Array<{ event: string; handler: (payload: unknown) => void }> = []
+    const fakeChannel: Record<string, unknown> = {}
+    fakeChannel.on = (_event: unknown, filter: unknown, handler: (payload: unknown) => void) => {
+      registrations.push({ event: String((filter as { event?: string })?.event ?? ''), handler })
+      return fakeChannel
+    }
+    fakeChannel.subscribe = (cb: (status: string) => void) => {
+      cb('SUBSCRIBED')
+      return fakeChannel
+    }
+    mockedChannel.mockImplementation(() => fakeChannel as never)
+
+    const seen: { latest: ReturnType<typeof useLiveTableRealtime> | null } = { latest: null }
+    function Harness() {
+      seen.latest = useLiveTableRealtime({ campaignId: 'c1', threadId: 't1' })
+      return null
+    }
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(<Harness />)
+    })
+    expect(seen.latest?.phase).toBe('live')
+
+    // The invalidation event must be registered or the reload below never runs.
+    const entry = registrations.find((r) => r.event === 'projection.invalidated')
+    expect(entry).toBeDefined()
+
+    const before = snapshotCalls().length
+    await act(async () => {
+      entry!.handler({
+        payload: {
+          type: 'projection.invalidated',
+          event_id: 'projection-invalidated:c1:t1:2',
+          campaign_id: 'c1',
+          thread_id: 't1',
+          revision: 2,
+        },
+      })
+    })
+    expect(snapshotCalls().length).toBeGreaterThan(before)
+    // The refreshed private surfaces become observable hook state.
+    expect(seen.latest?.surfaces).toEqual(SURFACES)
+
+    await act(async () => {
+      root.unmount()
+    })
+    container.remove()
+  })
 })

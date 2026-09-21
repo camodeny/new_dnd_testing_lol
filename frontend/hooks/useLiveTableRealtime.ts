@@ -46,6 +46,7 @@ interface LiveTableState {
   dmState: DmStateForRealtime | null
   rollRequests: NonNullable<SnapshotForRealtime['roll_requests']>
   dmMessages: DmMessageForRealtime[]
+  surfaces: NonNullable<SnapshotForRealtime['surfaces']> | null
   dmChunks: Map<string, RealtimeEvent[]> // incremental chunks newer than snapshot
   dmStatus: RealtimeEvent | null
   revision: number | null
@@ -89,6 +90,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         dmState: initialSnapshot.dm_state ?? null,
         dmMessages: initialSnapshot.dm_messages ?? [],
         rollRequests: initialSnapshot.roll_requests ?? [],
+        surfaces: initialSnapshot.surfaces ?? null,
         dmChunks: new Map(),
         dmStatus: null,
         revision: initialSnapshot.revision ?? null,
@@ -107,6 +109,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       dmState: null,
       dmMessages: [],
       rollRequests: [],
+      surfaces: null,
       dmChunks: new Map(),
       dmStatus: null,
       revision: initialSnapshot?.revision ?? null,
@@ -170,6 +173,10 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         dmState: snap.dm_state ?? null,
         dmMessages: snap.dm_messages ?? [],
         rollRequests: snap.roll_requests ?? [],
+        // Issue #250: per-player secret surfaces are replaced wholesale on
+        // every adopted snapshot (reconnect + invalidation reloads), never
+        // merged — a revoked view must not linger beside a new grant.
+        surfaces: snap.surfaces ?? null,
         // Clear incremental chunks — snapshot's visible_text is authoritative.
         // New chunks strictly newer than snapshot will repopulate this map.
         dmChunks: new Map(),
@@ -359,6 +366,14 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
             bufferedRef.current = []
           })
         }
+        if (ev.type === 'projection.invalidated') {
+          // Issue #250: visibility expanded/contracted — reload the
+          // visibility-safe snapshot so per-player surfaces converge. The
+          // event is audience-neutral (revision only, no grantee or secret
+          // metadata); every subscriber refetches its own filtered view.
+          // A missed event still converges via revision.
+          void fetchSnapshotAndAdopt(true)
+        }
       }
 
       try {
@@ -367,6 +382,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         ch.on('broadcast' as never, { event: 'dm.status' } as never, handleBroadcast as never)
         ch.on('broadcast' as never, { event: 'dm.thinking' } as never, handleBroadcast as never)
         ch.on('broadcast' as never, { event: 'revision' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'projection.invalidated' } as never, handleBroadcast as never)
       } catch {
         // fallback to postgres_changes if broadcast signature differs
       }
@@ -394,6 +410,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       dmState: null,
       dmMessages: [],
       rollRequests: [],
+      surfaces: null,
       dmChunks: new Map(),
       dmStatus: null,
       revision: null,
@@ -611,6 +628,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     dmState: state.dmState,
     dmMessages: state.dmMessages,
     rollRequests: state.rollRequests,
+    surfaces: state.surfaces,
     dmChunks: state.dmChunks,
     dmStatus: state.dmStatus,
     revision: state.revision,
