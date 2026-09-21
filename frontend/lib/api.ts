@@ -183,7 +183,25 @@ export const campaignMembers = {
   listMembers: (campaignId: string | number) =>
     apiFetch<{ members: import('@/types').CampaignMember[] }>(`/campaigns/${campaignId}/members`),
   getLobby: (campaignId: string | number) =>
-    apiFetch<{ campaign: import('@/types').Campaign; members: import('@/types').CampaignMember[]; eligibility: import('@/types').LobbyEligibility; launch_locked: boolean; invites?: import('@/types').CampaignInvite[]; outstanding_invites?: number }>(`/campaigns/${campaignId}/lobby`),
+    apiFetch<{ campaign: import('@/types').Campaign; members: import('@/types').CampaignMember[]; eligibility: import('@/types').LobbyEligibility; launch_locked: boolean; invites?: import('@/types').CampaignInvite[]; outstanding_invites?: number; party_composition?: import('@/types').PartyComposition }>(`/campaigns/${campaignId}/lobby`),
+  getPartyComposition: (campaignId: string | number) =>
+    apiFetch<{ party_composition: import('@/types').PartyComposition }>(`/campaigns/${campaignId}/party-composition`),
+  getPartyAdvice: (campaignId: string | number) =>
+    apiFetch<{ advice: import('@/types').PartyAdvice }>(`/campaigns/${campaignId}/party-advice`),
+  getCharacterLore: (campaignId: string | number, characterId: string) =>
+    apiFetch<{ lore: import('@/types').CharacterLore }>(`/campaigns/${campaignId}/characters/${characterId}/lore`),
+  putCharacterLore: (campaignId: string | number, characterId: string, expectedRevision: number, content: string, idempotencyKey: string, operationId?: string) =>
+    apiFetch(`/campaigns/${campaignId}/characters/${characterId}/lore`, {
+      method: 'PUT',
+      body: JSON.stringify({ expected_revision: expectedRevision, content, operation_id: operationId ?? idempotencyKey }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+  deleteCharacterLore: (campaignId: string | number, characterId: string, expectedRevision: number, idempotencyKey: string) =>
+    apiFetch(`/campaigns/${campaignId}/characters/${characterId}/lore`, {
+      method: 'DELETE',
+      body: JSON.stringify({ expected_revision: expectedRevision }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
   selectCharacter: (campaignId: string | number, expectedRevision: number, characterId: string, idempotencyKey: string) =>
     apiFetch(`/campaigns/${campaignId}/members/me/character`, {
       method: 'PUT',

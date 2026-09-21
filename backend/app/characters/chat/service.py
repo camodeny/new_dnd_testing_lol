@@ -59,6 +59,12 @@ class CharacterChatRequest(BaseModel):
     history: list[CharacterChatMessage] = Field(default_factory=list)
     draft_character: Optional[dict] = Field(default=None, description="Current frontend draft for context")
     active_page: Optional[str] = None
+    campaign_id: Optional[str] = Field(
+        default=None,
+        description="Optional lobby campaign id — the server resolves the PUBLIC "
+        "party composition itself (member-only) and adds it as advisory creator "
+        "context. Never carries private lore (issue #244).",
+    )
 
 
 def get_character_chat_model(adapter=None) -> str:
@@ -77,8 +83,29 @@ def get_character_chat_model(adapter=None) -> str:
     return model
 
 
-def build_chat_messages(req: CharacterChatRequest) -> list[dict]:
+def build_party_advisory_text(composition: dict, advice: dict) -> str:
+    """Advisory-only party context for the creator — issue #244.
+
+    Public projection only (class counts + readiness size). The assistant may
+    suggest gaps/overlap but must never require or block a choice.
+    """
+    counts = dict(composition.get("class_counts") or {})
+    size = int(composition.get("size") or 0)
+    parts = [f"Current party: {size} member(s)"]
+    if counts:
+        parts.append("Classes: " + ", ".join(f"{c} x{n}" for c, n in sorted(counts.items())))
+    suggestions = list(advice.get("suggestions") or [])
+    if suggestions:
+        parts.append("Coverage hints (advisory only, never enforce): " + " | ".join(suggestions))
+    parts.append("You may mention these hints when helpful, but never require, "
+                 "block, or shame a choice — the player picks whatever excites them.")
+    return "\n".join(parts)
+
+
+def build_chat_messages(req: CharacterChatRequest, party_advisory: str | None = None) -> list[dict]:
     msgs: list[dict] = [{"role": "system", "content": CHARACTER_CHAT_SYSTEM}]
+    if party_advisory:
+        msgs.append({"role": "system", "content": f"Party context (advisory, public only): {party_advisory[:2000]}"})
     if req.draft_character:
         try:
             draft_hint = json.dumps(req.draft_character)[:4000]
@@ -126,7 +153,8 @@ def save_chat_message(owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | N
 
 
 def character_chat_sync_generator(
-    req: CharacterChatRequest, owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None
+    req: CharacterChatRequest, owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None,
+    party_advisory: str | None = None,
 ):
     try:
         from app.providers.areas import resolve_area
@@ -136,7 +164,7 @@ def character_chat_sync_generator(
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
 
-    messages = build_chat_messages(req)
+    messages = build_chat_messages(req, party_advisory=party_advisory)
 
     full_text = ""
     has_patch = False
