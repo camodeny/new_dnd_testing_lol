@@ -1596,6 +1596,8 @@ def delete_character_lore(
     db: Session = Depends(get_db),
 ):
     """Remove own private setup lore before start — issue #244 (idempotent)."""
+    from models.characters import Character
+
     from app.campaigns.party_lore import LoreStatusError, require_lore_writable
 
     profile = resolve_profile(request, db)
@@ -1613,16 +1615,27 @@ def delete_character_lore(
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    # Ownership gate BEFORE any lore lookup: probing another player's
+    # character must return the same fail-closed 404 whether lore exists or
+    # not (no existence oracle). Missing own lore stays an idempotent no-op.
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id:
+        raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         require_lore_writable(camp)
     except LoreStatusError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     def _mutate(locked: Campaign):
+        from models.characters import Character as _Character
+
         try:
             require_lore_writable(locked)
         except LoreStatusError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        fresh = db.get(_Character, char_id)
+        if fresh is None or fresh.owner_id != profile.id:
+            raise HTTPException(status_code=404, detail="Character lore not found")
         existing = db.execute(
             select(CampaignCharacterLore).where(
                 CampaignCharacterLore.campaign_id == cid,

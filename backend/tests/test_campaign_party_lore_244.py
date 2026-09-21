@@ -226,6 +226,36 @@ def test_lore_events_hidden_from_other_members(api):
     assert not any("character_lore" in e["event_type"] for e in others)
 
 
+def test_lore_delete_reveals_no_existence(api):
+    """Review #414: DELETE on another player's character 404s with/without lore."""
+    client, factory, actor, owner_id, member_id, _ = api
+    camp = _create(client)
+    _add_member(factory, camp["id"], member_id)
+    actor["id"] = member_id
+    with_lore = _make_character(factory, member_id, name="HasLore")
+    without_lore = _make_character(factory, member_id, name="NoLore")
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    _select(client, camp["id"], rev, with_lore, "sel-m")
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    assert _put_lore(client, camp["id"], with_lore, rev, "secret", "ex-1").status_code == 200
+
+    actor["id"] = owner_id
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    probe_hit = client.request(
+        "DELETE", f"/api/campaigns/{camp['id']}/characters/{with_lore}/lore",
+        json={"expected_revision": rev}, headers={"Idempotency-Key": "probe-1"},
+    )
+    probe_miss = client.request(
+        "DELETE", f"/api/campaigns/{camp['id']}/characters/{without_lore}/lore",
+        json={"expected_revision": rev}, headers={"Idempotency-Key": "probe-2"},
+    )
+    assert probe_hit.status_code == 404
+    assert probe_miss.status_code == 404
+    # The lore itself is untouched by the probes.
+    actor["id"] = member_id
+    assert client.get(f"/api/campaigns/{camp['id']}/characters/{with_lore}/lore").status_code == 200
+
+
 def test_lore_validation_and_lifecycle_lock(api):
     client, factory, actor, owner_id, member_id, outsider_id = api
     camp = _create(client)
