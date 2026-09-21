@@ -31,7 +31,11 @@ Only ``current`` rows are eligible for forward-DM context, and then only as
 the lower-authority lane — direct sources always outrank them. Claim spans
 cover every stored character (overlong sentences chunk, never truncate);
 drafts exceeding the claim budget are deterministically rejected, so
-unverified prose can never become ``current`` by omission.
+unverified prose can never become ``current`` by omission. The source
+snapshot (hash + verifier evidence) covers the range events plus the
+current active facts/relations citing them, so an inline repair changes
+what the judge sees: a rebuild cannot re-verify stale pre-repair prose
+against pre-repair evidence.
 
 Summary/index failures are independently retryable derived work: they never
 delete or rewrite authoritative source records.
@@ -256,14 +260,86 @@ def _evidence_excerpt(events: list[CampaignDomainEvent]) -> list[dict[str, Any]]
     return out
 
 
-def _source_hash(events: list[CampaignDomainEvent]) -> str:
+def _source_hash(
+    events: list[CampaignDomainEvent],
+    facts: Any = (),
+    relations: Any = (),
+) -> str:
+    """Snapshot hash over events plus current repaired record versions.
+
+    Inline repairs (fact/relation supersession) carry forward the prior
+    ``source_event_id`` without emitting a new domain event, so an
+    events-only hash cannot see them: a rebuild would re-verify the same
+    pre-repair evidence and restore stale prose to ``current``. Hashing the
+    active in-range record versions makes the snapshot repair-sensitive.
+    """
     digest = hashlib.sha256()
     for event in events:
         digest.update(
             f"{event.sequence}:{event.event_type}:{event.visibility}:"
             f"{hashlib.sha256(str(event.payload or '').encode()).hexdigest()}|".encode()
         )
+    for fact in facts:
+        digest.update(
+            f"fact:{fact.id}:{fact.version}:{fact.visibility}:"
+            f"{hashlib.sha256(str(fact.content or '').encode()).hexdigest()}|".encode()
+        )
+    for relation in relations:
+        digest.update(
+            f"relation:{relation.id}:{relation.version}:{relation.visibility}:"
+            f"{relation.relation_type}:{relation.subject_entity_id}:"
+            f"{relation.object_entity_id or relation.object_label}|".encode()
+        )
     return digest.hexdigest()[:64]
+
+
+def _range_records(
+    db: Session, campaign_id: uuid.UUID, event_ids: set[Any],
+) -> tuple[list[Any], list[Any]]:
+    """Active facts/relations citing range events (repair-sensitive sources).
+
+    Only ``active`` versions: a supersede swaps the row the next snapshot
+    sees, so repaired truth — not the pre-repair row — feeds the hash and
+    the verifier. Records without an in-range source event are out of scope
+    for the range and excluded.
+    """
+    from models.world import WorldFact, WorldRelation
+
+    if not event_ids:
+        return [], []
+    facts = list(db.execute(select(WorldFact).where(
+        WorldFact.campaign_id == campaign_id,
+        WorldFact.status == "active",
+        WorldFact.source_event_id.in_(event_ids),
+    )).scalars().all())
+    relations = list(db.execute(select(WorldRelation).where(
+        WorldRelation.campaign_id == campaign_id,
+        WorldRelation.status == "active",
+        WorldRelation.source_event_id.in_(event_ids),
+    )).scalars().all())
+    return facts, relations
+
+
+def _record_excerpts(facts: Any, relations: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for fact in facts:
+        out.append({
+            "kind": "world_fact",
+            "record_id": str(fact.id),
+            "visibility": fact.visibility,
+            "content_excerpt": str(fact.content or "")[:MAX_EVIDENCE_EXCERPT],
+        })
+    for relation in relations:
+        out.append({
+            "kind": "world_relation",
+            "record_id": str(relation.id),
+            "visibility": relation.visibility,
+            "content_excerpt": (
+                f"{relation.subject_entity_id} {relation.relation_type} "
+                f"{relation.object_entity_id or relation.object_label}"
+            )[:MAX_EVIDENCE_EXCERPT],
+        })
+    return out
 
 
 def deterministic_validate(
@@ -272,6 +348,8 @@ def deterministic_validate(
     summary_visibility: str,
     *,
     prose: str,
+    facts: Any = (),
+    relations: Any = (),
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Code-owned source/range/provenance + visibility checks per claim.
 
@@ -287,6 +365,9 @@ def deterministic_validate(
     for event in events:
         if not event.visibility:
             return [], [f"source seq {event.sequence} missing visibility metadata"]
+    for record in (*facts, *relations):
+        if not getattr(record, "visibility", None):
+            return [], [f"source record {record.id} missing visibility metadata"]
     try:
         summary_rank = visibility_rank(summary_visibility)
     except ValueError as exc:
@@ -300,10 +381,14 @@ def deterministic_validate(
             f"too_many_claims: {len(claims)} spans exceed the "
             f"{MAX_CLAIMS}-claim verification budget; regenerate compressed prose"
         ]
-    narrowest = min(visibility_rank(e.visibility) for e in events)
+    narrowest = min(
+        [visibility_rank(e.visibility) for e in events]
+        + [visibility_rank(r.visibility) for r in (*facts, *relations)]
+    )
     if summary_rank > narrowest:
         narrowest_vis = min(
-            (e.visibility for e in events),
+            [e.visibility for e in events]
+            + [r.visibility for r in (*facts, *relations)],
             key=lambda v: visibility_rank(v),
         )
         return [], [
@@ -338,12 +423,24 @@ def _allowed_evidence(
     return [e for e in events if visibility_rank(e.visibility) >= summary_rank]
 
 
+def _allowed_records(
+    facts: Any, relations: Any, summary_visibility: str,
+) -> tuple[list[Any], list[Any]]:
+    """Repaired records the verifier may see (same visibility rule as events)."""
+    summary_rank = visibility_rank(summary_visibility)
+    return (
+        [f for f in facts if visibility_rank(f.visibility) >= summary_rank],
+        [r for r in relations if visibility_rank(r.visibility) >= summary_rank],
+    )
+
+
 # ── Bounded verification frames (one claim → SUPPORTED/UNSUPPORTED/DEFER) ────
 
 def build_claim_frame(
     claim: dict[str, Any],
     evidence_events: list[CampaignDomainEvent],
     *,
+    record_excerpts: list[dict[str, Any]] | None = None,
     from_sequence: int,
     to_sequence: int,
 ) -> DecisionFrame:
@@ -375,7 +472,7 @@ def build_claim_frame(
                 "source_from": claim["source_from"],
                 "source_to": claim["source_to"],
             },
-            "evidence": _evidence_excerpt(evidence_events),
+            "evidence": _evidence_excerpt(evidence_events) + list(record_excerpts or []),
             "source_range": [from_sequence, to_sequence],
         },
         state_revision=f"summary:{from_sequence}-{to_sequence}:{claim['id']}",
@@ -537,7 +634,8 @@ def consolidate_summary_for_range(
     except ValueError as exc:
         raise SummaryError(f"invalid summary visibility: {exc}") from exc
     events = _load_range(db, campaign.id, from_sequence, to_sequence)
-    source_hash = _source_hash(events)
+    facts, relations = _range_records(db, campaign.id, {e.id for e in events})
+    source_hash = _source_hash(events, facts, relations)
     evidence = _evidence_excerpt(events)
 
     row, _created = _get_or_create_row(
@@ -606,7 +704,8 @@ def consolidate_summary_for_range(
 
         claims = split_claims(prose)
         validated, failures = deterministic_validate(
-            claims, events, visibility, prose=prose)
+            claims, events, visibility, prose=prose,
+            facts=facts, relations=relations)
         if failures:
             # Deterministic rejection wins regardless of any semantic judge
             # output — the judge is not even consulted on this draft.
@@ -659,11 +758,14 @@ def consolidate_summary_for_range(
                     "claim_count": len(validated), "summary_id": str(row.id)}
 
         allowed = _allowed_evidence(events, visibility)
+        allowed_facts, allowed_relations = _allowed_records(
+            facts, relations, visibility)
+        record_excerpts = _record_excerpts(allowed_facts, allowed_relations)
         unsupported: list[str] = []
         uncertain: list[str] = []
         for claim in validated:
             frame = build_claim_frame(
-                claim, allowed,
+                claim, allowed, record_excerpts=record_excerpts,
                 from_sequence=from_sequence, to_sequence=to_sequence)
             verdict = decide_claim(
                 frame, decision_service, session_factory=session_factory)
