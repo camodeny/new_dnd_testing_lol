@@ -735,6 +735,108 @@ class VisibilityValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
+class KnowledgeValidator:
+    """Deterministic unavailable-knowledge checks against the #251 lane (issue #251).
+
+    NPC utterances that reference concrete world entities must be backed by
+    the speaking subject's fictional knowledge (code-supplied #211 lane
+    entries) or by an explicit in-turn learning source (``evidence_refs`` /
+    ``trigger_refs``). No model call, no DB: the packet's
+    ``knowledge_visibility`` lane is the authority.
+
+    Fail-conservative: perspectives missing from the lane or marked
+    unresolved are skipped (absence of evidence is not evidence of misuse).
+    Only resolved perspectives with concrete claim refs can fail.
+    """
+
+    name = "knowledge_validator"
+    category = "knowledge"
+
+    def _perspectives(self, packet) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        if packet is None:
+            return out
+        lane = next((lane for lane in packet.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY), None)
+        if lane is None:
+            return out
+        for rec in lane.records:
+            value = rec.value or {}
+            known: set[str] = set()
+            denied: set[str] = set()
+            for entry in value.get("entries") or []:
+                if not isinstance(entry, dict):
+                    continue
+                tid = str(entry.get("target_id") or "").strip()
+                if not tid:
+                    continue
+                if entry.get("knowledge_state") == "does_not_know":
+                    denied.add(tid)
+                else:
+                    known.add(tid)
+            perspective = {
+                "known": known,
+                "denied": denied,
+                "resolved": bool(value.get("subject_resolved")),
+            }
+            character_id = str(value.get("character_id") or "").strip()
+            subject_id = str(value.get("subject_entity_id") or "").strip()
+            if character_id:
+                out[character_id] = perspective
+            if subject_id:
+                out[subject_id] = perspective
+        return out
+
+    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+        t0 = time.monotonic()
+        violations: list[ValidationViolation] = []
+        perspectives = self._perspectives(packet)
+        for bi, ci, claim in _all_claims(contract):
+            if claim.claim_kind != "npc_utterance":
+                continue
+            if claim.actor_ref is None:
+                continue
+            actor_id = _norm_id(claim.actor_ref.id)
+            perspective = perspectives.get(actor_id)
+            if perspective is None or not perspective["resolved"]:
+                continue
+            refs = [
+                _norm_id(ref.id)
+                for ref in (list(claim.target_refs or []) + list(claim.topic_refs or []))
+                if _norm_id(ref.id)
+            ]
+            if not refs:
+                continue
+            # Explicit in-turn learning source excuses the utterance: the
+            # turn itself taught the speaker (typed provenance, not a guess).
+            if claim.evidence_refs or claim.trigger_refs:
+                continue
+            for ref in refs:
+                if ref in perspective["denied"]:
+                    violations.append(
+                        ValidationViolation(
+                            validator=self.name, category=self.category,
+                            code="npc_utterance_denied_knowledge",
+                            message="NPC utterance references a target the subject explicitly does not know",
+                            details={"beat": bi, "claim": ci, "actor": actor_id, "target": ref},
+                            claim_index=(bi, ci),
+                        )
+                    )
+                    break
+            else:
+                if not any(ref in perspective["known"] for ref in refs):
+                    violations.append(
+                        ValidationViolation(
+                            validator=self.name, category=self.category,
+                            code="npc_utterance_without_knowledge",
+                            message="NPC utterance references targets outside the subject's knowledge with no learning source",
+                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
+                            claim_index=(bi, ci),
+                        )
+                    )
+        latency = (time.monotonic() - t0) * 1000
+        return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
+
+
 class CanonValidator:
     """Basic current-canon contradiction checks against authoritative context.
 
@@ -952,6 +1054,7 @@ DEFAULT_VALIDATORS: list[Validator] = [
     ProvenanceValidator(),
     EpistemicValidator(),
     VisibilityValidator(),
+    KnowledgeValidator(),
     CanonValidator(),
     ContentBoundaryValidator(),
     RulesValidator(),

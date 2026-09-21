@@ -61,6 +61,11 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # (fail-closed): repositioning hidden tokens must never widen to a
     # shared audience unless the staged effect explicitly says so.
     "update_map_placement": "dm_private",
+    # Explicit in-fiction knowledge transfer (#251) defaults to dm_private
+    # (fail-closed): telling/showing/revealing secret truth writes a
+    # fictional-knowledge stance, never human disclosure — visibility grants
+    # remain a separate explicit act.
+    "transfer_knowledge": "dm_private",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -373,6 +378,45 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
             operation_id=operation_id, idempotency_key=idempotency_key,
         )
     logger.info("effect upsert_relation effect_id=%s type=%s supersedes=%s", effect.get("id"), args.get("relation_type"), supersedes)
+
+
+@register("transfer_knowledge")
+def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Record explicit in-fiction disclosure as a knowledge stance (#251).
+
+    Tell/show/reveal writes what one subject fictionally holds toward one
+    truth record via ``assert_knowledge_inline`` — it never mutates truth
+    tables and never grants human visibility. Runs inside the outer
+    ``commit_campaign_mutation`` so a failed turn commit rolls the stance
+    back with everything else. Duplicate retries keyed by the resolved
+    effect key return the existing row without re-mutating.
+    """
+    from app.world.epistemics import assert_knowledge_inline
+
+    args = effect.get("arguments") or {}
+    operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
+    idempotency_key = _resolve_effect_key(attempt, effect)
+    transfer_kind = str(args.get("transfer_kind") or "explicit_disclosure").strip().lower() or "explicit_disclosure"
+    assert_knowledge_inline(
+        db, campaign,
+        subject_kind=args.get("subject_kind"),
+        subject_entity_id=args.get("subject_entity_id"),
+        target_kind=args.get("target_kind"),
+        target_fact_id=args.get("target_fact_id"),
+        target_relation_id=args.get("target_relation_id"),
+        target_entity_id=args.get("target_entity_id"),
+        target_id=args.get("target_id"),
+        knowledge_state=args.get("knowledge_state") or "knows",
+        acquisition_source=args.get("acquisition_source") or transfer_kind,
+        visibility=args.get("visibility"),
+        provenance=args.get("provenance"),
+        source_turn_id=turn.id, source_attempt_id=attempt.id,
+        operation_id=operation_id, idempotency_key=idempotency_key,
+    )
+    logger.info(
+        "effect transfer_knowledge effect_id=%s subject=%s target_kind=%s transfer=%s",
+        effect.get("id"), args.get("subject_entity_id"), args.get("target_kind"), transfer_kind,
+    )
 
 
 @register("propose_sheet_update")

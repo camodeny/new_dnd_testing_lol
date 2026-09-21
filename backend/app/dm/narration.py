@@ -590,6 +590,7 @@ def build_narration_judge_evidence(
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
     evidence_revision: str = "",
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> Any:
     """Assemble code-owned judge evidence from a narration + contract.
 
@@ -601,7 +602,10 @@ def build_narration_judge_evidence(
     legitimate renderer output as unsupported. Player-declaration texts
     ground verbatim PC attribution, secret strings (DM-authorized,
     server-side judge use only) ground restricted material, and PC tokens
-    ground agency attribution. Never imports decision internals at module
+    ground agency attribution. ``knowledge_restricted_texts`` carries
+    fact texts unknown to the speaking subject (#251 perspective scope)
+    so the secrecy judge flags paraphrased hidden-knowledge misuse, not
+    just literal private-truth leaks. Never imports decision internals at module
     scope — the import stays local so DM layers keep one direction.
     """
     from app.decisions.judges import build_evidence
@@ -662,6 +666,8 @@ def build_narration_judge_evidence(
         if c.claim_kind == "player_declaration"
     ]
     secrets = sorted(_collect_secret_strings(contract, extra_secrets=extra_secrets))
+    if knowledge_restricted_texts:
+        secrets = sorted(set(secrets) | {s for s in knowledge_restricted_texts if s and str(s).strip()})
     tokens: set[str] = set()
     for beat in contract.beats:
         for claim in beat.claims:
@@ -694,6 +700,7 @@ def shadow_judge_narration(
     trace_id: str | None = None,
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> Any | None:
     """Run semantic judges in shadow mode over one full narration candidate.
 
@@ -714,6 +721,7 @@ def shadow_judge_narration(
             extra_secrets=extra_secrets,
             pc_names=pc_names,
             evidence_revision=str(trace_id or ""),
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
         violations = list(deterministic_violations or [])
         return shadow_judge(
@@ -742,6 +750,7 @@ def check_narration_fidelity_or_raise(
     trace_id: str | None = None,
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> None:
     violations = validate_narration_fidelity(
         narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
@@ -759,6 +768,7 @@ def check_narration_fidelity_or_raise(
         trace_id=trace_id,
         campaign_id=campaign_id,
         turn_id=turn_id,
+        knowledge_restricted_texts=knowledge_restricted_texts,
     )
     if violations:
         _tally_fidelity_violations(violations)

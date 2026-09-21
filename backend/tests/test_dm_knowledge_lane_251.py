@@ -128,8 +128,7 @@ def test_entries_truncate_at_limit():
 
 
 def test_lane_records_are_dm_only_adjudication_only():
-    Fac, camp = _setup()
-    db = Fac()
+    _, camp = _setup()
     scope = _scope(camp.id)
     record = ContextRecord(
         record_id="knowledge:no-pc",
