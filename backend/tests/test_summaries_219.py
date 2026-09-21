@@ -38,7 +38,7 @@ from app.world.summaries import (  # noqa: E402
     rebuild_stale_summaries,
     split_claims,
 )
-from models.campaigns import Campaign, CampaignDomainEvent  # noqa: E402
+from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import CampaignSummary  # noqa: E402
 
@@ -455,16 +455,58 @@ def test_forward_dm_distinguishes_summary_from_direct_sources():
     assert item["source_range"] == [e1.sequence, e1.sequence]
 
 
-def test_post_turn_run_refreshes_running_summary_without_threatening_state():
+def test_post_turn_run_verifies_running_summary_to_current():
     _F, db, c = _setup()
     e1 = _commit(db, c, payload={"n": 1})
     e2 = _commit(db, c, payload={"n": 2})
+    out = run_post_turn_range(
+        db, c.id, e1.sequence, e2.sequence,
+        clock_decision_service=_scripted(SUPPORTED),
+    )
+    assert out["duplicate"] is False
+    # The worker verifies (runtime default or injected service): the running
+    # summary is context-eligible, not stuck pending forever.
+    row = _row(db, c, 1, e2.sequence)
+    assert row is not None and row.status == "current"
+    assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == e2.sequence
+
+
+def test_post_turn_run_down_verifier_defers_without_threatening_state(monkeypatch):
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+    e2 = _commit(db, c, payload={"n": 2})
+    # The worker defaults to the runtime decision service when none is
+    # injected; a down verifier fails closed to deferred (retryable), never
+    # silently canon and never threatening the checkpoint.
+    import app.decisions
+
+    monkeypatch.setattr(
+        app.decisions, "DecisionService",
+        lambda *a, **k: DecisionService(_BoomAdapter(answers={})),
+    )
     out = run_post_turn_range(db, c.id, e1.sequence, e2.sequence)
     assert out["duplicate"] is False
-    # Derived summary work rode along best-effort (pending: no verifier here).
     row = _row(db, c, 1, e2.sequence)
-    assert row is not None and row.status == "pending"
+    assert row is not None and row.status == "deferred"
     assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == e2.sequence
+
+
+def test_explicit_none_service_stays_pending_and_retryable():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=_good_provider, decision_service=None,
+    )
+    assert out["status"] == "pending"
+    assert out["reason"] == "awaiting_verification"
+    # A later pass with a verifier converges to current on the same row.
+    out2 = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=_good_provider, decision_service=_scripted(SUPPORTED),
+    )
+    assert out2["status"] == "current"
+    assert _row(db, c, e1.sequence, e1.sequence).status == "current"
 
 
 def test_summary_failure_never_invalidates_committed_gameplay():
@@ -499,3 +541,118 @@ def test_split_claims_is_deterministic():
     first, second = split_claims(prose), split_claims(prose)
     assert first == second and len(first) == 4
     assert split_claims("") == []
+
+
+# ── Verification coverage (no silent omission) ───────────────────────────────
+
+def test_over_limit_draft_rejected_never_becomes_current():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+
+    def wordy(evidence, **kw):
+        return SummaryDraft(
+            prose=" ".join(f"Event detail number {i} holds." for i in range(60)))
+
+    adapter = FakeDecisionAdapter(answers={SUMMARY_QUESTION_ID: SUPPORTED})
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=wordy, decision_service=DecisionService(adapter),
+    )
+    assert out["status"] == "failed"
+    assert out["reason"] == "deterministic_rejection"
+    assert any("too_many_claims" in f for f in out["failures"])
+    # The over-budget draft never became quasi-canon: the judge was never
+    # even consulted, and no current summary exists for the range.
+    assert adapter.calls == []
+    assert _row(db, c, e1.sequence, e1.sequence).status == "failed"
+    assert get_valid_summaries_for_context(db, c.id, dm_internal=True) == []
+
+
+def test_long_sentence_fully_covered_by_verification():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+    long_sentence = " ".join(f"word{i}" for i in range(240)) + "."
+    assert len(long_sentence) > 1000
+
+    def lengthy(evidence, **kw):
+        return SummaryDraft(prose=f"Sequence {e1.sequence} records play. {long_sentence}")
+
+    adapter = FakeDecisionAdapter(answers={SUMMARY_QUESTION_ID: SUPPORTED})
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=lengthy, decision_service=DecisionService(adapter),
+    )
+    assert out["status"] == "current"
+    # Every span was individually judged: one decision call per chunk, each
+    # within the span bound — nothing past character 500 escaped review.
+    row = _row(db, c, e1.sequence, e1.sequence)
+    assert len(adapter.calls) == len(row.claims) >= 3
+    assert all(len(cl["text"]) <= 502 for cl in row.claims)
+
+
+class _MarkerAdapter(FakeDecisionAdapter):
+    """Supports every claim except ones carrying the planted marker."""
+
+    def execute(self, request, *, model, timeout):
+        data = super().execute(request, model=model, timeout=timeout)
+        claim_text = (request.state.get("claim") or {}).get("text", "")
+        data["answers"][SUMMARY_QUESTION_ID] = (
+            UNSUPPORTED if "UNVERIFIABLE-MARKER-XYZ" in claim_text else SUPPORTED
+        )
+        return data
+
+
+def test_unsupported_tail_past_span_bound_rejects_draft():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+    filler = " ".join(f"word{i}" for i in range(120))
+    # The marker sits well past character 500 of its sentence: under the old
+    # truncating splitter it would have escaped verification entirely.
+    tail = f"{filler} UNVERIFIABLE-MARKER-XYZ " + " ".join(
+        f"tail{i}" for i in range(60)) + "."
+
+    def sneaky(evidence, **kw):
+        return SummaryDraft(
+            prose=f"Sequence {e1.sequence} records play. {tail}")
+
+    out = consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=sneaky,
+        decision_service=DecisionService(_MarkerAdapter(answers={})),
+        max_regenerations=0,
+    )
+    assert out["status"] == "failed"
+    assert out["reason"] == "unsupported_claims_rejected"
+    assert get_valid_summaries_for_context(db, c.id, dm_internal=True) == []
+
+
+# ── Player-facing authorization ──────────────────────────────────────────────
+
+def test_player_facing_context_requires_campaign_membership():
+    _F, db, c = _setup()
+    e1 = _commit(db, c, payload={"n": 1})
+    consolidate_summary_for_range(
+        db, db.get(Campaign, c.id), e1.sequence, e1.sequence,
+        provider=_good_provider, decision_service=_scripted(SUPPORTED),
+    )
+    member = uuid.uuid4()
+    outsider = uuid.uuid4()
+    db.add(Profile(id=member, email="member@x.com"))
+    db.add(Profile(id=outsider, email="outsider@x.com"))
+    db.add(CampaignMember(campaign_id=c.id, user_id=member, role="player"))
+    db.commit()
+
+    owner = db.get(Campaign, c.id).owner_id
+    assert len(get_valid_summaries_for_context(
+        db, c.id, viewer_user_id=owner, dm_internal=False)) == 1
+    assert len(get_valid_summaries_for_context(
+        db, c.id, viewer_user_id=member, dm_internal=False)) == 1
+    # No viewer, garbage viewer, and non-member viewers get nothing — a
+    # known campaign ID alone must not disclose summaries.
+    assert get_valid_summaries_for_context(db, c.id, dm_internal=False) == []
+    assert get_valid_summaries_for_context(
+        db, c.id, viewer_user_id="not-a-uuid", dm_internal=False) == []
+    assert get_valid_summaries_for_context(
+        db, c.id, viewer_user_id=outsider, dm_internal=False) == []
+    # DM-internal authority lane is unaffected by viewer gating.
+    assert len(get_valid_summaries_for_context(db, c.id, dm_internal=True)) == 1

@@ -28,7 +28,10 @@ Lifecycle: ``pending`` (generated, awaiting verification) → ``current``
 ``stale`` (source repair/retcon invalidated the range); ``failed``
 (generation error, deterministic rejection, or exhausted regeneration).
 Only ``current`` rows are eligible for forward-DM context, and then only as
-the lower-authority lane — direct sources always outrank them.
+the lower-authority lane — direct sources always outrank them. Claim spans
+cover every stored character (overlong sentences chunk, never truncate);
+drafts exceeding the claim budget are deterministically rejected, so
+unverified prose can never become ``current`` by omission.
 
 Summary/index failures are independently retryable derived work: they never
 delete or rewrite authoritative source records.
@@ -114,6 +117,7 @@ _MEMBER_VISIBLE = frozenset({"campaign", "public"})
 # Deterministic bounds.
 MAX_PROSE_CHARS = 8000
 MAX_CLAIMS = 50
+MAX_CLAIM_SPAN = 500
 MAX_EVIDENCE_EXCERPT = 1000
 
 
@@ -173,15 +177,61 @@ def default_stub_provider(
 _CLAIM_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])|\n+")
 
 
+def _chunk_span(part: str, *, limit: int = MAX_CLAIM_SPAN) -> list[str]:
+    """Split one overlong sentence into fully-covering claim spans.
+
+    Chunking prefers whitespace boundaries but coverage is exact: no
+    character is ever truncated, so no stored prose can escape
+    verification. A trailing fragment below the verifiable minimum cannot
+    stand alone, so it folds into the previous span rather than dropping.
+    """
+    rest = part.strip()
+    if not rest:
+        return []
+    chunks: list[str] = []
+    while rest:
+        if len(rest) <= limit:
+            chunks.append(rest)
+            break
+        cut = rest.rfind(" ", 0, limit + 1)
+        cut = cut if cut > 0 else limit
+        chunks.append(rest[:cut].rstrip())
+        rest = rest[cut:].strip()
+    if len(chunks) > 1 and len(chunks[-1]) < 3:
+        tail = chunks.pop()
+        chunks[-1] = f"{chunks[-1]} {tail}".strip()
+    return [c for c in chunks if c and len(c) >= 3]
+
+
 def split_claims(prose: str) -> list[str]:
-    """Deterministically split prose into verifiable claim spans."""
+    """Deterministically split prose into verifiable claim spans.
+
+    Every character of the prose is covered by exactly one span: overlong
+    sentences are chunked (never truncated) and no span is dropped for
+    count. When the span count exceeds MAX_CLAIMS, deterministic validation
+    rejects the draft — verification never silently skips stored prose.
+    """
     text = str(prose or "").strip()
     if not text:
         return []
     parts = [p.strip() for p in _CLAIM_SPLIT_RE.split(text) if p and p.strip()]
     if not parts:
         return [text] if len(text) >= 3 else []
-    return [p[:500] for p in parts[:MAX_CLAIMS] if len(p) >= 3]
+    spans: list[str] = []
+    for part in parts:
+        spans.extend(_chunk_span(part))
+    # Fold fragments below the verifiable minimum into a neighbor so no
+    # stored character escapes verification (coverage stays exact).
+    merged: list[str] = []
+    for span in spans:
+        if len(span) < 3 and merged:
+            merged[-1] = f"{merged[-1]} {span}".strip()
+        else:
+            merged.append(span)
+    if len(merged) > 1 and len(merged[0]) < 3:
+        merged[1] = f"{merged[0]} {merged[1]}".strip()
+        del merged[0]
+    return [s for s in merged if len(s) >= 3]
 
 
 # ── Deterministic validation (code-owned; never delegated) ───────────────────
@@ -245,6 +295,11 @@ def deterministic_validate(
         return [], ["prose_too_long"]
     if not claims:
         return [], ["no_verifiable_claims"]
+    if len(claims) > MAX_CLAIMS:
+        return [], [
+            f"too_many_claims: {len(claims)} spans exceed the "
+            f"{MAX_CLAIMS}-claim verification budget; regenerate compressed prose"
+        ]
     narrowest = min(visibility_rank(e.visibility) for e in events)
     if summary_rank > narrowest:
         narrowest_vis = min(
@@ -822,6 +877,25 @@ def rebuild_stale_summaries(
 
 # ── Context-assembler access (lower-authority lane) ──────────────────────────
 
+def _context_uuid(value: Any) -> uuid.UUID | None:
+    try:
+        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _is_campaign_member(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> bool:
+    """Owner-or-member gate mirroring retrieval/clocks player-facing reads."""
+    if campaign.owner_id == viewer_id:
+        return True
+    from app.campaigns.service import is_campaign_member
+
+    try:
+        return bool(is_campaign_member(db, campaign.id, viewer_id))
+    except Exception:
+        return False
+
+
 def get_valid_summaries_for_context(
     db: Session,
     campaign_id: uuid.UUID,
@@ -833,12 +907,38 @@ def get_valid_summaries_for_context(
     """Current valid summaries as explicitly lower-authority context.
 
     Only ``current`` (fully verified) rows are eligible. Player-facing
-    callers receive member-visible summaries only; DM-internal callers keep
-    visibility metadata for later projection. Every item carries
-    ``authority: "derived_summary"`` plus the stronger lanes that outrank
-    it, so forward-DM code can distinguish summary evidence from direct
-    sources at a glance.
+    callers must supply a viewer with campaign membership (owner counts);
+    unknown campaigns, missing viewers, and non-members get nothing — an
+    arbitrary user UUID plus a known campaign ID must not read that
+    campaign's summaries. DM-internal callers keep visibility metadata for
+    later projection. Every item carries ``authority: "derived_summary"``
+    plus the stronger lanes that outrank it, so forward-DM code can
+    distinguish summary evidence from direct sources at a glance.
     """
+    if not dm_internal:
+        campaign = db.get(Campaign, campaign_id)
+        if campaign is None:
+            return []
+        raw = (
+            viewer_user_id
+            if isinstance(viewer_user_id, (list, tuple))
+            else [viewer_user_id]
+        )
+        member = any(
+            (vid := _context_uuid(value)) is not None
+            and _is_campaign_member(db, campaign, vid)
+            for value in raw
+        )
+        if not member:
+            structured_log(
+                logger, logging.INFO, "campaign_summary_context_denied",
+                campaign_id=str(campaign_id),
+                reason=(
+                    "viewer_required" if viewer_user_id is None
+                    else "not_campaign_member"
+                ),
+            )
+            return []
     rows = list(db.execute(
         select(CampaignSummary)
         .where(CampaignSummary.campaign_id == campaign_id,

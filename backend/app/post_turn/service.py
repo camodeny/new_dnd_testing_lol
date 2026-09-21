@@ -804,8 +804,15 @@ def _best_effort_running_summary(
     Independently retryable derived work: any failure is swallowed (with a
     rollback of the summary-only transaction) so it never threatens the
     already-committed checkpoint advancement or authoritative state above.
+
+    Verification runs on the runtime decision service by default (same
+    pattern as #217 materialize / #218 clocks), so normal post-turn
+    processing can actually produce a context-eligible ``current`` summary.
+    A down/unconfigured verifier fails closed to ``deferred`` — retryable,
+    never silently canon — rather than permanent ``pending``.
     """
     try:
+        from app.decisions import DecisionService
         from app.world import summaries as _summaries
 
         campaign = db.get(Campaign, campaign_id)
@@ -813,7 +820,7 @@ def _best_effort_running_summary(
             return
         _summaries.consolidate_summary_for_range(
             db, campaign, 1, int(to_sequence),
-            decision_service=decision_service,
+            decision_service=decision_service or DecisionService(),
             session_factory=session_factory,
             operation_id=f"post-turn-summary:1-{to_sequence}",
             commit=commit,
