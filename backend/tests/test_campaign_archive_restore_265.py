@@ -698,31 +698,33 @@ def test_only_owner_may_archive_or_restore_and_access_never_broadens(api):
         assert db.get(CampaignThreadMember, {"thread_id": private_id, "user_id": member_id}) is not None
 
 
-def test_solo_bootstrap_rejected_while_archived(api):
+def test_world_seed_rejected_while_archived(api):
+    from models.world import WorldEntity
+
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
     cid = campaign["id"]
     rev = campaign["revision"]
     with factory() as db:
-        threads_before = db.scalar(
-            select(func.count()).select_from(CampaignThread).where(
-                CampaignThread.campaign_id == uuid.UUID(cid)
+        entities_before = db.scalar(
+            select(func.count()).select_from(WorldEntity).where(
+                WorldEntity.campaign_id == uuid.UUID(cid)
             )
         )
     assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
-    bootstrap = client.post(
-        f"/api/campaigns/{cid}/solo-bootstrap",
-        json={},
-        headers={"Idempotency-Key": "bootstrap-archived"},
+    seed = client.post(
+        f"/api/campaigns/{cid}/world-seed",
+        json={"operation_id": "seed-archived"},
+        headers={"Idempotency-Key": "seed-archived"},
     )
-    assert bootstrap.status_code == 409
+    assert seed.status_code == 409
     with factory() as db:
-        threads_after = db.scalar(
-            select(func.count()).select_from(CampaignThread).where(
-                CampaignThread.campaign_id == uuid.UUID(cid)
+        entities_after = db.scalar(
+            select(func.count()).select_from(WorldEntity).where(
+                WorldEntity.campaign_id == uuid.UUID(cid)
             )
         )
-        assert threads_after == threads_before
+        assert entities_after == entities_before
 
 
 def test_archived_table_freezes_adventure_and_pc_lifecycle(api):

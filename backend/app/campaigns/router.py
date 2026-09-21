@@ -591,24 +591,24 @@ def transition_campaign_lifecycle(
     return result
 
 
-@router.post("/api/campaigns/{campaign_id}/solo-bootstrap")
-def solo_bootstrap_campaign(
+@router.post("/api/campaigns/{campaign_id}/world-seed")
+def world_seed_campaign(
     campaign_id: str,
     payload: dict,
     request: Request,
     response: Response,
     db: Session = Depends(get_db),
 ):
-    """Minimal solo start into the production live-table runtime — issue #355.
+    """Production world-seed generation — issue #245.
 
-    Pre-alpha scaffold; deleted/replaced by #245/#246. Owner-only, exactly one
-    ready member. Idempotent under repeated clicks (state-guarded).
-
-    Transaction boundary: ``run_solo_bootstrap`` is flush-only; the single
-    atomic commit happens in ``execute_http_idempotent``. DM execution is
-    triggered best-effort only after that commit succeeds (never inside).
+    Owner-only. Requires a fully ready launch party (any size 1..6).
+    Generates, validates, and stages durable seed canon (location, NPCs,
+    faction, party characters, relations, facts, knowledge, starting scene,
+    one pressure clock) and moves lobby -> starting atomically. Idempotent
+    under repeated calls: an existing seed event converges without new
+    writes. Failures leave the campaign pre-start for corrected retry.
     """
-    from app.campaigns.solo_bootstrap import SoloBootstrapError, run_solo_bootstrap
+    from app.campaigns.world_seed import WorldSeedError, run_world_seed
 
     profile = resolve_profile(request, db)
     try:
@@ -620,11 +620,11 @@ def solo_bootstrap_campaign(
 
     def _execute():
         try:
-            return run_solo_bootstrap(
+            return run_world_seed(
                 db, cid, actor_id=profile.id,
                 operation_id=operation_id or idempotency_key,
             )
-        except SoloBootstrapError as exc:
+        except WorldSeedError as exc:
             msg = str(exc)
             if msg == "Campaign not found":
                 raise HTTPException(status_code=404, detail=msg) from exc
@@ -632,52 +632,26 @@ def solo_bootstrap_campaign(
                 raise HTTPException(status_code=403, detail=msg) from exc
             raise HTTPException(status_code=409, detail=msg) from exc
         except RevisionConflictError as exc:
-            # Concurrent-start loser: the whole idempotent command (including
+            # Concurrent-seed loser: the whole idempotent command (including
             # its record) rolled back atomically, so retrying the same key
             # is a fresh command that converges via reuse.
             raise HTTPException(
                 status_code=409,
-                detail="Concurrent campaign start conflicted; retry the request",
+                detail="Concurrent world seed conflicted; retry the request",
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
 
-    result = execute_http_idempotent(
+    return execute_http_idempotent(
         db,
         response,
         actor_id=profile.id,
         idempotency_key=idempotency_key,
-        command_type="campaign.solo_bootstrap",
+        command_type="campaign.world_seed",
         scope_type="campaign",
         scope_id=cid,
         payload=payload,
         execute=_execute,
     )
-    # Post-commit best-effort DM execution: the opening attempt is durable
-    # now, so executing outside the idempotent transaction cannot wedge
-    # retries. Skipped on idempotent replay (already handled) and when no
-    # session factory exists (tests). Provider failures leave the pending
-    # turn as the owed opening turn for the cron sweep.
-    if response.headers.get("X-Idempotent-Replay") != "true":
-        attempt_id = (result.get("dm_attempt") or {}).get("id") if isinstance(result, dict) else None
-        if attempt_id:
-            try:
-                from database import SessionLocal as _SessionLocal
-
-                if _SessionLocal is not None:
-                    with _SessionLocal() as execution_db:
-                        from app.dm.execution import execute_dm_attempt
-
-                        execute_dm_attempt(execution_db, uuid_lib.UUID(str(attempt_id)))
-                    logger.info(
-                        "solo_bootstrap post_commit_execute_attempted campaign_id=%s attempt_id=%s",
-                        cid, attempt_id,
-                    )
-            except Exception as exc:
-                logger.warning(
-                    "solo_bootstrap post_commit_execute_deferred campaign_id=%s attempt_id=%s error=%s",
-                    cid, attempt_id, exc,
-                )
-    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/mutations")

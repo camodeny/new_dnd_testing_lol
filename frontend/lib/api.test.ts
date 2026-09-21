@@ -122,9 +122,9 @@ describe('exported API surface', () => {
       'quickCreate',
       'randomBrief',
       'restoreTarget',
-      'soloBootstrap',
       'transitionLifecycle',
       'update',
+      'worldSeed',
     ])
     expect(Object.keys(api.characters).sort()).toEqual([
       'chatStream',

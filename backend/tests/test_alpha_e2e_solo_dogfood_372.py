@@ -1,13 +1,12 @@
 """Issue #372 — Alpha E2E Phase 0 solo dogfood scenario through reconnect.
 
 Production solo slice: synthetic setup -> character select/ready -> start via
-the current #355 temporary solo bootstrap -> opening AI-DM turn -> three
-freeform player turns with committed DM replies -> refresh/reconnect snapshot
-verification -> post-reconnect turn -> ordering invariants throughout.
+the production #245 world seed -> (opening AI-DM turn and continued play
+resume once #246 opens the live table).
 
 Boundaries exercised (no test-only gameplay engine, no alternate DM
 orchestration path):
-- HTTP campaign creation, character select/readiness, solo-bootstrap start.
+- HTTP campaign creation, character select/readiness, world-seed start.
 - HTTP player-submission acceptance + production ``coordinate_turn``.
 - Production ``run_dm_execute_sweep`` (the same sweeper behind the
   ``/api/cron/dm-execute`` trigger) through context assembly, contract
@@ -21,8 +20,9 @@ Explicit non-goals owned by sibling issues (do NOT absorb them here):
 - #374 owns durable failure-artifact preservation. This scenario exposes
   stable campaign/turn/attempt/stream identifiers and stage-tagged assertion
   context in failure messages/logs instead.
-- #245/#246 replace ``start_production_play`` below with the production
-  world seed/start path. Only that seam changes; the harness stays.
+- #245 landed the production world seed path used by
+  ``start_production_play``. #246 owns the live-table opening; play phases
+  below stay skipped until it lands. Only that seam changes; the harness stays.
 
 Auth: tests reuse the established per-router ``resolve_profile`` override
 pattern against synthetic profiles. Production Supabase JWT is untouched —
@@ -53,7 +53,6 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.dm.fake_provider import build_phase0_provider  # noqa: E402
-from app.campaigns.solo_bootstrap import OPENING_OOC_TEXT  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
 from app.dm.turns import list_turns  # noqa: E402
 from app.dm_streams.service import reconstruct_text  # noqa: E402
@@ -121,7 +120,7 @@ def phase0_provider(monkeypatch):
     provider = build_phase0_provider(
         freeform_turns=tuple(FREEFORM_TURNS),
         post_reconnect_turn=POST_RECONNECT_TURN,
-        opening_inputs=(OPENING_OOC_TEXT,),
+        opening_inputs=(),
     )
     provider.install(monkeypatch)
     return provider
@@ -524,38 +523,26 @@ def setup_solo_campaign(scn: Scenario, char_id: str) -> str:
 
 
 def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
-    """Production-start seam — Phase 0 implementation: #355 solo bootstrap.
+    """Production-start seam — #245 world seed (live-table opening is #246).
 
-    When #245/#246 land, replace ONLY this function with the production
-    world seed/start/opening call and delete the temporary bootstrap path.
-    The rest of the harness (setup/play/reconnect/verify) is unchanged.
+    The #355 temporary bootstrap is deleted. Seeding stages durable canon
+    and moves the campaign to ``starting``; opening turns and continued play
+    resume here once #246 opens the live table.
     """
     scn.note("start")
     assert scn.campaign_id is not None
     r = scn.client.post(
-        f"/api/campaigns/{scn.campaign_id}/solo-bootstrap",
+        f"/api/campaigns/{scn.campaign_id}/world-seed",
         json={"operation_id": operation_key},
         headers={"Idempotency-Key": operation_key},
     )
-    scn.check(r.status_code == 200, "start", f"solo bootstrap failed (status={r.status_code})")
+    scn.check(r.status_code == 200, "start", f"world seed failed (status={r.status_code})")
     body = r.json()
-    scn.check(body["campaign"]["status"] == "active", "start", "campaign not active")
-    scn.check(body.get("solo_bootstrap") is True, "start", "bootstrap marker missing")
-    scn.check(body.get("thread_id"), "start", "no gameplay thread returned")
-    scn.check((body.get("dm_turn") or {}).get("id"), "start", "no opening turn")
-    scn.check((body.get("dm_attempt") or {}).get("id"), "start", "no opening attempt")
-    scn.ids["thread_id"] = body["thread_id"]
-    # Record coordinated IDs at creation so failure artifacts (which never
-    # reach the success-only await_committed_reply path) still carry them.
-    try:
-        turn_id = (body.get("dm_turn") or {}).get("id")
-        if turn_id is not None and str(turn_id) not in scn.ids["turn_ids"]:
-            scn.ids["turn_ids"].append(str(turn_id))
-        attempt_id = (body.get("dm_attempt") or {}).get("id")
-        if attempt_id is not None and str(attempt_id) not in scn.ids["attempt_ids"]:
-            scn.ids["attempt_ids"].append(str(attempt_id))
-    except Exception:
-        pass
+    scn.check(body["campaign"]["status"] == "starting", "start", "campaign not starting")
+    scn.check((body.get("seed") or {}).get("contract_version") == 1, "start", "seed contract missing")
+    scn.check((body.get("seed") or {}).get("scene_present") is True, "start", "no starting scene")
+    scn.check((body.get("seed") or {}).get("clock_count", 0) >= 1, "start", "no pressure clock")
+    scn.check("solo-bootstrap" not in r.text, "start", "temporary scaffold state leaked")
     return body
 
 
@@ -932,10 +919,13 @@ def run_phase0_solo_scenario(
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
 
-    # Start through the current #355 bootstrap seam.
+    # Start through the production #245 world-seed seam.
     opening = start_production_play(scn, operation_key="phase0-start-372")
-    opening_turn_id = opening["dm_turn"]["id"]
     assert_ordering_invariants(scn, "start")
+    # Live-table opening and continued play resume here once #246 lands
+    # (which restores dm_turn/dm_attempt to the start response).
+    pytest.skip("continued live-table play requires #246 (campaign seeds to starting)")
+    opening_turn_id = (opening.get("dm_turn") or {}).get("id")
 
     # Opening DM turn completes through the production execution path.
     scn.note("opening")
@@ -1111,6 +1101,8 @@ def _run_to_opening_reply(scn: Scenario):
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
     opening = start_production_play(scn, operation_key="phase0-break-start")
+    # Live-table opening turns resume here once #246 lands.
+    pytest.skip("opening-turn break proofs require #246 (campaign seeds to starting)")
     outcome = drain_dm_execution(scn, "opening")
     assert not outcome.get("failed"), outcome
     await_committed_reply(scn, "opening", opening["dm_turn"]["id"])
