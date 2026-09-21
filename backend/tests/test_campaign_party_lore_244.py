@@ -206,6 +206,26 @@ def test_private_lore_owner_denied_and_idempotent(api):
     assert client.get(f"/api/campaigns/{camp['id']}/characters/{char_id}/lore").status_code == 404
 
 
+def test_lore_events_hidden_from_other_members(api):
+    """Review #414: lore mutation events are private — invisible in others' feed."""
+    client, factory, actor, owner_id, member_id, _ = api
+    camp = _create(client)
+    _add_member(factory, camp["id"], member_id)
+    actor["id"] = member_id
+    char_id = _make_character(factory, member_id, name="Quiet")
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    _select(client, camp["id"], rev, char_id, "sel-m")
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    assert _put_lore(client, camp["id"], char_id, rev, "hidden secret", "ev-1").status_code == 200
+
+    # Actor sees their own private event; owner and others do not.
+    mine = client.get(f"/api/campaigns/{camp['id']}/events").json()["events"]
+    assert any(e["event_type"] == "campaign.character_lore_updated" for e in mine)
+    actor["id"] = owner_id
+    others = client.get(f"/api/campaigns/{camp['id']}/events").json()["events"]
+    assert not any("character_lore" in e["event_type"] for e in others)
+
+
 def test_lore_validation_and_lifecycle_lock(api):
     client, factory, actor, owner_id, member_id, outsider_id = api
     camp = _create(client)

@@ -1535,6 +1535,9 @@ def put_character_lore(
             actor_id=profile.id,
             targets={"character_id": str(char_id)},
             payload={"character_id": str(char_id), "content_length": len(content)},
+            # Private lore events stay out of the member-visible feed —
+            # the actor still sees their own via the actor_id rule.
+            visibility="private",
             mutate=_mutate,
             commit=False,
         )
@@ -1640,6 +1643,8 @@ def delete_character_lore(
             actor_id=profile.id,
             targets={"character_id": str(char_id)},
             payload={"character_id": str(char_id)},
+            # Same private-feed rule as lore updates.
+            visibility="private",
             mutate=_mutate,
             commit=False,
         )
