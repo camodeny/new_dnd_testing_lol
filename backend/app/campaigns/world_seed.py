@@ -417,7 +417,9 @@ def run_world_seed(
     members = db.execute(
         _select(CampaignMember).where(CampaignMember.campaign_id == campaign.id)
     ).scalars().all()
-    members = list(members)
+    # Deterministic member order so derived hook indices (and their
+    # idempotency keys) are stable across retries.
+    members = sorted(members, key=lambda m: (str(m.user_id), str(m.selected_character_id)))
     eligibility = compute_start_eligibility(campaign, members, db)
     if not eligibility.get("eligible"):
         raise WorldSeedError(
@@ -447,6 +449,11 @@ def run_world_seed(
     # public event payload or the HTTP projection, so one player's lore
     # presence is not inferable from another player's visible output (#244).
     lore_consumed = len(lore_bundle)
+    # Secret-derived hooks whose rendered text violates the campaign's
+    # content boundaries are silently suppressed at stage time: boundaries
+    # constrain generated material before acceptance, but suppression must
+    # not change any owner-visible outcome (#244 oracle).
+    hook_deny = _deny_phrases(getattr(campaign, "content_boundaries", None))
 
     holder: dict = {}
     from_status = str(campaign.status)
@@ -515,21 +522,35 @@ def run_world_seed(
         )
         hook_fact_by_char: dict[str, str] = {}
         hook_count = 0
+        suppressed_hooks = 0
         for idx, hook in enumerate(spec["hooks"]):
             # Kind-labeled metadata reference only — raw lore content never
             # enters canon; the kind makes lore differences visible to the
-            # DM without exposing recoverable text.
+            # DM without exposing recoverable text. Hooks violating the
+            # campaign's content boundaries are silently dropped (no
+            # owner-visible signal either way).
+            hook_text = (
+                f"Unrevealed {hook['kind']} hook for {hook['character_name']} "
+                f"(private lore v{hook['lore_version']}); the DM may surface it through play."
+            )
+            if any(
+                phrase and phrase in hook_text.lower()
+                for phrase in hook_deny
+            ):
+                suppressed_hooks += 1
+                continue
             hook_fact, _ = create_fact_inline(
-                db, locked,
-                content=(
-                    f"Unrevealed {hook['kind']} hook for {hook['character_name']} "
-                    f"(private lore v{hook['lore_version']}); the DM may surface it through play."
-                ),
+                db, locked, content=hook_text,
                 epistemic_state="confirmed", visibility="dm_only", provenance=prov,
                 operation_id=f"{operation_id}:hook:{idx}", idempotency_key=ck(f"hook:{idx}"),
             )
             hook_count += 1
             hook_fact_by_char[str(hook["character_id"])] = str(hook_fact.id)
+        if suppressed_hooks:
+            logger.info(
+                "world_seed hooks_suppressed_by_boundary campaign_id=%s count=%s",
+                campaign.id, suppressed_hooks,
+            )
 
         # Party knowledge: every seeded PC knows the starting situation;
         # each hooked PC holds its own unrevealed hook (DM-restricted record).
@@ -548,7 +569,10 @@ def run_world_seed(
         for hook in spec["hooks"]:
             row = char_by_pc_id.get(str(hook["character_id"]))
             hook_fact_id = hook_fact_by_char.get(str(hook["character_id"]))
-            if row is None or hook_fact_id is None:
+            if hook_fact_id is None:
+                # Boundary-suppressed hook: no staged fact, no knowledge row.
+                continue
+            if row is None:
                 raise WorldSeedError("World seed hook does not resolve to a seeded character")
             assert_knowledge_inline(
                 db, locked, subject_kind="character", subject_entity_id=row.id,

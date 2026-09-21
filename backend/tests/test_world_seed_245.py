@@ -256,16 +256,7 @@ def test_world_seed_member_lore_invisible_in_public_output(api):
     client, factory, actor, owner_id, member_id, _ = api
 
     def _seeded_campaign(key_suffix: str, with_member_lore: bool) -> dict:
-        # The lored campaign also denies the full hook-kind vocabulary: an
-        # owner boundary probe must not distinguish member lore presence.
-        boundaries = (
-            {"exclude": ["oath", "debt", "loss", "hidden_foe", "secret_kin", "quest", "past"]}
-            if with_member_lore else None
-        )
-        campaign = _create(
-            client, required_players=2, name=f"Lore invis {key_suffix}",
-            **({"content_boundaries": boundaries} if boundaries else {}),
-        )
+        campaign = _create(client, required_players=2, name=f"Lore invis {key_suffix}")
         with factory() as db:
             db.add(CampaignMember(
                 campaign_id=uuid.UUID(campaign["id"]), user_id=member_id,
@@ -315,6 +306,54 @@ def test_world_seed_member_lore_invisible_in_public_output(api):
         assert debt_hooks, "expected a DM-private debt hook fact"
         for f in facts:
             assert "crimson-ledger-99" not in (f.content or "")
+
+
+def test_world_seed_denied_hook_suppressed_silently(api):
+    """A boundary-violating secret hook is dropped with no visible signal.
+
+    The seed still succeeds and the public projection is indistinguishable
+    from a seed with no such hook — the owner cannot probe lore via hooks.
+    """
+    client, factory, actor, owner_id, member_id, _ = api
+    campaign = _create(
+        client, required_players=2, name="Hook suppression",
+        content_boundaries={"exclude": ["secret_kin"]},
+    )
+    with factory() as db:
+        db.add(CampaignMember(
+            campaign_id=uuid.UUID(campaign["id"]), user_id=member_id,
+        ))
+        db.commit()
+    chars = _ready_lobby(factory, campaign["id"], [owner_id, member_id])
+    member_char = chars[str(member_id)]
+    with factory() as db:
+        db.add(CampaignCharacterLore(
+            campaign_id=uuid.UUID(campaign["id"]),
+            character_id=member_char.id, user_id=member_id,
+            content="My brother vanished beyond the fog and I seek him still",
+            visibility="private", version=1,
+        ))
+        db.commit()
+
+    response = _seed(client, campaign["id"], "op-seed-suppress")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["campaign"]["status"] == "starting"
+    # The deny phrase echoes in the owner-set campaign settings, but no
+    # lore-derived surface may carry it.
+    assert "secret_kin" not in json.dumps(body["seed"])
+    assert "brother" not in json.dumps(body)
+
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        facts = db.execute(
+            select(WorldFact).where(WorldFact.campaign_id == cid)
+        ).scalars().all()
+        assert not [f for f in facts if "secret_kin" in (f.content or "")]
+        assert not [f for f in facts if "brother" in (f.content or "")]
+        # The rest of the seed (situation, secret, clock) is intact.
+        assert [f for f in facts if f.visibility == "campaign"]
+        assert [f for f in facts if f.visibility == "dm_only"]
 
 
 def test_world_seed_difficulty_shapes_pressure(api):
