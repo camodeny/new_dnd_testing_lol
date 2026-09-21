@@ -304,6 +304,12 @@ describe('useLiveTableRealtime snapshot fallback', () => {
   })
 
   it('subscribes to projection.invalidated and reloads the snapshot on it', async () => {
+    const SURFACES = { clues: { records: [{ id: 'fact-1' }], visible: 1 } }
+    mockedFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/realtime/authorize')) return {}
+      if (url.includes('/snapshot')) return { ...SNAPSHOT, surfaces: SURFACES }
+      throw new Error(`unexpected ${url}`)
+    })
     const registrations: Array<{ event: string; handler: (payload: unknown) => void }> = []
     const fakeChannel: Record<string, unknown> = {}
     fakeChannel.on = (_event: unknown, filter: unknown, handler: (payload: unknown) => void) => {
@@ -346,6 +352,8 @@ describe('useLiveTableRealtime snapshot fallback', () => {
       })
     })
     expect(snapshotCalls().length).toBeGreaterThan(before)
+    // The refreshed private surfaces become observable hook state.
+    expect(seen.latest?.surfaces).toEqual(SURFACES)
 
     await act(async () => {
       root.unmount()

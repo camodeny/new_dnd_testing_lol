@@ -434,6 +434,54 @@ def test_authoritative_grant_and_revoke_publish_invalidation(ctx):
         db.close()
 
 
+def test_dm_only_map_zones_absent_for_non_owner(ctx):
+    """Review #418 round 3: hidden trap geometry (kind/rect/label) must be
+    absent from unauthorized payloads — in surfaces AND the full snapshot."""
+    from app.combat.maps import ensure_map
+    from models.combat import Encounter
+
+    db = _db(ctx)
+    try:
+        camp = db.get(Campaign, ctx["campaign_id"])
+        enc = Encounter(
+            campaign_id=camp.id, thread_id=str(ctx["thread_id"]),
+            status="pending_initiative",
+        )
+        db.add(enc)
+        db.flush()
+        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
+        ensure_map(
+            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
+            terrain=[
+                {"kind": "difficult",
+                 "rect": {"col": 0, "row": 0, "width": 2, "height": 2},
+                 "visibility": "public"},
+                {"kind": "blocked",
+                 "rect": {"col": 4, "row": 3, "width": 1, "height": 1},
+                 "visibility": "dm_only", "label": "secret pit trap"},
+            ],
+            expected_revision=rev, operation_id="op-trapmap-250", commit=True,
+        )
+        alice_view = build_surfaces_for_viewer(db, camp, ctx["alice"])
+        assert alice_view["maps"]["visible"] is True
+        alice_zones = alice_view["maps"]["map"]["zones"]
+        assert len(alice_zones) == 1
+        assert alice_zones[0]["kind"] == "difficult"
+        assert "secret pit trap" not in str(alice_view["maps"])
+        owner_view = build_surfaces_for_viewer(db, camp, ctx["owner"])
+        assert len(owner_view["maps"]["map"]["zones"]) == 2
+
+        # Full-snapshot paths expose the same safe projection.
+        from app.snapshot.service import build_live_table_snapshot
+
+        snap = build_live_table_snapshot(db, ctx["campaign_id"], ctx["alice"])
+        assert "secret pit trap" not in str(snap["surfaces"]["maps"])
+        assert "secret pit trap" not in str(snap["encounter"])
+        assert len(snap["surfaces"]["maps"]["map"]["zones"]) == 1
+    finally:
+        db.close()
+
+
 def test_snapshot_wires_surfaces(ctx):
     from app.snapshot.service import build_live_table_snapshot
 

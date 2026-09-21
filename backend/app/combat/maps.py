@@ -1360,13 +1360,15 @@ def map_projection(
 ) -> dict | None:
     """Full map/terrain/placement projection; None when no map exists.
 
-    Viewer-aware privacy: DM-only terrain labels are stripped for
-    non-owners (mechanical kind/rect stay — they govern shared movement),
-    and tokens of hidden-entity NPC/monster participants are hidden from
-    non-owners entirely (fog/hidden hook). Token hiding follows the source
-    entity visibility signal, never ``stat_visibility`` (#230 stats-privacy
-    stays separate). The AI is the only DM: ownership here means the
-    campaign owner on the runtime path.
+    Viewer-aware privacy: DM-only terrain zones are omitted for non-owners
+    entirely — kind, rect, and label are all absent, not merely unlabeled
+    (issue #250: hidden map geometry must never reach unauthorized
+    payloads; movement legality stays server-side in commit geometry, so
+    clients never need hidden rects). Tokens of hidden-entity NPC/monster
+    participants are hidden from non-owners entirely (fog/hidden hook).
+    Token hiding follows the source entity visibility signal, never
+    ``stat_visibility`` (#230 stats-privacy stays separate). The AI is the
+    only DM: ownership here means the campaign owner on the runtime path.
     """
     encounter_map = get_map(db, encounter.id)
     if encounter_map is None:
@@ -1374,6 +1376,7 @@ def map_projection(
     zones = [
         z.to_dict(include_dm_label=is_owner)
         for z in list_zones(db, encounter_map.id)
+        if is_owner or str(z.visibility or "") != "dm_only"
     ]
     participants = {str(p.id): p for p in list_participants(db, encounter.id)}
     hidden_ids = set() if is_owner else _hidden_token_ids(db, encounter.id)
