@@ -340,3 +340,148 @@ def test_post_turn_status_exposes_backpressure_observability():
     assert bp["safe_budget_bytes"] > 0
     assert bp["processed_through"] == 0
     db.close()
+
+
+# ── Review #419 round 1: resume must survive revision-advancing catch-up ───
+
+def _respond_contract():
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+
+    return normalize_contract(
+        {
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": "story continuation",
+            "beats": [
+                {
+                    "id": "beat_1",
+                    "type": "narration",
+                    "claims": [
+                        {
+                            "text": "The dust settles and the room is quiet.",
+                            "claim_kind": "observation",
+                            "origin": "dm_adjudication",
+                            "visibility": "public",
+                        }
+                    ],
+                }
+            ],
+            "open_player_choice": "What do you do?",
+        }
+    )
+
+
+def test_blocked_input_resolves_after_revision_advancing_catchup(monkeypatch):
+    """Catch-up that advances Campaign.revision must not strand blocked input.
+
+    The blocked attempt is prepared at the pre-catch-up revision; normal
+    post-turn consolidation (e.g. clock completion emits a domain event)
+    bumps the revision before the backlog clears. On resume the executor
+    must rebase the never-executed prepared attempt onto current authority
+    (supersede, same submissions) so the accepted input resolves instead of
+    failing visible as stale.
+    """
+    from models.dm import DmTurn, DmTurnAttempt
+
+    monkeypatch.setenv("FORWARD_DM_SAFE_CONTEXT_BYTES", "300")
+    F = _factory()
+    cid, owner, tid = _campaign(F)
+    db = F()
+    for i in range(3):
+        _commit(db, cid, i, payload={"n": i, "pad": "w" * 60})
+    _turn_obj, attempt = _turn(db, cid, owner, tid)
+    old_aid = attempt.id
+    assert execute_dm_attempt(db, old_aid) is None  # paused, stays prepared
+    # Catch-up that itself advances the campaign revision, then clears the backlog.
+    _commit(db, cid, 3, etype="clock.completed", payload={"clock": "doom", "pad": "v" * 10})
+    out = run_post_turn_range(db, cid, 1, 4, consolidate_fn=lambda events: {})
+    assert out["duplicate"] is False
+    assert evaluate_backpressure(db, cid)["blocked"] is False
+
+    result = execute_dm_attempt(
+        db, old_aid,
+        adjudicate=lambda packet, feedback=None: _respond_contract(),
+        narrator="deterministic",
+    )
+    assert result is not None  # resolved, not failed-visible
+    db.expire_all()
+    old = db.get(DmTurnAttempt, old_aid)
+    assert old.status == "superseded"
+    assert old.invalidation_reason == "backpressure_revision_refresh"
+    turn = db.get(DmTurn, _turn_obj.id)
+    assert turn.status == "succeeded"
+    assert turn.current_attempt_id != old_aid
+    new = db.get(DmTurnAttempt, turn.current_attempt_id)
+    assert new.status == "succeeded"
+    assert list(new.submission_ids or []) == list(old.submission_ids or [])
+    db.close()
+
+
+def test_backpressured_attempts_defer_behind_ready_work(monkeypatch):
+    """Persistently blocked attempts must not starve ready turns in sweeps.
+
+    Five blocked attempts (oldest) plus one ready attempt (newest) with a
+    sweep limit of 5: the first sweep defers the blocked ones via the
+    existing retry-eligibility mechanism, and the next sweep executes the
+    ready turn instead of reselecting the blocked five forever.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.execution import find_prepared_attempts, run_dm_execute_sweep
+    from models.dm import DmTurn, DmTurnAttempt
+
+    monkeypatch.setenv("FORWARD_DM_SAFE_CONTEXT_BYTES", "200")
+    F = _factory()
+    base = datetime.now(timezone.utc) - timedelta(minutes=10)
+    db = F()
+    for n in range(5):
+        cid, owner, tid = _campaign(F)
+        for i in range(3):
+            # Campaign revision tracks the latest commit; coordinate after.
+            camp_rev = db.execute(
+                select(Campaign).where(Campaign.id == cid)
+            ).scalars().first().revision
+            _commit(db, cid, int(camp_rev), payload={"n": i, "pad": "y" * 60})
+        _t, attempt = _turn(db, cid, owner, tid, text=f"blocked {n}")
+        db.execute(
+            select(DmTurnAttempt).where(DmTurnAttempt.id == attempt.id)
+        ).scalars().first().created_at = base + timedelta(seconds=n)
+        db.commit()
+    cid_r, owner_r, tid_r = _campaign(F)
+    camp_rev_r = db.execute(
+        select(Campaign).where(Campaign.id == cid_r)
+    ).scalars().first().revision
+    assert int(camp_rev_r) == 0
+    turn_r, attempt_r = _turn(db, cid_r, owner_r, tid_r, text="ready to go")
+    ready_aid = str(attempt_r.id)
+    db.execute(
+        select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_r.id)
+    ).scalars().first().created_at = base + timedelta(seconds=60)
+    db.commit()
+
+    first = run_dm_execute_sweep(
+        db, limit=5,
+        adjudicate=lambda packet, feedback=None: _respond_contract(),
+        narrator="deterministic",
+    )
+    assert ready_aid not in first["executed"]  # limit covers only the older blocked five
+    assert first["executed"] == []
+    db.expire_all()
+    # Blocked attempts deferred behind ready work via retry eligibility.
+    for row in db.execute(select(DmTurnAttempt)).scalars().all():
+        if str(row.id) == ready_aid:
+            assert row.next_retry_at is None
+            continue
+        assert row.status == "prepared"
+        assert row.next_retry_at is not None
+    assert ready_aid in [str(a.id) for a in find_prepared_attempts(db, limit=5)]
+
+    second = run_dm_execute_sweep(
+        db, limit=5,
+        adjudicate=lambda packet, feedback=None: _respond_contract(),
+        narrator="deterministic",
+    )
+    assert second["executed"] == [ready_aid]
+    db.expire_all()
+    assert db.get(DmTurn, turn_r.id).status == "succeeded"
+    db.close()
