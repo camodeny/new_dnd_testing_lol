@@ -911,11 +911,20 @@ def _apply_npc_state(
     if existing is not None and (existing.provenance or {}).get("post_turn_run") == run_stamp:
         return {"outcome": "duplicate", "entity_id": str(entity.id)}
     source_order = assertion.source_sequence if assertion.source_sequence is not None else -1
-    if existing is not None and _provenance_order(existing.provenance) > source_order:
-        # A newer committed state already exists (delayed ranges execute
-        # lock-free): never clobber it with older materialization.
-        return {"outcome": "skipped", "reason": "stale_source_order",
-                "entity_id": str(entity.id)}
+    if existing is not None:
+        # Newer-state channels, strongest signal wins: the provenance
+        # channel stamped by this materializer, then the row's revision
+        # channel maintained by authoritative NPC writers (which replace
+        # provenance without stamping source_sequence).
+        known = _provenance_order(existing.provenance)
+        campaign_rev = existing.campaign_revision
+        if isinstance(campaign_rev, int):
+            known = max(known, campaign_rev)
+        if known > source_order:
+            # A newer committed state already exists (delayed ranges execute
+            # lock-free): never clobber it with older materialization.
+            return {"outcome": "skipped", "reason": "stale_source_order",
+                    "entity_id": str(entity.id)}
     allowed = {
         "role", "goals", "disposition", "resources", "current_activity",
         "location_entity_id", "location_name", "importance", "depth",
@@ -955,11 +964,14 @@ def _knowledge_current_order(
 ) -> int:
     """Committed ordering of the live stance for one (subject, target).
 
-    Prefers the materializer's provenance channel, then the committed
-    turn's ordering (source turn built on revision R-1 commits as R),
-    else unknown (-1, never treated as newer).
+    Strongest signal wins: the materializer's provenance channel, then
+    the authoritative ``world.knowledge_asserted`` event for the live row
+    (authoritative writers emit the event without assigning the row a
+    turn/source-sequence), then the row's source turn ordering, else
+    unknown (-1, never treated as newer).
     """
     from app.world.epistemics import list_knowledge_for_subject
+    from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn
 
     tid: uuid.UUID | None = None
@@ -981,11 +993,34 @@ def _knowledge_current_order(
         if not match:
             continue
         order = _provenance_order(row.provenance)
+        if order < 0:
+            order = max(order, _knowledge_asserted_order(
+                db, campaign_id, row.id))
         if order < 0 and row.source_turn_id is not None:
             turn = db.get(DmTurn, row.source_turn_id)
             if turn is not None and turn.campaign_id == campaign_id:
                 order = int(turn.source_revision or 0) + 1
         best = max(best, order)
+    return best
+
+
+def _knowledge_asserted_order(
+    db: Session, campaign_id: uuid.UUID, knowledge_id: uuid.UUID,
+) -> int:
+    """Latest authoritative assertion event sequence for one knowledge row."""
+    from models.campaigns import CampaignDomainEvent
+
+    best = -1
+    events = db.execute(select(CampaignDomainEvent).where(
+        CampaignDomainEvent.campaign_id == campaign_id,
+        CampaignDomainEvent.event_type == "world.knowledge_asserted",
+    )).scalars().all()
+    for event in events:
+        for container in (event.targets, event.payload):
+            if isinstance(container, dict) and str(
+                    container.get("knowledge_id") or "") == str(knowledge_id):
+                best = max(best, int(event.sequence or 0))
+                break
     return best
 
 

@@ -1067,3 +1067,77 @@ def test_delayed_scene_hint_preserves_newer_committed_scene():
     assert mat["skipped"] == 1
     assert get_current_scene(db, c.id).fictional_time == "dusk"
     assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == old.sequence
+
+
+# ── Round-10: authoritative writer paths also guard staleness ───────────────
+
+def test_delayed_npc_hint_preserves_authoritative_update():
+    from app.world.npcs import get_npc_state, update_npc_state_authoritative
+    _F, db, c = _setup()
+    old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "entities", "key": "arn", "visibility": "campaign",
+         "data": {"name": "Arn", "entity_type": "npc"}},
+        {"category": "npc_state", "key": "arn-old", "visibility": "campaign",
+         "data": {"entity_ref": "Arn", "current_activity": "Keeping watch."}}]})
+    newer = _commit(db, c, payload={"n": 2})
+    entity = db.execute(select(WorldEntity).where(
+        WorldEntity.campaign_id == c.id, WorldEntity.name == "Arn")).scalars().first()
+    assert entity is None  # not yet materialized; create for the auth write
+    entity, _ = create_entity_inline(
+        db, c, entity_type="npc", name="Arn", visibility="campaign",
+        operation_id="seed-arn", idempotency_key="seed-arn")
+    db.flush()
+    update_npc_state_authoritative(
+        db, c.id, entity.id, _rev(db, c),
+        current_activity="Sounding the alarm.",
+        provenance={"source": "world_api"}, source_event_id=newer.id,
+        operation_id="auth-newer")
+    db.commit()
+    out = run_post_turn_range(
+        db, c.id, old.sequence, old.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["npc_state"] == 0
+    assert mat["skipped"] == 1
+    assert get_npc_state(db, c.id, entity.id).current_activity == "Sounding the alarm."
+
+
+def test_delayed_knowledge_hint_preserves_authoritative_stance():
+    from app.world.epistemics import (
+        assert_knowledge_authoritative,
+        list_knowledge_for_subject,
+    )
+    from app.world.knowledge import create_fact_inline
+    _F, db, c = _setup()
+    hero, _ = create_entity_inline(
+        db, c, entity_type="character", name="Ash", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-ash")
+    fact, _ = create_fact_inline(
+        db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
+        visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
+    db.flush()
+    old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "knowledge", "key": "ash-old", "visibility": "dm_only",
+         "data": {"subject_kind": "character", "subject_ref": "Ash",
+                  "target_kind": "fact", "target_fact_id": str(fact.id),
+                  "knowledge_state": "suspects",
+                  "acquisition_source": "explicit_disclosure"}}]})
+    _commit(db, c, payload={"n": 2})
+    assert_knowledge_authoritative(
+        db, c.id, _rev(db, c), subject_kind="character",
+        subject_entity_id=hero.id, target_kind="fact",
+        target_fact_id=fact.id, knowledge_state="knows",
+        acquisition_source="explicit_disclosure", visibility="dm_only",
+        operation_id="auth-newer")
+    db.commit()
+    out = run_post_turn_range(
+        db, c.id, old.sequence, old.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["knowledge"] == 0
+    assert mat["skipped"] == 1
+    stances = list_knowledge_for_subject(db, c.id, hero.id)
+    assert len(stances) == 1
+    assert stances[0].knowledge_state == "knows"
