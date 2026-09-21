@@ -85,7 +85,12 @@ _EFFECT_VISIBILITY_MAP = {
 # Committed turn events the default compiler reads. Their payloads carry
 # turn_id/attempt_id locators into the durable attempt row, whose staged
 # effects and contract snapshot are committed gameplay — never rewritten.
-TURN_EVENT_TYPES = frozenset({"dm.turn_committed", "dm.turn_resolved"})
+# adventure.completed is a committed turn locator too (#260 promotes the
+# turn commit to that event type when it closes an adventure); its
+# payload carries the same turn/attempt fields.
+TURN_EVENT_TYPES = frozenset({
+    "dm.turn_committed", "dm.turn_resolved", "adventure.completed",
+})
 
 # Staged effects already applied durably at turn commit: recompiling them
 # here would duplicate canon, so the default compiler skips them (counted
@@ -431,7 +436,8 @@ def compile_committed_candidates(
         if not isinstance(proposals, list):
             raise MaterializeError(
                 f"event {event.sequence}: contract new_entities must be a list")
-        from app.world.service import _stable_jit_key
+        from app.world.service import _stable_jit_key, _stored_identity_outcomes
+        stored_outcomes = _stored_identity_outcomes(attempt)
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 raise MaterializeError(
@@ -455,6 +461,20 @@ def compile_committed_candidates(
                 if promoted is not None and not promoted.superseded_by_id:
                     counts["already_committed"] += 1
                     continue
+                # Reuse outcomes return the existing canonical entity
+                # without stamping a JIT row: a live outcome target means
+                # the proposal was already resolved at turn commit, even
+                # if a later KEEP_DISTINCT same-name entity now makes the
+                # name ambiguous. Rerunning identity would risk a third.
+                outcome = stored_outcomes.get(temp_id) or {}
+                outcome_id = _coerce_uuid_or_none(outcome.get("outcome"))
+                if outcome_id is not None:
+                    resolved = db.get(WorldEntity, outcome_id)
+                    if (resolved is not None
+                            and resolved.campaign_id == campaign.id
+                            and not resolved.superseded_by_id):
+                        counts["already_committed"] += 1
+                        continue
             entity, _ = resolve_entity_ref(db, campaign.id, name.strip())
             if entity is not None:
                 continue  # Promoted at commit; reuse, never duplicate.

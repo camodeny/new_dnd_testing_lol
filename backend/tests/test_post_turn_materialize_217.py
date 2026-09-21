@@ -972,3 +972,72 @@ def test_hint_multi_name_match_defers_through_identity():
     mat = out["result"]["materialization"]
     assert mat["deferred"] == 1
     assert _entity_names(db, c).count("Mira") == 2
+
+
+# ── Round-8: adventure-completing turns compile too ─────────────────────────
+
+def test_adventure_completed_turn_materializes_record_event():
+    _F, db, c = _setup()
+    event = _turn_event(db, c, [{
+        "id": "recA", "effect_type": "record_world_event",
+        "arguments": {"event_type": "victory", "summary": "The dragon fell.",
+                      "visibility": "public"},
+    }])
+    # The commit path promotes adventure-closing turns to this type (#260);
+    # the turn/attempt locators survive the promotion.
+    event.event_type = "adventure.completed"
+    db.flush()
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["facts"] == 1
+    facts = list_facts(db, c.id)
+    assert [f.content for f in facts] == ["The dragon fell."]
+
+
+# ── Round-8: reuse-then-KEEP_DISTINCT stays two entities ────────────────────
+
+def test_reuse_first_later_keep_distinct_stays_two():
+    from models.dm import DmTurn, DmTurnAttempt
+    _F, db, c = _setup()
+    first, _ = create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-mira-1")
+    db.flush()
+    # Turn 1 reuses Mira (no JIT row stamped); post-turn has not run yet.
+    turn_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    rev = _rev(db, c)
+    db.add(DmTurn(id=turn_id, campaign_id=c.id, thread_id="thread-1",
+                  source_revision=rev, status="succeeded"))
+    db.add(DmTurnAttempt(
+        id=attempt_id, turn_id=turn_id, attempt_number=1,
+        campaign_id=c.id, thread_id="thread-1",
+        source_revision=rev, input_set_revision=0,
+        status="succeeded", staged_effects=[],
+        contract_snapshot={"new_entities": [{
+            "temp_id": "tmp_npc_1", "kind": "npc",
+            "public_name": "Mira", "public_summary": "Same Mira."}]},
+        identity_resolutions=[{
+            "temp_id": "tmp_npc_1", "outcome": str(first.id)}]))
+    db.flush()
+    _c, event = commit_campaign_mutation(
+        db, c.id, rev, event_type="dm.turn_committed",
+        payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
+                 "submission_ids": [], "mode": "respond"},
+        operation_id=f"turn-{turn_id}")
+    # Turn 2 legitimately adds a KEEP_DISTINCT second Mira before
+    # post-turn catches up with turn 1.
+    create_entity_inline(
+        db, c, entity_type="npc", name="Mira", visibility="campaign",
+        operation_id="seed-2", idempotency_key="seed-mira-2")
+    db.flush()
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["proposed"] == 0
+    assert _entity_names(db, c).count("Mira") == 2
