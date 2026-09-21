@@ -248,6 +248,9 @@ def build_seed_spec(
         "difficulty": str(difficulty or "medium").lower(),
         "fictional_time": f"Evening of the first day at {loc_name}",
     }
+    # Boundary validation covers text derived from owner-controlled and
+    # public inputs only. DM-private hook kinds are secret-derived metadata
+    # and must never participate in owner-observable rejection (#244 oracle).
     _check_boundaries(
         {
             "location": loc_name, "location_summary": loc_summary,
@@ -255,7 +258,6 @@ def build_seed_spec(
             "faction": f"{faction_name} {faction_summary}",
             "pressure": f"{pressure_name} {pressure_desc}",
             "situation": situation, "premise": premise, "grounding": grounding,
-            "hooks": " ".join(h.get("kind", "") for h in hooks),
         },
         phrases, source="generated",
     )

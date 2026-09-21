@@ -256,7 +256,16 @@ def test_world_seed_member_lore_invisible_in_public_output(api):
     client, factory, actor, owner_id, member_id, _ = api
 
     def _seeded_campaign(key_suffix: str, with_member_lore: bool) -> dict:
-        campaign = _create(client, required_players=2, name=f"Lore invis {key_suffix}")
+        # The lored campaign also denies the full hook-kind vocabulary: an
+        # owner boundary probe must not distinguish member lore presence.
+        boundaries = (
+            {"exclude": ["oath", "debt", "loss", "hidden_foe", "secret_kin", "quest", "past"]}
+            if with_member_lore else None
+        )
+        campaign = _create(
+            client, required_players=2, name=f"Lore invis {key_suffix}",
+            **({"content_boundaries": boundaries} if boundaries else {}),
+        )
         with factory() as db:
             db.add(CampaignMember(
                 campaign_id=uuid.UUID(campaign["id"]), user_id=member_id,
