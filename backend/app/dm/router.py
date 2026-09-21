@@ -240,9 +240,19 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     attempts = db.execute(
         select(DmTurnAttempt).where(DmTurnAttempt.turn_id == tid).order_by(DmTurnAttempt.attempt_number)
     ).scalars().all()
+    # Issue #222 — low-key client state: ready vs temporary DM processing
+    # delay. Never exposes queues, providers, models, or internals.
+    try:
+        from app.post_turn.backpressure import describe_client_state, evaluate_backpressure
+
+        readiness = describe_client_state(evaluate_backpressure(db, campaign.id))
+    except Exception:
+        readiness = {"dm_state": "processing",
+                     "message": "The DM is finishing processing recent events before continuing."}
     return {
         "turn": turn.to_dict(),
         "attempts": [a.to_dict(include_private_roll_evidence=campaign.owner_id == profile.id, include_private_staged_effects=campaign.owner_id == profile.id) for a in attempts],
+        "readiness": readiness,
     }
 
 

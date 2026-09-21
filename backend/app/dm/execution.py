@@ -480,6 +480,21 @@ def _execute_owned_attempt(
     campaign_id = attempt.campaign_id
     turn_id = attempt.turn_id
 
+    # Issue #222 — safe lag/backpressure: while post-turn trails beyond the
+    # safe forward-DM context budget, new AI progression pauses BEFORE
+    # context becomes unreliable. The attempt stays prepared (no failure
+    # marker — this is not failure) and a critical catch-up trigger fires,
+    # so the sweep retries the same attempt once catch-up clears the state.
+    # Player-input acceptance/coordination is untouched: accepted intent
+    # stays durable and resolves after catch-up.
+    from app.post_turn.backpressure import pause_if_backpressured
+
+    _bp_status = pause_if_backpressured(
+        db, campaign_id, attempt_id=attempt.id, turn_id=turn_id,
+    )
+    if _bp_status is not None:
+        return None
+
     # A caller observing running work must never adopt another worker's claim.
     try:
         attempt = mark_attempt_running(db, attempt.id)
