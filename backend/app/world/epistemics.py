@@ -975,21 +975,23 @@ def collect_subject_restricted_fact_texts(
     limit_facts: int = RESTRICTED_FACT_SCAN_LIMIT,
     limit_texts: int = RESTRICTED_TEXT_LIMIT,
     max_chars: int = RESTRICTED_TEXT_CHARS,
-) -> set[str]:
-    """Fact texts no speaking subject could know — for the secrecy judge.
+) -> dict[str, set[str]]:
+    """Per-speaker fact texts that speaker could not know — for the judge.
 
-    Intersects across resolved speakers: a text is restricted only when
-    every resolved speaking subject lacks knowledge of that fact. Speakers
+    Derived from each speaker's ``WorldKnowledge`` independently of human
+    visibility: a campaign/public OOC fact a speaker never learned is still
+    that speaker's misuse to state, so all visibilities are scanned. A text
+    maps to every resolved speaker lacking knowledge of that fact; speakers
     that do not resolve to a campaign entity are excluded (their scope is
-    unknowable, never assumed). Only ``dm_only``/``private`` facts are
-    scanned (member-visible truth needs no judge to stay hidden), bounded
-    to recent rows. Returns possibly-empty; never raises for misshapen
-    input (callers treat failure as no extra scope).
+    unknowable, never assumed). An explicit ``does_not_know`` stance never
+    counts as coverage. Bounded to recent rows and capped texts; returns
+    possibly-empty; never raises for misshapen input (callers treat failure
+    as no extra scope).
     """
     try:
         speaker_ids = [str(s).strip() for s in (speaker_subject_ids or []) if str(s or "").strip()]
     except TypeError:
-        return set()
+        return {}
     subjects: list[WorldEntity] = []
     for raw in speaker_ids[:16]:
         try:
@@ -1000,9 +1002,9 @@ def collect_subject_restricted_fact_texts(
         if entity is not None and entity.campaign_id == campaign.id:
             subjects.append(entity)
     if not subjects:
-        return set()
+        return {}
     try:
-        known_per_speaker: list[set[str]] = []
+        known_per_speaker: list[tuple[str, set[str]]] = []
         for subject in subjects:
             rows = list_knowledge_for_subject(db, campaign.id, subject.id, limit=200)
             known: set[str] = set()
@@ -1012,29 +1014,31 @@ def collect_subject_restricted_fact_texts(
                     continue
                 if row.target_kind == "fact" and row.target_fact_id is not None:
                     known.add(str(row.target_fact_id))
-            known_per_speaker.append(known)
+            known_per_speaker.append((str(subject.id), known))
         scan = max(1, min(int(limit_facts or 100), 500))
         facts = list(db.execute(
             select(WorldFact).where(
                 WorldFact.campaign_id == campaign.id,
-                WorldFact.visibility.in_(("dm_only", "private")),
             ).order_by(WorldFact.created_at.desc()).limit(scan)
         ).scalars().all())
     except Exception:
-        return set()
-    out: set[str] = set()
+        return {}
+    out: dict[str, set[str]] = {}
     cap_texts = max(1, min(int(limit_texts or 32), 64))
     cap_chars = max(1, min(int(max_chars or 500), 4000))
+    total = 0
     for fact in facts:
         fid = str(fact.id)
-        if any(fid in known for known in known_per_speaker):
-            continue
         content = str(getattr(fact, "content", None) or "").strip()
         if not content:
             continue
-        out.add(content[:cap_chars])
-        if len(out) >= cap_texts:
-            break
+        for speaker_id, known in known_per_speaker:
+            if fid in known:
+                continue
+            out.setdefault(speaker_id, set()).add(content[:cap_chars])
+            total += 1
+            if total >= cap_texts:
+                return out
     return out
 
 

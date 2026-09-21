@@ -223,11 +223,21 @@ def test_npc_utterance_with_knowledge_or_learning_source_passes():
     assert KnowledgeValidator().validate(taught, pkt2).passed
 
 
-def test_validator_skips_unresolved_or_unrelated():
+def test_validator_skips_unresolvable_or_unrelated():
     pkt = _knowledge_packet(subject_id="npc:vera", target_id=str(uuid.uuid4()), resolved=False)
-    assert KnowledgeValidator().validate(_utterance("npc:vera", str(uuid.uuid4())), pkt).passed
-    pkt2 = _knowledge_packet(subject_id="npc:other", target_id=str(uuid.uuid4()))
-    assert KnowledgeValidator().validate(_utterance("npc:vera", str(uuid.uuid4())), pkt2).passed
+    contract = _utterance("npc:vera", str(uuid.uuid4()))
+    result = KnowledgeValidator().validate(contract, pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_ambiguous_knowledge"
+    # Non-NPC actors are out of scope: the system does not police roleplay.
+    human = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "narration", "claims": [
+             {"text": "Elara declares she inspects.", "claim_kind": "player_declaration",
+              "origin": "player_transcript",
+              "actor_ref": {"type": "character", "id": "char:elara"},
+              "topic_refs": [{"type": "location", "id": str(uuid.uuid4())}]}]}]})
+    assert KnowledgeValidator().validate(human, pkt).passed
     # does_not_know is an explicit denial, not coverage.
     target = str(uuid.uuid4())
     pkt3 = _knowledge_packet(subject_id="npc:vera", target_id=target, state="does_not_know")
@@ -363,6 +373,31 @@ def test_transfer_knowledge_effect_normalizes_in_contract():
                                  "arguments": {}}]})
 
 
+def test_transfer_knowledge_contract_rejects_kind_mismatch():
+    subject_id, entity_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+    def _contract(args):
+        return {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+                "beats": [{"id": "beat_1", "type": "narration", "claims": [
+                    {"text": "Aria tells Bram the way.", "claim_kind": "observation",
+                     "origin": "dm_adjudication", "visibility": "public"}]}],
+                "staged_effects": [{"id": "eff-tell-1", "effect_type": "transfer_knowledge",
+                                    "arguments": args}]}
+
+    # target_kind=fact with only an entity target fails at normalization.
+    with pytest.raises(Exception):
+        normalize_contract(_contract({"subject_kind": "character",
+                                      "subject_entity_id": subject_id,
+                                      "target_kind": "fact",
+                                      "target_entity_id": entity_id}))
+    # The polymorphic target_id form stays valid for any kind.
+    ok = normalize_contract(_contract({"subject_kind": "character",
+                                       "subject_entity_id": subject_id,
+                                       "target_kind": "fact",
+                                       "target_id": entity_id}))
+    assert ok.staged_effects[0].effect_type == "transfer_knowledge"
+
+
 def _utterance_multi(actor, topic_ids, **claim_over):
     base = {"text": "I know all about those places.", "claim_kind": "npc_utterance",
             "origin": "dm_adjudication", "visibility": "public",
@@ -388,38 +423,32 @@ def test_validator_rejects_mixed_known_and_unknown_refs():
     assert result.violations[0].details["unknown"] == [unknown]
 
 
-def _scene_packet(*, subject_id, target_id=None, scene_actors=(), knowledge_records=True):
-    pkt = _knowledge_packet(subject_id=subject_id, target_id=target_id)
-    if not knowledge_records:
-        pkt = _knowledge_packet(subject_id="npc:someone-else", target_id=target_id)
-    if scene_actors:
-        cid = pkt.audience.campaign_id
-        rec = ContextRecord(
-            record_id="current-scene:x", required=True, priority=90,
-            value={"present_actors": [{"entity_id": a, "name": "Vera"} for a in scene_actors]},
-            sources=[SourceRef(source_type="campaign_current_scene", source_id="x",
-                               source_version="1")],
-            authorization=AuthorizationScope(campaign_id=cid),
-            visibility="campaign")
-        by_name = {lane.name: list(lane.records) for lane in pkt.lanes}
-        by_name[LaneName.CURRENT_SCENE.value].append(rec)
-        status = {lane.name: lane.authority_status for lane in pkt.lanes}
-        rebuilt = {LaneName(name): recs for name, recs in by_name.items()}
-        return assemble_context_packet(audience=pkt.audience, records=rebuilt, lane_status=status)
-    return pkt
-
-
-def test_validator_scene_relevant_missing_perspective_fails_closed():
+def test_validator_missing_perspective_fails_closed():
     actor = str(uuid.uuid4())
-    pkt = _scene_packet(subject_id="npc:vera", target_id=None,
-                        scene_actors=[actor], knowledge_records=False)
+    pkt = _knowledge_packet(subject_id="npc:vera", target_id=None)
     contract = _utterance(actor, str(uuid.uuid4()))
     result = KnowledgeValidator().validate(contract, pkt)
     assert not result.passed
     assert result.violations[0].code == "npc_utterance_ambiguous_knowledge"
-    # Same gap with no scene lane stays out of scope (skip, not fail).
-    pkt2 = _knowledge_packet(subject_id="npc:vera", target_id=None)
-    assert KnowledgeValidator().validate(contract, pkt2).passed
+
+
+def test_validator_npc_action_claim_is_knowledge_checked():
+    """observation claims with an NPC actor are NPC actions, not narration."""
+    target = str(uuid.uuid4())
+    pkt = _knowledge_packet(subject_id="npc:vera", target_id=None)
+    action = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "narration", "claims": [
+             {"text": "Vera pockets the signet ring.", "claim_kind": "observation",
+              "origin": "dm_adjudication", "visibility": "public",
+              "actor_ref": {"type": "npc", "id": "npc:vera"},
+              "target_refs": [{"type": "object", "id": target}]}]}]})
+    result = KnowledgeValidator().validate(action, pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_without_knowledge"
+    # The same action with a covering perspective passes.
+    pkt2 = _knowledge_packet(subject_id="npc:vera", target_id=target)
+    assert KnowledgeValidator().validate(action, pkt2).passed
 
 
 def test_lane_builder_includes_npc_subjects():
@@ -452,25 +481,39 @@ def test_collect_subject_restricted_fact_texts():
     db = Fac()
     mara, _ = create_entity_authoritative(
         db, camp.id, 0, entity_type="npc", name="Mara", operation_id="op-mara-rs")
+    theo, _ = create_entity_authoritative(
+        db, camp.id, 1, entity_type="npc", name="Theo", operation_id="op-theo-rs")
     known_fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="Mara knows the cellar route.",
+        db, camp.id, 2, content="Mara knows the cellar route.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs1")
     hidden_fact, _ = create_fact_authoritative(
-        db, camp.id, 2, content="The vault combination is 12-34-56.",
+        db, camp.id, 3, content="The vault combination is 12-34-56.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs2")
+    # Campaign-visible OOC truth is still a speaker's misuse to state.
+    open_fact, _ = create_fact_authoritative(
+        db, camp.id, 4, content="The festival is at dusk.",
+        entity_refs=[mara.id], epistemic_state="confirmed", visibility="campaign",
+        provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs3")
     assert_knowledge_inline(
         db, camp, subject_kind="npc", subject_entity_id=mara.id,
         target_kind="fact", target_fact_id=known_fact.id,
         knowledge_state="knows", acquisition_source="direct_observation",
         operation_id="op-know-rs")
-    texts = collect_subject_restricted_fact_texts(db, camp, [str(mara.id)])
-    assert "The vault combination is 12-34-56." in texts
-    assert "Mara knows the cellar route." not in texts
+    scoped = collect_subject_restricted_fact_texts(db, camp, [str(mara.id), str(theo.id)])
+    # Per-speaker: Theo learned nothing, so every fact maps to Theo...
+    assert "The vault combination is 12-34-56." in scoped[str(theo.id)]
+    assert "The festival is at dusk." in scoped[str(theo.id)]
+    assert "Mara knows the cellar route." in scoped[str(theo.id)]
+    # ...while Mara's known fact is excluded for Mara only (mixed knowers
+    # stay detectable per speaker instead of suppressing each other).
+    assert "The vault combination is 12-34-56." in scoped[str(mara.id)]
+    assert "The festival is at dusk." in scoped[str(mara.id)]
+    assert "Mara knows the cellar route." not in scoped[str(mara.id)]
     # Unresolvable speakers contribute no scope.
-    assert collect_subject_restricted_fact_texts(db, camp, ["not-a-uuid"]) == set()
-    assert collect_subject_restricted_fact_texts(db, camp, []) == set()
+    assert collect_subject_restricted_fact_texts(db, camp, ["not-a-uuid"]) == {}
+    assert collect_subject_restricted_fact_texts(db, camp, []) == {}
 
 
 def test_stream_narration_forwards_knowledge_scope_to_shadow_judge(monkeypatch):

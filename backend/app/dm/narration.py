@@ -1466,10 +1466,12 @@ def execute_validated_turn(
         )
 
     # Issue #251 — derive subject-unknown restricted texts for the secrecy
-    # judge when the caller did not supply them. Bounded (recent restricted
-    # facts only, speakers that resolve to campaign entities) and fail-soft:
-    # derivation failure leaves the judge on literal secrets, never breaks
-    # narration or delays first-chunk streaming beyond one bounded query.
+    # judge when the caller did not supply them. Per-speaker scope from
+    # #211 knowledge, independent of human visibility; flattened with
+    # speaker tags the secrecy prompt interprets. Bounded (recent facts
+    # only, resolved campaign speakers) and fail-soft: derivation failure
+    # leaves the judge on literal secrets, never breaks narration or delays
+    # first-chunk streaming beyond one bounded query.
     if knowledge_restricted_texts is None:
         try:
             from models.campaigns import Campaign as _Campaign
@@ -1486,9 +1488,14 @@ def execute_validated_turn(
             if _speakers:
                 _campaign = db.get(_Campaign, turn.campaign_id)
                 if _campaign is not None:
-                    knowledge_restricted_texts = collect_subject_restricted_fact_texts(
+                    _scoped = collect_subject_restricted_fact_texts(
                         db, _campaign, _speakers
                     )
+                    knowledge_restricted_texts = {
+                        f"[unknown to speaker {speaker}] {text}"
+                        for speaker, texts in _scoped.items()
+                        for text in texts
+                    } or None
         except Exception as exc:
             logger.warning("knowledge judge scope derivation dropped: %s", exc)
             knowledge_restricted_texts = None

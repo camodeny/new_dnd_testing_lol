@@ -696,12 +696,20 @@ class TransferKnowledgeArgs(StrictModel):
 
     @model_validator(mode="after")
     def _exactly_one_target(self) -> "TransferKnowledgeArgs":
-        provided = [v for v in (
-            self.target_fact_id, self.target_relation_id,
-            self.target_entity_id, self.target_id,
-        ) if v is not None]
-        if len(provided) != 1:
+        fields = {
+            "fact": self.target_fact_id,
+            "relation": self.target_relation_id,
+            "entity": self.target_entity_id,
+        }
+        provided = [k for k, v in fields.items() if v is not None]
+        if self.target_id is None and len(provided) != 1:
             raise ValueError("exactly one target reference is required")
+        if self.target_id is not None and len(provided) != 0:
+            raise ValueError("target_id is polymorphic; do not combine it with a kind-specific target field")
+        if self.target_id is None and provided[0] != self.target_kind:
+            raise ValueError(
+                f"target_kind={self.target_kind!r} does not match the supplied target field"
+            )
         return self
 
 

@@ -738,19 +738,17 @@ class VisibilityValidator:
 class KnowledgeValidator:
     """Deterministic unavailable-knowledge checks against the #251 lane (issue #251).
 
-    NPC utterances that reference concrete world entities must be backed by
-    the speaking subject's fictional knowledge (code-supplied #211 lane
+    Knowledge-bearing claims (NPC utterances, NPC-attributed observations
+    and world facts) that reference concrete world entities must be backed
+    by the speaking subject's fictional knowledge (code-supplied #211 lane
     entries) or by an explicit in-turn learning source (``evidence_refs`` /
     ``trigger_refs``). No model call, no DB: the packet's
     ``knowledge_visibility`` lane is the authority.
 
-    Fail-conservative: perspectives entirely absent from the lane are
-    skipped unless the speaking subject is scene-relevant (a present actor
-    in the authoritative current-scene lane) — a relevant subject with no
-    resolvable knowledge is ambiguous state and fails closed. Unresolved
-    lane entries for non-scene subjects are skipped (absence of evidence
-    is not evidence of misuse). Only resolved perspectives with concrete
-    claim refs can fail on unknown targets.
+    Fail-conservative: a contract-referenced NPC with no resolvable lane
+    perspective is ambiguous state and fails closed. Non-NPC actors
+    (player declarations) are out of scope — the system does not police
+    player roleplay.
     """
 
     name = "knowledge_validator"
@@ -790,31 +788,17 @@ class KnowledgeValidator:
                 out[subject_id] = perspective
         return out
 
-    def _scene_subjects(self, packet) -> set[str]:
-        """Entity IDs of scene-relevant subjects (present actors)."""
-        out: set[str] = set()
-        if packet is None:
-            return out
-        lane = next((lane for lane in packet.lanes if lane.name == LaneName.CURRENT_SCENE), None)
-        if lane is None:
-            return out
-        for rec in lane.records:
-            for actor in (rec.value or {}).get("present_actors") or []:
-                if isinstance(actor, dict):
-                    eid = str(actor.get("entity_id") or "").strip()
-                    if eid:
-                        out.add(eid)
-        return out
+    # Claim kinds that can carry fictional knowledge for an NPC subject.
+    _NPC_KNOWLEDGE_KINDS = frozenset({"npc_utterance", "observation", "world_fact"})
 
     def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         perspectives = self._perspectives(packet)
-        scene_subjects = self._scene_subjects(packet)
         for bi, ci, claim in _all_claims(contract):
-            if claim.claim_kind != "npc_utterance":
+            if claim.claim_kind not in self._NPC_KNOWLEDGE_KINDS:
                 continue
-            if claim.actor_ref is None:
+            if claim.actor_ref is None or getattr(claim.actor_ref, "type", None) != "npc":
                 continue
             actor_id = _norm_id(claim.actor_ref.id)
             refs = [
@@ -830,18 +814,17 @@ class KnowledgeValidator:
                 continue
             perspective = perspectives.get(actor_id)
             if perspective is None or not perspective["resolved"]:
-                # Ambiguous state fails conservative only for scene-relevant
-                # subjects; anything else is out of the lane's scope.
-                if actor_id and actor_id in scene_subjects:
-                    violations.append(
-                        ValidationViolation(
-                            validator=self.name, category=self.category,
-                            code="npc_utterance_ambiguous_knowledge",
-                            message="NPC utterance from a scene-relevant subject with no resolvable knowledge",
-                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
-                            claim_index=(bi, ci),
-                        )
+                # Ambiguous state fails closed: a contract-referenced NPC
+                # with no resolvable knowledge cannot be cleared.
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name, category=self.category,
+                        code="npc_utterance_ambiguous_knowledge",
+                        message="NPC-attributed claim from a subject with no resolvable knowledge",
+                        details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
+                        claim_index=(bi, ci),
                     )
+                )
                 continue
             for ref in refs:
                 if ref in perspective["denied"]:
