@@ -9,12 +9,13 @@ Transport: triggers enqueue through the transactional outbox (#190) with the
 run id as outbox/job id; the relay publishes to the queue and the worker
 executes idempotently via WorkerExecution fencing (#191).
 
-The memory/repair contents of a post-turn patch remain out of scope —
-consolidation here validates the range against the immutable campaign
-sequence, preserves visibility metadata on read, evaluates criteria-driven
-campaign clocks (issue #218), and records the processed span. Further
-content builders plug in later behind ``consolidate_fn`` (which bypasses
-the built-in clock phase and owns its content explicitly).
+The memory/repair contents of a post-turn patch are built by the
+explicit materializer (issue #217) behind ``consolidate_fn``-style
+default consolidation: ``materialize_range`` compiles the range into
+validated durable writes (entities, relations, facts, NPC state,
+knowledge, visibility) before the criteria-driven campaign clocks
+(issue #218) evaluate. Custom ``consolidate_fn`` callers bypass both
+built-in phases and own their content explicitly.
 """
 
 from __future__ import annotations
@@ -553,8 +554,22 @@ def run_post_turn_range(
         if consolidate_fn is not None:
             patch = consolidate_fn(events)
         else:
-            # Placeholder consolidation (content out of scope): record span.
+            # Default consolidation: explicit materialization (issue #217)
+            # followed by criteria-driven clocks (issue #218). A
+            # MaterializeError propagates so the run fails and the
+            # checkpoint stays put for cumulative retry.
+            from app.post_turn.materialize import materialize_range
+
+            material_campaign = db.get(Campaign, campaign_id)
+            if material_campaign is None:
+                raise RuntimeError(f"post-turn campaign {campaign_id} not found")
             patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
+            patch["materialization"] = materialize_range(
+                db, material_campaign, events, effective_from, to_sequence,
+                decision_service=clock_decision_service,
+                operation_id=operation_id,
+                session_factory=clock_telemetry_factory,
+            )
             # Issue #218 — criteria-driven clocks are required consolidation:
             # a clock-processing failure raises here so the run fails and the
             # checkpoint stays put for cumulative retry. Custom
