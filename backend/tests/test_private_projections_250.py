@@ -381,6 +381,63 @@ def test_invalidation_fanout_targets_grantee_threads(ctx):
         db.close()
 
 
+def test_authoritative_grant_and_revoke_publish_invalidation(ctx):
+    """Review #418: real grant/revoke commits must emit the invalidation event."""
+    db = _db(ctx)
+    try:
+        camp = db.get(Campaign, ctx["campaign_id"])
+        secret, _ = _knowledge.create_fact_inline(
+            db, camp, content="the vault sigil is a moth",
+            visibility="private", operation_id="op-secret-auth-250",
+        )
+        db.commit()
+        mem = InMemoryRealtimePublisher()
+        set_realtime_publisher(mem)
+        try:
+            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
+            row, _ = _epistemics.grant_visibility_authoritative(
+                db, ctx["campaign_id"], rev,
+                operation_id="op-auth-grant-250", actor_id=ctx["owner"],
+                target_kind="fact", target_id=secret.id,
+                grantee_user_id=ctx["bob"],
+            )
+            assert row is not None
+            grants = [r for r in mem.published
+                      if r["payload"]["type"] == "projection.invalidated"]
+            assert len(grants) == 1
+            assert grants[0]["payload"]["transition"] == "granted"
+            assert grants[0]["payload"]["grantee_user_id"] == str(ctx["bob"])
+            assert "moth" not in str(grants[0]["payload"])
+
+            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
+            revoked, _ = _epistemics.revoke_visibility_authoritative(
+                db, ctx["campaign_id"], rev,
+                operation_id="op-auth-revoke-250", actor_id=ctx["owner"],
+                target_kind="fact", target_id=secret.id,
+                grantee_user_id=ctx["bob"],
+            )
+            assert revoked is True
+            revokes = [r for r in mem.published
+                       if r["payload"].get("transition") == "revoked"]
+            assert len(revokes) == 1
+
+            # No-op revoke (nothing active) changes nothing and stays silent.
+            before = len(mem.published)
+            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
+            revoked_again, _ = _epistemics.revoke_visibility_authoritative(
+                db, ctx["campaign_id"], rev,
+                operation_id="op-auth-revoke-noop-250", actor_id=ctx["owner"],
+                target_kind="fact", target_id=secret.id,
+                grantee_user_id=ctx["bob"],
+            )
+            assert revoked_again is False
+            assert len(mem.published) == before
+        finally:
+            set_realtime_publisher(None)
+    finally:
+        db.close()
+
+
 def test_snapshot_wires_surfaces(ctx):
     from app.snapshot.service import build_live_table_snapshot
 

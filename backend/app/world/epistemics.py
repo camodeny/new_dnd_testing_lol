@@ -690,7 +690,20 @@ def grant_visibility_authoritative(
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
     )
-    return db.get(WorldVisibilityGrant, holder["grant_id"]), event
+    row = db.get(WorldVisibilityGrant, holder["grant_id"])
+    # Issue #250: a committed grant expands someone's projection — publish
+    # the secret-free invalidation post-commit so clients reload. Best
+    # effort: never breaks the authoritative commit.
+    try:
+        from app.realtime.service import publish_projection_invalidated_for_grantee
+
+        publish_projection_invalidated_for_grantee(
+            db, campaign_after, target_kind=target_kind, transition="granted",
+            grantee_user_id=grantee_user_id,
+        )
+    except Exception:
+        pass
+    return row, event
 
 
 def revoke_visibility_authoritative(
@@ -726,7 +739,20 @@ def revoke_visibility_authoritative(
         provenance={"source": "world_api"},
         mutate=_mutate,
     )
-    return bool(holder.get("revoked")), event
+    revoked = bool(holder.get("revoked"))
+    if revoked:
+        # Issue #250: a committed revoke contracts someone's projection —
+        # publish the secret-free invalidation post-commit. Best effort.
+        try:
+            from app.realtime.service import publish_projection_invalidated_for_grantee
+
+            publish_projection_invalidated_for_grantee(
+                db, campaign_after, target_kind=target_kind, transition="revoked",
+                grantee_user_id=grantee_user_id,
+            )
+        except Exception:
+            pass
+    return revoked, event
 
 
 # ── Authorization + projection (server-side, RLS-compatible) ────────────────

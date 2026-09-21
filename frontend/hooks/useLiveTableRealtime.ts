@@ -374,6 +374,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         ch.on('broadcast' as never, { event: 'dm.status' } as never, handleBroadcast as never)
         ch.on('broadcast' as never, { event: 'dm.thinking' } as never, handleBroadcast as never)
         ch.on('broadcast' as never, { event: 'revision' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'projection.invalidated' } as never, handleBroadcast as never)
       } catch {
         // fallback to postgres_changes if broadcast signature differs
       }
