@@ -1163,26 +1163,43 @@ def assemble_attempt_context(
 
     # Per-subject fictional-knowledge lane (issue #251): DM-internal
     # perspective snapshots built from #211 WorldKnowledge, distinct from
-    # objective truth and human disclosure. dm_only + adjudication_only so
-    # narration_projection() can never carry it to a player audience.
-    # Source failure fails closed; unresolved subjects yield explicit empty
-    # perspectives (never fabricated knowledge).
+    # objective truth and human disclosure. Covers acting PCs plus
+    # scene-relevant non-player subjects (present actors carrying entity
+    # IDs) so NPC perspectives are knowledge-checked too. dm_only +
+    # adjudication_only so narration_projection() can never carry it to a
+    # player audience. Source failure fails closed; unresolved subjects
+    # yield explicit empty perspectives (never fabricated knowledge).
     lane_started = time.monotonic()
+    scene_npc_ids: list[str] = []
+    for scene_rec in records[LaneName.CURRENT_SCENE]:
+        present = (scene_rec.value or {}).get("present_actors") or []
+        for actor in present:
+            if isinstance(actor, dict):
+                eid = str(actor.get("entity_id") or "").strip()
+                if eid and eid not in scene_npc_ids:
+                    scene_npc_ids.append(eid)
+            if len(scene_npc_ids) >= 32:
+                break
     try:
         from app.world.epistemics import build_knowledge_visibility_values
 
         knowledge_values = build_knowledge_visibility_values(
-            db, campaign, sorted(character_ids, key=str)
+            db, campaign, sorted(character_ids, key=str),
+            npc_entity_ids=scene_npc_ids,
         )
     except (ImportError, AttributeError) as exc:
         logger.warning("knowledge_visibility reader unavailable: %s", exc)
         knowledge_values = []
-    for value in knowledge_values:
-        character_ref = value.get("character_id") or "no-pc"
+    for index, value in enumerate(knowledge_values):
+        subject_ref = (
+            value.get("character_id")
+            or value.get("subject_entity_id")
+            or f"no-subject-{index}"
+        )
         sources = [
             _source(
                 "character" if value.get("character_id") else "dm_turn_attempt",
-                character_ref if value.get("character_id") else attempt.id,
+                value.get("character_id") or attempt.id,
                 attempt.source_revision,
                 attempt.source_revision,
                 lane="knowledge_visibility",
@@ -1200,7 +1217,7 @@ def assemble_attempt_context(
             )
         records[LaneName.KNOWLEDGE_VISIBILITY].append(
             ContextRecord(
-                record_id=f"knowledge:{character_ref}",
+                record_id=f"knowledge:{subject_ref}",
                 required=False,
                 priority=90,
                 value=value,

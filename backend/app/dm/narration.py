@@ -909,6 +909,7 @@ def stream_narration(
     on_first_persist_tx: Callable[[Session, uuid.UUID], None] | None = None,
     judge_service: Any | None = None,
     judge_session_factory: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
@@ -1228,6 +1229,7 @@ def stream_narration(
             trace_id=trace_id,
             campaign_id=campaign_id,
             turn_id=turn_id,
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
         if violations:
             _tally_fidelity_violations(violations)
@@ -1374,6 +1376,7 @@ def execute_validated_turn(
     identity_session_factory: Any | None = None,
     judge_service: Any | None = None,
     judge_session_factory: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> ValidatedTurnResult:
     """Run a validated structured turn through narration to final commit.
 
@@ -1462,6 +1465,34 @@ def execute_validated_turn(
             db_, turn_id, attempt_id, stream_id=stream_id_, commit=False
         )
 
+    # Issue #251 — derive subject-unknown restricted texts for the secrecy
+    # judge when the caller did not supply them. Bounded (recent restricted
+    # facts only, speakers that resolve to campaign entities) and fail-soft:
+    # derivation failure leaves the judge on literal secrets, never breaks
+    # narration or delays first-chunk streaming beyond one bounded query.
+    if knowledge_restricted_texts is None:
+        try:
+            from models.campaigns import Campaign as _Campaign
+
+            from app.world.epistemics import collect_subject_restricted_fact_texts
+
+            _speakers = {
+                str(claim.actor_ref.id).strip()
+                for beat in (contract.beats or [])
+                for claim in (beat.claims or [])
+                if claim.claim_kind == "npc_utterance" and claim.actor_ref is not None
+                and str(claim.actor_ref.id or "").strip()
+            }
+            if _speakers:
+                _campaign = db.get(_Campaign, turn.campaign_id)
+                if _campaign is not None:
+                    knowledge_restricted_texts = collect_subject_restricted_fact_texts(
+                        db, _campaign, _speakers
+                    )
+        except Exception as exc:
+            logger.warning("knowledge judge scope derivation dropped: %s", exc)
+            knowledge_restricted_texts = None
+
     try:
         narration = stream_narration(
             db,
@@ -1481,6 +1512,7 @@ def execute_validated_turn(
             on_first_persist_tx=_boundary_tx,
             judge_service=judge_service,
             judge_session_factory=judge_session_factory,
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
     except NarrationStreamError:
         # Defined remediation for post-visibility failure: if the

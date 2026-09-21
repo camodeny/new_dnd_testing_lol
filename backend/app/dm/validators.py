@@ -744,9 +744,13 @@ class KnowledgeValidator:
     ``trigger_refs``). No model call, no DB: the packet's
     ``knowledge_visibility`` lane is the authority.
 
-    Fail-conservative: perspectives missing from the lane or marked
-    unresolved are skipped (absence of evidence is not evidence of misuse).
-    Only resolved perspectives with concrete claim refs can fail.
+    Fail-conservative: perspectives entirely absent from the lane are
+    skipped unless the speaking subject is scene-relevant (a present actor
+    in the authoritative current-scene lane) — a relevant subject with no
+    resolvable knowledge is ambiguous state and fails closed. Unresolved
+    lane entries for non-scene subjects are skipped (absence of evidence
+    is not evidence of misuse). Only resolved perspectives with concrete
+    claim refs can fail on unknown targets.
     """
 
     name = "knowledge_validator"
@@ -786,19 +790,33 @@ class KnowledgeValidator:
                 out[subject_id] = perspective
         return out
 
+    def _scene_subjects(self, packet) -> set[str]:
+        """Entity IDs of scene-relevant subjects (present actors)."""
+        out: set[str] = set()
+        if packet is None:
+            return out
+        lane = next((lane for lane in packet.lanes if lane.name == LaneName.CURRENT_SCENE), None)
+        if lane is None:
+            return out
+        for rec in lane.records:
+            for actor in (rec.value or {}).get("present_actors") or []:
+                if isinstance(actor, dict):
+                    eid = str(actor.get("entity_id") or "").strip()
+                    if eid:
+                        out.add(eid)
+        return out
+
     def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         perspectives = self._perspectives(packet)
+        scene_subjects = self._scene_subjects(packet)
         for bi, ci, claim in _all_claims(contract):
             if claim.claim_kind != "npc_utterance":
                 continue
             if claim.actor_ref is None:
                 continue
             actor_id = _norm_id(claim.actor_ref.id)
-            perspective = perspectives.get(actor_id)
-            if perspective is None or not perspective["resolved"]:
-                continue
             refs = [
                 _norm_id(ref.id)
                 for ref in (list(claim.target_refs or []) + list(claim.topic_refs or []))
@@ -809,6 +827,21 @@ class KnowledgeValidator:
             # Explicit in-turn learning source excuses the utterance: the
             # turn itself taught the speaker (typed provenance, not a guess).
             if claim.evidence_refs or claim.trigger_refs:
+                continue
+            perspective = perspectives.get(actor_id)
+            if perspective is None or not perspective["resolved"]:
+                # Ambiguous state fails conservative only for scene-relevant
+                # subjects; anything else is out of the lane's scope.
+                if actor_id and actor_id in scene_subjects:
+                    violations.append(
+                        ValidationViolation(
+                            validator=self.name, category=self.category,
+                            code="npc_utterance_ambiguous_knowledge",
+                            message="NPC utterance from a scene-relevant subject with no resolvable knowledge",
+                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
+                            claim_index=(bi, ci),
+                        )
+                    )
                 continue
             for ref in refs:
                 if ref in perspective["denied"]:
@@ -823,13 +856,16 @@ class KnowledgeValidator:
                     )
                     break
             else:
-                if not any(ref in perspective["known"] for ref in refs):
+                # Every referenced target must be known: one unknown target
+                # is enough for the utterance to rely on unavailable knowledge.
+                unknown = [ref for ref in refs if ref not in perspective["known"]]
+                if unknown:
                     violations.append(
                         ValidationViolation(
                             validator=self.name, category=self.category,
                             code="npc_utterance_without_knowledge",
                             message="NPC utterance references targets outside the subject's knowledge with no learning source",
-                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
+                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs, "unknown": unknown},
                             claim_index=(bi, ci),
                         )
                     )

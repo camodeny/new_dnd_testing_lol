@@ -322,3 +322,180 @@ def test_human_disclosure_does_not_create_character_knowledge():
     # ...but no character knowledge row exists for anyone.
     assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
     assert who_knows_target(db, camp, "fact", fact.id, owner)["total"] == 0
+
+
+# ── review findings: contract, mixed refs, scene relevance, lane NPCs ─────
+
+def _transfer_effect(subject_id, fact_id, **over):
+    args = {"subject_kind": "character", "subject_entity_id": str(subject_id),
+            "target_kind": "fact", "target_fact_id": str(fact_id),
+            "knowledge_state": "knows", "transfer_kind": "tell"}
+    args.update(over)
+    return {"id": "eff-tell-1", "effect_type": "transfer_knowledge", "arguments": args}
+
+
+def test_transfer_knowledge_effect_normalizes_in_contract():
+    subject_id, fact_id = str(uuid.uuid4()), str(uuid.uuid4())
+    contract = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "narration", "claims": [
+             {"text": "Aria tells Bram the way.", "claim_kind": "observation",
+              "origin": "dm_adjudication", "visibility": "public"}]}],
+         "staged_effects": [_transfer_effect(subject_id, fact_id)]})
+    assert contract.staged_effects[0].effect_type == "transfer_knowledge"
+    # Missing target fails closed at normalization, before any handler runs.
+    with pytest.raises(Exception):
+        normalize_contract(
+            {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+             "beats": [{"id": "beat_1", "type": "narration", "claims": [
+                 {"text": "Aria tells Bram the way.", "claim_kind": "observation",
+                  "origin": "dm_adjudication", "visibility": "public"}]}],
+             "staged_effects": [_transfer_effect(subject_id, fact_id, target_fact_id=None,
+                                                target_kind="fact")]})
+    # Unknown effect types stay rejected.
+    with pytest.raises(Exception):
+        normalize_contract(
+            {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+             "beats": [{"id": "beat_1", "type": "narration", "claims": [
+                 {"text": "Something happens.", "claim_kind": "observation",
+                  "origin": "dm_adjudication", "visibility": "public"}]}],
+             "staged_effects": [{"id": "eff-x", "effect_type": "invent_knowledge",
+                                 "arguments": {}}]})
+
+
+def _utterance_multi(actor, topic_ids, **claim_over):
+    base = {"text": "I know all about those places.", "claim_kind": "npc_utterance",
+            "origin": "dm_adjudication", "visibility": "public",
+            "actor_ref": {"type": "npc", "id": actor},
+            "topic_refs": [{"type": "location", "id": tid} for tid in topic_ids]}
+    base.update(claim_over)
+    return normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond",
+                               "reason": "x", "beats": [
+                                   {"id": "beat_1", "type": "npc_dialogue",
+                                    "speaker_ref": {"type": "npc", "id": actor},
+                                    "speaker_public_name": "Vera",
+                                    "truth_status": "truthful",
+                                    "claims": [base]}
+                               ]})
+
+
+def test_validator_rejects_mixed_known_and_unknown_refs():
+    known, unknown = str(uuid.uuid4()), str(uuid.uuid4())
+    pkt = _knowledge_packet(subject_id="npc:vera", target_id=known)
+    result = KnowledgeValidator().validate(_utterance_multi("npc:vera", [known, unknown]), pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_without_knowledge"
+    assert result.violations[0].details["unknown"] == [unknown]
+
+
+def _scene_packet(*, subject_id, target_id=None, scene_actors=(), knowledge_records=True):
+    pkt = _knowledge_packet(subject_id=subject_id, target_id=target_id)
+    if not knowledge_records:
+        pkt = _knowledge_packet(subject_id="npc:someone-else", target_id=target_id)
+    if scene_actors:
+        cid = pkt.audience.campaign_id
+        rec = ContextRecord(
+            record_id="current-scene:x", required=True, priority=90,
+            value={"present_actors": [{"entity_id": a, "name": "Vera"} for a in scene_actors]},
+            sources=[SourceRef(source_type="campaign_current_scene", source_id="x",
+                               source_version="1")],
+            authorization=AuthorizationScope(campaign_id=cid),
+            visibility="campaign")
+        by_name = {lane.name: list(lane.records) for lane in pkt.lanes}
+        by_name[LaneName.CURRENT_SCENE.value].append(rec)
+        status = {lane.name: lane.authority_status for lane in pkt.lanes}
+        rebuilt = {LaneName(name): recs for name, recs in by_name.items()}
+        return assemble_context_packet(audience=pkt.audience, records=rebuilt, lane_status=status)
+    return pkt
+
+
+def test_validator_scene_relevant_missing_perspective_fails_closed():
+    actor = str(uuid.uuid4())
+    pkt = _scene_packet(subject_id="npc:vera", target_id=None,
+                        scene_actors=[actor], knowledge_records=False)
+    contract = _utterance(actor, str(uuid.uuid4()))
+    result = KnowledgeValidator().validate(contract, pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_ambiguous_knowledge"
+    # Same gap with no scene lane stays out of scope (skip, not fail).
+    pkt2 = _knowledge_packet(subject_id="npc:vera", target_id=None)
+    assert KnowledgeValidator().validate(contract, pkt2).passed
+
+
+def test_lane_builder_includes_npc_subjects():
+    from app.world.epistemics import build_knowledge_visibility_values
+
+    Fac, camp, *_ = _setup()
+    db = Fac()
+    mara, _ = create_entity_authoritative(
+        db, camp.id, 0, entity_type="npc", name="Mara", operation_id="op-mara-lane")
+    fact, _ = create_fact_authoritative(
+        db, camp.id, 1, content="The cellar connects to the old mine.",
+        entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
+        provenance={"source": "dm_adjudication"}, operation_id="op-truth-lane")
+    assert_knowledge_inline(
+        db, camp, subject_kind="npc", subject_entity_id=mara.id,
+        target_kind="fact", target_fact_id=fact.id,
+        knowledge_state="suspects", acquisition_source="eavesdropping",
+        operation_id="op-know-lane")
+    values = build_knowledge_visibility_values(db, camp, set(), npc_entity_ids=[mara.id])
+    assert len(values) == 1
+    assert values[0]["perspective"] == "npc"
+    assert values[0]["subject_entity_id"] == str(mara.id)
+    assert values[0]["entries"][0]["knowledge_state"] == "suspects"
+
+
+def test_collect_subject_restricted_fact_texts():
+    from app.world.epistemics import collect_subject_restricted_fact_texts
+
+    Fac, camp, *_ = _setup()
+    db = Fac()
+    mara, _ = create_entity_authoritative(
+        db, camp.id, 0, entity_type="npc", name="Mara", operation_id="op-mara-rs")
+    known_fact, _ = create_fact_authoritative(
+        db, camp.id, 1, content="Mara knows the cellar route.",
+        entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
+        provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs1")
+    hidden_fact, _ = create_fact_authoritative(
+        db, camp.id, 2, content="The vault combination is 12-34-56.",
+        entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
+        provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs2")
+    assert_knowledge_inline(
+        db, camp, subject_kind="npc", subject_entity_id=mara.id,
+        target_kind="fact", target_fact_id=known_fact.id,
+        knowledge_state="knows", acquisition_source="direct_observation",
+        operation_id="op-know-rs")
+    texts = collect_subject_restricted_fact_texts(db, camp, [str(mara.id)])
+    assert "The vault combination is 12-34-56." in texts
+    assert "Mara knows the cellar route." not in texts
+    # Unresolvable speakers contribute no scope.
+    assert collect_subject_restricted_fact_texts(db, camp, ["not-a-uuid"]) == set()
+    assert collect_subject_restricted_fact_texts(db, camp, []) == set()
+
+
+def test_stream_narration_forwards_knowledge_scope_to_shadow_judge(monkeypatch):
+    import app.decisions.judges as judges_module
+    from app.dm.narration import stream_narration
+
+    Fac, camp, *_ = _setup()
+    db = Fac()
+    captured = {}
+
+    def _capture(service, evidence, **kwargs):
+        captured["secrets"] = set(evidence.secret_texts)
+        return None
+
+    monkeypatch.setattr(judges_module, "shadow_judge", _capture)
+    contract = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "narration", "claims": [
+             {"text": "The party walks on.", "claim_kind": "observation",
+              "origin": "dm_adjudication", "visibility": "public"}]}]})
+    result = stream_narration(
+        db, campaign_id=camp.id, thread_id=uuid.uuid4(),
+        turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+        contract=contract, publish_realtime=False,
+        judge_service=object(),
+        knowledge_restricted_texts={"The vault combination is 12-34-56."})
+    assert result.completed
+    assert "The vault combination is 12-34-56." in captured["secrets"]
