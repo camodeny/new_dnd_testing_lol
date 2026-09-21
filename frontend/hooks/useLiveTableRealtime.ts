@@ -410,6 +410,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       dmState: null,
       dmMessages: [],
       rollRequests: [],
+      surfaces: null,
       dmChunks: new Map(),
       dmStatus: null,
       revision: null,
