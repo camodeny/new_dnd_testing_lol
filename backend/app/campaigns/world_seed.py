@@ -40,6 +40,12 @@ WORLD_SEED_CONTRACT_VERSION = 1
 #: Domain event emitted exactly once per seeded campaign.
 WORLD_SEEDED_EVENT = "world.seeded_245"
 
+#: Bounded in-process regeneration budget: on content-boundary rejection the
+#: seed job tries alternate deterministic candidates (rotated picks) before
+#: failing. Retries with a new operation converge on the first passing
+#: candidate for the same inputs, so staging stays idempotent.
+MAX_SEED_CANDIDATES = 6
+
 #: Campaign statuses the seed job accepts. ``lobby`` is the normal path;
 #: ``starting`` without a seed event converges (campaigns that transitioned
 #: before this path existed). Anything else is rejected.
@@ -137,11 +143,22 @@ def build_seed_spec(
     content_boundaries: dict | None,
     composition: dict,
     lore_bundle: list[dict],
+    slot: int = 0,
 ) -> dict:
     """Derive the versioned seed spec (pure — no DB, no side effects).
 
+    ``slot`` rotates the deterministic curated picks for bounded
+    reject/regenerate cycles; slot 0 is the primary candidate.
+
     Raises ``WorldSeedError`` when inputs cannot seed (unready party,
     malformed boundaries, boundary rejection).
+
+    Privacy: raw private lore content is NEVER boundary-scanned — lore
+    shapes only DM-restricted hook metadata (character + version), never
+    generated text, so scanning it would build an owner-visible substring
+    oracle over another player's secrets (#244). Only generated seed output
+    (derived from owner-controlled settings + public composition) is
+    boundary-checked.
     """
     members = list((composition or {}).get("members") or [])
     pcs = [
@@ -156,11 +173,12 @@ def build_seed_spec(
             raise WorldSeedError("World seed requires every party character to be named")
 
     phrases = _deny_phrases(content_boundaries)
-    loc_name, loc_summary = _SEED_LOCATIONS[_stable_index(campaign_id, "location", len(_SEED_LOCATIONS))]
-    npc_pick = _SEED_NPCS[_stable_index(campaign_id, "npc", len(_SEED_NPCS))]
-    npc2_pick = _SEED_NPCS[(_stable_index(campaign_id, "npc", len(_SEED_NPCS)) + 2) % len(_SEED_NPCS)]
-    faction_name, faction_summary = _SEED_FACTIONS[_stable_index(campaign_id, "faction", len(_SEED_FACTIONS))]
-    pressure_name, pressure_desc = _SEED_PRESSURES[_stable_index(campaign_id, "pressure", len(_SEED_PRESSURES))]
+    pick = lambda name, n: _stable_index(campaign_id, f"{name}:{slot}", n)
+    loc_name, loc_summary = _SEED_LOCATIONS[pick("location", len(_SEED_LOCATIONS))]
+    npc_pick = _SEED_NPCS[pick("npc", len(_SEED_NPCS))]
+    npc2_pick = _SEED_NPCS[(pick("npc", len(_SEED_NPCS)) + 2) % len(_SEED_NPCS)]
+    faction_name, faction_summary = _SEED_FACTIONS[pick("faction", len(_SEED_FACTIONS))]
+    pressure_name, pressure_desc = _SEED_PRESSURES[pick("pressure", len(_SEED_PRESSURES))]
 
     # Multiplayer seeds get a second NPC so hooks can distribute; solo stays lean.
     npc_specs = [npc_pick] if len(pcs) < 2 else [npc_pick, npc2_pick]
@@ -214,12 +232,40 @@ def build_seed_spec(
         },
         phrases, source="generated",
     )
-    # Lore inputs are boundary-checked without ever entering public text.
-    _check_boundaries(
-        {f"lore:{e.get('character_id')}": str(e.get("content") or "") for e in (lore_bundle or [])},
-        phrases, source="lore",
-    )
     return spec
+
+
+def generate_seed_spec(
+    *,
+    campaign_id: str,
+    theme: str | None,
+    brief: str | None,
+    difficulty: str,
+    content_boundaries: dict | None,
+    composition: dict,
+    lore_bundle: list[dict],
+    required_pc_ids: list[str],
+) -> tuple[dict, int]:
+    """Build + validate the first boundary-passing candidate (bounded regen).
+
+    Tries deterministic slots in order and returns ``(spec, candidates_tried)``.
+    Raises the last ``WorldSeedError`` when every candidate is rejected.
+    """
+    last_error: WorldSeedError | None = None
+    for slot in range(max(1, MAX_SEED_CANDIDATES)):
+        try:
+            spec = build_seed_spec(
+                campaign_id=campaign_id, theme=theme, brief=brief,
+                difficulty=difficulty, content_boundaries=content_boundaries,
+                composition=composition, lore_bundle=lore_bundle, slot=slot,
+            )
+            validate_seed_spec(spec, required_pc_ids=required_pc_ids)
+            if slot:
+                logger.info("world_seed regenerated campaign_id=%s slot=%s", campaign_id, slot)
+            return spec, slot + 1
+        except WorldSeedError as exc:
+            last_error = exc
+    raise last_error if last_error is not None else WorldSeedError("World seed generation failed")
 
 
 def validate_seed_spec(spec: dict, *, required_pc_ids: list[str]) -> None:
@@ -353,7 +399,11 @@ def run_world_seed(
 
     composition = build_party_composition(db, members)
     lore_bundle = get_seed_lore_bundle(db, campaign_id=campaign.id)
-    spec = build_seed_spec(
+    required_pc_ids = [
+        str(m.selected_character_id) for m in members
+        if getattr(m, "selected_character_id", None) is not None
+    ]
+    spec, candidates_tried = generate_seed_spec(
         campaign_id=str(campaign.id),
         theme=getattr(campaign, "theme", None),
         brief=getattr(campaign, "brief", None),
@@ -361,12 +411,8 @@ def run_world_seed(
         content_boundaries=getattr(campaign, "content_boundaries", None),
         composition=composition,
         lore_bundle=lore_bundle,
+        required_pc_ids=required_pc_ids,
     )
-    required_pc_ids = [
-        str(m.selected_character_id) for m in members
-        if getattr(m, "selected_character_id", None) is not None
-    ]
-    validate_seed_spec(spec, required_pc_ids=required_pc_ids)
 
     holder: dict = {}
     from_status = str(campaign.status)
@@ -530,6 +576,7 @@ def run_world_seed(
             "clock_id": holder.get("clock_id"),
             "hook_count": holder.get("hook_count", 0),
             "lore_consumed": len(get_seed_lore_bundle(db, campaign_id=campaign.id)),
+            "candidates_tried": candidates_tried,
             "seed": WORLD_SEED_TAG,
         },
         operation_id=f"{operation_id}:seeded",
@@ -542,12 +589,14 @@ def run_world_seed(
     )
     db.refresh(campaign_after)
     logger.info(
-        "world_seed staged campaign_id=%s status=%s location=%s npcs=%s clock=%s revision=%s",
+        "world_seed staged campaign_id=%s status=%s location=%s npcs=%s clock=%s candidates=%s revision=%s",
         campaign.id, campaign_after.status, spec["location"]["name"],
-        len(holder.get("npc_ids") or []), holder.get("clock_id"), campaign_after.revision,
+        len(holder.get("npc_ids") or []), holder.get("clock_id"),
+        candidates_tried, campaign_after.revision,
     )
     snapshot = _seeded_snapshot(db, campaign_after, replayed=False)
     snapshot["seed"].update({
+        "candidates_tried": candidates_tried,
         "location": {"entity_id": holder.get("location_id"), "name": spec["location"]["name"]},
         "npcs": [
             {"entity_id": eid, "name": npc["name"]}

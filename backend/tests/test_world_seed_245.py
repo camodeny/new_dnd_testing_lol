@@ -275,6 +275,77 @@ def test_world_seed_boundary_rejection_stays_prestart(api):
         assert count == 0
 
 
+def test_world_seed_boundary_probe_cannot_reveal_private_lore(api):
+    """Owner-controlled boundary phrases must not oracle another player's lore.
+
+    A deny phrase matching private lore content must not change the
+    owner-visible seed outcome: the seed succeeds and leaks nothing.
+    """
+    client, factory, actor, owner_id, _, _ = api
+    campaign = _create(
+        client,
+        content_boundaries={"exclude": ["xyzzy-moth-123"]},
+    )
+    chars = _ready_lobby(factory, campaign["id"], [owner_id])
+    char = chars[str(owner_id)]
+    secret = "My secret pact of the xyzzy-moth-123 sealed at midnight"
+    with factory() as db:
+        db.add(CampaignCharacterLore(
+            campaign_id=uuid.UUID(campaign["id"]), character_id=char.id,
+            user_id=owner_id, content=secret, visibility="private", version=1,
+        ))
+        db.commit()
+
+    response = _seed(client, campaign["id"], "op-seed-probe")
+    assert response.status_code == 200, response.text
+    # The deny phrase itself echoes in the owner-set campaign settings, but
+    # the lore-only remainder must never surface anywhere owner-visible.
+    assert "sealed at midnight" not in response.text
+    assert response.json()["campaign"]["status"] == "starting"
+
+
+def test_world_seed_rejected_candidate_regenerates(api):
+    """A boundary-rejected first candidate regenerates to a passing slot."""
+    from app.campaigns.world_seed import build_seed_spec
+
+    client, factory, actor, owner_id, _, _ = api
+    campaign = _create(client)
+    chars = _ready_lobby(factory, campaign["id"], [owner_id])
+    char = chars[str(owner_id)]
+    composition = {"members": [{
+        "character_id": str(char.id), "character_name": char.name,
+        "user_id": str(owner_id), "is_ready": True,
+    }]}
+    slot_locations = [
+        build_seed_spec(
+            campaign_id=campaign["id"], theme=None, brief=None,
+            difficulty="medium", content_boundaries=None,
+            composition=composition, lore_bundle=[], slot=slot,
+        )["location"]["name"]
+        for slot in range(6)
+    ]
+    denied = {slot_locations[0].lower()}
+    expected_slot = next(
+        slot for slot, name in enumerate(slot_locations)
+        if name.lower() not in denied
+    )
+    expected_location = slot_locations[expected_slot]
+    update = client.put(
+        f"/api/campaigns/{campaign['id']}",
+        json={"expected_revision": campaign["revision"],
+              "content_boundaries": {"exclude": sorted(denied)}},
+        headers={"Idempotency-Key": "op-seed-regen-settings"},
+    )
+    assert update.status_code == 200, update.text
+
+    response = _seed(client, campaign["id"], "op-seed-regen")
+    assert response.status_code == 200, response.text
+    seed = response.json()["seed"]
+    assert seed["location"]["name"] == expected_location
+    assert seed["candidates_tried"] == expected_slot + 1
+    assert seed["candidates_tried"] > 1
+
+
 def test_world_seed_duplicate_retry_no_dupes(api):
     client, factory, actor, owner_id, _, _ = api
     campaign = _create(client)
