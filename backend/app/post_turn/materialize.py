@@ -887,6 +887,15 @@ def _apply_fact(
     return {"outcome": "applied" if created else "duplicate", "fact_id": str(row.id)}
 
 
+def _provenance_order(provenance: Any) -> int:
+    """Committed ordering of a row from the materializer's provenance channel."""
+    if isinstance(provenance, dict):
+        order = provenance.get("source_sequence")
+        if isinstance(order, int):
+            return order
+    return -1
+
+
 def _apply_npc_state(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
@@ -901,6 +910,12 @@ def _apply_npc_state(
     existing = get_npc_state(db, campaign.id, entity.id)
     if existing is not None and (existing.provenance or {}).get("post_turn_run") == run_stamp:
         return {"outcome": "duplicate", "entity_id": str(entity.id)}
+    source_order = assertion.source_sequence if assertion.source_sequence is not None else -1
+    if existing is not None and _provenance_order(existing.provenance) > source_order:
+        # A newer committed state already exists (delayed ranges execute
+        # lock-free): never clobber it with older materialization.
+        return {"outcome": "skipped", "reason": "stale_source_order",
+                "entity_id": str(entity.id)}
     allowed = {
         "role", "goals", "disposition", "resources", "current_activity",
         "location_entity_id", "location_name", "importance", "depth",
@@ -915,7 +930,11 @@ def _apply_npc_state(
         else:
             updates["location_name"] = str(location_ref)
     row = apply_npc_state_inline(
-        db, campaign, entity.id, new_revision=int(campaign.revision or 1),
+        db, campaign, entity.id,
+        # Source-ordered stamp, not the execution-time campaign revision:
+        # a delayed range must not make old state look current.
+        new_revision=assertion.source_sequence
+        if assertion.source_sequence is not None else int(campaign.revision or 1),
         provenance={
             "source": "post_turn_materialize",
             "post_turn_run": run_stamp,
@@ -928,6 +947,46 @@ def _apply_npc_state(
         **updates,
     )
     return {"outcome": "applied", "entity_id": str(row.entity_id)}
+
+
+def _knowledge_current_order(
+    db: Session, campaign_id: uuid.UUID, subject_id: uuid.UUID,
+    target_kind: str, target_ids: dict[str, Any],
+) -> int:
+    """Committed ordering of the live stance for one (subject, target).
+
+    Prefers the materializer's provenance channel, then the committed
+    turn's ordering (source turn built on revision R-1 commits as R),
+    else unknown (-1, never treated as newer).
+    """
+    from app.world.epistemics import list_knowledge_for_subject
+    from models.dm import DmTurn
+
+    tid: uuid.UUID | None = None
+    raw = (target_ids.get("target_id") or target_ids.get("target_fact_id")
+           or target_ids.get("target_relation_id") or target_ids.get("target_entity_id"))
+    try:
+        tid = uuid.UUID(str(raw)) if raw is not None else None
+    except (ValueError, AttributeError, TypeError):
+        return -1
+    if tid is None:
+        return -1
+    best = -1
+    for row in list_knowledge_for_subject(db, campaign_id, subject_id):
+        match = (
+            (target_kind == "fact" and row.target_fact_id == tid)
+            or (target_kind == "relation" and row.target_relation_id == tid)
+            or (target_kind == "entity" and row.target_entity_id == tid)
+        )
+        if not match:
+            continue
+        order = _provenance_order(row.provenance)
+        if order < 0 and row.source_turn_id is not None:
+            turn = db.get(DmTurn, row.source_turn_id)
+            if turn is not None and turn.campaign_id == campaign_id:
+                order = int(turn.source_revision or 0) + 1
+        best = max(best, order)
+    return best
 
 
 def _apply_knowledge(
@@ -981,6 +1040,11 @@ def _apply_knowledge(
             raise MaterializeError(
                 f"knowledge/{assertion.key}: requires target_ref or a target id")
         return {"outcome": "rejected", "reason": "missing_target"}
+    if _knowledge_current_order(db, campaign.id, subject.id, target_kind, target_ids) > (
+            assertion.source_sequence if assertion.source_sequence is not None else -1):
+        # A newer committed stance already exists (transfer_knowledge at
+        # commit writes in place): never clobber it with older state.
+        return {"outcome": "skipped", "reason": "stale_source_order"}
     row, created = assert_knowledge_inline(
         db, campaign, subject_kind=subject_kind, subject_entity_id=subject.id,
         target_kind=target_kind, **target_ids,
@@ -1006,10 +1070,12 @@ def _apply_scene(
     """Apply one current-state projection to the transient scene row (#209).
 
     Single-row upsert semantics converge on replay (no duplication
-    possible). Uses the current campaign revision without bumping it —
-    post-turn consolidation never advances the revision counter.
+    possible). The row's revision channel doubles as the staleness guard:
+    both commit-time scene writes and these stamps use event-sequence
+    numbering (sequence == resulting revision), so a delayed older
+    assertion never overwrites newer committed state.
     """
-    from app.world.service import UNSET, apply_scene_update_inline
+    from app.world.service import UNSET, apply_scene_update_inline, get_current_scene
 
     data = assertion.data
     if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
@@ -1030,8 +1096,14 @@ def _apply_scene(
         location_id = location.id
     elif location_ref is None:
         location_id = None
+    source_order = assertion.source_sequence if assertion.source_sequence is not None else -1
+    current = get_current_scene(db, campaign.id)
+    if current is not None and int(current.revision or 0) > source_order:
+        # A newer committed scene already exists (e.g. update_scene at a
+        # later commit ran before this delayed range): preserve it.
+        return {"outcome": "skipped", "reason": "stale_source_order"}
     row = apply_scene_update_inline(
-        db, campaign, new_revision=int(campaign.revision or 0),
+        db, campaign, new_revision=source_order,
         location_entity_id=location_id,
         location_name=patch.get("location_name", data.get("location_name")),
         fictional_time=patch.get("fictional_time", data.get("fictional_time")),
@@ -1194,6 +1266,7 @@ def materialize_range(
     duplicates = 0
     rejected: list[dict] = []
     deferred: list[dict] = []
+    skipped: list[dict] = []
     outcomes: list[dict] = []
 
     ordered = sorted(
@@ -1352,6 +1425,8 @@ def materialize_range(
             duplicates += 1
         elif outcome == "rejected":
             rejected.append(record)
+        elif outcome == "skipped":
+            skipped.append(record)
         else:
             deferred.append(record)
         outcomes.append(record)
@@ -1365,6 +1440,7 @@ def materialize_range(
         "duplicates": duplicates,
         "rejected": len(rejected),
         "deferred": len(deferred),
+        "skipped": len(skipped),
         "generation": generation_trace,
         "verification": verification_tally,
         "outcomes": outcomes,
@@ -1375,6 +1451,6 @@ def materialize_range(
         to_sequence=to_sequence, proposed=len(candidates),
         applied=sum(applied.values()), duplicates=duplicates,
         rejected=len(rejected), deferred=len(deferred),
-        operation_id=op_id,
+        skipped=len(skipped), operation_id=op_id,
     )
     return summary

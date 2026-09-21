@@ -1041,3 +1041,29 @@ def test_reuse_first_later_keep_distinct_stays_two():
     mat = out["result"]["materialization"]
     assert mat["proposed"] == 0
     assert _entity_names(db, c).count("Mira") == 2
+
+
+# ── Round-9: delayed ranges never clobber newer current state ───────────────
+
+def test_delayed_scene_hint_preserves_newer_committed_scene():
+    from app.world.service import apply_scene_update_inline, get_current_scene
+    _F, db, c = _setup()
+    old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "scene", "key": "old", "visibility": "campaign",
+         "data": {"scene_patch": {"fictional_time": "dawn"}}}]})
+    newer = _commit(db, c, payload={"n": 2})
+    # A newer committed scene update lands before the old range runs.
+    db.refresh(db.get(Campaign, c.id))
+    apply_scene_update_inline(
+        db, db.get(Campaign, c.id), new_revision=newer.sequence,
+        fictional_time="dusk", operation_id="commit-newer")
+    db.commit()
+    out = run_post_turn_range(
+        db, c.id, old.sequence, old.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["scene"] == 0
+    assert mat["skipped"] == 1
+    assert get_current_scene(db, c.id).fictional_time == "dusk"
+    assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == old.sequence
