@@ -590,6 +590,7 @@ def build_narration_judge_evidence(
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
     evidence_revision: str = "",
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> Any:
     """Assemble code-owned judge evidence from a narration + contract.
 
@@ -601,7 +602,10 @@ def build_narration_judge_evidence(
     legitimate renderer output as unsupported. Player-declaration texts
     ground verbatim PC attribution, secret strings (DM-authorized,
     server-side judge use only) ground restricted material, and PC tokens
-    ground agency attribution. Never imports decision internals at module
+    ground agency attribution. ``knowledge_restricted_texts`` carries
+    fact texts unknown to the speaking subject (#251 perspective scope)
+    so the secrecy judge flags paraphrased hidden-knowledge misuse, not
+    just literal private-truth leaks. Never imports decision internals at module
     scope — the import stays local so DM layers keep one direction.
     """
     from app.decisions.judges import build_evidence
@@ -662,6 +666,8 @@ def build_narration_judge_evidence(
         if c.claim_kind == "player_declaration"
     ]
     secrets = sorted(_collect_secret_strings(contract, extra_secrets=extra_secrets))
+    if knowledge_restricted_texts:
+        secrets = sorted(set(secrets) | {s for s in knowledge_restricted_texts if s and str(s).strip()})
     tokens: set[str] = set()
     for beat in contract.beats:
         for claim in beat.claims:
@@ -694,6 +700,7 @@ def shadow_judge_narration(
     trace_id: str | None = None,
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> Any | None:
     """Run semantic judges in shadow mode over one full narration candidate.
 
@@ -714,6 +721,7 @@ def shadow_judge_narration(
             extra_secrets=extra_secrets,
             pc_names=pc_names,
             evidence_revision=str(trace_id or ""),
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
         violations = list(deterministic_violations or [])
         return shadow_judge(
@@ -742,6 +750,7 @@ def check_narration_fidelity_or_raise(
     trace_id: str | None = None,
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> None:
     violations = validate_narration_fidelity(
         narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
@@ -759,6 +768,7 @@ def check_narration_fidelity_or_raise(
         trace_id=trace_id,
         campaign_id=campaign_id,
         turn_id=turn_id,
+        knowledge_restricted_texts=knowledge_restricted_texts,
     )
     if violations:
         _tally_fidelity_violations(violations)
@@ -899,6 +909,7 @@ def stream_narration(
     on_first_persist_tx: Callable[[Session, uuid.UUID], None] | None = None,
     judge_service: Any | None = None,
     judge_session_factory: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
@@ -1218,6 +1229,7 @@ def stream_narration(
             trace_id=trace_id,
             campaign_id=campaign_id,
             turn_id=turn_id,
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
         if violations:
             _tally_fidelity_violations(violations)
@@ -1343,6 +1355,25 @@ class ValidatedTurnResult:
     event: Any
 
 
+def derive_knowledge_speaker_scope(contract: DmTurnContractV1) -> set[str]:
+    """NPC subjects whose unknown facts scope the secrecy judge (#251).
+
+    Mirrors the deterministic ``KnowledgeValidator`` boundary: NPC-attributed
+    ``npc_utterance``/``observation``/``world_fact`` claims are
+    knowledge-bearing for their speaker. Pure (no I/O) — callers resolve
+    the IDs against campaign entities when deriving restricted texts.
+    """
+    return {
+        str(claim.actor_ref.id).strip()
+        for beat in (contract.beats or [])
+        for claim in (beat.claims or [])
+        if claim.claim_kind in ("npc_utterance", "observation", "world_fact")
+        and claim.actor_ref is not None
+        and getattr(claim.actor_ref, "type", None) == "npc"
+        and str(claim.actor_ref.id or "").strip()
+    }
+
+
 def execute_validated_turn(
     db: Session,
     *,
@@ -1364,6 +1395,7 @@ def execute_validated_turn(
     identity_session_factory: Any | None = None,
     judge_service: Any | None = None,
     judge_session_factory: Any | None = None,
+    knowledge_restricted_texts: set[str] | None = None,
 ) -> ValidatedTurnResult:
     """Run a validated structured turn through narration to final commit.
 
@@ -1452,6 +1484,35 @@ def execute_validated_turn(
             db_, turn_id, attempt_id, stream_id=stream_id_, commit=False
         )
 
+    # Issue #251 — derive subject-unknown restricted texts for the secrecy
+    # judge when the caller did not supply them. Per-speaker scope from
+    # #211 knowledge, independent of human visibility; flattened with
+    # speaker tags the secrecy prompt interprets. Bounded (recent facts
+    # only, resolved campaign speakers) and fail-soft: derivation failure
+    # leaves the judge on literal secrets, never breaks narration or delays
+    # first-chunk streaming beyond one bounded query.
+    if knowledge_restricted_texts is None:
+        try:
+            from models.campaigns import Campaign as _Campaign
+
+            from app.world.epistemics import collect_subject_restricted_fact_texts
+
+            _speakers = derive_knowledge_speaker_scope(contract)
+            if _speakers:
+                _campaign = db.get(_Campaign, turn.campaign_id)
+                if _campaign is not None:
+                    _scoped = collect_subject_restricted_fact_texts(
+                        db, _campaign, _speakers
+                    )
+                    knowledge_restricted_texts = {
+                        f"[unknown to speaker {speaker}] {text}"
+                        for speaker, texts in _scoped.items()
+                        for text in texts
+                    } or None
+        except Exception as exc:
+            logger.warning("knowledge judge scope derivation dropped: %s", exc)
+            knowledge_restricted_texts = None
+
     try:
         narration = stream_narration(
             db,
@@ -1471,6 +1532,7 @@ def execute_validated_turn(
             on_first_persist_tx=_boundary_tx,
             judge_service=judge_service,
             judge_session_factory=judge_session_factory,
+            knowledge_restricted_texts=knowledge_restricted_texts,
         )
     except NarrationStreamError:
         # Defined remediation for post-visibility failure: if the

@@ -218,6 +218,96 @@ def enumerate_candidates(
 
 
 @dataclass(frozen=True)
+class FramePerspective:
+    """Knowledge scope a decision frame was built for (issue #251).
+
+    Semantic decision roles for a PC/NPC may receive only the
+    knowledge/truth lanes explicitly appropriate to that DM-internal role:
+    candidate/context assembly filters by the relevant character/NPC/group
+    knowledge before the decision model sees the state. A perspective never
+    grants knowledge — it only restricts what the frame may contain.
+
+    - ``subject_kind``: ``"character"`` | ``"npc"`` | ``"party"`` | ``"dm"``.
+    - ``subject_entity_id``: canonical WorldEntity subject, if any.
+    - ``known_target_refs``: ``"kind:id"`` strings (fact/relation/entity)
+      this perspective holds, code-supplied from the #211 knowledge lane.
+      The ``"dm"`` kind is unscoped (DM sees all) regardless of refs.
+    """
+
+    subject_kind: str
+    subject_entity_id: str | None = None
+    known_target_refs: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.subject_kind, str) or not self.subject_kind.strip():
+            raise DecisionError("frame perspective is missing a subject kind", kind="malformed")
+        if self.subject_kind not in ("character", "npc", "party", "dm"):
+            raise DecisionError(
+                f"unknown perspective subject kind {self.subject_kind!r}",
+                kind="malformed",
+            )
+        if self.subject_entity_id is not None and (
+            not isinstance(self.subject_entity_id, str) or not self.subject_entity_id.strip()
+        ):
+            raise DecisionError("frame perspective has an empty subject entity id", kind="malformed")
+        for ref in self.known_target_refs:
+            if not isinstance(ref, str) or not ref.strip():
+                raise DecisionError("frame perspective has an empty known target ref", kind="malformed")
+
+
+def perspective_target_ref(target_kind: str, target_id: str) -> str:
+    """Canonical ``"kind:id"`` key for perspective membership checks."""
+    return f"{target_kind}:{target_id}"
+
+
+def perspective_allows_target(
+    perspective: FramePerspective | None, target_kind: str, target_id: Any,
+) -> bool:
+    """Whether a perspective may use one knowledge target.
+
+    A missing perspective means unscoped (legacy callers); ``"dm"`` sees all.
+    Anything else requires an exact code-supplied ``"kind:id"`` membership —
+    the check never infers from related records.
+    """
+    if perspective is None:
+        return True
+    if perspective.subject_kind == "dm":
+        return True
+    tid = str(target_id).strip() if target_id is not None else ""
+    if not tid:
+        return False
+    return perspective_target_ref(target_kind, tid) in set(perspective.known_target_refs)
+
+
+def filter_candidates_by_perspective(
+    candidates: Iterable[CandidateRecord],
+    *,
+    perspective: FramePerspective | None,
+    target_ref_of: Callable[[CandidateRecord], tuple[str, Any] | None] | None = None,
+) -> tuple[CandidateRecord, ...]:
+    """Drop candidates whose knowledge target the perspective does not hold.
+
+    Candidates with no target (``target_ref_of`` returns None) and all
+    escape/defer IDs are always kept — the model can still decline to the
+    open-ended DM or clarify. A missing perspective keeps everything
+    (unscoped legacy frames).
+    """
+    kept: list[CandidateRecord] = []
+    for candidate in candidates:
+        if is_escape_id(candidate.id):
+            kept.append(candidate)
+            continue
+        ref = target_ref_of(candidate) if target_ref_of is not None else None
+        if ref is None:
+            kept.append(candidate)
+            continue
+        kind, tid = ref
+        if perspective_allows_target(perspective, kind, tid):
+            kept.append(candidate)
+    return tuple(kept)
+
+
+@dataclass(frozen=True)
 class DecisionFrame:
     """An authorized decision frame: state revision + candidate set + question.
 
@@ -236,6 +326,7 @@ class DecisionFrame:
     candidates: tuple[CandidateRecord, ...] = field(default_factory=tuple)
     frame_id: str = ""
     schema_version: int = FRAME_SCHEMA_VERSION
+    perspective: FramePerspective | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.decision_class, str) or not self.decision_class.strip():
@@ -278,15 +369,26 @@ def build_frame(
     id_fn: Callable[[Any], str] | None = None,
     label_fn: Callable[[Any], str] | None = None,
     source: str = "code:enumeration",
+    perspective: FramePerspective | None = None,
+    perspective_filter: Callable[[CandidateRecord], tuple[str, Any] | None] | None = None,
 ) -> DecisionFrame:
     """Construct a validated frame, appending escape candidates by default.
 
     Enumeration stays in caller code: pass already-authorized
     :class:`CandidateRecord` entries (or raw mappings projected by code-owned
     ``id_fn``/``label_fn``). Escape candidates are appended unless their IDs
-    are already present.
+    are already present. When ``perspective`` is supplied with
+    ``perspective_filter``, domain candidates outside the perspective's known
+    targets are dropped before escapes are appended — the model never sees a
+    candidate the subject could not know.
     """
     enumerated = list(enumerate_candidates(candidates, id_fn=id_fn, label_fn=label_fn, source=source))
+    if perspective is not None and perspective_filter is not None:
+        enumerated = list(
+            filter_candidates_by_perspective(
+                enumerated, perspective=perspective, target_ref_of=perspective_filter
+            )
+        )
     if include_escapes:
         present = {c.id for c in enumerated}
         for escape in escape_candidates():
@@ -300,6 +402,7 @@ def build_frame(
         state_revision=state_revision,
         candidates=tuple(enumerated),
         frame_id=frame_id or uuid.uuid4().hex,
+        perspective=perspective,
     )
 
 
@@ -406,6 +509,7 @@ def rebuild_frame(
         state_revision=state_revision,
         candidates=tuple(base),
         frame_id=uuid.uuid4().hex,
+        perspective=frame.perspective,
     )
 
 
@@ -477,6 +581,12 @@ def frame_trace(frame: DecisionFrame, policy_version: int | None = None) -> dict
         "state_revision": frame.state_revision,
         "candidate_ids": [c.id for c in frame.candidates],
     }
+    if frame.perspective is not None:
+        trace["perspective"] = {
+            "subject_kind": frame.perspective.subject_kind,
+            "subject_entity_id": frame.perspective.subject_entity_id,
+            "known_target_refs": list(frame.perspective.known_target_refs),
+        }
     if policy_version is not None:
         trace["policy_schema_version"] = policy_version
     return trace

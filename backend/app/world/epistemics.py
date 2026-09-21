@@ -963,9 +963,220 @@ def project_facts_for_user(
     return _project_records_for_user(db, campaign, viewer_user_id, facts, "fact")
 
 
+# ── #251 judge scoping: subject-unknown restricted texts ─────────────────
+
+RESTRICTED_FACT_SCAN_LIMIT = 100
+RESTRICTED_TEXT_LIMIT = 32
+RESTRICTED_TEXT_CHARS = 500
+
+
+def collect_subject_restricted_fact_texts(
+    db: Session, campaign: Campaign, speaker_subject_ids: Any, *,
+    limit_facts: int = RESTRICTED_FACT_SCAN_LIMIT,
+    limit_texts: int = RESTRICTED_TEXT_LIMIT,
+    max_chars: int = RESTRICTED_TEXT_CHARS,
+) -> dict[str, set[str]]:
+    """Per-speaker fact texts that speaker could not know — for the judge.
+
+    Derived from each speaker's ``WorldKnowledge`` independently of human
+    visibility: a campaign/public OOC fact a speaker never learned is still
+    that speaker's misuse to state, so all visibilities are scanned. A text
+    maps to every resolved speaker lacking knowledge of that fact; speakers
+    that do not resolve to a campaign entity are excluded (their scope is
+    unknowable, never assumed). An explicit ``does_not_know`` stance never
+    counts as coverage. Bounded to recent rows and capped texts; returns
+    possibly-empty; never raises for misshapen input (callers treat failure
+    as no extra scope).
+    """
+    try:
+        speaker_ids = [str(s).strip() for s in (speaker_subject_ids or []) if str(s or "").strip()]
+    except TypeError:
+        return {}
+    subjects: list[WorldEntity] = []
+    for raw in speaker_ids[:16]:
+        try:
+            sid = _coerce_uuid(raw, field="subject_entity_id")
+        except ValueError:
+            continue
+        entity = db.get(WorldEntity, sid)
+        if entity is not None and entity.campaign_id == campaign.id:
+            subjects.append(entity)
+    if not subjects:
+        return {}
+    try:
+        known_per_speaker: list[tuple[str, set[str]]] = []
+        for subject in subjects:
+            rows = list_knowledge_for_subject(db, campaign.id, subject.id, limit=200)
+            known: set[str] = set()
+            for row in rows:
+                # An explicit does_not_know stance is not coverage.
+                if row.knowledge_state == "does_not_know":
+                    continue
+                if row.target_kind == "fact" and row.target_fact_id is not None:
+                    known.add(str(row.target_fact_id))
+            known_per_speaker.append((str(subject.id), known))
+        scan = max(1, min(int(limit_facts or 100), 500))
+        facts = list(db.execute(
+            select(WorldFact).where(
+                WorldFact.campaign_id == campaign.id,
+            ).order_by(WorldFact.created_at.desc()).limit(scan)
+        ).scalars().all())
+    except Exception:
+        return {}
+    out: dict[str, set[str]] = {}
+    cap_texts = max(1, min(int(limit_texts or 32), 64))
+    cap_chars = max(1, min(int(max_chars or 500), 4000))
+    total = 0
+    for fact in facts:
+        fid = str(fact.id)
+        content = str(getattr(fact, "content", None) or "").strip()
+        if not content:
+            continue
+        for speaker_id, known in known_per_speaker:
+            if fid in known:
+                continue
+            out.setdefault(speaker_id, set()).add(content[:cap_chars])
+            total += 1
+            if total >= cap_texts:
+                return out
+    return out
+
+
 def project_relations_for_user(
     db: Session, campaign: Campaign, viewer_user_id: Any,
     relations: list[WorldRelation],
 ) -> dict[str, Any]:
     """Viewer projection over an explicit relation set with leak-free counts."""
     return _project_records_for_user(db, campaign, viewer_user_id, relations, "relation")
+
+
+# ── #251 knowledge-visibility lane reader (DM-internal, adjudication-only) ──
+
+KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT = 50
+
+
+def _resolve_subject_for_character(
+    db: Session, campaign_id: uuid.UUID, character_id: Any,
+) -> WorldEntity | None:
+    """Map a canonical PC (characters.id) to its WorldEntity subject, if any.
+
+    PCs materialize into world_entities via post-turn (#217); before that no
+    subject row exists and the lane reports an explicit empty perspective
+    rather than failing. Never raises: unresolved maps to None.
+    """
+    try:
+        cid = _coerce_uuid(character_id, field="character_id")
+    except ValueError:
+        return None
+    direct = db.get(WorldEntity, cid)
+    if direct is not None and direct.campaign_id == campaign_id:
+        return direct
+    try:
+        candidates = list(
+            db.execute(
+                select(WorldEntity).where(
+                    WorldEntity.campaign_id == campaign_id,
+                    WorldEntity.entity_type == "character",
+                ).limit(200)
+            ).scalars().all()
+        )
+    except Exception:
+        return None
+    needle = str(cid)
+    for entity in candidates:
+        details = getattr(entity, "details", None) or {}
+        if isinstance(details, dict):
+            for key in ("character_id", "pc_id", "canonical_character_id"):
+                if str(details.get(key) or "") == needle:
+                    return entity
+    return None
+
+
+def _subject_knowledge_value(
+    db: Session, campaign: Campaign, subject: WorldEntity | None, *,
+    character_id: Any = None, perspective: str = "character",
+    limit: int = KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT,
+) -> dict[str, Any]:
+    """One DM-internal perspective snapshot for a resolved-or-empty subject."""
+    if subject is None:
+        return {
+            "character_id": str(character_id) if character_id is not None else None,
+            "subject_entity_id": None,
+            "subject_resolved": False,
+            "perspective": perspective,
+            "entries": [],
+            "total": 0,
+            "truncated": False,
+        }
+    rows = list_knowledge_for_subject(db, campaign.id, subject.id, limit=limit + 1)
+    truncated = len(rows) > limit
+    entries: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        try:
+            tkind, tid = _knowledge_target_ref(row)
+        except ValueError:
+            continue
+        entries.append({
+            "knowledge_id": str(row.id),
+            "target_kind": tkind,
+            "target_id": str(tid),
+            "knowledge_state": row.knowledge_state,
+            "acquisition_source": row.acquisition_source,
+            "visibility": getattr(row, "visibility", "dm_only"),
+        })
+    return {
+        "character_id": str(character_id) if character_id is not None else None,
+        "subject_entity_id": str(subject.id),
+        "subject_resolved": True,
+        "perspective": perspective,
+        "entries": entries,
+        "total": len(rows),
+        "truncated": truncated,
+    }
+
+
+def build_knowledge_visibility_values(
+    db: Session, campaign: Campaign, character_ids: Any, *,
+    npc_entity_ids: Any = None,
+    max_entries_per_subject: int = KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT,
+) -> list[dict[str, Any]]:
+    """DM-internal per-subject knowledge snapshots for the #202 lane.
+
+    Covers acting PCs (``character_ids``) plus scene-relevant non-player
+    subjects (``npc_entity_ids``: NPC/group WorldEntity IDs, e.g. from the
+    current scene's present actors). Returns one value dict per subject plus
+    a single empty value when no subject is relevant at all, so the REQUIRED
+    lane is always satisfiable without fabricating knowledge. Values carry
+    target refs + stances only (no truth text); the DM retrieves full
+    evidence through #212 tools. Raises only on DB failure (caller fails
+    closed); unresolved subjects yield explicit empty entries.
+    """
+    try:
+        ids = list(character_ids or [])
+    except TypeError:
+        ids = []
+    try:
+        npc_ids = list(npc_entity_ids or [])
+    except TypeError:
+        npc_ids = []
+    if not ids and not npc_ids:
+        return [{"perspectives": [], "note": "no_pc_in_attempt"}]
+    limit = max(1, min(int(max_entries_per_subject or 50), 200))
+    values: list[dict[str, Any]] = []
+    for character_id in ids:
+        subject = _resolve_subject_for_character(db, campaign.id, character_id)
+        values.append(_subject_knowledge_value(
+            db, campaign, subject, character_id=character_id,
+            perspective="character", limit=limit,
+        ))
+    for npc_id in npc_ids[:32]:
+        try:
+            eid = _coerce_uuid(npc_id, field="subject_entity_id")
+        except ValueError:
+            continue
+        entity = db.get(WorldEntity, eid)
+        subject = entity if entity is not None and entity.campaign_id == campaign.id else None
+        values.append(_subject_knowledge_value(
+            db, campaign, subject, perspective="npc", limit=limit,
+        ))
+    return values

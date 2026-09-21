@@ -735,6 +735,172 @@ class VisibilityValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
+class KnowledgeValidator:
+    """Deterministic unavailable-knowledge checks against the #251 lane (issue #251).
+
+    Knowledge-bearing claims (NPC utterances, NPC-attributed observations
+    and world facts) that reference concrete world entities must be backed
+    by the speaking subject's fictional knowledge (code-supplied #211 lane
+    entries) or by a matching in-turn ``transfer_knowledge`` staged effect
+    for the same subject and target. Generic provenance (``evidence_refs`` /
+    ``trigger_refs``) merely cites what prompted the reaction and never
+    exempts on its own. No model call, no DB: the packet's
+    ``knowledge_visibility`` lane plus the contract's staged effects are
+    the authority.
+
+    Fail-conservative: a contract-referenced NPC with no resolvable lane
+    perspective is ambiguous state and fails closed. Non-NPC actors
+    (player declarations) are out of scope — the system does not police
+    player roleplay.
+    """
+
+    name = "knowledge_validator"
+    category = "knowledge"
+
+    def _perspectives(self, packet) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        if packet is None:
+            return out
+        lane = next((lane for lane in packet.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY), None)
+        if lane is None:
+            return out
+        for rec in lane.records:
+            value = rec.value or {}
+            known: set[str] = set()
+            denied: set[str] = set()
+            for entry in value.get("entries") or []:
+                if not isinstance(entry, dict):
+                    continue
+                tid = str(entry.get("target_id") or "").strip()
+                if not tid:
+                    continue
+                if entry.get("knowledge_state") == "does_not_know":
+                    denied.add(tid)
+                else:
+                    known.add(tid)
+            perspective = {
+                "known": known,
+                "denied": denied,
+                "resolved": bool(value.get("subject_resolved")),
+            }
+            character_id = str(value.get("character_id") or "").strip()
+            subject_id = str(value.get("subject_entity_id") or "").strip()
+            if character_id:
+                out[character_id] = perspective
+            if subject_id:
+                out[subject_id] = perspective
+        return out
+
+    # Claim kinds that can carry fictional knowledge for an NPC subject.
+    _NPC_KNOWLEDGE_KINDS = frozenset({"npc_utterance", "observation", "world_fact"})
+
+    # Staged transfer fields that can name a knowledge target.
+    _TRANSFER_TARGET_FIELDS = (
+        "target_fact_id", "target_relation_id", "target_entity_id", "target_id",
+    )
+
+    def _transfer_coverage(self, contract) -> dict[str, set[str]]:
+        """Actor subject ID -> target IDs taught by in-turn transfers.
+
+        Only a staged ``transfer_knowledge`` effect for the same subject and
+        target counts as an explicit learning source. Generic provenance
+        (``evidence_refs``/``trigger_refs``) merely cites what prompted the
+        reaction — a player submission that prompts an NPC does not teach
+        that NPC the referenced facts — so it never exempts on its own.
+        """
+        out: dict[str, set[str]] = {}
+        for effect in contract.staged_effects or []:
+            if getattr(effect, "effect_type", None) != "transfer_knowledge":
+                continue
+            args = getattr(effect, "arguments", None) or {}
+            if not isinstance(args, dict):
+                continue
+            # A denial transfer ("this subject does not know X") is not a
+            # learning source — it must never clear the claim. Omitted
+            # state defaults to "knows" like the effect handler.
+            if str(args.get("knowledge_state") or "knows").strip().lower() == "does_not_know":
+                continue
+            subject = str(args.get("subject_entity_id") or "").strip()
+            targets = {
+                str(args.get(field) or "").strip()
+                for field in self._TRANSFER_TARGET_FIELDS
+            } - {""}
+            if subject and targets:
+                out.setdefault(subject, set()).update(targets)
+        return out
+
+    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+        t0 = time.monotonic()
+        violations: list[ValidationViolation] = []
+        perspectives = self._perspectives(packet)
+        transfers = self._transfer_coverage(contract)
+        for bi, ci, claim in _all_claims(contract):
+            if claim.claim_kind not in self._NPC_KNOWLEDGE_KINDS:
+                continue
+            if claim.actor_ref is None or getattr(claim.actor_ref, "type", None) != "npc":
+                continue
+            actor_id = _norm_id(claim.actor_ref.id)
+            refs = [
+                _norm_id(ref.id)
+                for ref in (list(claim.target_refs or []) + list(claim.topic_refs or []))
+                if _norm_id(ref.id)
+            ]
+            if claim.location_ref is not None and _norm_id(claim.location_ref.id):
+                refs.append(_norm_id(claim.location_ref.id))
+            if not refs:
+                continue
+            perspective = perspectives.get(actor_id)
+            if perspective is None or not perspective["resolved"]:
+                # Ambiguous state fails closed: a contract-referenced NPC
+                # with no resolvable knowledge cannot be cleared.
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name, category=self.category,
+                        code="npc_utterance_ambiguous_knowledge",
+                        message="NPC-attributed claim from a subject with no resolvable knowledge",
+                        details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs},
+                        claim_index=(bi, ci),
+                    )
+                )
+                continue
+            taught = transfers.get(actor_id, set())
+            denied_hit = next(
+                (ref for ref in refs if ref in perspective["denied"] and ref not in taught),
+                None,
+            )
+            if denied_hit is not None:
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name, category=self.category,
+                        code="npc_utterance_denied_knowledge",
+                        message="NPC utterance references a target the subject explicitly does not know",
+                        details={"beat": bi, "claim": ci, "actor": actor_id, "target": denied_hit},
+                        claim_index=(bi, ci),
+                    )
+                )
+                continue
+            # Every referenced target must be known or taught in-turn: one
+            # uncovered target is enough for reliance on unavailable
+            # knowledge. A matching staged transfer covers even a prior
+            # denial — the turn itself is the learning source.
+            unknown = [
+                ref for ref in refs
+                if ref not in perspective["known"] and ref not in taught
+            ]
+            if unknown:
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name, category=self.category,
+                        code="npc_utterance_without_knowledge",
+                        message="NPC utterance references targets outside the subject's knowledge with no learning source",
+                        details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs, "unknown": unknown},
+                        claim_index=(bi, ci),
+                    )
+                )
+        latency = (time.monotonic() - t0) * 1000
+        return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
+
+
 class CanonValidator:
     """Basic current-canon contradiction checks against authoritative context.
 
@@ -952,6 +1118,7 @@ DEFAULT_VALIDATORS: list[Validator] = [
     ProvenanceValidator(),
     EpistemicValidator(),
     VisibilityValidator(),
+    KnowledgeValidator(),
     CanonValidator(),
     ContentBoundaryValidator(),
     RulesValidator(),

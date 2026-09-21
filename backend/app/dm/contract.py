@@ -661,13 +661,65 @@ class UpdateMapPlacementArgs(StrictModel):
         return str(v)
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs
+class TransferKnowledgeArgs(StrictModel):
+    """Explicit in-fiction disclosure — issue #251.
+
+    Tell/show/reveal writes what one subject fictionally holds toward one
+    truth record. It never mutates truth tables and never grants human
+    visibility — those stay separate explicit acts. Promotion-time
+    references resolve fail-closed inside ``assert_knowledge_inline``.
+    """
+    subject_kind: Literal["character", "npc", "party", "group"] = Field(description="Kind of knowing subject")
+    subject_entity_id: str = Field(min_length=1, max_length=160, description="WorldEntity subject UUID")
+    target_kind: Literal["fact", "relation", "entity"] = Field(description="Kind of truth target")
+    target_fact_id: str | None = Field(default=None, max_length=160)
+    target_relation_id: str | None = Field(default=None, max_length=160)
+    target_entity_id: str | None = Field(default=None, max_length=160)
+    target_id: str | None = Field(default=None, max_length=160)
+    knowledge_state: Literal["knows", "believes", "suspects", "claims", "does_not_know"] = "knows"
+    transfer_kind: Literal["tell", "show", "reveal", "direct_observation", "explicit_disclosure"] = "explicit_disclosure"
+    acquisition_source: str | None = Field(default=None, max_length=64)
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
+    provenance: dict[str, Any] | None = None
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("subject_entity_id", "target_fact_id", "target_relation_id", "target_entity_id", "target_id")
+    @classmethod
+    def _valid_uuids(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("knowledge references must be UUIDs") from exc
+        return str(v)
+
+    @model_validator(mode="after")
+    def _exactly_one_target(self) -> "TransferKnowledgeArgs":
+        fields = {
+            "fact": self.target_fact_id,
+            "relation": self.target_relation_id,
+            "entity": self.target_entity_id,
+        }
+        provided = [k for k, v in fields.items() if v is not None]
+        if self.target_id is None and len(provided) != 1:
+            raise ValueError("exactly one target reference is required")
+        if self.target_id is not None and len(provided) != 0:
+            raise ValueError("target_id is polymorphic; do not combine it with a kind-specific target field")
+        if self.target_id is None and provided[0] != self.target_kind:
+            raise ValueError(
+                f"target_kind={self.target_kind!r} does not match the supplied target field"
+            )
+        return self
+
+
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -731,6 +783,8 @@ class StagedEffect(StrictModel):
                 UpdateMapTerrainArgs.model_validate(args)
             elif t == "update_map_placement":
                 UpdateMapPlacementArgs.model_validate(args)
+            elif t == "transfer_knowledge":
+                TransferKnowledgeArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation
