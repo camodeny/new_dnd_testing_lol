@@ -155,6 +155,14 @@ export interface SnapshotForRealtime {
   }
   active_thread_id?: string
   campaign?: { id: string; revision: number }
+  /**
+   * Per-player secret-state projections (issue #250). Present only on
+   * snapshot payloads, never on shared broadcast events. Each surface is
+   * already filtered server-side for the requesting user — clients must
+   * never share, cache across, or copy these payloads into another
+   * session's store. Key any local cache by (campaignId, userId, revision).
+   */
+  surfaces?: Record<string, unknown>
 }
 
 /**

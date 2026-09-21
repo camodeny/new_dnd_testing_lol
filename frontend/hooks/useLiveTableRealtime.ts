@@ -359,6 +359,13 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
             bufferedRef.current = []
           })
         }
+        if (ev.type === 'projection.invalidated') {
+          // Issue #250: visibility expanded/contracted — reload the
+          // visibility-safe snapshot so per-player surfaces converge. The
+          // payload names the grantee (grantee_user_id) but carries no
+          // secret content; a missed event still converges via revision.
+          void fetchSnapshotAndAdopt(true)
+        }
       }
 
       try {
