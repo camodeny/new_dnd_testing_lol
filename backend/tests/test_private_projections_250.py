@@ -550,6 +550,63 @@ def test_dm_only_map_zones_absent_for_non_owner(ctx):
         db.close()
 
 
+def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
+    """Review #418 round 6: a private NPC granted to Alice reveals its map
+    token to Alice alone — Bob's map stays token-free."""
+    from app.combat.maps import ensure_map
+    from models.combat import Encounter, EncounterParticipant, EncounterPlacement
+
+    db = _db(ctx)
+    try:
+        camp = db.get(Campaign, ctx["campaign_id"])
+        shade, _ = _world.create_entity_inline(
+            db, camp, entity_type="npc", name="Veil Shade",
+            visibility="private", operation_id="op-shade-250",
+        )
+        _epistemics.grant_visibility_inline(
+            db, camp, target_kind="entity", target_id=shade.id,
+            grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
+            operation_id="op-grant-shade-250",
+        )
+        enc = Encounter(
+            campaign_id=camp.id, thread_id=str(ctx["thread_id"]),
+            status="pending_initiative",
+        )
+        db.add(enc)
+        db.flush()
+        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
+        ensure_map(
+            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
+            terrain=[{"kind": "open",
+                      "rect": {"col": 0, "row": 0, "width": 6, "height": 6},
+                      "visibility": "public"}],
+            expected_revision=rev, operation_id="op-shademap-250", commit=True,
+        )
+        part = EncounterParticipant(
+            encounter_id=enc.id, campaign_id=camp.id,
+            participant_key=f"npc:{shade.id}", kind="npc",
+            npc_entity_id=shade.id, display_name="Veil Shade",
+        )
+        db.add(part)
+        db.flush()
+        db.add(EncounterPlacement(
+            encounter_id=enc.id, campaign_id=camp.id,
+            participant_id=part.id, col=2, row=2,
+        ))
+        db.commit()
+
+        alice_map = build_surfaces_for_viewer(db, camp, ctx["alice"])["maps"]
+        bob_map = build_surfaces_for_viewer(db, camp, ctx["bob"])["maps"]
+        assert alice_map["visible"] is True
+        assert bob_map["visible"] is True
+        alice_tokens = [p.get("participant_id") for p in alice_map["map"]["placements"]]
+        assert str(part.id) in alice_tokens
+        assert bob_map["map"]["placements"] == []
+        assert "Veil Shade" not in str(bob_map)
+    finally:
+        db.close()
+
+
 def test_snapshot_wires_surfaces(ctx):
     from app.snapshot.service import build_live_table_snapshot
 

@@ -165,8 +165,14 @@ def _next_zone_order(db: Session, map_id: uuid.UUID) -> int:
     return int(current or 0) + (1 if current is not None else 0)
 
 
-def _hidden_token_ids(db: Session, encounter_id: uuid.UUID) -> set[str]:
-    """Participant ids whose map tokens stay hidden from non-owners.
+def _hidden_token_ids(
+    db: Session,
+    encounter_id: uuid.UUID,
+    *,
+    viewer_user_id: uuid.UUID | None = None,
+    campaign: Campaign | None = None,
+) -> set[str]:
+    """Participant ids whose map tokens stay hidden from the viewer.
 
     Token hiding follows the source entity/map visibility signal — a
     ``dm_only`` (or otherwise hidden-visibility) NPC/monster entity — and
@@ -175,11 +181,18 @@ def _hidden_token_ids(db: Session, encounter_id: uuid.UUID) -> set[str]:
     visible enemies must keep their tokens, reachable reads, and movement
     (only their stats stay private). Tokens default to visible when the
     entity row is missing.
+
+    Viewer-aware grants (issue #250): when a viewer + campaign are supplied,
+    a hidden-visibility entity explicitly granted to that viewer through a
+    #211 ``WorldVisibilityGrant`` reveals its token to them alone
+    (player-specific map reveal). Without a viewer the full hidden set is
+    returned for server-side geometry paths, which stay viewer-agnostic.
     """
     from models.combat import HIDDEN_ENTITY_VISIBILITIES
     from models.world import WorldEntity
 
     hidden: set[str] = set()
+    entity_by_participant: dict[str, WorldEntity] = {}
     for participant in list_participants(db, encounter_id):
         if participant.kind not in ("npc", "monster"):
             continue
@@ -188,7 +201,24 @@ def _hidden_token_ids(db: Session, encounter_id: uuid.UUID) -> set[str]:
         entity = db.get(WorldEntity, participant.npc_entity_id)
         if entity is not None and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES:
             hidden.add(str(participant.id))
-    return hidden
+            entity_by_participant[str(participant.id)] = entity
+    if not hidden or viewer_user_id is None or campaign is None:
+        return hidden
+    try:
+        from app.world import epistemics as _epistemics
+    except Exception:
+        return hidden
+    revealed: set[str] = set()
+    for participant_id, entity in entity_by_participant.items():
+        try:
+            verdict = _epistemics.may_user_receive(
+                db, campaign, "entity", entity.id, viewer_user_id
+            )
+        except Exception:
+            continue
+        if verdict.get("allowed"):
+            revealed.add(participant_id)
+    return hidden - revealed
 
 
 def list_placements(db: Session, encounter_id: uuid.UUID) -> list[EncounterPlacement]:
@@ -1365,8 +1395,10 @@ def map_projection(
     (issue #250: hidden map geometry must never reach unauthorized
     payloads; movement legality stays server-side in commit geometry, so
     clients never need hidden rects). Tokens of hidden-entity NPC/monster
-    participants are hidden from non-owners entirely (fog/hidden hook).
-    Token hiding follows the source entity visibility signal, never
+    participants are hidden from non-owners entirely (fog/hidden hook),
+    except when the viewer holds an explicit visibility grant for that
+    entity (issue #250 player-specific map reveal). Token hiding follows
+    the source entity visibility signal, never
     ``stat_visibility`` (#230 stats-privacy stays separate). The AI is the
     only DM: ownership here means the campaign owner on the runtime path.
     """
@@ -1379,7 +1411,13 @@ def map_projection(
         if is_owner or str(z.visibility or "") != "dm_only"
     ]
     participants = {str(p.id): p for p in list_participants(db, encounter.id)}
-    hidden_ids = set() if is_owner else _hidden_token_ids(db, encounter.id)
+    if is_owner:
+        hidden_ids: set[str] = set()
+    else:
+        campaign = db.get(Campaign, encounter.campaign_id)
+        hidden_ids = _hidden_token_ids(
+            db, encounter.id, viewer_user_id=viewer_id, campaign=campaign
+        )
     placements = []
     for placement in list_placements(db, encounter.id):
         participant = participants.get(str(placement.participant_id))
