@@ -25,6 +25,7 @@ consolidation (same posture as #218 clock DEFER).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import uuid
 from dataclasses import dataclass, field
@@ -61,7 +62,35 @@ MATERIALIZE_CONTRACT_VERSION = 1
 # malformed mechanical hints fail the run, never guess into canon.
 MATERIALIZE_HINT_KEY = "post_turn_materialize"
 
-WRITE_CATEGORIES = ("entities", "relations", "facts", "npc_state")
+WRITE_CATEGORIES = (
+    "entities", "relations", "facts", "npc_state",
+    "knowledge", "scene", "visibility_grants",
+)
+
+# Visibility lattice for the widening cap (finding: a private source event
+# must not certify party-visible memory absent explicit disclosure).
+# Aliases collapse before ranking: party_known -> campaign,
+# dm_private -> dm_only.
+_VISIBILITY_RANK = {"dm_only": 0, "private": 1, "campaign": 2, "public": 3}
+
+# Staged-effect visibility vocabulary (RecordWorldEventArgs/RevealFactArgs)
+# onto the world lattice.
+_EFFECT_VISIBILITY_MAP = {
+    "public": "campaign", "party_known": "campaign", "dm_private": "dm_only",
+    "campaign": "campaign", "private": "private", "dm_only": "dm_only",
+}
+
+# Committed turn events the default compiler reads. Their payloads carry
+# turn_id/attempt_id locators into the durable attempt row, whose staged
+# effects and contract snapshot are committed gameplay — never rewritten.
+TURN_EVENT_TYPES = frozenset({"dm.turn_committed", "dm.turn_resolved"})
+
+# Staged effects already applied durably at turn commit: recompiling them
+# here would duplicate canon, so the default compiler skips them (counted
+# for observability instead).
+_COMMIT_APPLIED_EFFECTS = frozenset({
+    "assert_fact", "upsert_relation", "transfer_knowledge", "update_scene",
+})
 
 # Bounded verification vocabulary for one candidate assertion.
 SUPPORTED = "SUPPORTED"
@@ -105,6 +134,7 @@ class CandidateAssertion:
     mechanical: bool = True
     source_event_id: uuid.UUID | None = None
     source_sequence: int | None = None
+    source_effect_id: str | None = None
 
 
 def _require_str(mapping: dict, field_name: str, *, what: str) -> str:
@@ -145,6 +175,14 @@ def validate_hint(hint: Any, *, event_sequence: int) -> CandidateAssertion:
             raise MaterializeError(
                 f"event {event_sequence}: hint {key!r} has invalid epistemic_state: {exc}"
             ) from exc
+    if category == "knowledge":
+        from app.world.epistemics import validate_knowledge_state
+        try:
+            validate_knowledge_state(data.get("knowledge_state", "knows"))
+        except ValueError as exc:
+            raise MaterializeError(
+                f"event {event_sequence}: hint {key!r} has invalid knowledge_state: {exc}"
+            ) from exc
     mechanical = hint.get("mechanical", True)
     if not isinstance(mechanical, bool):
         raise MaterializeError(f"event {event_sequence}: hint {key!r} mechanical must be a boolean")
@@ -184,6 +222,206 @@ def extract_candidates(events: list[CampaignDomainEvent]) -> list[CandidateAsser
             seen.add((assertion.category, assertion.key))
             candidates.append(assertion)
     return candidates
+
+
+# ── Visibility widening cap ──────────────────────────────────────────────
+
+def visibility_rank(value: Any) -> int:
+    """Rank a visibility string on the disclosure lattice (fail closed)."""
+    from app.world.service import normalize_visibility
+    normalized = normalize_visibility(_EFFECT_VISIBILITY_MAP.get(str(value or "").strip(), value))
+    return _VISIBILITY_RANK[normalized]
+
+
+def _disclosure_allows(
+    assertion: CandidateAssertion,
+    disclosures: dict[tuple[str, str], int],
+    *,
+    resolved_entity_id: str | None = None,
+) -> int:
+    """Highest same-range reveal rank authorizing this assertion.
+
+    Matches mirror the reveal contract: entities by canonical id, name, or
+    assertion key; facts/relations/knowledge/scene by assertion key or the
+    staged effect the compiler derived them from.
+    """
+    best = -1
+    wanted: set[tuple[str, str]] = set()
+    if assertion.category == "entities":
+        names = {assertion.key, str(assertion.data.get("name") or "")}
+        if resolved_entity_id:
+            names.add(resolved_entity_id)
+        for name in names:
+            if name:
+                wanted.add(("entity", name))
+    else:
+        kind = {"facts": "fact", "relations": "relation"}.get(assertion.category, assertion.category)
+        for token in (assertion.key, assertion.source_effect_id):
+            if token:
+                wanted.add((kind, token))
+                wanted.add((assertion.category, token))
+    for key in wanted:
+        rank = disclosures.get(key)
+        if rank is not None and rank > best:
+            best = rank
+    return best
+
+
+def enforce_visibility_cap(
+    assertion: CandidateAssertion,
+    source_event: CampaignDomainEvent,
+    disclosures: dict[tuple[str, str], int],
+    *,
+    resolved_entity_id: str | None = None,
+) -> None:
+    """Reject DM-private evidence certifying party-visible memory.
+
+    Allowed rank is the max of the cited source event's rank and any
+    same-range reveal_fact disclosure matching the assertion. Mechanical
+    violations fail the run; generated ones are rejected by the caller.
+    """
+    from app.world.service import normalize_visibility
+    target = normalize_visibility(_EFFECT_VISIBILITY_MAP.get(
+        str(assertion.visibility or "").strip(), assertion.visibility))
+    assertion.visibility = target
+    allowed = visibility_rank(source_event.visibility)
+    disclosed = _disclosure_allows(
+        assertion, disclosures, resolved_entity_id=resolved_entity_id)
+    allowed = max(allowed, disclosed)
+    if _VISIBILITY_RANK[target] > allowed:
+        raise MaterializeError(
+            f"{assertion.category}/{assertion.key}: visibility {target!r} widens "
+            f"source seq {assertion.source_sequence} ({source_event.visibility!r}) "
+            f"without explicit disclosure"
+        )
+
+
+# ── Committed-structure compiler ─────────────────────────────────────────
+
+def _coerce_uuid_or_none(value: Any) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(str(value)) if value is not None else None
+    except (ValueError, AttributeError, TypeError):
+        return None
+
+
+def compile_committed_candidates(
+    db: Session, campaign: Campaign, events: list[CampaignDomainEvent],
+) -> tuple[list[CandidateAssertion], dict[tuple[str, str], int], dict[str, int]]:
+    """Compile candidates from committed turn structures (default source).
+
+    Loads each dm.turn_committed/dm.turn_resolved event's durable attempt
+    and translates staged effects the turn commit left unpersisted:
+
+    - record_world_event -> confirmed-history fact (the commit handler
+      explicitly persists nothing; this materializer is that extension);
+    - reveal_fact -> same-range disclosure authorization for the
+      visibility cap (no row of its own);
+    - contract new_entities proposals missing from canon -> entity
+      assertions (promotion normally covers these; anything left is a
+      genuine gap, never a duplicate — exact identity reuses the owner);
+    - assert_fact/upsert_relation/transfer_knowledge/update_scene ->
+      skipped: already durable from the turn commit.
+
+    Returns (candidates, disclosures, counts). Unknown attempt references
+    fail closed; events without turn locators are skipped and counted.
+    """
+    from models.dm import DmTurnAttempt
+
+    candidates: list[CandidateAssertion] = []
+    disclosures: dict[tuple[str, str], int] = {}
+    counts = {"turn_events": 0, "skipped_no_locator": 0,
+              "already_committed": 0, "compiled": 0, "disclosures": 0}
+    for event in events:
+        if event.event_type not in TURN_EVENT_TYPES:
+            continue
+        counts["turn_events"] += 1
+        payload = event.payload or {}
+        attempt = None
+        attempt_id = _coerce_uuid_or_none(payload.get("attempt_id"))
+        if attempt_id is not None:
+            attempt = db.get(DmTurnAttempt, attempt_id)
+            if attempt is None or attempt.campaign_id != campaign.id:
+                raise MaterializeError(
+                    f"event {event.sequence}: turn locator references "
+                    f"unknown attempt {payload.get('attempt_id')!r}"
+                )
+        if attempt is None:
+            counts["skipped_no_locator"] += 1
+            continue
+        for eff in attempt.staged_effects or []:
+            if not isinstance(eff, dict):
+                raise MaterializeError(
+                    f"event {event.sequence}: staged effect must be an object")
+            eff_type = eff.get("effect_type")
+            eff_id = str(eff.get("id") or "").strip()
+            args = eff.get("arguments") or {}
+            if not isinstance(args, dict):
+                raise MaterializeError(
+                    f"event {event.sequence}: staged effect {eff_id!r} arguments "
+                    f"must be an object")
+            if eff_type in _COMMIT_APPLIED_EFFECTS:
+                counts["already_committed"] += 1
+                continue
+            if eff_type == "reveal_fact":
+                item_type = str(args.get("item_type") or "").strip()
+                item_id = str(args.get("item_id") or "").strip()
+                if not item_type or not item_id:
+                    raise MaterializeError(
+                        f"event {event.sequence}: reveal_fact {eff_id!r} "
+                        f"requires item_type and item_id")
+                rank = visibility_rank(args.get("visibility") or "dm_private")
+                key = (item_type, item_id)
+                disclosures[key] = max(disclosures.get(key, -1), rank)
+                counts["disclosures"] += 1
+                continue
+            if eff_type == "record_world_event":
+                summary = args.get("summary")
+                if not isinstance(summary, str) or not summary.strip():
+                    raise MaterializeError(
+                        f"event {event.sequence}: record_world_event {eff_id!r} "
+                        f"requires a summary")
+                assertion = CandidateAssertion(
+                    category="facts", key=f"rec-{eff_id}",
+                    data={"content": summary.strip()},
+                    visibility=_EFFECT_VISIBILITY_MAP.get(
+                        str(args.get("visibility") or "dm_private").strip(),
+                        "dm_only"),
+                    epistemic_state="confirmed", mechanical=True,
+                    source_event_id=event.id, source_sequence=event.sequence,
+                    source_effect_id=eff_id or None,
+                )
+                candidates.append(assertion)
+                counts["compiled"] += 1
+                continue
+            # Other staged types (mechanics, encounters, sheets) carry no
+            # durable memory semantics; they are not materialization input.
+        snapshot = attempt.contract_snapshot or {}
+        proposals = snapshot.get("new_entities") or []
+        if not isinstance(proposals, list):
+            raise MaterializeError(
+                f"event {event.sequence}: contract new_entities must be a list")
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                raise MaterializeError(
+                    f"event {event.sequence}: entity proposal must be an object")
+            name = proposal.get("public_name") or proposal.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise MaterializeError(
+                    f"event {event.sequence}: entity proposal is missing a name")
+            entity, _ = resolve_entity_ref(db, campaign.id, name.strip())
+            if entity is not None:
+                continue  # Promoted at commit; reuse, never duplicate.
+            candidates.append(CandidateAssertion(
+                category="entities", key=f"proposal-{len(candidates)}",
+                data={"name": name.strip(), "entity_type": "npc",
+                      "summary": proposal.get("public_summary"),
+                      "ref": name.strip()},
+                visibility="campaign", mechanical=True,
+                source_event_id=event.id, source_sequence=event.sequence,
+            ))
+            counts["compiled"] += 1
+    return candidates, disclosures, counts
 
 
 # ── Reference resolution ─────────────────────────────────────────────────
@@ -351,7 +589,16 @@ def _idempotency_key(
     campaign_id: uuid.UUID, from_sequence: int, to_sequence: int,
     assertion: CandidateAssertion,
 ) -> str:
-    return f"pt217:{campaign_id}:{from_sequence}-{to_sequence}:{assertion.category}:{assertion.key}"
+    """Bounded deterministic key: fixed prefix + digest (always <= 128 chars).
+
+    Contract keys may be up to 128 chars themselves, so embedding them
+    verbatim would overflow the world writers' idempotency cap and fail
+    the run. The digest preserves exactly-once semantics per
+    (campaign, range, category, key).
+    """
+    raw = f"{campaign_id}:{from_sequence}-{to_sequence}:{assertion.category}:{assertion.key}"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return f"pt217-{assertion.category}-{digest}"
 
 
 def _apply_entity(
@@ -359,10 +606,13 @@ def _apply_entity(
     *, from_sequence: int, to_sequence: int,
     decision_service: DecisionService | None, session_factory: Any,
     verification_tally: dict[str, int],
+    disclosures: dict[tuple[str, str], int] | None = None,
+    source_event: CampaignDomainEvent | None = None,
 ) -> dict[str, Any]:
     """Apply one entity assertion: reuse exact identity, bounded-resolve
     collisions via #214, or create. Ambiguity without a decision service
-    defers fail-closed."""
+    defers fail-closed. The visibility cap re-checks once the canonical
+    id is known, so an id-matched reveal authorizes precisely."""
     from app.world.identity import (
         DEFER as IDENTITY_DEFER,
         KEEP_DISTINCT,
@@ -391,9 +641,27 @@ def _apply_entity(
     key = _idempotency_key(campaign.id, from_sequence, to_sequence, assertion)
     ref = data.get("ref", name)
 
+    def _gate(entity_id: str, outcome: dict[str, Any]) -> dict[str, Any]:
+        if source_event is None:
+            return outcome
+        try:
+            enforce_visibility_cap(
+                assertion, source_event, disclosures or {},
+                resolved_entity_id=entity_id,
+            )
+        except MaterializeError as exc:
+            if assertion.mechanical:
+                raise
+            return {"outcome": "rejected",
+                    "reason": f"visibility_widening: {exc}"[:300]}
+        return outcome
+
     entity, how = resolve_entity_ref(db, campaign.id, ref)
     if entity is not None and how in ("uuid", "alias"):
-        return {"outcome": "resolved_existing", "entity_id": str(entity.id), "via": how}
+        return _gate(str(entity.id), {
+            "outcome": "resolved_existing",
+            "entity_id": str(entity.id), "via": how,
+        })
     if entity is None:
         collision = exact_identity(db, campaign.id, name)
         if collision is None:
@@ -405,10 +673,10 @@ def _apply_entity(
                 operation_id=f"post-turn-217:{from_sequence}-{to_sequence}",
                 idempotency_key=key,
             )
-            return {
+            return _gate(str(created.id), {
                 "outcome": "applied" if is_new else "duplicate",
                 "entity_id": str(created.id), "via": "created",
-            }
+            })
     # Ambiguous: exact canonical-name collision — route through #214.
     frame = build_identity_frame(
         db, campaign, name=name.strip(),
@@ -422,7 +690,10 @@ def _apply_entity(
     if decision.selected_id == IDENTITY_DEFER:
         return {"outcome": "deferred", "reason": "duplicate_identity_ambiguous"}
     if decision.selected_id not in {NEW_ENTITY, KEEP_DISTINCT}:
-        return {"outcome": "resolved_existing", "entity_id": str(decision.selected_id), "via": "identity_decision"}
+        return _gate(str(decision.selected_id), {
+            "outcome": "resolved_existing",
+            "entity_id": str(decision.selected_id), "via": "identity_decision",
+        })
     try:
         created, is_new = create_entity_after_resolution(
             db, campaign, frame, decision.selected_id,
@@ -432,7 +703,10 @@ def _apply_entity(
         )
     except ValueError as exc:
         return {"outcome": "deferred", "reason": f"identity_resolution_rejected: {exc}"}
-    return {"outcome": "applied" if is_new else "duplicate", "entity_id": str(created.id), "via": "identity_decision"}
+    return _gate(str(created.id), {
+        "outcome": "applied" if is_new else "duplicate",
+        "entity_id": str(created.id), "via": "identity_decision",
+    })
 
 
 def _apply_relation(
@@ -563,6 +837,187 @@ def _apply_npc_state(
     return {"outcome": "applied", "entity_id": str(row.entity_id)}
 
 
+def _apply_knowledge(
+    db: Session, campaign: Campaign, assertion: CandidateAssertion,
+    *, from_sequence: int, to_sequence: int, operation_id: str | None,
+) -> dict[str, Any]:
+    """Assert one knower stance toward one truth record (#211 lanes).
+
+    Never mutates truth tables by construction; re-assertion updates the
+    single current row per (subject, target) in place.
+    """
+    from app.world.epistemics import (
+        assert_knowledge_inline,
+        validate_knower_kind,
+        validate_knowledge_target_kind,
+    )
+
+    data = assertion.data
+    try:
+        subject_kind = validate_knower_kind(data.get("subject_kind"))
+    except ValueError as exc:
+        if assertion.mechanical:
+            raise MaterializeError(f"knowledge/{assertion.key}: {exc}") from exc
+        return {"outcome": "rejected", "reason": f"invalid_subject_kind: {exc}"}
+    subject = _resolve_required_ref(
+        db, campaign.id, data.get("subject_ref"), assertion=assertion, role="subject")
+    if subject is None:
+        return {"outcome": "deferred", "reason": "unresolvable_subject_ref"}
+    try:
+        target_kind = validate_knowledge_target_kind(data.get("target_kind"))
+    except ValueError as exc:
+        if assertion.mechanical:
+            raise MaterializeError(f"knowledge/{assertion.key}: {exc}") from exc
+        return {"outcome": "rejected", "reason": f"invalid_target_kind: {exc}"}
+    target_ref = data.get("target_ref")
+    target_ids: dict[str, Any] = {}
+    if target_ref is not None:
+        target = _resolve_required_ref(
+            db, campaign.id, target_ref, assertion=assertion, role="target")
+        if target is None:
+            return {"outcome": "deferred", "reason": "unresolvable_target_ref"}
+        target_ids = {"target_id": target.id}
+    elif target_kind == "fact" and data.get("target_fact_id") is not None:
+        target_ids = {"target_fact_id": data["target_fact_id"]}
+    elif target_kind == "relation" and data.get("target_relation_id") is not None:
+        target_ids = {"target_relation_id": data["target_relation_id"]}
+    elif target_kind == "entity" and data.get("target_entity_id") is not None:
+        target_ids = {"target_entity_id": data["target_entity_id"]}
+    else:
+        if assertion.mechanical:
+            raise MaterializeError(
+                f"knowledge/{assertion.key}: requires target_ref or a target id")
+        return {"outcome": "rejected", "reason": "missing_target"}
+    row, created = assert_knowledge_inline(
+        db, campaign, subject_kind=subject_kind, subject_entity_id=subject.id,
+        target_kind=target_kind, **target_ids,
+        knowledge_state=data.get("knowledge_state", "knows"),
+        acquisition_source=data.get("acquisition_source") or "post_turn_materialize",
+        visibility=assertion.visibility,
+        provenance={
+            "post_turn_range": [from_sequence, to_sequence],
+            "source_sequence": assertion.source_sequence,
+        },
+        details=data.get("details") if isinstance(data.get("details"), dict) else {},
+        source_event_id=assertion.source_event_id,
+        operation_id=operation_id,
+        idempotency_key=_idempotency_key(campaign.id, from_sequence, to_sequence, assertion),
+    )
+    return {"outcome": "applied" if created else "duplicate", "knowledge_id": str(row.id)}
+
+
+def _apply_scene(
+    db: Session, campaign: Campaign, assertion: CandidateAssertion,
+    *, operation_id: str | None,
+) -> dict[str, Any]:
+    """Apply one current-state projection to the transient scene row (#209).
+
+    Single-row upsert semantics converge on replay (no duplication
+    possible). Uses the current campaign revision without bumping it —
+    post-turn consolidation never advances the revision counter.
+    """
+    from app.world.service import UNSET, apply_scene_update_inline
+
+    data = assertion.data
+    if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
+        if assertion.mechanical:
+            raise MaterializeError(f"scene/{assertion.key}: scene_patch must be an object")
+        return {"outcome": "rejected", "reason": "invalid_scene_patch"}
+    patch = data.get("scene_patch") or {}
+    location_ref = patch.get("location_entity_id", data.get("location_entity_id", UNSET))
+    location_id: Any = UNSET
+    if location_ref is not UNSET and location_ref is not None:
+        location, _ = resolve_entity_ref(db, campaign.id, location_ref)
+        if location is None:
+            if assertion.mechanical:
+                raise MaterializeError(
+                    f"scene/{assertion.key}: location ref {location_ref!r} "
+                    f"matches no canonical entity")
+            return {"outcome": "deferred", "reason": "unresolvable_location_ref"}
+        location_id = location.id
+    elif location_ref is None:
+        location_id = None
+    row = apply_scene_update_inline(
+        db, campaign, new_revision=int(campaign.revision or 0),
+        location_entity_id=location_id,
+        location_name=patch.get("location_name", data.get("location_name")),
+        fictional_time=patch.get("fictional_time", data.get("fictional_time")),
+        fictional_time_details=patch.get("fictional_time_details"),
+        present_actors=patch.get("present_actors", data.get("present_actors")),
+        environment=patch.get("environment", data.get("environment")),
+        visibility=assertion.visibility,
+        source_turn_id=None, source_attempt_id=None,
+        operation_id=operation_id,
+    )
+    return {"outcome": "applied", "scene_revision": int(row.revision)}
+
+
+def _apply_visibility_grant(
+    db: Session, campaign: Campaign, assertion: CandidateAssertion,
+    *, from_sequence: int, to_sequence: int, operation_id: str | None,
+) -> dict[str, Any]:
+    """Authorize one human user for one record (#211 grant lanes).
+
+    Grants are the durable form of explicit disclosure: they widen human
+    access without touching fictional-character knowledge or truth rows.
+    """
+    from app.world.epistemics import grant_visibility_inline, validate_grant_target_kind
+
+    data = assertion.data
+    try:
+        target_kind = validate_grant_target_kind(data.get("target_kind"))
+    except ValueError as exc:
+        if assertion.mechanical:
+            raise MaterializeError(f"visibility_grants/{assertion.key}: {exc}") from exc
+        return {"outcome": "rejected", "reason": f"invalid_target_kind: {exc}"}
+    target = data.get("target_ref")
+    if target is None:
+        target = (data.get("target_fact_id") or data.get("target_relation_id")
+                  or data.get("target_entity_id") or data.get("target_id"))
+    tid: uuid.UUID | None = None
+    if target is not None:
+        tid = _coerce_uuid_or_none(target)
+        if tid is None:
+            # Name/alias form: only canonical entities resolve this way.
+            entity = _resolve_required_ref(
+                db, campaign.id, target, assertion=assertion, role="target")
+            if entity is None:
+                return {"outcome": "deferred", "reason": "unresolvable_target_ref"}
+            tid = entity.id
+    if tid is None:
+        if assertion.mechanical:
+            raise MaterializeError(
+                f"visibility_grants/{assertion.key}: requires target_ref or a target id")
+        return {"outcome": "rejected", "reason": "missing_target"}
+    try:
+        row, created = grant_visibility_inline(
+            db, campaign, target_kind=target_kind, target_id=tid,
+            grantee_user_id=data.get("grantee_user_id"),
+            granted_by=data.get("granted_by"),
+            operation_id=operation_id,
+            idempotency_key=_idempotency_key(
+                campaign.id, from_sequence, to_sequence, assertion),
+        )
+    except ValueError as exc:
+        if assertion.mechanical:
+            raise MaterializeError(
+                f"visibility_grants/{assertion.key}: {exc}") from exc
+        return {"outcome": "rejected", "reason": f"invalid_grant: {exc}"}
+    return {"outcome": "applied" if created else "duplicate", "grant_id": str(row.id)}
+
+
+def _append_unique(
+    candidates: list[CandidateAssertion], assertion: CandidateAssertion, from_sequence: int,
+) -> None:
+    """Append a hint/provider assertion, failing closed on key collision."""
+    if any(a.category == assertion.category and a.key == assertion.key for a in candidates):
+        raise MaterializeError(
+            f"event {from_sequence}: duplicate assertion key "
+            f"{assertion.category}/{assertion.key} in range"
+        )
+    candidates.append(assertion)
+
+
 # ── Range entry point ────────────────────────────────────────────────────
 
 CandidateProvider = Callable[
@@ -585,19 +1040,28 @@ def materialize_range(
 ) -> dict[str, Any]:
     """Compile one committed range into validated durable writes and apply them.
 
-    Raises MaterializeError on deterministic failure (run fails, checkpoint
-    stays). Unsupported/uncertain assertions are recorded as rejected or
-    deferred while the range still consumes. Flushes; never commits — the
-    post-turn worker owns commit/rollback so retries converge.
+    Candidate sources, in order: the committed-structure compiler (turn
+    staged effects left unpersisted at commit), explicit materialize hints
+    on event payloads (validated strictly), and an optional generative
+    candidate provider. Raises MaterializeError on deterministic failure
+    (run fails, checkpoint stays). Unsupported/uncertain assertions are
+    recorded as rejected or deferred while the range still consumes.
+    Flushes; never commits — the post-turn worker owns commit/rollback
+    so retries converge.
     """
     service = decision_service or DecisionService()
     op_id = operation_id or f"post-turn-217:{campaign.id}:{from_sequence}-{to_sequence}"
+    events_by_id = {e.id: e for e in events}
 
-    candidates = extract_candidates(events)
+    committed, disclosures, compile_counts = compile_committed_candidates(db, campaign, events)
+    candidates = list(committed)
     generation_trace: dict[str, Any] = {
         "role": "deterministic-compiler", "model": None,
         "compiler_candidates": len(candidates), "generated_candidates": 0,
+        "committed_compile": compile_counts,
     }
+    for assertion in extract_candidates(events):
+        _append_unique(candidates, assertion, from_sequence)
     if candidate_provider is not None:
         try:
             extra_raw, gen_trace = candidate_provider(events)
@@ -611,7 +1075,7 @@ def materialize_range(
             if assertion.source_event_id is None:
                 assertion.source_event_id = events[0].id if events else None
                 assertion.source_sequence = events[0].sequence if events else from_sequence
-            candidates.append(assertion)
+            _append_unique(candidates, assertion, from_sequence)
         generation_trace.update({
             "role": (gen_trace or {}).get("role", "generative-candidate"),
             "model": (gen_trace or {}).get("model"),
@@ -637,7 +1101,7 @@ def materialize_range(
             "source_sequence": assertion.source_sequence,
         }
         try:
-            needs_verdict = not assertion.mechanical and assertion.category in ("relations", "facts")
+            needs_verdict = not assertion.mechanical and assertion.category != "entities"
             if needs_verdict:
                 frame = build_verification_frame(
                     assertion, events, from_sequence=from_sequence, to_sequence=to_sequence,
@@ -668,6 +1132,35 @@ def materialize_range(
                     # Generated content reaches confirmed only through an
                     # explicit SUPPORTED verdict — never by default.
                     pass
+            if assertion.category != "visibility_grants":
+                # Grants ARE explicit disclosure; every other write must not
+                # widen its cited source event without a same-range reveal.
+                source_event = (
+                    events_by_id.get(assertion.source_event_id)
+                    if assertion.source_event_id is not None else None
+                )
+                if source_event is None:
+                    if assertion.mechanical:
+                        raise MaterializeError(
+                            f"{assertion.category}/{assertion.key}: missing "
+                            f"source event for provenance"
+                        )
+                    record["outcome"] = "rejected"
+                    record["reason"] = "missing_source_event"
+                    rejected.append(record)
+                    outcomes.append(record)
+                    continue
+                try:
+                    enforce_visibility_cap(
+                        assertion, source_event, disclosures)
+                except MaterializeError as exc:
+                    if assertion.mechanical:
+                        raise
+                    record["outcome"] = "rejected"
+                    record["reason"] = f"visibility_widening: {exc}"[:300]
+                    rejected.append(record)
+                    outcomes.append(record)
+                    continue
             if assertion.category == "entities":
                 result = _apply_entity(
                     db, campaign, assertion,
@@ -675,6 +1168,8 @@ def materialize_range(
                     decision_service=decision_service,
                     session_factory=session_factory,
                     verification_tally=verification_tally,
+                    disclosures=disclosures,
+                    source_event=events_by_id.get(assertion.source_event_id),
                 )
             elif assertion.category == "relations":
                 result = _apply_relation(
@@ -683,6 +1178,20 @@ def materialize_range(
                 )
             elif assertion.category == "facts":
                 result = _apply_fact(
+                    db, campaign, assertion, from_sequence=from_sequence,
+                    to_sequence=to_sequence, operation_id=op_id,
+                )
+            elif assertion.category == "knowledge":
+                result = _apply_knowledge(
+                    db, campaign, assertion, from_sequence=from_sequence,
+                    to_sequence=to_sequence, operation_id=op_id,
+                )
+            elif assertion.category == "scene":
+                result = _apply_scene(
+                    db, campaign, assertion, operation_id=op_id,
+                )
+            elif assertion.category == "visibility_grants":
+                result = _apply_visibility_grant(
                     db, campaign, assertion, from_sequence=from_sequence,
                     to_sequence=to_sequence, operation_id=op_id,
                 )

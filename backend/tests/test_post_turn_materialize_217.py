@@ -124,7 +124,9 @@ def test_mechanical_entity_relation_fact_without_model_calls():
     assert out["duplicate"] is False
     mat = out["result"]["materialization"]
     assert mat["proposed"] == 3
-    assert mat["applied"] == {"entities": 1, "relations": 1, "facts": 1, "npc_state": 0}
+    assert mat["applied"] == {"entities": 1, "relations": 1, "facts": 1,
+                              "npc_state": 0, "knowledge": 0, "scene": 0,
+                              "visibility_grants": 0}
     assert mat["rejected"] == 0 and mat["deferred"] == 0
     assert "Brindle Tavern" in _entity_names(db, c)
     assert len(list_relations(db, c.id)) == 1
@@ -142,7 +144,8 @@ def test_empty_range_compiles_nothing_and_advances():
     )
     mat = out["result"]["materialization"]
     assert mat["proposed"] == 0 and mat["applied"] == {
-        "entities": 0, "relations": 0, "facts": 0, "npc_state": 0}
+        "entities": 0, "relations": 0, "facts": 0, "npc_state": 0,
+        "knowledge": 0, "scene": 0, "visibility_grants": 0}
     assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == event.sequence
 
 
@@ -225,9 +228,10 @@ def test_ambiguous_same_name_defers_without_decision_service():
         operation_id="seed-mira", idempotency_key="seed-mira",
     )
     db.commit()
-    events = _range(db, c, 1, _rev(db, c))
+    seed_event = _commit(db, c, payload={"n": "seed"})
+    events = _range(db, c, seed_event.sequence, seed_event.sequence)
     summary = materialize_range(
-        db, db.get(Campaign, c.id), events, 1, _rev(db, c),
+        db, db.get(Campaign, c.id), events, seed_event.sequence, seed_event.sequence,
         decision_service=None,
         candidate_provider=lambda evts: (
             [{"category": "entities", "key": "mira2", "visibility": "campaign",
@@ -297,7 +301,9 @@ def test_positive_verdict_cannot_override_deterministic_failure():
         decision_service=_scripted(SUPPORTED),
         candidate_provider=lambda evts: (bad, {"role": "gen", "model": "m"}),
     )
-    assert summary["applied"] == {"entities": 0, "relations": 0, "facts": 0, "npc_state": 0}
+    assert summary["applied"] == {"entities": 0, "relations": 0, "facts": 0,
+                                    "npc_state": 0, "knowledge": 0, "scene": 0,
+                                    "visibility_grants": 0}
     assert summary["deferred"] == 1
     assert list_relations(db, c.id) == []
 
@@ -360,3 +366,243 @@ def test_replay_does_not_duplicate_and_preserves_events():
     assert len(list_facts(db, c.id)) == 1
     after = [(e.sequence, e.event_type, e.payload) for e in _range(db, c, 1, event.sequence)]
     assert before == after
+
+
+# ── Round-2: committed-structure compiler ──────────────────────────────────
+
+def _turn_event(db, c, staged_effects, *, contract_snapshot=None, visibility="public"):
+    """Fabricate a committed turn + attempt, then commit its turn event."""
+    from models.dm import DmTurn, DmTurnAttempt
+    turn_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    rev = _rev(db, c)
+    db.add(DmTurn(id=turn_id, campaign_id=c.id, thread_id="thread-1",
+                  source_revision=rev, status="succeeded"))
+    db.add(DmTurnAttempt(id=attempt_id, turn_id=turn_id, attempt_number=1,
+                         campaign_id=c.id, thread_id="thread-1",
+                         source_revision=rev, input_set_revision=0,
+                         status="succeeded",
+                         staged_effects=staged_effects,
+                         contract_snapshot=contract_snapshot or {}))
+    db.flush()
+    _c, event = commit_campaign_mutation(
+        db, c.id, rev, event_type="dm.turn_committed",
+        payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
+                 "submission_ids": [], "mode": "respond"},
+        visibility=visibility,
+        operation_id=f"turn-{turn_id}",
+    )
+    return event
+
+
+def test_normal_turn_record_world_event_materializes_fact():
+    _F, db, c = _setup()
+    event = _turn_event(db, c, [{
+        "id": "rec1", "effect_type": "record_world_event",
+        "arguments": {"event_type": "battle", "summary": "The bridge fell at dusk.",
+                      "visibility": "public"},
+    }])
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["proposed"] == 1
+    assert mat["applied"]["facts"] == 1
+    facts = list_facts(db, c.id)
+    assert len(facts) == 1
+    assert facts[0].content == "The bridge fell at dusk."
+    assert facts[0].epistemic_state == "confirmed"
+    assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == event.sequence
+
+
+def test_committed_staged_fact_is_not_duplicated():
+    """Effects already applied at turn commit are skipped, never recompiled."""
+    from app.world.knowledge import create_fact_inline
+    _F, db, c = _setup()
+    row, _ = create_fact_inline(
+        db, c, content="Committed at turn time.", epistemic_state="confirmed",
+        visibility="campaign", operation_id="turn-commit",
+        idempotency_key="turn-commit-fact",
+    )
+    db.flush()
+    event = _turn_event(db, c, [{
+        "id": "af1", "effect_type": "assert_fact",
+        "arguments": {"content": "Committed at turn time.",
+                      "epistemic_state": "confirmed", "visibility": "campaign"},
+    }])
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["proposed"] == 0
+    assert len(list_facts(db, c.id)) == 1
+
+
+# ── Round-2: knowledge, scene, and grant categories ────────────────────────
+
+def test_knowledge_acquisition_hint_for_absent_learner():
+    """One PC's discovery becomes that character's stance — never party-wide."""
+    from app.world.epistemics import list_knowledge_for_subject
+    from app.world.knowledge import create_fact_inline
+    _F, db, c = _setup()
+    hero, _ = create_entity_inline(
+        db, c, entity_type="character", name="Ash", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-ash")
+    scout, _ = create_entity_inline(
+        db, c, entity_type="character", name="Bram", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-bram")
+    fact, _ = create_fact_inline(
+        db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
+        visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
+    db.flush()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "knowledge", "key": "ash-knows", "visibility": "dm_only",
+         "data": {"subject_kind": "character", "subject_ref": "Ash",
+                  "target_kind": "fact", "target_fact_id": str(fact.id),
+                  "knowledge_state": "knows",
+                  "acquisition_source": "explicit_disclosure"}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["knowledge"] == 1
+    assert len(list_knowledge_for_subject(db, c.id, hero.id)) == 1
+    assert list_knowledge_for_subject(db, c.id, scout.id) == []
+
+
+def test_scene_projection_hint_updates_current_scene():
+    from app.world.service import get_current_scene
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "scene", "key": "nightfall", "visibility": "campaign",
+         "data": {"scene_patch": {"fictional_time": "nightfall",
+                                  "location_name": "Brindle Tavern"}}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    assert out["result"]["materialization"]["applied"]["scene"] == 1
+    scene = get_current_scene(db, c.id)
+    assert scene.fictional_time == "nightfall"
+    assert scene.location_name == "Brindle Tavern"
+
+
+def test_visibility_grant_hint_authorizes_human_access():
+    from app.world.epistemics import has_active_grant
+    from app.world.knowledge import create_fact_inline
+    from models.campaigns import CampaignMember
+    _F, db, c = _setup()
+    reader = uuid.uuid4()
+    db.add(Profile(id=reader, email="reader@x.com"))
+    db.add(CampaignMember(campaign_id=c.id, user_id=reader))
+    db.flush()
+    fact, _ = create_fact_inline(
+        db, c, content="Secret map.", epistemic_state="confirmed",
+        visibility="dm_only", operation_id="seed", idempotency_key="seed-map")
+    db.flush()
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "visibility_grants", "key": "grant-map", "visibility": "dm_only",
+         "data": {"target_kind": "fact", "target_ref": str(fact.id),
+                  "grantee_user_id": str(reader)}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    assert out["result"]["materialization"]["applied"]["visibility_grants"] == 1
+    assert has_active_grant(db, c.id, "fact", fact.id, reader) is True
+
+
+# ── Round-2: visibility widening cap ───────────────────────────────────────
+
+def test_private_source_campaign_assertion_fails_run():
+    event_holder = {}
+
+    def _setup_private():
+        F, db, c = _setup()
+        event_holder["event"] = _commit(
+            db, c, payload={"n": 1, "post_turn_materialize": [
+                {"category": "facts", "key": "leak", "visibility": "campaign",
+                 "epistemic_state": "confirmed",
+                 "data": {"content": "DM-only secret."}}]},
+            visibility="dm_only")
+        return F, db, c
+
+    _F, db, c = _setup_private()
+    with pytest.raises(MaterializeError):
+        run_post_turn_range(
+            db, c.id, event_holder["event"].sequence, event_holder["event"].sequence,
+            clock_decision_service=DecisionService(_NeverCall()),
+        )
+    db.rollback()
+    assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == 0
+    assert list_facts(db, c.id) == []
+
+
+def test_reveal_fact_authorizes_disclosure():
+    _F, db, c = _setup()
+    event = _turn_event(
+        db, c,
+        [{"id": "rv1", "effect_type": "reveal_fact",
+          "arguments": {"item_type": "fact", "item_id": "open-secret",
+                        "visibility": "party_known", "reason": "Read aloud."}}],
+        visibility="dm_only",
+    )
+    # Attach the campaign-visible hint to the private turn event.
+    payload = dict(event.payload or {})
+    payload["post_turn_materialize"] = [
+        {"category": "facts", "key": "open-secret", "visibility": "campaign",
+         "epistemic_state": "confirmed",
+         "data": {"content": "The password is read aloud."}}]
+    event.payload = payload
+    db.flush()
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"]["facts"] == 1
+    assert mat["rejected"] == 0 and mat["deferred"] == 0
+
+
+def test_generated_widening_is_rejected_not_applied():
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1}, visibility="dm_only")
+    events = _range(db, c, event.sequence, event.sequence)
+    wide = [{"category": "facts", "key": "wide", "visibility": "campaign",
+             "mechanical": False, "epistemic_state": "claimed",
+             "data": {"content": "A secret made public."}}]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=_scripted(SUPPORTED),
+        candidate_provider=lambda evts: (wide, {"role": "gen", "model": "m"}),
+    )
+    assert summary["rejected"] == 1
+    assert summary["outcomes"][0]["reason"].startswith("visibility_widening")
+    assert list_facts(db, c.id) == []
+
+
+# ── Round-2: bounded digest idempotency keys ──────────────────────────────
+
+def test_long_keys_apply_with_bounded_idempotency():
+    from app.world.knowledge import create_fact_inline  # noqa: F401
+    _F, db, c = _setup()
+    long_key = "k" * 128
+    event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "entities", "key": long_key, "visibility": "campaign",
+         "data": {"name": "Long Key Tavern", "entity_type": "location"}},
+        {"category": "facts", "key": long_key, "visibility": "campaign",
+         "epistemic_state": "confirmed",
+         "data": {"content": "Long keys still materialize.",
+                  "entity_refs": ["Long Key Tavern"]}}]})
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    mat = out["result"]["materialization"]
+    assert mat["applied"] == {"entities": 1, "relations": 0, "facts": 1,
+                              "npc_state": 0, "knowledge": 0, "scene": 0,
+                              "visibility_grants": 0}
+    assert mat["rejected"] == 0 and mat["deferred"] == 0
