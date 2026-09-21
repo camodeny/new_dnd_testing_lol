@@ -117,7 +117,10 @@ def test_two_players_receive_different_projections(ctx):
         assert "the tavern serves stew" in alice_texts
         assert "the tavern serves stew" in bob_texts
         assert "the vault sigil is a moth" not in bob_texts
-        assert bob_view["clues"]["denied"] >= 1
+        # Member payload carries no denied metadata to infer hidden counts.
+        assert "denied" not in bob_view["clues"]
+        assert "denied_reasons" not in bob_view["clues"]
+        assert "total" not in bob_view["clues"]
     finally:
         db.close()
 
@@ -131,8 +134,48 @@ def test_hidden_data_absent_not_masked(ctx):
         blob = str(bob_view["clues"]) + str(bob_view["knowledge"])
         assert "moth" not in blob
         assert str(secret_id) not in blob
-        # Only leak-free reason counts, no ids/content of denied rows.
-        assert bob_view["clues"]["denied_reasons"]
+        # No denied metadata at all: counts/classes of hidden records
+        # cannot be inferred from an unauthorized payload.
+        assert "denied" not in blob
+        assert "private_requires_grant" not in blob
+        assert "dm_only_requires_authority" not in blob
+    finally:
+        db.close()
+
+
+def test_hidden_records_do_not_change_unauthorized_serialized_view(ctx):
+    """Review #418 round 4: adding hidden records must not change an
+    unauthorized viewer's serialized surfaces — no count/class inference."""
+    import json
+
+    _seed_private_fact(ctx)
+    db = _db(ctx)
+    try:
+        camp = db.get(Campaign, ctx["campaign_id"])
+        before = json.dumps(
+            build_surfaces_for_viewer(db, camp, ctx["bob"]), sort_keys=True, default=str,
+        )
+        # Add more secrets Bob cannot see: private fact, private item, secret clock.
+        secret, _ = _knowledge.create_fact_inline(
+            db, camp, content="a second moth sigil",
+            visibility="private", operation_id="op-secret2-250",
+        )
+        dagger, _ = _world.create_entity_inline(
+            db, camp, entity_type="item", name="Hidden Dagger",
+            visibility="private", operation_id="op-dagger2-250",
+        )
+        _clocks.create_clock_inline(
+            db, camp, name="Hidden Doom", threshold=8,
+            advancement_criteria={"kind": "deterministic"}, visibility="dm_only",
+            provenance={"source": "test-250"},
+            operation_id="op-clock-hidden-250",
+        )
+        db.commit()
+        after = json.dumps(
+            build_surfaces_for_viewer(db, camp, ctx["bob"]), sort_keys=True, default=str,
+        )
+        assert before == after
+        _ = (secret, dagger)
     finally:
         db.close()
 

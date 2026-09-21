@@ -22,8 +22,10 @@ Surfaces:
 Fail-closed contract:
 - Ambiguous/failed surface projections yield empty records with an
   ``error`` marker — never unfiltered data.
-- Denied rows are counted by reason (``denied_reasons``) without leaking
-  ids, content, or counts of *which* secret was denied beyond the reason.
+- Denied rows are counted by reason server-side (logs) without leaking
+  ids or content. Serialized member payloads carry visible records plus
+  visible counts only — ``total``/``denied``/``denied_reasons`` are
+  authority-lane only, so hidden-record counts/classes cannot be inferred.
 - No module-level per-user cache exists here by design. Any caller-side
   cache MUST key by ``(campaign_id, viewer_id, revision)`` so one account's
   secret projection can never bleed into another session.
@@ -52,6 +54,23 @@ SHOP_ENTITY_TYPES = frozenset({"shop"})
 _FACT_SCAN_LIMIT = 200
 _RELATION_SCAN_LIMIT = 200
 _ENTITY_SCAN_LIMIT = 200
+
+# Denied-record metadata keys. Serialized only for the DM authority lane;
+# ordinary members receive visible records + visible counts alone, so the
+# number and visibility class of hidden records cannot be inferred (#250).
+_DENIED_METADATA_KEYS = ("total", "denied", "denied_reasons")
+
+
+def _strip_denied_metadata(node: Any) -> None:
+    """Remove denied-record metadata in place (records/visible stay)."""
+    if isinstance(node, dict):
+        for key in _DENIED_METADATA_KEYS:
+            node.pop(key, None)
+        for value in node.values():
+            _strip_denied_metadata(value)
+    elif isinstance(node, list):
+        for value in node:
+            _strip_denied_metadata(value)
 
 
 def _empty_surface(reason: str | None = None) -> dict[str, Any]:
@@ -263,12 +282,26 @@ def build_surfaces_for_viewer(
         "clocks": clocks,
     }
 
+    # Filtering counts stay server-side for observability even when they
+    # are stripped from the member payload below (no secret content logged).
+    denied_summary = {
+        "knowledge_denied": knowledge.get("denied"),
+        "items_denied": items.get("denied"),
+        "shops_denied": shops.get("denied"),
+    }
+
+    if not is_authority:
+        # Ordinary members must not infer hidden-record counts/classes:
+        # denied metadata stays server-side (logs below), never serialized.
+        for key in ("knowledge", "clues", "items", "shops"):
+            _strip_denied_metadata(surfaces[key])
+
     logger.info(
         "surfaces built campaign_id=%s authority=%s knowledge_visible=%s knowledge_denied=%s items_visible=%s items_denied=%s shops_visible=%s shops_denied=%s maps_visible=%s clocks=%s",
         campaign.id, is_authority,
-        knowledge.get("visible"), knowledge.get("denied"),
-        items.get("visible"), items.get("denied"),
-        shops.get("visible"), shops.get("denied"),
+        knowledge.get("visible"), denied_summary["knowledge_denied"],
+        items.get("visible"), denied_summary["items_denied"],
+        shops.get("visible"), denied_summary["shops_denied"],
         maps.get("visible"), clocks.get("count"),
     )
     return surfaces
