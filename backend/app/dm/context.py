@@ -1161,6 +1161,57 @@ def assemble_attempt_context(
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
 
+    # Per-subject fictional-knowledge lane (issue #251): DM-internal
+    # perspective snapshots built from #211 WorldKnowledge, distinct from
+    # objective truth and human disclosure. dm_only + adjudication_only so
+    # narration_projection() can never carry it to a player audience.
+    # Source failure fails closed; unresolved subjects yield explicit empty
+    # perspectives (never fabricated knowledge).
+    lane_started = time.monotonic()
+    try:
+        from app.world.epistemics import build_knowledge_visibility_values
+
+        knowledge_values = build_knowledge_visibility_values(
+            db, campaign, sorted(character_ids, key=str)
+        )
+    except (ImportError, AttributeError) as exc:
+        logger.warning("knowledge_visibility reader unavailable: %s", exc)
+        knowledge_values = []
+    for value in knowledge_values:
+        character_ref = value.get("character_id") or "no-pc"
+        sources = [
+            _source(
+                "character" if value.get("character_id") else "dm_turn_attempt",
+                character_ref if value.get("character_id") else attempt.id,
+                attempt.source_revision,
+                attempt.source_revision,
+                lane="knowledge_visibility",
+            )
+        ]
+        if value.get("subject_entity_id"):
+            sources.append(
+                _source(
+                    "world_entity",
+                    value["subject_entity_id"],
+                    attempt.source_revision,
+                    attempt.source_revision,
+                    lane="knowledge_visibility",
+                )
+            )
+        records[LaneName.KNOWLEDGE_VISIBILITY].append(
+            ContextRecord(
+                record_id=f"knowledge:{character_ref}",
+                required=False,
+                priority=90,
+                value=value,
+                sources=sources,
+                authorization=scope,
+                visibility="dm_only",
+                use="adjudication_only",
+            )
+        )
+    timings[LaneName.KNOWLEDGE_VISIBILITY] = (time.monotonic() - lane_started) * 1000
+
     # Fulfilled player-roll evidence (issue #354): when this attempt resumes
     # the same logical turn after a roll fulfillment, project the authoritative
     # die result into the adjudication-only evidence lane. dm_only +
@@ -1250,6 +1301,8 @@ def assemble_attempt_context(
             "campaign_domain_events",
             "campaign_current_scenes",
             "world_entities",
+            "world_knowledge",
+            "world_visibility_grants",
             "player_roll_requests",
             "player_roll_fulfillments",
         ],

@@ -90,11 +90,12 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, suppleme
 
     Strict assembly first (fail-closed). When the ONLY missing authority is
     a lane with no usable source for this attempt — no scene row established
-    yet (``current_scene``) or no knowledge reader wired yet
-    (``knowledge_visibility``) — retry with just those lanes explicitly
-    declared ``not_applicable`` and the downgrade recorded as source errors.
-    Any other missing lane still fails closed. Once a scene row or lane
-    reader exists, strict assembly succeeds and no downgrade applies.
+    yet (``current_scene``) — retry with just that lane explicitly declared
+    ``not_applicable`` and the downgrade recorded as source errors.
+    Any other missing lane still fails closed. Once a scene row exists,
+    strict assembly succeeds and no downgrade applies. The
+    ``knowledge_visibility`` lane has a wired #211 reader (#251) and always
+    emits at least one record, so it never downgrades.
     """
     from app.dm.context import (
         LaneName,
@@ -125,11 +126,6 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, suppleme
                     downgraded[LaneName.CURRENT_SCENE] = [f"declared not_applicable: {msg}"[:500]]
                 else:
                     raise
-            if LaneName.KNOWLEDGE_VISIBILITY.value in msg \
-                    and LaneName.KNOWLEDGE_VISIBILITY not in extra \
-                    and LaneName.KNOWLEDGE_VISIBILITY.value not in extra:
-                extra[LaneName.KNOWLEDGE_VISIBILITY] = "not_applicable"
-                downgraded[LaneName.KNOWLEDGE_VISIBILITY] = [f"declared not_applicable: {msg}"[:500]]
             if not downgraded:
                 raise
             errors.update(downgraded)

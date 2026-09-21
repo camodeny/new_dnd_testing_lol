@@ -969,3 +969,111 @@ def project_relations_for_user(
 ) -> dict[str, Any]:
     """Viewer projection over an explicit relation set with leak-free counts."""
     return _project_records_for_user(db, campaign, viewer_user_id, relations, "relation")
+
+
+# ── #251 knowledge-visibility lane reader (DM-internal, adjudication-only) ──
+
+KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT = 50
+
+
+def _resolve_subject_for_character(
+    db: Session, campaign_id: uuid.UUID, character_id: Any,
+) -> WorldEntity | None:
+    """Map a canonical PC (characters.id) to its WorldEntity subject, if any.
+
+    PCs materialize into world_entities via post-turn (#217); before that no
+    subject row exists and the lane reports an explicit empty perspective
+    rather than failing. Never raises: unresolved maps to None.
+    """
+    try:
+        cid = _coerce_uuid(character_id, field="character_id")
+    except ValueError:
+        return None
+    direct = db.get(WorldEntity, cid)
+    if direct is not None and direct.campaign_id == campaign_id:
+        return direct
+    try:
+        candidates = list(
+            db.execute(
+                select(WorldEntity).where(
+                    WorldEntity.campaign_id == campaign_id,
+                    WorldEntity.entity_type == "character",
+                ).limit(200)
+            ).scalars().all()
+        )
+    except Exception:
+        return None
+    needle = str(cid)
+    for entity in candidates:
+        details = getattr(entity, "details", None) or {}
+        if isinstance(details, dict):
+            for key in ("character_id", "pc_id", "canonical_character_id"):
+                if str(details.get(key) or "") == needle:
+                    return entity
+    return None
+
+
+def build_knowledge_visibility_values(
+    db: Session, campaign: Campaign, character_ids: Any,
+    *, max_entries_per_subject: int = KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT,
+) -> list[dict[str, Any]]:
+    """DM-internal per-subject knowledge snapshots for the #202 lane.
+
+    Returns one value dict per character plus a single empty value when no PC
+    is relevant, so the REQUIRED lane is always satisfiable without fabricating
+    knowledge. Values carry target refs + stances only (no truth text); the DM
+    retrieves full evidence through #212 tools. Raises only on DB failure
+    (caller fails closed); unresolved subjects yield explicit empty entries.
+    """
+    try:
+        ids = list(character_ids or [])
+    except TypeError:
+        ids = []
+    if not ids:
+        return [{"perspectives": [], "note": "no_pc_in_attempt"}]
+    limit = max(1, min(int(max_entries_per_subject or 50), 200))
+    values: list[dict[str, Any]] = []
+    for character_id in ids:
+        subject = _resolve_subject_for_character(db, campaign.id, character_id)
+        if subject is None:
+            values.append({
+                "character_id": str(character_id),
+                "subject_entity_id": None,
+                "subject_resolved": False,
+                "perspective": "character",
+                "entries": [],
+                "total": 0,
+                "truncated": False,
+            })
+            continue
+        try:
+            rows = list_knowledge_for_subject(
+                db, campaign.id, subject.id, limit=limit + 1,
+            )
+        except Exception:
+            raise
+        truncated = len(rows) > limit
+        entries: list[dict[str, Any]] = []
+        for row in rows[:limit]:
+            try:
+                tkind, tid = _knowledge_target_ref(row)
+            except ValueError:
+                continue
+            entries.append({
+                "knowledge_id": str(row.id),
+                "target_kind": tkind,
+                "target_id": str(tid),
+                "knowledge_state": row.knowledge_state,
+                "acquisition_source": row.acquisition_source,
+                "visibility": getattr(row, "visibility", "dm_only"),
+            })
+        values.append({
+            "character_id": str(character_id),
+            "subject_entity_id": str(subject.id),
+            "subject_resolved": True,
+            "perspective": "character",
+            "entries": entries,
+            "total": len(rows) if not truncated else len(rows),
+            "truncated": truncated,
+        })
+    return values
