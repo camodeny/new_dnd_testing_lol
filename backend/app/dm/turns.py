@@ -294,14 +294,15 @@ def coordinate_turn(
     active = _get_active_turn_for_update(db, campaign_id, tid)
 
     # No active turn → create new logical turn from all unresolved submissions.
+    # No capacity gate here by design (#254): authorization is a one-time
+    # acceptance boundary enforced where submissions are durably accepted
+    # (the submission endpoint, inside its idempotent command). Every
+    # unresolved row reaching this path was already accepted, so assembling
+    # it later is owed work even if capacity has since been exhausted —
+    # re-gating here would strand accepted input. Fresh work while paused is
+    # refused at acceptance; expansion of an active turn keeps its own
+    # serialized race protection below.
     if active is None:
-        # Issue #254 — capacity boundary before a NEW AI obligation. Owed
-        # continuations (active-turn expansion below, roll fulfillment,
-        # streaming, commit, post-turn) always proceed; only starting fresh
-        # AI work is gated. Read-only: duplicate calls grant nothing twice.
-        from app.billing.resolution_guarantee import require_new_ai_work
-
-        require_new_ai_work(db, campaign_id, tid)
         sub_ids = [str(s.id) for s in unresolved]
         window_start = min(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
         window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()

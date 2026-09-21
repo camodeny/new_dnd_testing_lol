@@ -143,13 +143,16 @@ def test_boundary_before_new_turn():
     with pytest.raises(CapacityPausedError):
         require_new_ai_work(db, cid, tid)
     db.rollback()
-    # And the coordinator refuses to start a *new* turn while paused.
+    # But a row accepted before exhaustion is owed, not new: later assembly
+    # proceeds (one-time acceptance boundary, never an assembly boundary for
+    # already-accepted rows — see test 22). The endpoint pre-check above is
+    # what refuses genuinely new submissions while paused.
     db = Fac()
     sub = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="late arrival",
                             segments=[{"type": "ic", "text": "late arrival"}], thread_id=tid)
     db.commit()
-    with pytest.raises(CapacityPausedError):
-        coordinate_turn(db, cid, tid)
+    turn, _attempt = coordinate_turn(db, cid, tid)
+    assert turn.status == "pending" and turn.submission_ids == [str(sub.id)]
     db.rollback()
     db.close()
 
@@ -905,4 +908,47 @@ def test_pause_decision_scopes_owed_rolls_to_authorized_thread():
     # ... while the owning thread still sees its owed roll.
     assert describe_owed_work(db, cid, dm_tid)["pending_roll_count"] == 1
     db.rollback()
+    db.close()
+
+
+# ── 22. accepted-but-deferred input assembles after later exhaustion ─────────
+
+def test_accepted_deferred_input_assembles_after_exhaustion():
+    from app.dm.turns import StreamBoundaryError
+
+    Fac, cid, owner, _p2, _char, tid = _setup()
+    db = Fac()
+    _fund(db, cid, 100)
+    _sub_a, turn_a, attempt_a = _submit_and_coordinate(Fac, cid, owner, tid, text="first")
+    turn_a_id, attempt_a_id = turn_a.id, attempt_a.id
+    # Turn A starts streaming while capacity remains.
+    db = Fac()
+    stream_a = _stream(db, cid, tid, db.get(DmTurn, turn_a_id), db.get(DmTurnAttempt, attempt_a_id))
+    db.commit()
+    mark_streaming_started(db, turn_a_id, attempt_a_id, stream_id=stream_a.id)
+    # Input B is accepted while open but defers behind streaming turn A.
+    db2 = Fac()
+    sub_b = accept_submission(db2, campaign_id=cid, user_id=owner, raw_content="second",
+                              segments=[{"type": "ic", "text": "second"}], thread_id=tid)
+    db2.commit()
+    sub_b_id = str(sub_b.id)
+    with pytest.raises(StreamBoundaryError):
+        coordinate_turn(db2, cid, tid)
+    db2.rollback()
+    db2.close()
+    # Turn A completes and its cost crosses the boundary.
+    db = Fac()
+    commit_turn(db, turn_a_id, attempt_a_id)
+    _spend(db, cid, 5.00, tag="deferpause")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["allowed"] is False
+    # B was accepted before exhaustion: it still forms and finishes its turn.
+    turn_b, _attempt_b = coordinate_turn(db, cid, tid)
+    assert turn_b.status == "pending" and turn_b.submission_ids == [sub_b_id]
+    stream_b = _stream(db, cid, tid, turn_b, db.get(DmTurnAttempt, turn_b.current_attempt_id))
+    db.commit()
+    mark_streaming_started(db, turn_b.id, turn_b.current_attempt_id, stream_id=stream_b.id)
+    done_b, _att_b, _ev_b = commit_turn(db, turn_b.id, turn_b.current_attempt_id)
+    assert done_b.status == "succeeded"
+    assert describe_owed_work(db, cid, tid)["accepted_submission_ids"] == []
     db.close()
