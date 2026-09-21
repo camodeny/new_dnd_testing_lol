@@ -319,11 +319,16 @@ def test_non_ai_access_usable_while_paused():
     db = Fac()
     assert evaluate_new_work(db, cid, tid)["allowed"] is False
     # State hook, history reads, and ledger aggregates all stay available.
+    # State hook, history reads, and ledger aggregates all stay available.
+    # The hook carries pause/grace state only — no per-thread owed breakdown
+    # (any member can read it, including members outside private threads).
     state = capacity_state_payload(db, cid)
     assert state["ai_paused"] is True
     assert set(state) >= {"funded_cents", "consumed_cents", "remaining_cents",
                           "percent_used", "contributor_count", "ai_paused",
-                          "grace_active", "has_owed_work"}
+                          "grace_active", "gate_reason"}
+    assert "owed" not in state and "has_owed_work" not in state
+    assert "accepted_submission_count" not in str(state)
     assert "idempotency_key" not in str(state)
     rows = list_submissions(db, cid, thread_id=tid)
     assert any(r["id"] == str(sub.id) for r in rows)
@@ -688,3 +693,52 @@ def test_direct_thread_submission_usable_while_paused(paused_direct_api):
     )
     assert paused.status_code == 409
     assert paused.json()["detail"]["code"] == "ai_paused_capacity"
+
+
+# ── 18. private direct chat is never owed AI work and never leaks via hook ───
+
+def test_direct_thread_activity_not_owed_and_not_exposed():
+    from app.runtime.threads import get_or_create_private_gameplay_thread
+
+    Fac, cid, owner, p2, _char, tid = _setup()
+    p3 = uuid.uuid4()
+    db = Fac()
+    db.add(Profile(id=p3, email="p3@example.com"))
+    db.add(CampaignMember(campaign_id=cid, user_id=p3, role="player"))
+    db.commit()
+    _fund(db, cid, 100)
+    # Private player-to-player thread the observer (owner) cannot read.
+    direct, _ = get_or_create_private_gameplay_thread(
+        db, campaign_id=cid, created_by=p2, private_kind="direct",
+        participant_ids=[p3], title="Private player conversation",
+    )
+    direct_tid = str(direct.id)
+    whisper = accept_submission(db, campaign_id=cid, user_id=p2, raw_content="quiet",
+                                segments=[{"type": "ooc", "text": "quiet"}],
+                                thread_id=direct_tid)
+    db.commit()
+    # Direct chat never enters DM coordination, so it is never owed AI work —
+    # neither campaign-wide nor thread-scoped.
+    owed = describe_owed_work(db, cid)
+    assert str(whisper.id) not in owed["accepted_submission_ids"]
+    assert owed["has_owed"] is False
+    assert describe_owed_work(db, cid, direct_tid)["accepted_submission_ids"] == []
+    # A real AI-thread submission is still detected (no over-exclusion).
+    db2 = Fac()
+    real = accept_submission(db2, campaign_id=cid, user_id=owner, raw_content="I advance",
+                             segments=[{"type": "ic", "text": "I advance"}], thread_id=tid)
+    db2.commit()
+    db2.close()
+    assert str(real.id) in describe_owed_work(db, cid)["accepted_submission_ids"]
+    # Even while paused with private activity present, the participant hook
+    # exposes pause/grace state only — no per-thread owed counts.
+    _spend(db, cid, 1.00, tag="privpause")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["allowed"] is False
+    state = capacity_state_payload(db, cid)
+    assert state["ai_paused"] is True
+    assert "owed" not in state and "has_owed_work" not in state
+    blob = str(state)
+    assert direct_tid not in blob and str(whisper.id) not in blob
+    assert "accepted_submission_count" not in blob
+    db.close()

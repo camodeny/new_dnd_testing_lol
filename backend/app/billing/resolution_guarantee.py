@@ -109,15 +109,32 @@ def describe_owed_work(
     non-terminal lifecycle state, pending player-owned rolls, and
     post-turn checkpoint lag behind the committed sequence. All sourced
     from existing durable rows; no new state.
+
+    Direct player-to-player threads never invoke the AI DM, so their
+    submissions (which stay ``accepted`` forever by construction) are not
+    owed AI work and are excluded — otherwise the hook would both cry
+    owed work that can never resolve and expose private-thread activity
+    to members who cannot read those threads.
     """
     from models.dm import DmTurn, PlayerRollRequest
     from models.post_turn import PostTurnCheckpoint
-    from models.threads import PlayerSubmission
+    from models.threads import CampaignThread, PlayerSubmission
 
     sub_q = select(PlayerSubmission.id).where(
         PlayerSubmission.campaign_id == campaign_id,
         PlayerSubmission.resolution_status == "accepted",
     )
+    direct_ids = [
+        str(v)
+        for v in db.execute(
+            select(CampaignThread.id).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.private_kind == "direct",
+            )
+        ).scalars().all()
+    ]
+    if direct_ids:
+        sub_q = sub_q.where(PlayerSubmission.thread_id.not_in(direct_ids))
     if thread_id is not None:
         sub_q = sub_q.where(PlayerSubmission.thread_id == str(thread_id))
     accepted_ids = [str(v) for v in db.execute(sub_q).scalars().all()]
@@ -373,25 +390,22 @@ def require_new_ai_work(
 def capacity_state_payload(
     db: Session, campaign_id: uuid.UUID, thread_id: str | None = None
 ) -> dict:
-    """Participant-safe state hook: aggregates + pause/grace/owed flags.
+    """Participant-safe state hook: aggregates + pause/grace flags.
 
     No secrets, no idempotency keys, no narrative content. Usable while
-    AI-paused (non-AI surfaces stay available).
+    AI-paused (non-AI surfaces stay available). The per-thread owed
+    breakdown is deliberately omitted here: this hook is readable by any
+    campaign member, and campaign-wide owed counts would expose activity
+    in threads the caller cannot read. Thread-authorized owed detail
+    remains available in the 409 pause decision (scoped to the caller's
+    own thread) and the thread-scoped turn/roll endpoints.
     """
     public = _ledger.public_capacity(db, campaign_id)
     decision = evaluate_new_work(db, campaign_id, thread_id)
-    owed = describe_owed_work(db, campaign_id, thread_id)
     return {
         **public,
         "ai_paused": bool(decision["ai_paused"]),
         "grace_active": bool(decision.get("grace_active", False)),
         "gate_reason": decision["reason"],
         "overage_allowance_cents": decision.get("overage_allowance_cents", 0),
-        "has_owed_work": owed["has_owed"],
-        "owed": {
-            "pending_roll_count": owed["pending_roll_count"],
-            "post_turn_lag": owed["post_turn_lag"],
-            "active_turn_count": len(owed["active_turns"]),
-            "accepted_submission_count": len(owed["accepted_submission_ids"]),
-        },
     }
