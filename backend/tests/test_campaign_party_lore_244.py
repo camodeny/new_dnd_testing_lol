@@ -55,6 +55,10 @@ def api(monkeypatch):
         "app.characters.router.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
+    monkeypatch.setattr(
+        "app.characters.chat.router.resolve_profile",
+        lambda request, db: db.get(Profile, actor["id"]),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, actor, owner_id, member_id, outsider_id
@@ -239,6 +243,68 @@ def test_lore_validation_and_lifecycle_lock(api):
     readable = client.get(f"/api/campaigns/{camp['id']}/characters/{char_id}/lore")
     assert readable.status_code == 200
     assert readable.json()["lore"]["content"] == "pre-start secret"
+
+
+def test_lore_secret_absent_from_idempotency_ledger(api):
+    """Review #414: raw lore must never land in IdempotentCommand.result."""
+    from models.reliability import IdempotentCommand
+
+    client, factory, actor, owner_id, _, _ = api
+    camp = _create(client)
+    char_id = _make_character(factory, owner_id)
+    _select(client, camp["id"], 0, char_id, "sel-o")
+    secret = "ledger-leak-probe-secret"
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    put = _put_lore(client, camp["id"], char_id, rev, secret, "ledger-1")
+    assert put.status_code == 200, put.text
+    # PUT result itself is metadata-only.
+    assert secret not in json.dumps(put.json())
+    with factory() as db:
+        rows = db.execute(
+            select(IdempotentCommand).where(
+                IdempotentCommand.command_type == "campaign.character.lore.put"
+            )
+        ).scalars().all()
+    assert rows, "expected durable idempotency record"
+    for row in rows:
+        assert secret not in json.dumps(row.result or {}), "raw lore in idempotency ledger"
+
+
+def test_character_creator_consumes_public_party_context(api):
+    """Review #414: the AI-assisted creator resolves party context server-side."""
+    from app.characters.chat.service import build_chat_messages, build_party_advisory_text
+    from app.characters.chat.service import CharacterChatRequest
+
+    client, factory, actor, owner_id, member_id, outsider_id = api
+    camp = _create(client)
+    char_id = _make_character(factory, owner_id, char_class="Fighter")
+    _select(client, camp["id"], 0, char_id, "sel-o")
+
+    # Pure advisory builder: public counts only, never prescriptive.
+    text = build_party_advisory_text(
+        {"size": 1, "class_counts": {"Fighter": 1}}, {"suggestions": ["hint"], "enforced": False},
+    )
+    assert "Fighter" in text and "never require" in text
+    msgs = build_chat_messages(CharacterChatRequest(content="hi"), party_advisory=text)
+    assert any("Party context" in m["content"] for m in msgs if m["role"] == "system")
+    plain = build_chat_messages(CharacterChatRequest(content="hi"))
+    assert not any("Party context" in m["content"] for m in plain)
+
+    body = {"content": "help me build a rogue", "campaign_id": camp["id"]}
+    # Outsider is refused before any provider work.
+    actor["id"] = outsider_id
+    denied = client.post(f"/api/characters/new/chat", json=body)
+    assert denied.status_code in (403, 404)
+    # Unknown campaign fails closed.
+    actor["id"] = owner_id
+    missing = client.post(
+        "/api/characters/new/chat",
+        json={"content": "hi", "campaign_id": str(uuid.uuid4())},
+    )
+    assert missing.status_code == 404
+    # Member passes auth into the provider path (fallback SSE when no provider).
+    ok = client.post("/api/characters/new/chat", json=body)
+    assert ok.status_code == 200
 
 
 def test_seed_bundle_consumes_lore_without_public_leak(api):

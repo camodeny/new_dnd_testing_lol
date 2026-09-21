@@ -158,6 +158,22 @@ def build_party_advice(composition: dict) -> dict:
     return {"suggestions": suggestions, "class_counts": counts, "enforced": False}
 
 
+def assert_lore_readable(row: CampaignCharacterLore | None, viewer_id: uuid_lib.UUID) -> CampaignCharacterLore:
+    """Central #211-``private`` read rule for setup lore.
+
+    Mirrors ``may_user_receive`` for private records: disclosure to exactly
+    the owning player (the explicit grantee set of one) — never to the
+    campaign at large and never to the owner implicitly. Missing rows,
+    non-``private`` rows, and non-owners all deny identically (fail closed,
+    no existence leak).
+    """
+    if row is None or str(getattr(row, "visibility", "") or "") != "private":
+        raise LoreAuthorizationError("Character lore not found")
+    if row.user_id != viewer_id:
+        raise LoreAuthorizationError("Character lore not found")
+    return row
+
+
 def get_own_lore(
     db: Session, *, campaign_id: uuid_lib.UUID, character_id: uuid_lib.UUID, user_id: uuid_lib.UUID
 ) -> CampaignCharacterLore:
@@ -168,10 +184,7 @@ def get_own_lore(
             CampaignCharacterLore.character_id == character_id,
         )
     ).scalars().first()
-    if row is None or row.user_id != user_id:
-        # No existence leak: missing vs unauthorized are indistinguishable.
-        raise LoreAuthorizationError("Character lore not found")
-    return row
+    return assert_lore_readable(row, user_id)
 
 
 def list_lore_presence(db: Session, *, campaign_id: uuid_lib.UUID) -> dict[str, bool]:

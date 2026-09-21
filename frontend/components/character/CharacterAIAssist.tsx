@@ -11,6 +11,9 @@ interface Props {
   draftCharacter?: Record<string, unknown> | CharacterDraft | null
   activePage?: string | null
   clearTrigger?: number
+  // Optional lobby campaign — the backend resolves the PUBLIC party
+  // composition itself for advisory creator context (#244). Never private lore.
+  campaignId?: string | null
 }
 
 const EXAMPLES = [
@@ -101,7 +104,7 @@ type ChatMsg = { role: 'ai' | 'user'; content: string }
 
 const WELCOME: ChatMsg = { role: 'ai', content: "Hey! I can help you build your D&D 5e sheet — just describe who you imagine (e.g. 'grumpy dwarf cleric who loves ale' or 'shy half-elf druid, level 2'). I'll draft the stats and you can tweak everything before saving." }
 
-export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage, clearTrigger }: Props) {
+export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage, clearTrigger, campaignId }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([WELCOME])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
@@ -178,6 +181,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
           history: history.map((m) => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.content })),
           draft_character: draftCharacter ?? null,
           active_page: activePage ?? null,
+          ...(campaignId ? { campaign_id: campaignId } : {}),
         }),
       })
 

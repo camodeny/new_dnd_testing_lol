@@ -11,9 +11,11 @@ interface Props {
   initial?: Partial<Character>
   onSaved: (character: Character) => void
   onCancel: () => void
+  // Optional lobby campaign for party-aware creator advice (#244).
+  campaignId?: string | null
 }
 
-export default function CharacterFormLayout({ characterId, initial, onSaved, onCancel }: Props) {
+export default function CharacterFormLayout({ characterId, initial, onSaved, onCancel, campaignId }: Props) {
   const [aiPatch, setAiPatch] = useState<Partial<CharacterDraft> | null>(null)
   const [aiCollapsed, setAiCollapsed] = useState(false)
   const [draftSnapshot, setDraftSnapshot] = useState<CharacterDraft | null>(null)
@@ -74,6 +76,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
                 draftCharacter={draftSnapshot as unknown as Record<string, unknown>}
                 activePage={activePage}
                 clearTrigger={clearTrigger}
+                campaignId={campaignId ?? null}
                 onGenerated={(draft) => setAiPatch({ ...draft } as Partial<CharacterDraft>)}
               />
               {aiPatch && (

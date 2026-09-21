@@ -563,6 +563,9 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
             <button type="button" className="lobby-generate-btn" onClick={handleSelect} disabled={busy || !selectedId}>
               Select
             </button>
+            <a className="lobby-copy-btn" href={`/characters/new?campaign=${encodeURIComponent(campaign.id)}`}>
+              New with party advice
+            </a>
             {me?.is_ready ? (
               <button type="button" className="lobby-copy-btn" onClick={() => void handleReadiness(false)} disabled={busy}>
                 Unready

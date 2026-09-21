@@ -139,11 +139,17 @@ class CampaignCharacterLore(Base):
 
     One row per (campaign, character): the controlling player's private
     backstory/secrets shared with the DM (the AI runtime) during setup.
-    Visibility is ``private`` semantics per #211: readable by the owning
-    player only (plus DM-internal seed consumption via
-    ``get_seed_lore_bundle``); the campaign owner gets nothing implicit —
-    owner reads of another player's row fail closed (404, no existence
-    leak). Public party-composition projections must never include content.
+    Visibility follows #211 ``private`` semantics, enforced centrally in
+    ``app.campaigns.party_lore.assert_lore_readable`` (owning player only,
+    plus DM-internal seed consumption via ``get_seed_lore_bundle``); the
+    campaign owner gets nothing implicit — owner reads of another player's
+    row fail closed (404, no existence leak). Public party-composition
+    projections must never include content.
+
+    A dedicated table (rather than WorldFact rows) keeps pre-start setup
+    secrets isolated from world-truth/retrieval paths until #245 explicitly
+    consumes them as restricted seed input; authorization matches the shared
+    private rule exactly.
     """
 
     __tablename__ = "campaign_character_lore"
@@ -163,6 +169,9 @@ class CampaignCharacterLore(Base):
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
     )
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    # #211 visibility tier for this row — always ``private``. Stored
+    # explicitly so the authorization rule keys off data, not table identity.
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="private", server_default="private")
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

@@ -1511,7 +1511,12 @@ def put_character_lore(
             )
         ).scalars().first()
         if existing is not None:
-            if existing.user_id != profile.id:
+            from app.campaigns.party_lore import LoreAuthorizationError as _LoreAuthError
+            from app.campaigns.party_lore import assert_lore_readable as _assert_readable
+
+            try:
+                _assert_readable(existing, profile.id)
+            except _LoreAuthError:
                 raise HTTPException(status_code=404, detail="Character lore not found")
             if existing.content != content:
                 existing.content = content
@@ -1544,10 +1549,13 @@ def put_character_lore(
             cid, profile.id, char_id,
             row.version if row else None, len(content), campaign_after.revision,
         )
+        # Secret-free idempotent result: the raw lore must never land in the
+        # generic idempotency ledger (IdempotentCommand.result) or its
+        # payload — content travels only via the lore row + GET.
         return {
             "ok": True,
             "campaign": campaign_after.to_dict(),
-            "lore": row.to_dict(include_content=True) if row else None,
+            "lore": row.to_dict(include_content=False) if row else None,
             "event": event.to_dict(),
         }
 
@@ -1556,7 +1564,12 @@ def put_character_lore(
             db, response, actor_id=profile.id, idempotency_key=idempotency_key,
             command_type="campaign.character.lore.put",
             scope_type="campaign_character_lore", scope_id=f"{cid}:{char_id}:{profile.id}",
-            payload={**payload, "content_length": len(content)},
+            payload={
+                "expected_revision": expected_revision,
+                "operation_id": operation_id,
+                "character_id": str(char_id),
+                "content_length": len(content),
+            },
             execute=_execute,
         )
     except RevisionConflictError as exc:

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.characters.chat.service import (
     CharacterChatRequest,
+    build_party_advisory_text,
     character_chat_sync_generator,
     resolve_character_uuid,
     save_chat_message,
@@ -80,9 +81,35 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
         char = db.get(Character, character_uuid)
         if not char or char.owner_id != profile.id:
             raise HTTPException(status_code=404, detail="Character not found")
+    # Optional party-aware creator context — issue #244. Resolved
+    # server-side from the public lobby projection (member-only); the client
+    # never supplies composition content, and private lore is never included.
+    party_advisory: str | None = None
+    raw_campaign = (req.campaign_id or "").strip()
+    if raw_campaign:
+        import uuid as uuid_lib
+
+        from app.campaigns.party_lore import build_party_advice, build_party_composition
+        from app.campaigns.service import is_campaign_member
+        from models.campaigns import Campaign, CampaignMember
+
+        try:
+            cid = uuid_lib.UUID(raw_campaign)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        camp = db.get(Campaign, cid)
+        if camp is None:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+            raise HTTPException(status_code=403, detail="Not a member of this campaign")
+        members = db.execute(
+            select(CampaignMember).where(CampaignMember.campaign_id == cid)
+        ).scalars().all()
+        composition = build_party_composition(db, list(members))
+        party_advisory = build_party_advisory_text(composition, build_party_advice(composition))
     save_chat_message(profile.id, character_uuid, "user", req.content)
     return StreamingResponse(
-        character_chat_sync_generator(req, profile.id, character_uuid),
+        character_chat_sync_generator(req, profile.id, character_uuid, party_advisory=party_advisory),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
