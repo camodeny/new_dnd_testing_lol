@@ -26,8 +26,8 @@ function determineCampaignMode(
 ): CampaignMode {
   if (currentMode) return currentMode
   if (campaign.active_session) return 'session'
-  // status is the only live-table state that survives refresh (#355):
-  // solo bootstrap leaves the campaign active with a durable thread.
+  // status is the only live-table state that survives refresh:
+  // an active campaign re-enters its durable live-table thread.
   if (campaign.status === 'active') return 'session'
   if (campaign.status === 'starting' && (campaign.required_players ?? 1) <= 1) return 'world-building'
   return 'lobby'
@@ -95,7 +95,7 @@ export default function CampaignViewPage() {
       } else if (camp.status === 'active') {
         // Live table survived a refresh: re-enter the session with a
         // synthetic session handle; the durable thread id comes from
-        // channels above and history from the snapshot hook (#355).
+        // channels above and history from the snapshot hook.
         setSession({
           id: `solo-${String(id)}`,
           campaign_id: String(id),
@@ -120,27 +120,20 @@ export default function CampaignViewPage() {
   const handleStartSession = useCallback(async () => {
     if (!id) return
     try {
-      // Solo dogfood path (#355, pre-alpha): bootstrap straight into the
-      // production live-table runtime. Temporary — replaced by #245/#246.
+      // Solo start path (#245): seed the production world (lobby -> starting).
+      // The live-table opening arrives with #246; until then the seeded
+      // campaign stays in the lobby/detail view.
       const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
       if (solo) {
         const key =
           typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
             ? crypto.randomUUID()
             : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-        const data = await campaignsApi.soloBootstrap(String(id), key) as {
+        const data = await campaignsApi.worldSeed(String(id), key) as {
           campaign: Campaign
-          thread_id: string
+          seed: unknown
         }
         setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
-        if (data.thread_id) setActiveThreadId(data.thread_id)
-        setSession({
-          id: `solo-${String(id)}`,
-          campaign_id: String(id),
-          status: 'active',
-          created_at: new Date().toISOString(),
-        })
-        setMode('session')
         return
       }
       const data = await sessionsApi.start(String(id)) as { session: Session }

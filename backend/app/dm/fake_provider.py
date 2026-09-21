@@ -503,8 +503,7 @@ def build_phase0_provider(
 
     Markers are fixed per logical step (not call order), so repeated runs
     from clean state produce identical DM outputs. The opening matches an
-    input-free packet or the given synthetic opening inputs (the #355
-    solo bootstrap seeds an OOC opening line).
+    input-free packet or the given synthetic opening inputs.
     """
     provider = FakeDMProvider()
     provider.register_step(

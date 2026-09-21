@@ -135,10 +135,10 @@ export const campaigns = {
     }
     return from
   },
-  // Pre-alpha solo bootstrap into the production live-table runtime (#355).
-  // Temporary scaffold — deleted/replaced by #245/#246.
-  soloBootstrap: (id: string | number, idempotencyKey: string) =>
-    apiFetch<{ campaign: import('@/types').Campaign; thread_id: string }>(`/campaigns/${id}/solo-bootstrap`, {
+  // Production world-seed generation (#245): stages durable seed canon and
+  // moves the campaign lobby -> starting. The live-table opening is #246.
+  worldSeed: (id: string | number, idempotencyKey: string) =>
+    apiFetch<{ campaign: import('@/types').Campaign; seed: unknown }>(`/campaigns/${id}/world-seed`, {
       method: 'POST',
       body: JSON.stringify({ operation_id: idempotencyKey }),
       headers: { 'Idempotency-Key': idempotencyKey },
