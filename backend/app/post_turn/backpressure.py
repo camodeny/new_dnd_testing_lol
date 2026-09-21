@@ -26,7 +26,6 @@ Rules:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -92,21 +91,23 @@ def get_safe_context_budget() -> tuple[int, int]:
     return get_safe_context_budget_bytes(), get_safe_context_budget_tokens()
 
 
-def _canonical_size(value: Any) -> int:
-    return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"))
-
-
 def estimate_unprocessed_cost(
     db: Session, campaign_id: uuid.UUID, *, upto_sequence: int | None = None
 ) -> dict[str, int]:
     """Deterministic estimated context cost of unprocessed committed history.
 
-    Sums canonical payload sizes over checkpoint+1..upto (default: current
-    max committed sequence) plus a fixed per-record envelope margin, so the
-    estimate is conservative relative to assembled ``ContextRecord`` sizes.
+    Sizes the exact records context assembly must keep: every unprocessed
+    event is built through ``app.dm.context._history_record`` (required,
+    with the post-turn marker) and measured with the same serialized-record
+    ``_size`` the packet budget enforces — so unbounded fields such as
+    ``event.provenance`` (carried in ``SourceRef.provenance``) plus
+    ids/operation/trace metadata are all accounted for. Events assembly
+    itself omits (scopeless private history) contribute nothing here either.
     Raises on any failure — callers must treat that as blocked, never as
     zero (fail-safe: never silently omit history).
     """
+    from app.dm.context import _history_record
+    from app.dm.context import _size as _record_size
     from app.post_turn.service import get_checkpoint, get_max_sequence
 
     cp = get_checkpoint(db, campaign_id, commit=False)
@@ -114,12 +115,8 @@ def estimate_unprocessed_cost(
     max_seq = int(upto_sequence) if upto_sequence is not None else get_max_sequence(db, campaign_id)
     if max_seq <= processed:
         return {"estimated_bytes": 0, "estimated_tokens": 0, "event_count": 0}
-    rows = db.execute(
-        select(
-            CampaignDomainEvent.event_type,
-            CampaignDomainEvent.payload,
-            CampaignDomainEvent.targets,
-        )
+    events = db.scalars(
+        select(CampaignDomainEvent)
         .where(
             CampaignDomainEvent.campaign_id == campaign_id,
             CampaignDomainEvent.sequence > processed,
@@ -128,16 +125,21 @@ def estimate_unprocessed_cost(
         .order_by(CampaignDomainEvent.sequence.asc())
     ).all()
     total = 0
-    for event_type, payload, targets in rows:
-        total += _canonical_size(
-            {"event_type": event_type, "payload": payload or {}, "targets": targets or {}}
-        ) + RECORD_ENVELOPE_MARGIN_BYTES
+    for event in events:
+        record = _history_record(
+            campaign_id, event,
+            required=True, priority=95,
+            post_turn_processed_through=processed,
+        )
+        if record is None:
+            continue
+        total += _record_size(record.model_dump(mode="json"))
     # Lag-summary record overhead carried alongside the gap-fill records.
     total += RECORD_ENVELOPE_MARGIN_BYTES
     return {
         "estimated_bytes": total,
         "estimated_tokens": math.ceil(total / 4),
-        "event_count": len(rows),
+        "event_count": len(events),
     }
 
 

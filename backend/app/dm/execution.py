@@ -483,16 +483,24 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
     submissions, fresh ``source_revision``, new attempt id) so the durable
     input executes against current authority. The stale-revision guard
     itself is untouched — this only refreshes never-executed prepared work.
-    The refresh applies only to attempts previously deferred by backpressure
-    (``next_retry_at`` set by the deferral path): other revision drift keeps
-    the existing fail-visible behavior.
+    The refresh applies only to attempts carrying the explicit backpressure-
+    deferral signal (``next_retry_at`` set with no failure markers): the
+    ordinary transient-retry path also sets ``next_retry_at`` but always
+    alongside ``last_error``/``error_class``/``retry_count``, and such
+    attempts keep the existing fail-visible behavior with their
+    recovery/non-billable lineage intact. Retry lineage is preserved onto
+    the replacement attempt either way.
     Returns the attempt to execute (possibly a fresh row).
     """
     from models.campaigns import Campaign
     from models.dm import DmTurn, DmTurnAttempt
 
     try:
-        if getattr(attempt, "next_retry_at", None) is None:
+        if (
+            getattr(attempt, "next_retry_at", None) is None
+            or getattr(attempt, "last_error", None) is not None
+            or getattr(attempt, "error_class", None) is not None
+        ):
             return attempt
         campaign = db.get(Campaign, attempt.campaign_id)
         if campaign is None:
@@ -536,10 +544,10 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
             staged_effects=[],
             contract_snapshot=None,
             commit_operation_id=None,
-            retry_count=0,
+            retry_count=int(getattr(old, "retry_count", 0) or 0),
             next_retry_at=None,
-            last_error=None,
-            error_class=None,
+            last_error=getattr(old, "last_error", None),
+            error_class=getattr(old, "error_class", None),
         )
         new_attempt.commit_operation_id = str(new_attempt.id)
         db.add(new_attempt)

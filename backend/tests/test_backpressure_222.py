@@ -485,3 +485,99 @@ def test_backpressured_attempts_defer_behind_ready_work(monkeypatch):
     db.expire_all()
     assert db.get(DmTurn, turn_r.id).status == "succeeded"
     db.close()
+
+
+# ── Review #419 round 2: estimate must cover the assembled record shape ───
+
+def test_gate_accounts_for_provenance_and_requires_window_lag(monkeypatch):
+    """Unbounded provenance must trip the gate; window lag must be required.
+
+    The safety estimate is derived from the serialized records assembly
+    actually keeps (provenance included), so a provenance-heavy backlog
+    blocks instead of being admitted and then omitted under total-budget
+    pressure. And unprocessed events inside the normal recent window are
+    required records that fail closed rather than droppable.
+    """
+    monkeypatch.setenv("FORWARD_DM_SAFE_CONTEXT_BYTES", "2000")
+    F = _factory()
+    cid, owner, tid = _campaign(F)
+    db = F()
+    big_provenance = {"trace": "p" * 4000, "origin": "load-test"}
+    for i in range(2):
+        commit_campaign_mutation(
+            db, cid, expected_revision=i, event_type="game.play",
+            payload={"n": i}, visibility="campaign",
+            provenance=dict(big_provenance),
+            operation_id=f"op-prov-{i}-{uuid.uuid4().hex[:6]}",
+        )
+    status = evaluate_backpressure(db, cid)
+    assert status["blocked"] is True and status["reason"] == "over_safe_budget"
+    with pytest.raises(BackpressureBlocked):
+        require_forward_progress(db, cid)
+
+    # Estimate covers the assembled shape: still conservative vs records.
+    cost = estimate_unprocessed_cost(db, cid)
+    _turn_obj, attempt = _turn(db, cid, owner, tid)
+    packet = assemble_attempt_context(db, attempt.id, supplemental_status=_stub_status())
+    from app.dm.context import _size as _ctx_size
+
+    lane = _history_lane(packet)
+    actual = sum(_ctx_size(r.model_dump(mode="json")) for r in lane.records)
+    assert cost["estimated_bytes"] >= actual
+
+    # Unprocessed window records are required (fail closed, never dropped).
+    unprocessed = [
+        r for r in lane.records
+        if r.value.get("post_turn", {}).get("processed") is False
+    ]
+    assert unprocessed, "expected unprocessed history in context"
+    assert all(r.required for r in unprocessed)
+    db.close()
+
+
+def test_ordinary_transient_retry_keeps_stale_guard_and_lineage(monkeypatch):
+    """A transient retry plus revision drift must NOT take the refresh path.
+
+    No backpressure anywhere (generous budget): an attempt requeued by the
+    pre-visibility transient path (next_retry_at + error markers +
+    retry_count) that goes stale before re-eligibility keeps the existing
+    fail-visible behavior — no supersession, no retry_count reset, recovery
+    lineage intact.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.context import MissingAuthoritativeContextError
+    from models.dm import DmTurn, DmTurnAttempt
+
+    F = _factory()
+    cid, owner, tid = _campaign(F)
+    db = F()
+    _turn_obj, attempt = _turn(db, cid, owner, tid)
+    aid = attempt.id
+    # Simulate the transient-retry requeue: eligibility + error markers.
+    row = db.get(DmTurnAttempt, aid)
+    row.last_error = "TimeoutError: adjudication timed out"
+    row.error_class = "retriable"
+    row.retry_count = 1
+    row.next_retry_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    db.commit()
+    # Authority advances while the retry waits (no backpressure involved).
+    _commit(db, cid, int(db.get(Campaign, cid).revision), payload={"drift": True})
+    assert evaluate_backpressure(db, cid)["blocked"] is False
+
+    with pytest.raises(MissingAuthoritativeContextError, match="stale"):
+        execute_dm_attempt(
+            db, aid,
+            adjudicate=lambda packet, feedback=None: _respond_contract(),
+            narrator="deterministic",
+        )
+    db.expire_all()
+    stale = db.get(DmTurnAttempt, aid)
+    assert stale.status == "failed_visible"
+    assert stale.retry_count == 1  # lineage preserved, not reset
+    assert db.get(DmTurn, _turn_obj.id).current_attempt_id == aid  # no supersession
+    orphans = db.execute(
+        select(DmTurnAttempt).where(DmTurnAttempt.parent_attempt_id == aid)
+    ).scalars().all()
+    assert orphans == []
+    db.close()

@@ -1105,8 +1105,13 @@ def assemble_attempt_context(
         )
         covered_ids: set[str] = set()
         for event in reversed(recent_events):
+            # Issue #222 — unprocessed history is required wherever it is
+            # found: a recent-window event past processed_through must fail
+            # closed under budget pressure like gap-fill records, never be
+            # silently dropped while the gate reports within_budget.
             record = _history_record(
                 campaign.id, event,
+                required=int(event.sequence or 0) > int(processed_through),
                 post_turn_processed_through=processed_through,
             )
             if record is None:
