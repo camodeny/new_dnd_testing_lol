@@ -135,6 +135,8 @@ class CandidateAssertion:
     source_event_id: uuid.UUID | None = None
     source_sequence: int | None = None
     source_effect_id: str | None = None
+    source_turn_id: uuid.UUID | None = None
+    source_attempt_id: uuid.UUID | None = None
 
 
 def _require_str(mapping: dict, field_name: str, *, what: str) -> str:
@@ -339,6 +341,7 @@ def compile_committed_candidates(
         payload = event.payload or {}
         attempt = None
         attempt_id = _coerce_uuid_or_none(payload.get("attempt_id"))
+        turn_id = _coerce_uuid_or_none(payload.get("turn_id"))
         if attempt_id is not None:
             attempt = db.get(DmTurnAttempt, attempt_id)
             if attempt is None or attempt.campaign_id != campaign.id:
@@ -381,15 +384,40 @@ def compile_committed_candidates(
                     raise MaterializeError(
                         f"event {event.sequence}: record_world_event {eff_id!r} "
                         f"requires a summary")
+                # Preserve the full historical-event metadata (#217): the
+                # fact content carries the summary, while event_type,
+                # payload, source facets, and the staged effect id travel
+                # in details/provenance — never dropped.
+                facet_ids = args.get("source_facet_ids")
+                if facet_ids is not None and not isinstance(facet_ids, list):
+                    raise MaterializeError(
+                        f"event {event.sequence}: record_world_event {eff_id!r} "
+                        f"source_facet_ids must be a list")
+                effect_payload = args.get("payload")
+                if effect_payload is not None and not isinstance(effect_payload, dict):
+                    raise MaterializeError(
+                        f"event {event.sequence}: record_world_event {eff_id!r} "
+                        f"payload must be an object")
                 assertion = CandidateAssertion(
                     category="facts", key=f"rec-{eff_id}",
-                    data={"content": summary.strip()},
+                    data={
+                        "content": summary.strip(),
+                        "details": {
+                            "historical_event": {
+                                "event_type": args.get("event_type"),
+                                "payload": effect_payload or {},
+                                "source_facet_ids": facet_ids or [],
+                                "effect_id": eff_id or None,
+                            },
+                        },
+                    },
                     visibility=_EFFECT_VISIBILITY_MAP.get(
                         str(args.get("visibility") or "dm_private").strip(),
                         "dm_only"),
                     epistemic_state="confirmed", mechanical=True,
                     source_event_id=event.id, source_sequence=event.sequence,
                     source_effect_id=eff_id or None,
+                    source_turn_id=turn_id, source_attempt_id=attempt_id,
                 )
                 candidates.append(assertion)
                 counts["compiled"] += 1
@@ -419,6 +447,7 @@ def compile_committed_candidates(
                       "ref": name.strip()},
                 visibility="campaign", mechanical=True,
                 source_event_id=event.id, source_sequence=event.sequence,
+                source_turn_id=turn_id, source_attempt_id=attempt_id,
             ))
             counts["compiled"] += 1
     return candidates, disclosures, counts
@@ -670,6 +699,8 @@ def _apply_entity(
                 name=name.strip(), summary=data.get("summary"),
                 status=status, visibility=assertion.visibility,
                 details=data.get("details") if isinstance(data.get("details"), dict) else {},
+                source_turn_id=assertion.source_turn_id,
+                source_attempt_id=assertion.source_attempt_id,
                 operation_id=f"post-turn-217:{from_sequence}-{to_sequence}",
                 idempotency_key=key,
             )
@@ -700,6 +731,8 @@ def _apply_entity(
             entity_type=str(entity_type).strip().lower(), name=name.strip(),
             idempotency_key=key, details=data.get("details"),
             summary=data.get("summary"), operation_id=f"post-turn-217:{from_sequence}-{to_sequence}",
+            source_turn_id=assertion.source_turn_id,
+            source_attempt_id=assertion.source_attempt_id,
         )
     except ValueError as exc:
         return {"outcome": "deferred", "reason": f"identity_resolution_rejected: {exc}"}
@@ -1071,7 +1104,10 @@ def materialize_range(
             raise MaterializeError("candidate provider must return a list of hint objects")
         for raw in extra_raw:
             assertion = validate_hint(raw, event_sequence=from_sequence)
-            assertion.mechanical = bool(raw.get("mechanical", False))
+            # The provider is the generative lane: its output can never
+            # self-mark as mechanical to bypass bounded verification.
+            # Generation proposes; bounded decisions verify (#379).
+            assertion.mechanical = False
             if assertion.source_event_id is None:
                 assertion.source_event_id = events[0].id if events else None
                 assertion.source_sequence = events[0].sequence if events else from_sequence

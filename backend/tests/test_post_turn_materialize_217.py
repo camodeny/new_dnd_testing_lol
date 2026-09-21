@@ -606,3 +606,89 @@ def test_long_keys_apply_with_bounded_idempotency():
                               "npc_state": 0, "knowledge": 0, "scene": 0,
                               "visibility_grants": 0}
     assert mat["rejected"] == 0 and mat["deferred"] == 0
+
+
+# ── Round-3: provider cannot bypass verification ───────────────────────────
+
+def test_provider_mechanical_claim_still_requires_verdict():
+    _F, db, c = _setup()
+    event = _commit(db, c, payload={"n": 1})
+    events = _range(db, c, event.sequence, event.sequence)
+    sneaky = [{"category": "facts", "key": "sneaky", "visibility": "campaign",
+               "mechanical": True, "epistemic_state": "confirmed",
+               "data": {"content": "Provider invents canon."}}]
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events, event.sequence, event.sequence,
+        decision_service=_scripted(UNSUPPORTED),
+        candidate_provider=lambda evts: (sneaky, {"role": "gen", "model": "m"}),
+    )
+    assert summary["verification"]["decisions"] == 1
+    assert summary["rejected"] == 1
+    assert list_facts(db, c.id) == []
+
+
+# ── Round-3: historical-event metadata survives ────────────────────────────
+
+def test_record_world_event_metadata_preserved():
+    _F, db, c = _setup()
+    event = _turn_event(db, c, [{
+        "id": "rec9", "effect_type": "record_world_event",
+        "arguments": {"event_type": "oath", "summary": "Mira swore the oath.",
+                      "visibility": "public",
+                      "payload": {"oath": "protection"},
+                      "source_facet_ids": ["facet-1"]},
+    }])
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    assert out["result"]["materialization"]["applied"]["facts"] == 1
+    facts = list_facts(db, c.id)
+    assert len(facts) == 1
+    historical = (facts[0].details or {}).get("historical_event") or {}
+    assert historical.get("event_type") == "oath"
+    assert historical.get("payload") == {"oath": "protection"}
+    assert historical.get("source_facet_ids") == ["facet-1"]
+    assert historical.get("effect_id") == "rec9"
+
+
+# ── Round-3: compiler-created entities carry turn provenance ───────────────
+
+def test_compiler_entity_links_back_to_committed_turn():
+    from models.dm import DmTurn
+    _F, db, c = _setup()
+    turn_id = uuid.uuid4()
+    attempt_id = uuid.uuid4()
+    rev = _rev(db, c)
+    db.add(DmTurn(id=turn_id, campaign_id=c.id, thread_id="thread-1",
+                  source_revision=rev, status="succeeded"))
+    db.flush()
+    from models.dm import DmTurnAttempt
+    db.add(DmTurnAttempt(id=attempt_id, turn_id=turn_id, attempt_number=1,
+                         campaign_id=c.id, thread_id="thread-1",
+                         source_revision=rev, input_set_revision=0,
+                         status="succeeded", staged_effects=[],
+                         contract_snapshot={"new_entities": [{
+                             "temp_id": "tmp_npc_1", "kind": "npc",
+                             "public_name": "Unpromoted Nina",
+                             "public_summary": "Missed by promotion."}]}))
+    db.flush()
+    _c, event = commit_campaign_mutation(
+        db, c.id, rev, event_type="dm.turn_committed",
+        payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
+                 "submission_ids": [], "mode": "respond"},
+        operation_id=f"turn-{turn_id}",
+    )
+    out = run_post_turn_range(
+        db, c.id, event.sequence, event.sequence,
+        clock_decision_service=DecisionService(_NeverCall()),
+    )
+    assert out["result"]["materialization"]["applied"]["entities"] == 1
+    names = _entity_names(db, c)
+    assert "Unpromoted Nina" in names
+    row = db.execute(select(WorldEntity).where(
+        WorldEntity.campaign_id == c.id,
+        WorldEntity.name == "Unpromoted Nina")).scalars().first()
+    assert row is not None
+    assert row.source_turn_id == turn_id
+    assert row.source_attempt_id == attempt_id
