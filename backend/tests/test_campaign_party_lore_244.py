@@ -331,3 +331,12 @@ def test_seed_bundle_consumes_lore_without_public_leak(api):
     # Public lobby payload still carries no secret content.
     lobby = client.get(f"/api/campaigns/{camp['id']}/lobby")
     assert "seed-only secret" not in json.dumps(lobby.json())
+
+    # Switching characters excludes the abandoned character's stale lore.
+    alt_id = _make_character(factory, owner_id, name="Alt")
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    switched = _select(client, camp["id"], rev, alt_id, "switch-1")
+    assert switched.status_code == 200, switched.text
+    with factory() as db:
+        bundle = get_seed_lore_bundle(db, campaign_id=uuid.UUID(camp["id"]))
+    assert bundle == [], "abandoned character lore must not seed the world"

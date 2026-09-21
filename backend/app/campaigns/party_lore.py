@@ -207,7 +207,19 @@ def get_seed_lore_bundle(db: Session, *, campaign_id: uuid_lib.UUID) -> list[dic
     that reads other players' content server-side; it must never be attached
     to a public seed/narration payload — #245 must copy content into
     restricted seed inputs only. No logging of raw content here.
+
+    Only lore for each member's CURRENTLY selected character is included:
+    selection is changeable before launch, and abandoned characters' secrets
+    must not seed the world.
     """
+    members = db.execute(
+        select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
+    ).scalars().all()
+    selected = {
+        (str(m.selected_character_id), str(m.user_id))
+        for m in members
+        if getattr(m, "selected_character_id", None) is not None
+    }
     rows = db.execute(
         select(CampaignCharacterLore).where(
             CampaignCharacterLore.campaign_id == campaign_id
@@ -221,4 +233,5 @@ def get_seed_lore_bundle(db: Session, *, campaign_id: uuid_lib.UUID) -> list[dic
             "version": r.version,
         }
         for r in rows
+        if (str(r.character_id), str(r.user_id)) in selected
     ]
