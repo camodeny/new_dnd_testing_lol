@@ -882,3 +882,27 @@ def test_scene_updates_apply_in_source_order_not_key_order():
     mat = out["result"]["materialization"]
     assert mat["applied"]["scene"] == 2
     assert get_current_scene(db, c.id).fictional_time == "dusk"
+
+
+# ── Round-6: verification is bound to cited source evidence ────────────────
+
+def test_verification_sees_only_cited_source_event():
+    _F, db, c = _setup()
+    public_event = _commit(db, c, payload={"n": 1}, visibility="public")
+    private_event = _commit(db, c, payload={"n": 2}, visibility="dm_only")
+    events = _range(db, c, public_event.sequence, private_event.sequence)
+    candidate = [{"category": "facts", "key": "bound", "visibility": "campaign",
+                  "source_sequence": public_event.sequence,
+                  "epistemic_state": "claimed",
+                  "data": {"content": "Cited public evidence."}}]
+    adapter = FakeDecisionAdapter(answers={MATERIALIZE_QUESTION_ID: SUPPORTED})
+    summary = materialize_range(
+        db, db.get(Campaign, c.id), events,
+        public_event.sequence, private_event.sequence,
+        decision_service=DecisionService(adapter),
+        candidate_provider=lambda evts: (candidate, {"role": "gen", "model": "m"}),
+    )
+    assert summary["applied"]["facts"] == 1
+    assert len(adapter.calls) == 1
+    evidence = adapter.calls[0]["state"]["evidence"]
+    assert [e["sequence"] for e in evidence] == [public_event.sequence]

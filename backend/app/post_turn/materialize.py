@@ -498,9 +498,16 @@ def _evidence_excerpt(events: list[CampaignDomainEvent]) -> list[dict[str, Any]]
 
 
 def build_verification_frame(
-    assertion: CandidateAssertion, events: list[CampaignDomainEvent],
+    assertion: CandidateAssertion, evidence_events: list[CampaignDomainEvent],
     *, from_sequence: int, to_sequence: int,
 ) -> DecisionFrame:
+    """Build the bounded frame over the candidate's cited source evidence.
+
+    Evidence is bound to the cited source event(s) — never the whole
+    range — so a candidate citing a public event cannot be judged
+    SUPPORTED on the strength of unrelated DM-private evidence and then
+    pass the visibility cap against its false public source.
+    """
     records = (
         CandidateRecord(
             id=SUPPORTED, label="Assertion is supported by the committed evidence",
@@ -529,7 +536,7 @@ def build_verification_frame(
                 "data": assertion.data,
                 "source_sequence": assertion.source_sequence,
             },
-            "evidence": _evidence_excerpt(events),
+            "evidence": _evidence_excerpt(evidence_events),
             "source_range": [from_sequence, to_sequence],
         },
         state_revision=f"post-turn:{from_sequence}-{to_sequence}",
@@ -1155,6 +1162,25 @@ def materialize_range(
             "source_sequence": assertion.source_sequence,
         }
         try:
+            # Source provenance resolves before anything else: every
+            # assertion — grants included — must cite a real in-range
+            # source event, and verification is bound to that cited
+            # evidence so private range-mates cannot launder support.
+            source_event = (
+                events_by_id.get(assertion.source_event_id)
+                if assertion.source_event_id is not None else None
+            )
+            if source_event is None:
+                if assertion.mechanical:
+                    raise MaterializeError(
+                        f"{assertion.category}/{assertion.key}: missing "
+                        f"source event for provenance"
+                    )
+                record["outcome"] = "rejected"
+                record["reason"] = "invalid_provenance: unknown source event"
+                rejected.append(record)
+                outcomes.append(record)
+                continue
             # Every generated (non-mechanical) assertion is verified —
             # entities included: verification judges evidential support
             # first, then #214 identity handling gates entity creation.
@@ -1171,7 +1197,8 @@ def materialize_range(
                 continue
             if needs_verdict:
                 frame = build_verification_frame(
-                    assertion, events, from_sequence=from_sequence, to_sequence=to_sequence,
+                    assertion, [source_event],
+                    from_sequence=from_sequence, to_sequence=to_sequence,
                 )
                 verdict = decide_assertion(frame, service, session_factory=session_factory)
                 verification_tally["decisions"] += 1
@@ -1199,25 +1226,8 @@ def materialize_range(
                     # Generated content reaches confirmed only through an
                     # explicit SUPPORTED verdict — never by default.
                     pass
-            # Every assertion must resolve to a real in-range source event —
-            # grants included: bounded verification can never override a
-            # deterministic provenance failure. Grants ARE explicit
-            # disclosure, so only they skip the widening cap itself.
-            source_event = (
-                events_by_id.get(assertion.source_event_id)
-                if assertion.source_event_id is not None else None
-            )
-            if source_event is None:
-                if assertion.mechanical:
-                    raise MaterializeError(
-                        f"{assertion.category}/{assertion.key}: missing "
-                        f"source event for provenance"
-                    )
-                record["outcome"] = "rejected"
-                record["reason"] = "invalid_provenance: unknown source event"
-                rejected.append(record)
-                outcomes.append(record)
-                continue
+            # Grants ARE explicit disclosure, so only they skip the
+            # widening cap itself (provenance above still applies).
             if assertion.category != "visibility_grants":
                 try:
                     enforce_visibility_cap(
