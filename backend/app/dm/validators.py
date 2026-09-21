@@ -815,6 +815,11 @@ class KnowledgeValidator:
             args = getattr(effect, "arguments", None) or {}
             if not isinstance(args, dict):
                 continue
+            # A denial transfer ("this subject does not know X") is not a
+            # learning source — it must never clear the claim. Omitted
+            # state defaults to "knows" like the effect handler.
+            if str(args.get("knowledge_state") or "knows").strip().lower() == "does_not_know":
+                continue
             subject = str(args.get("subject_entity_id") or "").strip()
             targets = {
                 str(args.get(field) or "").strip()

@@ -246,6 +246,32 @@ def test_npc_utterance_with_knowledge_or_transfer_passes():
     assert KnowledgeValidator().validate(taught, pkt3).passed
 
 
+def test_denial_transfer_does_not_teach():
+    """A matching does_not_know transfer never clears the claim."""
+    vera_id, target = str(uuid.uuid4()), str(uuid.uuid4())
+    denied = normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "beats": [{"id": "beat_1", "type": "npc_dialogue",
+                    "speaker_ref": {"type": "npc", "id": vera_id},
+                    "speaker_public_name": "Vera",
+                    "truth_status": "truthful",
+                    "claims": [{"text": "I know all about that place.",
+                                "claim_kind": "npc_utterance",
+                                "origin": "dm_adjudication", "visibility": "public",
+                                "actor_ref": {"type": "npc", "id": vera_id},
+                                "topic_refs": [{"type": "location", "id": target}]}]}],
+         "staged_effects": [{"id": "eff-deny-1", "effect_type": "transfer_knowledge",
+                             "arguments": {"subject_kind": "npc",
+                                           "subject_entity_id": vera_id,
+                                           "target_kind": "entity",
+                                           "target_entity_id": target,
+                                           "knowledge_state": "does_not_know"}}]})
+    pkt = _knowledge_packet(subject_id=vera_id, target_id=target, state="does_not_know")
+    result = KnowledgeValidator().validate(denied, pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_denied_knowledge"
+
+
 def test_validator_skips_unresolvable_or_unrelated():
     pkt = _knowledge_packet(subject_id="npc:vera", target_id=str(uuid.uuid4()), resolved=False)
     contract = _utterance("npc:vera", str(uuid.uuid4()))
