@@ -269,6 +269,14 @@ def test_lore_secret_absent_from_idempotency_ledger(api):
     for row in rows:
         assert secret not in json.dumps(row.result or {}), "raw lore in idempotency ledger"
 
+    # Same key + different same-length content must 409 (payload fingerprint
+    # covers content) and leave the stored lore untouched.
+    rev = client.get(f"/api/campaigns/{camp['id']}/lobby").json()["campaign"]["revision"]
+    clash = _put_lore(client, camp["id"], char_id, rev, "X" * len(secret), "ledger-1")
+    assert clash.status_code == 409
+    got = client.get(f"/api/campaigns/{camp['id']}/characters/{char_id}/lore")
+    assert got.json()["lore"]["content"] == secret
+
 
 def test_character_creator_consumes_public_party_context(api):
     """Review #414: the AI-assisted creator resolves party context server-side."""

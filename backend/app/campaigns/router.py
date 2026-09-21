@@ -1564,11 +1564,15 @@ def put_character_lore(
             db, response, actor_id=profile.id, idempotency_key=idempotency_key,
             command_type="campaign.character.lore.put",
             scope_type="campaign_character_lore", scope_id=f"{cid}:{char_id}:{profile.id}",
+            # The idempotency helper persists only the SHA-256 digest of this
+            # payload (never the raw payload), so the actual content belongs
+            # here: same key + different same-length lore must 409 rather
+            # than silently replay the old write.
             payload={
                 "expected_revision": expected_revision,
                 "operation_id": operation_id,
                 "character_id": str(char_id),
-                "content_length": len(content),
+                "content": content,
             },
             execute=_execute,
         )
