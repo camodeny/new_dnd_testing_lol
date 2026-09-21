@@ -145,6 +145,11 @@ class RouteSignals:
     pending_roll_labels: tuple[str, ...] = ()
     complete: bool = True
     signal_error: str | None = None
+    # Attempt audience scope (issue #248): the frame state is already
+    # audience-authorized content, and the audience marker lets downstream
+    # consumers (primer attachment, telemetry) keep private scope without
+    # re-reading authority.
+    audience: str = "campaign"
 
 
 @dataclass
@@ -211,6 +216,7 @@ def build_route_frame(signals: RouteSignals) -> DecisionFrame:
         "pending_roll_count": signals.pending_roll_count,
         "pending_roll_labels": list(signals.pending_roll_labels),
         "source_revision": signals.state_revision,
+        "audience": signals.audience,
     }
     return build_frame(
         decision_class=FORWARD_DM_ROUTE_CLASS,
@@ -471,6 +477,7 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
         complete = False
         signal_error = "no submission segments read for a non-empty input set"
     revision = getattr(attempt, "source_revision", 0)
+    audience = str(getattr(attempt, "audience", None) or "campaign")
     return RouteSignals(
         state_revision=revision,
         submission_ids=submission_ids,
@@ -480,6 +487,7 @@ def collect_signals(db: Any, attempt: Any, turn: Any) -> RouteSignals:
         pending_roll_labels=tuple(pending_labels),
         complete=complete,
         signal_error=signal_error,
+        audience=audience,
     )
 
 
@@ -592,6 +600,58 @@ def _fresh_roll_evidence(db: Any, attempt: Any) -> list[Any]:
     return list(fresh.roll_evidence or [])
 
 
+def _private_authorization_error(db: Any, attempt: Any, turn: Any) -> str | None:
+    """Verify the attempt may build a decision frame on its thread (issue #248).
+
+    Decision frames/candidates are built only after private-thread
+    authorization: the attempt audience must match its authoritative thread
+    type on the same campaign. Returns a reason string when the frame must
+    NOT be built (the caller escalates to the generative path, which
+    re-authorizes through context assembly), or None when authorized.
+
+    Never raises: any authority-read failure escalates rather than guessing.
+    Logs metadata/IDs only — never submission text or hidden state.
+    """
+    try:
+        import uuid as _uuid
+
+        from models.threads import CampaignThread
+
+        attempt_audience = str(getattr(attempt, "audience", None) or "campaign")
+        turn_audience = str(getattr(turn, "audience", None) or "campaign")
+        if attempt_audience != turn_audience:
+            logger.warning(
+                "decision routing audience mismatch attempt_id=%s turn_id=%s attempt_audience=%s turn_audience=%s",
+                getattr(attempt, "id", None), getattr(turn, "id", None),
+                attempt_audience, turn_audience,
+            )
+            return "attempt audience does not match its turn audience"
+        try:
+            thread_uuid = _uuid.UUID(str(getattr(attempt, "thread_id", "")))
+        except (ValueError, TypeError, AttributeError):
+            return "attempt thread id is not a valid thread"
+        thread = db.get(CampaignThread, thread_uuid)
+        if thread is None:
+            logger.warning(
+                "decision routing thread missing attempt_id=%s turn_id=%s",
+                getattr(attempt, "id", None), getattr(turn, "id", None),
+            )
+            return "attempt thread authority is missing"
+        if str(thread.campaign_id) != str(getattr(attempt, "campaign_id", "")):
+            return "attempt thread belongs to another campaign"
+        if str(thread.thread_type) != attempt_audience:
+            logger.warning(
+                "decision routing thread audience mismatch attempt_id=%s thread_id=%s thread_type=%s attempt_audience=%s",
+                getattr(attempt, "id", None), thread_uuid,
+                thread.thread_type, attempt_audience,
+            )
+            return "attempt audience does not match its authoritative thread type"
+        return None
+    except Exception as exc:
+        logger.warning("decision routing authorization check failed: %s", exc)
+        return f"authorization authority unreadable: {exc}"
+
+
 PRIMER_RECORD_PREFIX = "decision-primer:"
 
 
@@ -628,6 +688,31 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
         ) from exc
     if any(r.record_id == record_id for r in lanes[lane_index].records):
         return packet
+    # Issue #248 — the primer advisory inherits the packet audience: on a
+    # private turn it stays private/thread-scoped (never campaign-visible),
+    # so the advisory prior cannot widen private routing metadata.
+    packet_audience = getattr(packet, "audience", None)
+    audience_kind = str(getattr(packet_audience, "audience", "campaign") or "campaign")
+    thread_id = str(getattr(packet_audience, "thread_id", "") or "")
+    if audience_kind == "private":
+        if not thread_id:
+            raise DecisionError(
+                "primer attachment needs a thread-scoped private audience",
+                kind="malformed",
+            )
+        primer_visibility = "private"
+        primer_auth = AuthorizationScope(
+            campaign_id=str(getattr(packet_audience, "campaign_id", "")),
+            thread_ids=[thread_id],
+            user_ids=[],
+        )
+    else:
+        primer_visibility = "campaign"
+        primer_auth = AuthorizationScope(
+            campaign_id=str(audience.campaign_id),
+            thread_ids=[str(audience.thread_id)],
+            user_ids=[],
+        )
     record = ContextRecord(
         record_id=record_id,
         value={
@@ -650,12 +735,8 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
                 provenance={"decision_class": FORWARD_DM_ROUTE_CLASS},
             )
         ],
-        authorization=AuthorizationScope(
-            campaign_id=str(audience.campaign_id),
-            thread_ids=[str(audience.thread_id)],
-            user_ids=[],
-        ),
-        visibility="campaign",
+        authorization=primer_auth,
+        visibility=primer_visibility,  # type: ignore[arg-type]
         use="adjudication_only",
         required=False,
         priority=5,
@@ -829,6 +910,20 @@ def route_attempt(
             )
     except Exception as exc:
         logger.warning("decision routing evidence gate failed: %s", exc)
+    # Issue #248 — private-thread authorization precedes frame/candidate
+    # assembly: a bounded decision must never be evaluated on input the
+    # attempt is not authorized to see. Failure escalates to the generative
+    # path (which re-authorizes through context assembly), never executes.
+    try:
+        auth_error = _private_authorization_error(db, attempt, turn)
+    except Exception as exc:
+        logger.warning("decision routing authorization gate failed: %s", exc)
+        auth_error = f"authorization gate failed: {exc}"
+    if auth_error is not None:
+        return _escalate(
+            f"attempt authorization failed ({auth_error}); generative escape",
+            decision_skipped=True,
+        )
     try:
         signals = collect_signals(db, attempt, turn)
     except Exception as exc:
