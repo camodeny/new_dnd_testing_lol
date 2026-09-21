@@ -992,14 +992,18 @@ def _knowledge_current_order(
         )
         if not match:
             continue
+        # Every channel always counts (maximum wins): authoritative
+        # re-assertion merges provenance, so a row first written by
+        # post-turn keeps its old source_sequence even after a newer
+        # authoritative update — the event/turn channels must still be
+        # consulted rather than treated as fallbacks.
         order = _provenance_order(row.provenance)
-        if order < 0:
-            order = max(order, _knowledge_asserted_order(
-                db, campaign_id, row.id))
-        if order < 0 and row.source_turn_id is not None:
+        order = max(order, _knowledge_asserted_order(
+            db, campaign_id, row.id))
+        if row.source_turn_id is not None:
             turn = db.get(DmTurn, row.source_turn_id)
             if turn is not None and turn.campaign_id == campaign_id:
-                order = int(turn.source_revision or 0) + 1
+                order = max(order, int(turn.source_revision or 0) + 1)
         best = max(best, order)
     return best
 

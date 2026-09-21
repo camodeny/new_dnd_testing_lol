@@ -1141,3 +1141,56 @@ def test_delayed_knowledge_hint_preserves_authoritative_stance():
     stances = list_knowledge_for_subject(db, c.id, hero.id)
     assert len(stances) == 1
     assert stances[0].knowledge_state == "knows"
+
+
+# ── Round-11: merged provenance never hides newer channels ─────────────────
+
+def test_materialized_then_authoritative_then_delayed_preserves_newer():
+    from app.world.epistemics import (
+        assert_knowledge_authoritative,
+        list_knowledge_for_subject,
+    )
+    from app.world.knowledge import create_fact_inline
+    _F, db, c = _setup()
+    hero, _ = create_entity_inline(
+        db, c, entity_type="character", name="Ash", visibility="campaign",
+        operation_id="seed", idempotency_key="seed-ash")
+    fact, _ = create_fact_inline(
+        db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
+        visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
+    db.flush()
+    # Range N materializes the stance first (provenance stamps N).
+    old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
+        {"category": "knowledge", "key": "ash-n", "visibility": "dm_only",
+         "data": {"subject_kind": "character", "subject_ref": "Ash",
+                  "target_kind": "fact", "target_fact_id": str(fact.id),
+                  "knowledge_state": "suspects",
+                  "acquisition_source": "explicit_disclosure"}}]})
+    run_post_turn_range(
+        db, c.id, old.sequence, old.sequence,
+        clock_decision_service=DecisionService(_NeverCall()))
+    # A second hint commits at N+1 but post-turn has not caught up yet.
+    mid = _commit(db, c, payload={"n": 2, "post_turn_materialize": [
+        {"category": "knowledge", "key": "ash-mid", "visibility": "dm_only",
+         "data": {"subject_kind": "character", "subject_ref": "Ash",
+                  "target_kind": "fact", "target_fact_id": str(fact.id),
+                  "knowledge_state": "suspects",
+                  "acquisition_source": "explicit_disclosure"}}]})
+    # Authoritative update at N+2 merges (preserves) that provenance.
+    assert_knowledge_authoritative(
+        db, c.id, _rev(db, c), subject_kind="character",
+        subject_entity_id=hero.id, target_kind="fact",
+        target_fact_id=fact.id, knowledge_state="knows",
+        acquisition_source="explicit_disclosure", visibility="dm_only",
+        operation_id="auth-newer")
+    db.commit()
+    # Delayed range N+1 must not rewind to its older stance.
+    out2 = run_post_turn_range(
+        db, c.id, mid.sequence, mid.sequence,
+        clock_decision_service=DecisionService(_NeverCall()))
+    mat = out2["result"]["materialization"]
+    assert mat["applied"]["knowledge"] == 0
+    assert mat["skipped"] == 1
+    stances = list_knowledge_for_subject(db, c.id, hero.id)
+    assert len(stances) == 1
+    assert stances[0].knowledge_state == "knows"
