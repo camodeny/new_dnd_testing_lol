@@ -317,7 +317,7 @@ def test_world_seed_denied_hook_suppressed_silently(api):
     client, factory, actor, owner_id, member_id, _ = api
     campaign = _create(
         client, required_players=2, name="Hook suppression",
-        content_boundaries={"exclude": ["secret_kin"]},
+        content_boundaries={"exclude": ["brother"]},
     )
     with factory() as db:
         db.add(CampaignMember(
@@ -340,9 +340,10 @@ def test_world_seed_denied_hook_suppressed_silently(api):
     body = response.json()
     assert body["campaign"]["status"] == "starting"
     # The deny phrase echoes in the owner-set campaign settings, but no
-    # lore-derived surface may carry it.
+    # lore-derived surface may carry it — even though the hook label itself
+    # ("secret_kin") no longer contains the denied lore term.
     assert "secret_kin" not in json.dumps(body["seed"])
-    assert "brother" not in json.dumps(body)
+    assert "brother" not in json.dumps(body["seed"])
 
     with factory() as db:
         cid = uuid.UUID(campaign["id"])

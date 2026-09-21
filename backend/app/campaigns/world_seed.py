@@ -454,6 +454,14 @@ def run_world_seed(
     # constrain generated material before acceptance, but suppression must
     # not change any owner-visible outcome (#244 oracle).
     hook_deny = _deny_phrases(getattr(campaign, "content_boundaries", None))
+    # Raw lore text for boundary matching only: a lore-derived hook is
+    # suppressed when a deny phrase matches either the restricted lore input
+    # or the rendered hook text. This map never leaves the server and
+    # suppression never surfaces in public output (#244 oracle).
+    lore_text_by_char = {
+        str(entry.get("character_id")): str(entry.get("content") or "")
+        for entry in (lore_bundle or [])
+    }
 
     holder: dict = {}
     from_status = str(campaign.status)
@@ -533,8 +541,9 @@ def run_world_seed(
                 f"Unrevealed {hook['kind']} hook for {hook['character_name']} "
                 f"(private lore v{hook['lore_version']}); the DM may surface it through play."
             )
+            lore_source = lore_text_by_char.get(str(hook["character_id"]), "")
             if any(
-                phrase and phrase in hook_text.lower()
+                phrase and (phrase in hook_text.lower() or phrase in lore_source.lower())
                 for phrase in hook_deny
             ):
                 suppressed_hooks += 1
