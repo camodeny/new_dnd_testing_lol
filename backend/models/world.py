@@ -778,3 +778,115 @@ class WorldEmbedding(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+# ── Issue #219: rebuildable campaign summaries with claim-support verification ─
+
+# Lifecycle of one running-summary record. Only ``current`` rows are eligible
+# for forward-DM context (and then only as the lower-authority lane);
+# ``pending`` awaits semantic verification, ``deferred`` awaits uncertain-claim
+# resolution, ``stale`` awaits rebuild after a source repair/retcon, and
+# ``failed`` records a terminal generation/verification failure. All are
+# retryable derived work — never canon.
+SUMMARY_STATUSES = frozenset({"pending", "current", "stale", "failed", "deferred"})
+
+# Single canonical scope for this issue: the running compression of the
+# processed event prefix. One live row per (campaign, scope, from, to).
+SUMMARY_SCOPE_RUNNING = "running"
+
+
+class CampaignSummary(Base):
+    """Rebuildable derived running summary — issue #219.
+
+    Compact narrative/context compression of a committed domain-event range.
+    Explicitly NOT authoritative: domain events, facts, relations, entities,
+    and repairs always outrank this prose. Every row identifies the exact
+    source range/revision it compresses (``from_sequence``/``to_sequence``/
+    ``source_revision``) plus a ``source_hash`` over the committed evidence,
+    so re-summarization converges (same sources → same claims) instead of
+    drifting, and repairs/retcons invalidate precisely the affected rows.
+
+    Generated prose is split into verifiable ``claims`` (each bound to source
+    sequences). Deterministic code owns source existence/range/provenance and
+    visibility checks; bounded semantic judgments (``campaign_summary_verify``
+    role) only judge SUPPORTED/UNSUPPORTED/DEFER among code-supplied outcomes
+    and can never broaden visibility beyond the source evidence.
+    """
+
+    __tablename__ = "campaign_summaries"
+    __table_args__ = (
+        UniqueConstraint(
+            "campaign_id", "scope", "from_sequence", "to_sequence",
+            name="uq_campaign_summaries_campaign_scope_range",
+        ),
+        Index("ix_campaign_summaries_campaign_status", "campaign_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False,
+    )
+    scope: Mapped[str] = mapped_column(String(32), nullable=False, default="running", server_default="running")
+    from_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    to_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    source_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    prose: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claims: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    claim_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    deterministic_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    unsupported_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    uncertain_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    stale_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    rebuild_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    generation_provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    generation_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    generation_latency_ms: Mapped[float | None] = mapped_column(Integer, nullable=True)
+    verification_policy: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    verification_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    support_distribution: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self, *, include_prose: bool = True):
+        out = {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "scope": self.scope,
+            "from_sequence": self.from_sequence,
+            "to_sequence": self.to_sequence,
+            "source_revision": self.source_revision,
+            "source_hash": self.source_hash,
+            "version": self.version,
+            "status": self.status,
+            "visibility": self.visibility,
+            "claim_count": self.claim_count,
+            "deterministic_failures": self.deterministic_failures,
+            "unsupported_count": self.unsupported_count,
+            "uncertain_count": self.uncertain_count,
+            "stale_count": self.stale_count,
+            "rebuild_count": self.rebuild_count,
+            "generation_provider": self.generation_provider,
+            "generation_model": self.generation_model,
+            "generation_latency_ms": self.generation_latency_ms,
+            "verification_policy": self.verification_policy or {},
+            "verification_model": self.verification_model,
+            "support_distribution": self.support_distribution or {},
+            "error": self.error,
+            "operation_id": self.operation_id,
+            "is_derived": True,
+            "authority": "derived_summary",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_prose:
+            out["prose"] = self.prose
+            out["claims"] = list(self.claims or [])
+        return out
