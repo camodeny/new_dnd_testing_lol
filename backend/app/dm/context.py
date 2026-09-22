@@ -569,6 +569,102 @@ def _source(
     )
 
 
+def _history_record(
+    campaign_id: uuid.UUID,
+    event: CampaignDomainEvent,
+    *,
+    required: bool = False,
+    priority: int = 80,
+    post_turn_processed_through: int | None = None,
+) -> ContextRecord | None:
+    """Build one RECENT_HISTORY record for a committed domain event.
+
+    Returns None when the event cannot be safely scoped (private without an
+    explicit thread scope) — it is never widened. When
+    ``post_turn_processed_through`` is given and the event sequence trails
+    past it, the record carries an additive ``post_turn`` marker exposing
+    the outstanding range (issue #222) so the forward DM reasons from
+    accumulated unprocessed history instead of claiming an unaware state.
+    The marker carries only sequence numbers — never private payloads —
+    and per-event visibility/authorization still governs who may see it.
+    """
+    visibility = (
+        event.visibility
+        if event.visibility in {"public", "campaign", "private", "dm_only"}
+        else "dm_only"
+    )
+    event_thread = None
+    for container in (event.payload, event.provenance):
+        if isinstance(container, dict) and container.get("thread_id"):
+            event_thread = str(container["thread_id"])
+            break
+    # A private event without an explicit scope cannot be safely widened.
+    if visibility == "private" and event_thread is None:
+        return None
+    value: dict[str, Any] = {
+        "event_id": str(event.id),
+        "sequence": event.sequence,
+        "event_type": event.event_type,
+        "payload": event.payload,
+        "targets": event.targets,
+    }
+    if (
+        post_turn_processed_through is not None
+        and int(event.sequence or 0) > int(post_turn_processed_through)
+    ):
+        value["post_turn"] = {
+            "processed": False,
+            "processed_through": int(post_turn_processed_through),
+        }
+    return ContextRecord(
+        record_id=f"domain-event:{event.id}",
+        required=required,
+        priority=priority,
+        sort_key=f"{event.sequence:020d}",
+        value=value,
+        sources=[
+            _source(
+                "campaign_domain_event",
+                event.id,
+                event.sequence,
+                event.sequence,
+                operation_id=event.operation_id,
+                trace_id=event.trace_id,
+                upstream_provenance=event.provenance or {},
+            )
+        ],
+        authorization=_scope(
+            campaign_id, thread_ids=[event_thread] if event_thread else []
+        ),
+        visibility=visibility,  # type: ignore[arg-type]
+        use="adjudication_only"
+        if visibility == "dm_only"
+        else "narration_eligible",
+    )
+
+
+def _processed_through_sequence(db: Session, campaign_id: uuid.UUID) -> int:
+    """Read-only post-turn checkpoint position (issue #222).
+
+    Never creates a row: assembly is a read path, and a missing checkpoint
+    simply means nothing has been processed yet.
+    """
+    try:
+        from models.post_turn import PostTurnCheckpoint
+    except (ImportError, AttributeError):
+        return 0
+    try:
+        row = db.get(PostTurnCheckpoint, campaign_id)
+    except Exception:
+        return 0
+    if row is None:
+        return 0
+    try:
+        return int(row.processed_through_sequence or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _audience_for_attempt(
     db: Session, campaign: Campaign, turn: DmTurnAttempt
 ) -> ContextAudience:
@@ -986,6 +1082,15 @@ def assemble_attempt_context(
     timings[LaneName.RULESET_IDENTITY] = timings[LaneName.PROTECTED_PCS]
 
     lane_started = time.monotonic()
+    # Issue #222 — the forward DM must reason from ALL completed but
+    # post-turn-unprocessed gameplay while lag is safe, not just the recent
+    # window. Events already covered by the window below are never
+    # duplicated; unprocessed events beyond the window are appended as
+    # required gap-fill records so budget pressure fails closed
+    # (ContextBudgetError) instead of silently dropping required history.
+    # The execution gate (pause_if_backpressured) blocks before that in
+    # production; private history keeps its scoped visibility either way.
+    processed_through = _processed_through_sequence(db, campaign.id)
     if recent_event_limit:
         recent_events = list(
             db.scalars(
@@ -998,52 +1103,45 @@ def assemble_attempt_context(
                 .limit(recent_event_limit)
             ).all()
         )
+        covered_ids: set[str] = set()
         for event in reversed(recent_events):
-            visibility = (
-                event.visibility
-                if event.visibility in {"public", "campaign", "private", "dm_only"}
-                else "dm_only"
+            # Issue #222 — unprocessed history is required wherever it is
+            # found: a recent-window event past processed_through must fail
+            # closed under budget pressure like gap-fill records, never be
+            # silently dropped while the gate reports within_budget.
+            record = _history_record(
+                campaign.id, event,
+                required=int(event.sequence or 0) > int(processed_through),
+                post_turn_processed_through=processed_through,
             )
-            event_thread = None
-            for container in (event.payload, event.provenance):
-                if isinstance(container, dict) and container.get("thread_id"):
-                    event_thread = str(container["thread_id"])
-                    break
-            # A private event without an explicit scope cannot be safely widened.
-            if visibility == "private" and event_thread is None:
+            if record is None:
                 continue
-            records[LaneName.RECENT_HISTORY].append(
-                ContextRecord(
-                    record_id=f"domain-event:{event.id}",
-                    priority=80,
-                    sort_key=f"{event.sequence:020d}",
-                    value={
-                        "event_id": str(event.id),
-                        "sequence": event.sequence,
-                        "event_type": event.event_type,
-                        "payload": event.payload,
-                        "targets": event.targets,
-                    },
-                    sources=[
-                        _source(
-                            "campaign_domain_event",
-                            event.id,
-                            event.sequence,
-                            event.sequence,
-                            operation_id=event.operation_id,
-                            trace_id=event.trace_id,
-                            upstream_provenance=event.provenance or {},
-                        )
-                    ],
-                    authorization=_scope(
-                        campaign.id, thread_ids=[event_thread] if event_thread else []
-                    ),
-                    visibility=visibility,
-                    use="adjudication_only"
-                    if visibility == "dm_only"
-                    else "narration_eligible",
-                )
+            records[LaneName.RECENT_HISTORY].append(record)
+            covered_ids.add(str(event.id))
+        if processed_through < attempt.source_revision:
+            gap_events = list(
+                db.scalars(
+                    select(CampaignDomainEvent)
+                    .where(
+                        CampaignDomainEvent.campaign_id == campaign.id,
+                        CampaignDomainEvent.sequence > processed_through,
+                        CampaignDomainEvent.sequence <= attempt.source_revision,
+                    )
+                    .order_by(CampaignDomainEvent.sequence.asc())
+                ).all()
             )
+            for event in gap_events:
+                if str(event.id) in covered_ids:
+                    continue
+                record = _history_record(
+                    campaign.id, event,
+                    required=True,
+                    priority=95,
+                    post_turn_processed_through=processed_through,
+                )
+                if record is None:
+                    continue
+                records[LaneName.RECENT_HISTORY].append(record)
     timings[LaneName.RECENT_HISTORY] = (time.monotonic() - lane_started) * 1000
 
     # Populate authoritative campaign-level lanes directly from the campaign row.
@@ -1316,6 +1414,7 @@ def assemble_attempt_context(
             "characters",
             "dnd5e_character_sheets",
             "campaign_domain_events",
+            "post_turn_checkpoints",
             "campaign_current_scenes",
             "world_entities",
             "world_knowledge",

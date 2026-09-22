@@ -796,10 +796,21 @@ def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
     failed = [r for r in runs if r.status == "failed"]
     last = runs[0] if runs else None
     retry_count = sum(int(r.attempts or 0) for r in runs)
+    # Issue #222 — safe-lag observability alongside the checkpoint span:
+    # outstanding range size, estimated context cost, safe budget, and the
+    # block state. Guarded: status reporting never raises.
+    try:
+        from app.post_turn.backpressure import evaluate_backpressure
+
+        backpressure = evaluate_backpressure(db, campaign_id)
+    except Exception as exc:  # noqa: BLE001 — observability must not break status
+        backpressure = {"blocked": True, "reason": "estimation_failed",
+                        "error": str(exc)[:300]}
     return {
         "campaign_id": str(campaign_id),
         "checkpoint": int(cp.processed_through_sequence or 0),
         "outstanding": span,
+        "backpressure": backpressure,
         "run_attempts": len(runs),
         "retry_count": retry_count,
         "last_run": last.to_dict() if last else None,

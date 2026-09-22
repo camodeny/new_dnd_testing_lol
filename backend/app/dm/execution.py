@@ -430,6 +430,153 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
     return SilentResult(turn=turn, attempt=attempt, event=event)
 
 
+def _defer_backpressured_attempt(db: Session, attempt) -> None:
+    """Defer a backpressured attempt behind ready work — issue #222.
+
+    A blocked attempt stays ``prepared`` (no failure marker — backpressure
+    is not failure) but takes a future ``next_retry_at`` via the existing
+    retry-eligibility/backoff mechanism, so ``find_prepared_attempts`` skips
+    it on subsequent sweeps instead of letting persistently blocked attempts
+    monopolize every sweep and starve unrelated ready turns. ``retry_count``
+    is untouched (this is not a failure); the sweep retries the attempt once
+    the eligibility time passes and catch-up has cleared the backlog.
+    """
+    from datetime import datetime, timezone
+    from datetime import timedelta as _td
+
+    try:
+        from models.dm import DmTurnAttempt as _Attempt
+
+        fresh = db.get(_Attempt, attempt.id)
+        if fresh is None or fresh.status != "prepared":
+            return
+        fresh.next_retry_at = datetime.now(timezone.utc) + _td(
+            seconds=retry_backoff_seconds(int(getattr(fresh, "retry_count", 0) or 0) + 1)
+        )
+        db.add(fresh)
+        db.commit()
+        logger.info(
+            "dm_execute backpressure_deferred attempt_id=%s campaign_id=%s next_retry_at=%s",
+            fresh.id, fresh.campaign_id, fresh.next_retry_at,
+        )
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "dm_execute backpressure deferral failed attempt_id=%s error=%s",
+            getattr(attempt, "id", None), exc,
+        )
+
+
+def _refresh_backpressured_stale_attempt(db: Session, attempt):
+    """Rebase a backpressure-delayed attempt onto current authority — #222.
+
+    Normal post-turn catch-up can itself advance ``Campaign.revision``
+    (e.g. clock advancement/completion emits a domain event). An attempt
+    prepared before the backlog is therefore stale once the gate passes,
+    and context assembly would reject it as a stale-revision failure
+    instead of resolving the accepted input. When the attempt is still the
+    current prepared attempt of its pending turn with an unchanged input
+    set, supersede it (pre-stream coordination semantics: same accepted
+    submissions, fresh ``source_revision``, new attempt id) so the durable
+    input executes against current authority. The stale-revision guard
+    itself is untouched — this only refreshes never-executed prepared work.
+    The refresh applies only to attempts carrying the explicit backpressure-
+    deferral signal (``next_retry_at`` set with no failure markers): the
+    ordinary transient-retry path also sets ``next_retry_at`` but always
+    alongside ``last_error``/``error_class``/``retry_count``, and such
+    attempts keep the existing fail-visible behavior with their
+    recovery/non-billable lineage intact. Retry lineage is preserved onto
+    the replacement attempt either way.
+    Returns the attempt to execute (possibly a fresh row).
+    """
+    from models.campaigns import Campaign
+    from models.dm import DmTurn, DmTurnAttempt
+
+    try:
+        if (
+            getattr(attempt, "next_retry_at", None) is None
+            or getattr(attempt, "last_error", None) is not None
+            or getattr(attempt, "error_class", None) is not None
+        ):
+            return attempt
+        campaign = db.get(Campaign, attempt.campaign_id)
+        if campaign is None:
+            return attempt
+        if int(campaign.revision or 0) == int(attempt.source_revision or 0):
+            return attempt
+        turn = db.get(DmTurn, attempt.turn_id)
+        if turn is None:
+            return attempt
+        if (
+            turn.status != "pending"
+            or attempt.status != "prepared"
+            or str(turn.current_attempt_id) != str(attempt.id)
+            or list(turn.submission_ids or []) != list(attempt.submission_ids or [])
+        ):
+            return attempt
+        from app.dm.turns import _now
+
+        now = _now()
+        old = db.get(DmTurnAttempt, attempt.id)
+        if old is None or old.status != "prepared":
+            return attempt
+        old.status = "superseded"
+        old.invalidation_reason = "backpressure_revision_refresh"
+        old.invalidated_at = now
+        new_attempt = DmTurnAttempt(
+            id=uuid.uuid4(),
+            turn_id=turn.id,
+            attempt_number=int(old.attempt_number or 0) + 1,
+            status="prepared",
+            campaign_id=old.campaign_id,
+            thread_id=old.thread_id,
+            audience=old.audience,
+            source_revision=int(campaign.revision or 0),
+            input_set_revision=old.input_set_revision,
+            submission_ids=list(old.submission_ids or []),
+            parent_attempt_id=old.id,
+            assembly_window_start=old.assembly_window_start,
+            assembly_window_end=old.assembly_window_end,
+            roll_evidence=list(old.roll_evidence or []),
+            staged_effects=[],
+            contract_snapshot=None,
+            commit_operation_id=None,
+            retry_count=int(getattr(old, "retry_count", 0) or 0),
+            next_retry_at=None,
+            last_error=getattr(old, "last_error", None),
+            error_class=getattr(old, "error_class", None),
+        )
+        new_attempt.commit_operation_id = str(new_attempt.id)
+        db.add(new_attempt)
+        db.flush()
+        turn.current_attempt_id = new_attempt.id
+        turn.source_revision = int(campaign.revision or 0)
+        db.add(turn)
+        db.flush()
+        db.commit()
+        db.refresh(new_attempt)
+        logger.info(
+            "dm_execute backpressure_revision_refresh campaign_id=%s turn_id=%s "
+            "old_attempt_id=%s new_attempt_id=%s old_source_revision=%s new_source_revision=%s",
+            campaign.id, turn.id, old.id, new_attempt.id,
+            old.source_revision, new_attempt.source_revision,
+        )
+        return new_attempt
+    except Exception as exc:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "dm_execute backpressure revision refresh failed attempt_id=%s error=%s",
+            getattr(attempt, "id", None), exc,
+        )
+        return attempt
+
+
 def _execute_owned_attempt(
     db: Session,
     attempt_id: uuid.UUID,
@@ -479,6 +626,27 @@ def _execute_owned_attempt(
     submission_ids = list(attempt.submission_ids or [])
     campaign_id = attempt.campaign_id
     turn_id = attempt.turn_id
+
+    # Issue #222 — safe lag/backpressure: while post-turn trails beyond the
+    # safe forward-DM context budget, new AI progression pauses BEFORE
+    # context becomes unreliable. The attempt stays prepared (no failure
+    # marker — this is not failure) with a future retry-eligibility time so
+    # blocked attempts defer behind ready work, and a critical catch-up
+    # trigger fires. Player-input acceptance/coordination is untouched:
+    # accepted intent stays durable and resolves after catch-up (the resume
+    # path rebases the prepared attempt when catch-up advanced authority).
+    from app.post_turn.backpressure import pause_if_backpressured
+
+    _bp_status = pause_if_backpressured(
+        db, campaign_id, attempt_id=attempt.id, turn_id=turn_id,
+    )
+    if _bp_status is not None:
+        _defer_backpressured_attempt(db, attempt)
+        return None
+    attempt = _refresh_backpressured_stale_attempt(db, attempt)
+    attempt_id = attempt.id
+    turn = db.get(DmTurn, attempt.turn_id)
+    submission_ids = list(attempt.submission_ids or [])
 
     # A caller observing running work must never adopt another worker's claim.
     try:
