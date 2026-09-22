@@ -289,13 +289,22 @@ def test_shadow_decide_returns_outcome_without_raising():
 def _stub_db_for_route():
     attempt_id = uuid.uuid4()
     turn_id = uuid.uuid4()
+    thread_id = uuid.uuid4()
+    camp_id = uuid.uuid4()
     fresh_attempt = SimpleNamespace(
         id=attempt_id, turn_id=turn_id, status="prepared", submission_ids=[],
         input_set_revision=0, roll_evidence=[], source_revision=3,
+        campaign_id=camp_id, thread_id=str(thread_id), audience="campaign",
     )
     fresh_turn = SimpleNamespace(
         id=turn_id, current_attempt_id=attempt_id, input_set_revision=0,
-        submission_ids=[],
+        submission_ids=[], campaign_id=camp_id, thread_id=str(thread_id),
+        audience="campaign",
+    )
+    # Issue #248 — the router authorizes the attempt against its thread
+    # before building any frame, so stubs must supply thread authority.
+    stub_thread = SimpleNamespace(
+        id=thread_id, campaign_id=camp_id, thread_type="campaign",
     )
 
     def _scalars(*args, **kwargs):
@@ -309,6 +318,8 @@ def _stub_db_for_route():
             return fresh_attempt
         if name == "DmTurn":
             return fresh_turn
+        if name == "CampaignThread":
+            return stub_thread if str(_id) == str(thread_id) else None
         return None
 
     return SimpleNamespace(
@@ -319,7 +330,8 @@ def _stub_db_for_route():
 def test_shadow_route_records_comparable_decision_without_changing_path():
     stub_db, attempt, turn = _stub_db_for_route()
     attempt = SimpleNamespace(
-        id=attempt.id, campaign_id=uuid.uuid4(), turn_id=turn.id,
+        id=attempt.id, campaign_id=attempt.campaign_id, turn_id=turn.id,
+        thread_id=attempt.thread_id, audience="campaign",
         submission_ids=[], source_revision=3, status="prepared",
         input_set_revision=0, roll_evidence=[],
     )
@@ -574,18 +586,27 @@ def test_superseded_attempt_still_records_policy_outcome_and_revalidation():
     engine = _create_engine("sqlite://")
     Base.metadata.create_all(engine)
     factory = _sessionmaker(bind=engine, expire_on_commit=False)
-    owner_id, camp_id, turn_id, attempt_id = (uuid.uuid4() for _ in range(4))
+    owner_id, camp_id, turn_id, attempt_id, thread_id = (uuid.uuid4() for _ in range(5))
     with factory() as db:
         db.add(Profile(id=owner_id, email="owner@example.com"))
         db.add(Campaign(id=camp_id, owner_id=owner_id, name="Table", revision=3))
+        # Issue #248 — the router authorizes the attempt against its thread
+        # before building any frame, so the attempt needs a real thread row
+        # whose type matches its audience.
+        from models.threads import CampaignThread
+
+        db.add(CampaignThread(
+            id=thread_id, campaign_id=camp_id, thread_type="campaign",
+            created_by=owner_id,
+        ))
         db.add(DmTurn(
-            id=turn_id, campaign_id=camp_id, thread_id="thread-1",
+            id=turn_id, campaign_id=camp_id, thread_id=str(thread_id),
             source_revision=3, input_set_revision=0, submission_ids=[],
             current_attempt_id=attempt_id,
         ))
         db.add(DmTurnAttempt(
             id=attempt_id, turn_id=turn_id, attempt_number=1,
-            campaign_id=camp_id, thread_id="thread-1",
+            campaign_id=camp_id, thread_id=str(thread_id),
             source_revision=3, input_set_revision=0, submission_ids=[],
             # A newer submission superseded this attempt mid-decision.
             status="superseded",

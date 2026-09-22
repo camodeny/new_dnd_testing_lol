@@ -1096,8 +1096,28 @@ def commit_turn(
         raise StaleRevisionError(turn.campaign_id, int(expected), actual, attempt.id)
 
     execute_start = time.monotonic()
+    # Issue #248 — private-turn audience scope. A canonical turn on a
+    # private thread commits its domain event with restricted visibility so
+    # no shared feed/projection broadcasts the private action, while the
+    # thread-scoped payload preserves causal links for later DM reasoning,
+    # post-turn processing, and repair (context assembly scopes
+    # RECENT_HISTORY records by payload/provenance thread_id).
+    attempt_audience = str(
+        getattr(attempt, "audience", None) or getattr(turn, "audience", None) or "campaign"
+    )
+    is_private_turn = attempt_audience == "private"
+    turn_visibility = "private" if is_private_turn else "public"
+    turn_provenance: dict[str, Any] = {
+        "source": "dm_turn",
+        "thread_id": str(turn.thread_id),
+        "audience": attempt_audience,
+        "attempt_id": str(attempt.id),
+    }
     # Build enriched payload that includes staged effects metadata for audit
     base_payload = payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []}
+    base_payload = dict(base_payload)
+    base_payload.setdefault("thread_id", str(turn.thread_id))
+    base_payload.setdefault("audience", attempt_audience)
     # Include staged effect ids/types in payload for observability
     staged_list = attempt.staged_effects or []
     adventure_completion_args: dict | None = None
@@ -1214,6 +1234,8 @@ def commit_turn(
             payload=None if event_type == "adventure.completed" else base_payload,
             operation_id=duplicate_op,
             actor_id=actor_id,
+            visibility=turn_visibility,
+            provenance=turn_provenance,
             mutate=_mutate_with_effects,
             commit=False,
             payload_builder=_adventure_event_payload if event_type == "adventure.completed" else None,
@@ -1560,13 +1582,14 @@ def commit_turn(
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "
         "input_set_revision=%s submission_count=%s assembly_window_start=%s assembly_window_end=%s time_executing_ms=%s "
-        "staged_effect_count=%s staged_effect_types=%s commit_duration_ms=%s operation_id=%s",
+        "staged_effect_count=%s staged_effect_types=%s commit_duration_ms=%s operation_id=%s audience=%s visibility=%s",
         turn.campaign_id, turn.thread_id, turn.id, attempt.id, campaign_after.revision, event.id,
         attempt.input_set_revision, len(attempt.submission_ids or []),
         turn.assembly_window_start.isoformat() if turn.assembly_window_start else None,
         turn.assembly_window_end.isoformat() if turn.assembly_window_end else None,
         turn.time_executing_ms,
         len(staged_list), [e.get("effect_type") for e in staged_list], commit_duration_ms, duplicate_op,
+        attempt_audience, turn_visibility,
     )
     return turn, attempt, event
 

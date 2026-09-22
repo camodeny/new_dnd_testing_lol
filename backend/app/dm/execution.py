@@ -344,11 +344,17 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
     expected = int(attempt.source_revision)
     submission_ids = list(attempt.submission_ids or [])
     duplicate_op = str(attempt.id)
+    # Issue #248 — same restricted-visibility commit as the narration path:
+    # a private silent turn must not broadcast a public domain event.
+    silent_audience = str(getattr(attempt, "audience", None) or getattr(turn, "audience", None) or "campaign")
+    silent_visibility = "private" if silent_audience == "private" else "public"
     base_payload: dict = {
         "turn_id": str(turn.id),
         "attempt_id": str(attempt.id),
         "submission_ids": submission_ids,
         "mode": "silent",
+        "thread_id": str(turn.thread_id),
+        "audience": silent_audience,
     }
     if not attempt.commit_operation_id:
         attempt.commit_operation_id = duplicate_op
@@ -371,6 +377,14 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
         operation_id=duplicate_op,
         mutate=_silent_playable_guard,
         commit=False,
+        visibility=silent_visibility,
+        provenance={
+            "source": "dm_turn",
+            "thread_id": str(turn.thread_id),
+            "audience": silent_audience,
+            "attempt_id": str(attempt.id),
+            "mode": "silent",
+        },
         outbox_event_type="dm.turn_committed",
         outbox_payload={**base_payload, "operation_id": duplicate_op},
         outbox_operation_id=duplicate_op,
@@ -1184,6 +1198,7 @@ def _execute_owned_attempt(
         logger, logging.INFO, "dm_execute_complete",
         turn_id=str(result.turn.id), attempt_id=str(result.attempt.id),
         stream_id=str(result.narration.stream_id),
+        audience=str(getattr(result.turn, "audience", "campaign")),
         provider=path_info.get("provider") or pname,
         model=path_info.get("model") or model,
         failover_reasons=path_info.get("failover_reasons") or [],
