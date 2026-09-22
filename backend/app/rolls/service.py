@@ -212,6 +212,10 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     post-commit realtime publish: ``{"encounter_id": str, "ready": bool}`` when
     this request is encounter initiative, else ``None``. ``ready`` is true only
     when this fulfillment completed the final pending initiative.
+
+    Issue #254 — roll fulfillment is an owed continuation of an accepted
+    resolution, never new AI work: it bypasses the capacity gate by
+    construction and completes even past 100%.
     """
     started = time.monotonic()
     # Canonical lock order for encounter initiative is encounter-first, so

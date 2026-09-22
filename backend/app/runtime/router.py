@@ -134,6 +134,42 @@ def create_player_submission(
     )
 
     def _execute():
+        # Issue #254 — capacity boundary before a NEW AI obligation. This runs
+        # only on first execution: idempotent retries replay the committed
+        # result via the idempotency record without re-gating, so already
+        # accepted work is never refused as though it were new. When this
+        # submission would start fresh AI work (no active owed turn to merge
+        # into pre-stream), an AI-paused campaign refuses with a
+        # machine-readable state hook; the client keeps the unsent text as an
+        # editable local draft. Merging into an existing owed turn, and all
+        # owed continuations (rolls, streaming, commit, post-turn), proceed.
+        try:
+            from app.billing.resolution_guarantee import (
+                CapacityPausedError as _CapPausedPre,
+                require_new_ai_work,
+            )
+            from app.dm.turns import get_active_turn
+
+            _active = get_active_turn(db, campaign.id, thread_id_str)
+            # Direct player conversations never invoke the AI DM (coordination
+            # is skipped below), so the capacity gate does not apply to them
+            # — this non-AI surface stays usable while AI work is paused.
+            _is_direct = thread is not None and thread.private_kind == "direct"
+            if not _is_direct and (
+                _active is None or str(_active.status) not in ("pending", "awaiting_roll")
+            ):
+                require_new_ai_work(db, campaign.id, thread_id_str)
+        except _CapPausedPre as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ai_paused_capacity",
+                    "message": str(exc),
+                    "retryable": True,
+                    "draft_safe": True,
+                    "capacity_state": exc.decision,
+                },
+            ) from exc
         try:
             submission = accept_submission(
                 db,
@@ -166,6 +202,7 @@ def create_player_submission(
                 TurnConflictError,
                 coordinate_turn,
             )
+            from app.billing.resolution_guarantee import CapacityPausedError as _CapPaused
 
             # Direct player conversations do not summon or expose their content
             # to the AI DM. Shared and AI-DM threads retain normal coordination.
@@ -189,6 +226,26 @@ def create_player_submission(
                 thread_id_str,
                 exc,
             )
+        except _CapPaused as exc:
+            # Lost a capacity race between the first-execution pre-check above
+            # and serialized coordination: nothing is accepted (outer
+            # transaction rolls back) so the client keeps its local draft and
+            # retries after capacity returns.
+            logger.info(
+                "player_submission rejected campaign_id=%s thread_id=%s reason=ai_paused_capacity",
+                campaign.id,
+                thread_id_str,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ai_paused_capacity",
+                    "message": str(exc),
+                    "retryable": True,
+                    "draft_safe": True,
+                    "capacity_state": exc.decision,
+                },
+            ) from exc
         except Exception as exc:  # pragma: no cover — observability only
             logger.warning(
                 "player_submission dm_turn coordination error campaign_id=%s thread_id=%s error=%s",
@@ -262,6 +319,20 @@ def create_player_submission(
             campaign.id, exc,
         )
     return result
+
+
+@router.get("/api/campaigns/{campaign_id}/capacity-state")
+def get_capacity_state(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Participant-safe capacity state hook — issue #254.
+
+    Aggregates + AI-pause/grace/owed flags only (no secrets, keys, or
+    narrative). Non-AI surface: stays usable while AI play is paused.
+    """
+    from app.billing.resolution_guarantee import capacity_state_payload
+
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    return capacity_state_payload(db, campaign.id)
 
 
 @router.get("/api/campaigns/{campaign_id}/submissions")
