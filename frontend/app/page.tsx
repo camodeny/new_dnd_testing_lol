@@ -230,7 +230,7 @@ export default function HomePage() {
       <Modal open={activeModal === 'delete'} onClose={() => setActiveModal(null)} title="Delete campaign" titleId="delete-campaign-title" alertDialog>
         <div style={{ display: 'grid', gap: 16 }}>
           <p style={{ margin: 0, lineHeight: 1.6, color: 'var(--ink)' }}>Are you sure you want to delete <strong>{campaignToDelete?.name}</strong>?</p>
-          <p style={{ margin: 0, fontSize: '0.9rem', color: 'var(--danger)' }}><i className="bi bi-exclamation-triangle-fill" style={{ marginRight: 8 }} aria-hidden="true" />This is permanent and will delete all sessions and campaign data.</p>
+          <p style={{ margin: 0, fontSize: '0.9rem', color: 'var(--danger)' }}><i className="bi bi-exclamation-triangle-fill" style={{ marginRight: 8 }} aria-hidden="true" />This hides the campaign from your list. Its campaign data will be retained.</p>
           {deleteError && <ErrorMessage message={deleteError} />}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
             <button type="button" className="btn btn-secondary" onClick={() => setActiveModal(null)} disabled={deleteLoading}>Cancel</button>

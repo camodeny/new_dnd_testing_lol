@@ -28,6 +28,7 @@ class Campaign(Base):
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_deleted: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     random_seed: Mapped[str | None] = mapped_column(String(128), nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="lobby", server_default="lobby")
