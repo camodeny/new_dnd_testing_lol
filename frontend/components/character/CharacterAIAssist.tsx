@@ -100,7 +100,74 @@ function mockGenerate(prompt: string): Partial<CharacterDraft> {
   return draft
 }
 
-type ChatMsg = { role: 'ai' | 'user'; content: string }
+type ChatMsg = {
+  role: 'ai' | 'user'
+  content: string
+  updatedFields?: string[]
+}
+
+const PATCH_FIELD_LABELS: Record<string, string> = {
+  name: 'Name',
+  player_name: 'Player name',
+  race: 'Ancestry',
+  subrace: 'Heritage',
+  classes: 'Class',
+  total_level: 'Level',
+  background: 'Background',
+  alignment: 'Alignment',
+  experience_points: 'Experience points',
+  ability_scores: 'Ability scores',
+  skills: 'Skills',
+  saving_throws: 'Saving throws',
+  proficiencies: 'Proficiencies',
+  combat: 'Combat stats',
+  general: 'General stats',
+  spellcasting: 'Spellcasting',
+  spells: 'Spells',
+  equipment: 'Equipment',
+  weapons: 'Weapons',
+  currency: 'Currency',
+  personality: 'Personality',
+  appearance: 'Appearance',
+  background_details: 'Backstory',
+  features: 'Features',
+  resources: 'Resources',
+  companions: 'Companions',
+  conditions: 'Conditions',
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+}
+
+function valuesEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => valuesEqual(value, right[index]))
+  }
+  if (isPlainObject(left) && isPlainObject(right)) {
+    const leftKeys = Object.keys(left)
+    const rightKeys = Object.keys(right)
+    return leftKeys.length === rightKeys.length && leftKeys.every((key) => key in right && valuesEqual(left[key], right[key]))
+  }
+  return false
+}
+
+function patchChangesValue(current: unknown, incoming: unknown): boolean {
+  if (isPlainObject(incoming)) {
+    if (!isPlainObject(current)) return true
+    return Object.entries(incoming).some(([key, value]) => patchChangesValue(current[key], value))
+  }
+  return !valuesEqual(current, incoming)
+}
+
+function summarizePatch(patch: Partial<CharacterDraft>, current?: Partial<CharacterDraft> | null): string[] {
+  const labels = Object.entries(patch)
+    .filter(([key, value]) => patchChangesValue(current?.[key], value))
+    .map(([key]) => PATCH_FIELD_LABELS[key])
+    .filter((label): label is string => Boolean(label))
+  return [...new Set(labels)].slice(0, 3)
+}
 
 const WELCOME: ChatMsg = { role: 'ai', content: "Tell me who your character is, or ask me to help shape their backstory. I’ll draft ideas into the character sheet for you to review and edit before saving." }
 
@@ -118,7 +185,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
     async function loadHistory() {
       const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
       const backendBase =
-        (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
+        (typeof process !== 'undefined' && process.env.BACKEND_URL) ||
         (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
       const chatUrl = backendBase
         ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(characterId)}/chat`
@@ -163,7 +230,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
     const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
     // bypass Next rewrites for SSE to avoid buffering; hit backend directly when local
     const backendBase =
-      (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
+      (typeof process !== 'undefined' && process.env.BACKEND_URL) ||
       (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
     const chatUrl = backendBase
       ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(characterId)}/chat`
@@ -222,7 +289,21 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
               })
             } else if (data.type === 'patch' && data.patch) {
               gotPatch = true
-              onGenerated(data.patch as Partial<CharacterDraft>)
+              const patch = data.patch as Partial<CharacterDraft>
+              const updatedFields = summarizePatch(patch, draftCharacter)
+              onGenerated(patch)
+              setMessages((m) => {
+                const copy = [...m]
+                const existing = copy[aiIndex]
+                if (existing?.role === 'ai') {
+                  copy[aiIndex] = { ...existing, updatedFields }
+                } else if (copy.length === aiIndex) {
+                  copy.push({ role: 'ai', content: fullText, updatedFields })
+                } else {
+                  copy[aiIndex] = { role: 'ai', content: fullText, updatedFields }
+                }
+                return copy
+              })
               if (!fullText) {
                 setMessages((m) => {
                   const copy = [...m]
@@ -262,12 +343,13 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
       try {
         const draft = mockGenerate(text)
         onGenerated(draft)
+        const updatedFields = summarizePatch(draft, draftCharacter)
         setMessages((m) => {
           const copy = [...m]
           const msg = "Draft applied to the form → review the 5 steps on the right and hit Create when you're happy. Want to adjust anything? Just tell me. (offline mock)"
-          if (copy[aiIndex] && copy[aiIndex].role === 'ai') copy[aiIndex] = { ...copy[aiIndex], content: msg }
-          else if (copy.length === aiIndex) copy.push({ role: 'ai', content: msg })
-          else copy[aiIndex] = { role: 'ai', content: msg }
+          if (copy[aiIndex] && copy[aiIndex].role === 'ai') copy[aiIndex] = { ...copy[aiIndex], content: msg, updatedFields }
+          else if (copy.length === aiIndex) copy.push({ role: 'ai', content: msg, updatedFields })
+          else copy[aiIndex] = { role: 'ai', content: msg, updatedFields }
           return copy
         })
       } catch {
@@ -292,6 +374,12 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
           <div key={i} className={`character-ai-chat__bubble is-${msg.role}`}>
             <span className="character-ai-chat__bubble-role">{msg.role === 'ai' ? 'AI' : 'You'}</span>
             {msg.role === 'ai' ? <MarkdownContent content={msg.content} /> : <p>{msg.content}</p>}
+            {msg.role === 'ai' && msg.updatedFields && msg.updatedFields.length > 0 && (
+              <div className="character-ai-chat__applied" aria-label={`Updated character sheet: ${msg.updatedFields.join(', ')}`}>
+                <i className="bi bi-check-circle-fill" aria-hidden="true" />
+                Updated sheet · {msg.updatedFields.join(', ')}
+              </div>
+            )}
           </div>
         ))}
         {loading && messages[messages.length - 1]?.role !== 'ai' && <div className="character-ai-chat__bubble is-ai is-typing"><span>AI</span><p>Drafting…</p></div>}

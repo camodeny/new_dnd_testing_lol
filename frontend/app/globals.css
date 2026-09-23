@@ -3127,6 +3127,18 @@ a.automation-list-item:focus-visible {
 
 .character-ai-chat__bubble.is-typing { opacity: 0.7; font-style: italic; }
 
+.character-ai-chat__applied {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 9px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+  color: var(--moss);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
 .character-ai-chat__composer {
   padding: 10px 12px 12px;
   border-top: 1px solid var(--line);
