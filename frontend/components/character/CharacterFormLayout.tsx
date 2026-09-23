@@ -33,8 +33,9 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const saveChainRef = useRef<Promise<void>>(Promise.resolve())
   const lastSaveFingerprintRef = useRef<string | null>(null)
-  const latestSaveRef = useRef<{ payload: Record<string, unknown>; fingerprint: string } | null>(null)
+  const latestSaveRef = useRef<{ characterId: string | number; payload: Record<string, unknown>; fingerprint: string } | null>(null)
   const pageHideSaveFingerprintRef = useRef<string | null>(null)
+  const draftCompletedRef = useRef(false)
   const resolvedInitial = initial ?? createdDraft ?? undefined
   const activeCharacterId = resolvedInitial?.id ?? characterId
   const isDraft = resolvedInitial?.status === 'draft'
@@ -109,11 +110,12 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     if (!isDraft || !draftSnapshot) return
     const payload = { ...toCharacterPayload(draftSnapshot), creator_step: activePage }
     const fingerprint = JSON.stringify(payload)
-    latestSaveRef.current = { payload, fingerprint }
+    latestSaveRef.current = { characterId: activeCharacterId, payload, fingerprint }
     if (lastSaveFingerprintRef.current === fingerprint) return
     setDraftSaveStatus('pending')
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
     saveTimerRef.current = setTimeout(() => {
+      saveTimerRef.current = null
       setDraftSaveStatus('saving')
       queueDraftSave(payload, fingerprint)
     }, 650)
@@ -123,7 +125,23 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   }, [activePage, draftSnapshot, isDraft, queueDraftSave])
 
   useEffect(() => () => {
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    const debounceWasPending = saveTimerRef.current !== null
+    if (saveTimerRef.current) {
+      clearTimeout(saveTimerRef.current)
+      saveTimerRef.current = null
+    }
+    const latest = latestSaveRef.current
+    if (
+      !debounceWasPending ||
+      draftCompletedRef.current ||
+      !latest ||
+      lastSaveFingerprintRef.current === latest.fingerprint ||
+      pageHideSaveFingerprintRef.current === latest.fingerprint
+    ) return
+    pageHideSaveFingerprintRef.current = latest.fingerprint
+    void charactersApi.updateDraft(latest.characterId, latest.payload, { keepalive: true })
+      .then(() => { lastSaveFingerprintRef.current = latest.fingerprint })
+      .catch(() => { pageHideSaveFingerprintRef.current = null })
   }, [])
 
   useEffect(() => {
@@ -143,6 +161,11 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     window.addEventListener('pagehide', saveBeforePageHide)
     return () => window.removeEventListener('pagehide', saveBeforePageHide)
   }, [activeCharacterId, isDraft])
+
+  const handleSaved = useCallback((character: Character) => {
+    draftCompletedRef.current = true
+    onSaved(character)
+  }, [onSaved])
 
   const clearChat = async () => {
     try {
@@ -230,7 +253,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
           <CharacterFormPage
             initial={resolvedInitial}
             aiPatch={aiPatch}
-            onSaved={onSaved}
+            onSaved={handleSaved}
             onCancel={handleCancel}
             onToggleAI={() => setAiCollapsed((v) => !v)}
             onOpenAI={() => setAiCollapsed(false)}
