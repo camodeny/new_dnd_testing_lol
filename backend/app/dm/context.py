@@ -643,6 +643,34 @@ def _history_record(
     )
 
 
+def _history_record_for_audience(
+    campaign_id: uuid.UUID,
+    event: CampaignDomainEvent,
+    audience: ContextAudience,
+    *,
+    required: bool = False,
+    priority: int = 80,
+    post_turn_processed_through: int | None = None,
+) -> ContextRecord | None:
+    """Return history only when its event scope matches this attempt.
+
+    The campaign event stream contains events from every thread. Events that
+    belong to another private thread are expected to be omitted from this
+    attempt's history; passing them onward as required records would turn
+    normal audience filtering into an authorization failure.
+    """
+    record = _history_record(
+        campaign_id,
+        event,
+        required=required,
+        priority=priority,
+        post_turn_processed_through=post_turn_processed_through,
+    )
+    if record is None or not _authorized(record, audience):
+        return None
+    return record
+
+
 def _processed_through_sequence(db: Session, campaign_id: uuid.UUID) -> int:
     """Read-only post-turn checkpoint position (issue #222).
 
@@ -1105,19 +1133,21 @@ def assemble_attempt_context(
         )
         covered_ids: set[str] = set()
         for event in reversed(recent_events):
+            # Events from other threads are still covered by this window,
+            # even though their records are intentionally omitted below.
+            covered_ids.add(str(event.id))
             # Issue #222 — unprocessed history is required wherever it is
             # found: a recent-window event past processed_through must fail
             # closed under budget pressure like gap-fill records, never be
             # silently dropped while the gate reports within_budget.
-            record = _history_record(
-                campaign.id, event,
+            record = _history_record_for_audience(
+                campaign.id, event, audience,
                 required=int(event.sequence or 0) > int(processed_through),
                 post_turn_processed_through=processed_through,
             )
             if record is None:
                 continue
             records[LaneName.RECENT_HISTORY].append(record)
-            covered_ids.add(str(event.id))
         if processed_through < attempt.source_revision:
             gap_events = list(
                 db.scalars(
@@ -1133,8 +1163,8 @@ def assemble_attempt_context(
             for event in gap_events:
                 if str(event.id) in covered_ids:
                     continue
-                record = _history_record(
-                    campaign.id, event,
+                record = _history_record_for_audience(
+                    campaign.id, event, audience,
                     required=True,
                     priority=95,
                     post_turn_processed_through=processed_through,
