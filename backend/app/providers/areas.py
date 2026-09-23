@@ -7,12 +7,14 @@ either. Only API keys come from the environment
   dm             — forward-DM adjudication
   narrator       — streaming turn narration (prose expander)
   character_chat — character-creator assistant
+  lore_dm_chat   — lobby lore-DM setup assistant (private lore back-and-forth)
 """
 
 AREA_CONFIG = {
     "dm": ("meta", "muse-spark-1.3-contributor"),
     "narrator": ("openai", "gpt-5.6-luna"),
     "character_chat": ("meta", "muse-spark-1.3-contributor"),
+    "lore_dm_chat": ("meta", "muse-spark-1.3-contributor"),
 }
 
 AREAS = tuple(AREA_CONFIG)

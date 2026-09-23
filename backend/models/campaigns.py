@@ -194,6 +194,59 @@ class CampaignCharacterLore(Base):
         return d
 
 
+class CampaignLoreChatMessage(Base):
+    """Private lore-DM setup chat — per (campaign, character, player).
+
+    A guided back-and-forth that helps the player write private setup lore
+    before launch (especially new players unsure what lore is). Rows follow
+    the same #211 ``private`` semantics as ``CampaignCharacterLore``: only
+    the owning player reads their thread — the campaign owner and other
+    players get a fail-closed 404 with no existence leak. The DM side is
+    advisory only: nothing here is canon and the seed job never reads this
+    table. Only an explicit "use this lore" write through the standard lore
+    endpoint (versioned, lobby-locked) can seed the world.
+
+    Frozen with lore writes once the campaign leaves the lobby.
+    """
+
+    __tablename__ = "campaign_lore_chat_messages"
+    __table_args__ = (
+        Index("ix_lore_chat_campaign_character", "campaign_id", "character_id"),
+        Index("ix_lore_chat_user", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Extracted lore proposal (assistant rows only): offered draft text the
+    # player may apply to their lore doc. Advisory — never canon itself.
+    proposal_text: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        d = {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "character_id": str(self.character_id),
+            "user_id": str(self.user_id),
+            "role": self.role,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if self.proposal_text:
+            d["proposal"] = self.proposal_text
+        return d
+
+
 class CampaignInvite(Base):
     """Shareable lobby invitation — issue #242.
 

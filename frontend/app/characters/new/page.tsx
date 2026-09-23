@@ -10,12 +10,18 @@ function CharacterCreateInner() {
   // advice — the backend resolves public composition itself (#244).
   const searchParams = useSearchParams()
   const campaignId = searchParams.get('campaign')
+  // Created from a campaign lobby: return there on save/cancel instead of
+  // stranding the user in the character library. On save, ask the lobby to
+  // select the new character via ?selectCharacter=.
+  const lobbyUrl = campaignId ? `/campaigns/${encodeURIComponent(campaignId)}` : null
   return (
     <CharacterFormLayout
       characterId="new"
       campaignId={campaignId}
-      onSaved={(character) => router.push(`/characters/${character.id}`)}
-      onCancel={() => router.push('/characters')}
+      onSaved={(character) => router.push(
+        lobbyUrl ? `${lobbyUrl}?selectCharacter=${encodeURIComponent(character.id)}` : `/characters/${character.id}`,
+      )}
+      onCancel={() => router.push(lobbyUrl ?? '/characters')}
     />
   )
 }

@@ -1,5 +1,4 @@
 import Link from 'next/link'
-import { useMemo } from 'react'
 import type { Campaign } from '@/types'
 
 function formatDate(iso?: string): string {
@@ -11,25 +10,6 @@ function formatDate(iso?: string): string {
   })
 }
 
-function getInitials(name: string): string {
-  return name
-    .split(' ')
-    .map((w) => w[0])
-    .join('')
-    .slice(0, 2)
-    .toUpperCase()
-}
-
-// Ember-palette avatar gradient — avoids the old purple gradients
-function getAvatarColor(str: string): string {
-  let hash = 0
-  for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash)
-  // Warm hues only: ember, gold, moss
-  const hues = [16, 24, 30, 38, 150, 160, 170]
-  const h = hues[Math.abs(hash) % hues.length]
-  return `hsl(${h}, 42%, 42%)`
-}
-
 interface CampaignCardProps {
   campaign: Campaign
   onDelete?: ((e: React.MouseEvent) => void) | null
@@ -37,34 +17,23 @@ interface CampaignCardProps {
   onArchive?: ((e: React.MouseEvent) => void) | null
   onRestore?: ((e: React.MouseEvent) => void) | null
   actionBusy?: boolean
+  layout?: 'rows' | 'compact' | 'grid' | 'feature'
 }
 
-export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, onRestore, actionBusy }: CampaignCardProps) {
-  const initials = useMemo(() => getInitials(campaign.name), [campaign.name])
-  const avatarColor = useMemo(
-    () => getAvatarColor(campaign.name + (campaign.random_seed ?? '')),
-    [campaign.name, campaign.random_seed],
-  )
+export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, onRestore, actionBusy, layout = 'rows' }: CampaignCardProps) {
   const archived = campaign.status === 'archived'
   const archiveHandler = isOwner && !archived ? onArchive : null
   const restoreHandler = isOwner && archived ? onRestore : null
   const hasActions = Boolean(onDelete || archiveHandler || restoreHandler)
 
   return (
-    <article className={`campaign-card-v2${hasActions ? ' has-actions' : ''}`}>
+    <article className={`campaign-card-v2 campaign-card--${layout}${hasActions ? ' has-actions' : ''}`}>
       <Link
         href={`/campaigns/${campaign.id}`}
         className="campaign-card-inner campaign-card-link"
         aria-label={`Open campaign ${campaign.name}`}
       >
         <div className="campaign-card-header">
-          <div
-            className="campaign-avatar"
-            style={{ background: avatarColor, color: '#fff8ec' }}
-            aria-hidden="true"
-          >
-            {initials}
-          </div>
           <div className="campaign-meta">
             <h3 className="campaign-title">{campaign.name}</h3>
             {archived && (

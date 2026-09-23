@@ -96,6 +96,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
             onSaved={onSaved}
             onCancel={handleCancel}
             onToggleAI={() => setAiCollapsed((v) => !v)}
+            onOpenAI={() => setAiCollapsed(false)}
             aiCollapsed={aiCollapsed}
             onDraftChange={setDraftSnapshot}
             onActivePageChange={setActivePage}

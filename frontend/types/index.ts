@@ -103,12 +103,6 @@ export interface PartyComposition {
   members: PartyCompositionEntry[]
 }
 
-export interface PartyAdvice {
-  suggestions: string[]
-  class_counts: Record<string, number>
-  enforced: false
-}
-
 export interface CharacterLore {
   id: string
   campaign_id: string
@@ -119,6 +113,17 @@ export interface CharacterLore {
   content?: string
   created_at?: string | null
   updated_at?: string | null
+}
+
+// Private lore-DM setup thread: one player's guided back-and-forth per
+// character. DM replies are advisory only — proposals become canon solely
+// through the standard lore write.
+export interface LoreDmMessage {
+  id?: string
+  role: 'user' | 'assistant'
+  content: string
+  proposal?: string
+  created_at?: string | null
 }
 
 // Lobby invitations — issue #242. Owner list entries carry the full
