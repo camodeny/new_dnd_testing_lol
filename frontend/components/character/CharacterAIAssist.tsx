@@ -102,7 +102,7 @@ function mockGenerate(prompt: string): Partial<CharacterDraft> {
 
 type ChatMsg = { role: 'ai' | 'user'; content: string }
 
-const WELCOME: ChatMsg = { role: 'ai', content: "Hey! I can help you build your D&D 5e sheet — just describe who you imagine (e.g. 'grumpy dwarf cleric who loves ale' or 'shy half-elf druid, level 2'). I'll draft the stats and you can tweak everything before saving." }
+const WELCOME: ChatMsg = { role: 'ai', content: "Tell me who your character is, or ask me to help shape their backstory. I’ll draft ideas into the character sheet for you to review and edit before saving." }
 
 export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage, clearTrigger, campaignId }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([WELCOME])

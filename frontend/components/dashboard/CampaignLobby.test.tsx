@@ -11,7 +11,7 @@ vi.mock('@/lib/api', () => ({
     getLobby: vi.fn(), listMembers: vi.fn(), listInvites: vi.fn(), createInvite: vi.fn(),
     revokeInvite: vi.fn(), sendInviteEmail: vi.fn(),
     setReadiness: vi.fn(), selectCharacter: vi.fn(),
-    getPartyComposition: vi.fn(), getPartyAdvice: vi.fn(),
+    getPartyComposition: vi.fn(),
     getCharacterLore: vi.fn(), putCharacterLore: vi.fn(), deleteCharacterLore: vi.fn(),
   },
   campaigns: { transitionLifecycle: vi.fn() },

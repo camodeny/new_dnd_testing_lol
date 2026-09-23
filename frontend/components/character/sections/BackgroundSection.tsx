@@ -11,12 +11,19 @@ const FIELDS = [
 interface Props {
   data: Record<string, string>
   onChange: (data: Record<string, string>) => void
+  onOpenAI?: () => void
 }
 
-export default function BackgroundSection({ data, onChange }: Props) {
+export default function BackgroundSection({ data, onChange, onOpenAI }: Props) {
   return (
     <div className="form-section">
-      <h3>Background Details</h3>
+      <div className="background-section-heading">
+        <div>
+          <h3>Background Details</h3>
+          <p>Build the story your character brings into the adventure. You can shape it with the AI Helper, then edit the draft here.</p>
+        </div>
+        {onOpenAI && <button type="button" className="btn btn-secondary" onClick={onOpenAI}><i className="bi bi-stars" aria-hidden="true" /> Shape with AI</button>}
+      </div>
       {FIELDS.map(([key, label, rows]) => (
         <FormGroup key={key} label={label} htmlFor={`bg-${key}`}>
           <TextArea

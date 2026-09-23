@@ -141,7 +141,6 @@ describe('exported API surface', () => {
       'getCharacterLore',
       'getLobby',
       'getLoreDmChat',
-      'getPartyAdvice',
       'getPartyComposition',
       'joinCampaign',
       'listCharacters',

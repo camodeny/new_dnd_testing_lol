@@ -103,12 +103,6 @@ export interface PartyComposition {
   members: PartyCompositionEntry[]
 }
 
-export interface PartyAdvice {
-  suggestions: string[]
-  class_counts: Record<string, number>
-  enforced: false
-}
-
 export interface CharacterLore {
   id: string
   campaign_id: string

@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect, useRef } from 'react'
 import Modal from '@/components/common/Modal'
 import LoreDmChat from '@/components/campaign/LoreDmChat'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
-import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyAdvice, PartyComposition, User } from '@/types'
+import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyComposition, User } from '@/types'
 
 interface CampaignLobbyProps {
   campaign: Campaign
@@ -63,7 +63,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // Public party composition + advisory gaps (#244). Composition comes from
   // the lobby payload; advice is fetched on demand for the creator.
   const [composition, setComposition] = useState<PartyComposition | null>(null)
-  const [advice, setAdvice] = useState<PartyAdvice | null>(null)
   // Private setup lore (#244): the player's own secret notes for the DM.
   // Never rendered for other players; the owner sees nothing here.
   const [lore, setLore] = useState('')
@@ -248,6 +247,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // ignores abandoned characters' secrets, so writing lore for an
   // unselected one would silently do nothing.
   const loreCharId = me?.selected_character_id ?? null
+  const isSolo = (campaign as { required_players?: number }).required_players === 1
 
   useEffect(() => {
     if (myCharId && !selectedId) setSelectedId(myCharId)
@@ -286,11 +286,15 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // Private setup lore (#244): load own lore when the selected character
   // changes; save/delete are lobby-only and fail closed for others.
   useEffect(() => {
-    if (!loreCharId) { setLore(''); setLoreSaved(false); return }
+    if (!loreCharId || isSolo) { setLore(''); setLoreSaved(false); return }
     membersApi.getCharacterLore(campaign.id, loreCharId)
-      .then((data) => { setLore((data.lore as { content?: string }).content ?? ''); setLoreSaved(true) })
+      .then((data) => {
+        const content = (data.lore as { content?: string }).content ?? ''
+        setLore(content)
+        setLoreSaved(Boolean(content.trim()))
+      })
       .catch(() => { setLore(''); setLoreSaved(false) })
-  }, [campaign.id, loreCharId])
+  }, [campaign.id, loreCharId, isSolo])
 
   const handleSaveLore = useCallback(async () => {
     if (!loreCharId || loreBusy || launchLocked) return
@@ -345,13 +349,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     }
   }, [loreCharId, loreBusy, applyingProposal, launchLocked, campaign.id, revision, refreshLobby])
 
-  const handleLoadAdvice = useCallback(async () => {
-    try {
-      const data = await membersApi.getPartyAdvice(campaign.id)
-      setAdvice(data.advice)
-    } catch { /* advisory only */ }
-  }, [campaign.id])
-
   const handleBegin = useCallback(async () => {
     if (busy || launchLocked || !isOwner || !eligibility?.eligible) return
     setBusy(true)
@@ -375,7 +372,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // whole invite flow are meaningless — hide them instead of showing a
   // party of one an empty dance floor. required_players is the source of
   // truth: anything that isn't exactly 1 needs a party lobby.
-  const isSolo = (campaign as { required_players?: number }).required_players === 1
   const activeInvites = invites.filter((inv) => inv.usable !== false && inv.status === 'active')
   const canBegin = isOwner && (eligibility?.eligible ?? false)
 
@@ -386,7 +382,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   return (
     <div className="lobby-page">
       <div className="lobby-container">
-        <div className={`lobby-card${isSolo ? ' lobby-solo' : ''}${loreCharId && !launchLocked ? ' has-lore' : ''}`}>
+        <div className={`lobby-card${isSolo ? ' lobby-solo' : ''}${!isSolo && loreCharId && !launchLocked ? ' has-lore' : ''}`}>
           {/* Left: hero panel */}
           <div className="lobby-hero">
             <h1 className="lobby-title">{campaign.name}</h1>
@@ -463,20 +459,12 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                 {Object.entries(composition.class_counts ?? {}).map(([cls, n]) => (
                   <span key={cls} style={{ marginLeft: 8 }}>{cls} × {n}</span>
                 ))}
-                <button type="button" onClick={() => void handleLoadAdvice()} style={{ marginLeft: 12 }} aria-label="Get party advice">
-                  Party advice
-                </button>
               </div>
-            )}
-            {advice && !isSolo && (
-              <ul style={{ marginTop: 8, fontSize: '0.78rem' }}>
-                {advice.suggestions.map((s, i) => <li key={i}>{s}</li>)}
-              </ul>
             )}
           </section>
 
           {/* Private character lore (#244): your secrets for the DM only. */}
-          {loreCharId && !launchLocked && (
+          {!isSolo && loreCharId && !launchLocked && (
             <section className="lobby-lore-section" aria-label="Private character lore">
               <div className="lobby-section-header">
                 <span className="lobby-section-label">
@@ -486,9 +474,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               <textarea
                 value={lore}
                 onChange={(e) => setLore(e.target.value)}
-                placeholder={isSolo
-                  ? 'Secrets, backstory hooks, personal goals — only you and the DM will ever see this'
-                  : 'Secrets, backstory hooks, personal goals — hidden from the party and the host'}
+                placeholder="Secrets, backstory hooks, personal goals — hidden from the party and the host"
                 rows={4}
                 maxLength={4000}
                 style={{ width: '100%' }}

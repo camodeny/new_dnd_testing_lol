@@ -35,6 +35,7 @@ interface CharacterFormPageProps {
   onSaved: (character: Character) => void
   onCancel: () => void
   onToggleAI?: () => void
+  onOpenAI?: () => void
   aiCollapsed?: boolean
   onDraftChange?: (draft: CharacterDraft) => void
   onActivePageChange?: (page: string) => void
@@ -90,7 +91,7 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed, onDraftChange, onActivePageChange }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, onOpenAI, aiCollapsed, onDraftChange, onActivePageChange }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
   const aiPatchRef = useRef(0)
   const prevInitialRef = useRef<string | undefined>(undefined)
@@ -214,7 +215,7 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
       case 'appearance':
         return <AppearanceSection key={section} data={draft.appearance} onChange={(value) => updateGroup('appearance', value)} />
       case 'background_details':
-        return <BackgroundSection key={section} data={draft.background_details} onChange={(value) => updateGroup('background_details', value)} />
+        return <BackgroundSection key={section} data={draft.background_details} onChange={(value) => updateGroup('background_details', value)} onOpenAI={onOpenAI} />
       default: {
         const key = section as CharacterListKey
         const config = ITEM_CONFIG_BY_KEY[key]
