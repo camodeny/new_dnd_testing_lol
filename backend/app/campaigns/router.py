@@ -787,7 +787,7 @@ def _member_lobby_projection(db: Session, camp: Campaign, m: CampaignMember) -> 
     }
     if m.selected_character_id:
         char = db.get(Character, m.selected_character_id)
-        if char is not None:
+        if char is not None and not char.is_deleted:
             sheet = db.execute(
                 select(Dnd5eCharacterSheet)
                 .where(Dnd5eCharacterSheet.character_id == char.id)
@@ -1116,7 +1116,7 @@ def select_own_character(
     except ValueError:
         raise HTTPException(status_code=404, detail="Character not found")
     char = db.get(Character, char_id)
-    if char is None:
+    if char is None or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character not found")
     if char.owner_id != profile.id:
         logger.warning(
@@ -1154,7 +1154,7 @@ def select_own_character(
         # Re-verify ownership inside the mutation so a failed command can never
         # leave the member pointing at an unauthorized character.
         fresh = db.get(Character, char_id)
-        if fresh is None:
+        if fresh is None or fresh.is_deleted:
             raise HTTPException(status_code=404, detail="Character not found")
         if fresh.owner_id != profile.id:
             raise HTTPException(status_code=403, detail="Only your own character can be selected")
@@ -1257,7 +1257,7 @@ def set_own_readiness(
         if char_id is None:
             raise HTTPException(status_code=422, detail="Select a character before marking ready")
         char = db.get(Character, char_id)
-        if char is None or char.owner_id != profile.id:
+        if char is None or char.is_deleted or char.owner_id != profile.id:
             raise HTTPException(status_code=422, detail="Selected character is missing or not owned")
         sheet = db.execute(
             select(Dnd5eCharacterSheet)
@@ -1291,7 +1291,7 @@ def set_own_readiness(
         if ready:
             char_id = current.selected_character_id
             char = db.get(Character, char_id) if char_id else None
-            if char is None or char.owner_id != profile.id:
+            if char is None or char.is_deleted or char.owner_id != profile.id:
                 raise HTTPException(status_code=422, detail="Selected character is missing or not owned")
             sheet = db.execute(
                 select(Dnd5eCharacterSheet)
@@ -1405,6 +1405,7 @@ def get_character_lore(campaign_id: str, character_id: str, request: Request, db
     404 with no existence leak. Reads survive the start transition.
     """
     from app.campaigns.party_lore import LoreAuthorizationError, get_own_lore
+    from models.characters import Character
 
     profile = resolve_profile(request, db)
     try:
@@ -1417,6 +1418,9 @@ def get_character_lore(campaign_id: str, character_id: str, request: Request, db
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id or char.is_deleted:
+        raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         row = get_own_lore(db, campaign_id=cid, character_id=char_id, user_id=profile.id)
     except LoreAuthorizationError:
@@ -1468,7 +1472,7 @@ def put_character_lore(
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
-    if char is None or char.owner_id != profile.id:
+    if char is None or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=403, detail="Only your own character's lore can be edited")
     try:
         require_lore_writable(camp)
@@ -1483,7 +1487,7 @@ def put_character_lore(
         except LoreStatusError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         fresh = db.get(_Character, char_id)
-        if fresh is None or fresh.owner_id != profile.id:
+        if fresh is None or fresh.owner_id != profile.id or fresh.is_deleted:
             raise HTTPException(status_code=403, detail="Only your own character's lore can be edited")
         existing = db.execute(
             select(CampaignCharacterLore).where(
@@ -1600,7 +1604,7 @@ def delete_character_lore(
     # character must return the same fail-closed 404 whether lore exists or
     # not (no existence oracle). Missing own lore stays an idempotent no-op.
     char = db.get(Character, char_id)
-    if char is None or char.owner_id != profile.id:
+    if char is None or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         require_lore_writable(camp)
@@ -1615,7 +1619,7 @@ def delete_character_lore(
         except LoreStatusError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         fresh = db.get(_Character, char_id)
-        if fresh is None or fresh.owner_id != profile.id:
+        if fresh is None or fresh.owner_id != profile.id or fresh.is_deleted:
             raise HTTPException(status_code=404, detail="Character lore not found")
         existing = db.execute(
             select(CampaignCharacterLore).where(
@@ -1687,7 +1691,7 @@ def get_lore_dm_chat(campaign_id: str, character_id: str, request: Request, db: 
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     # Ownership gate BEFORE any thread lookup: same no-oracle rule as lore.
     char = db.get(Character, char_id)
-    if char is None or char.owner_id != profile.id:
+    if char is None or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character lore not found")
     rows = db.execute(
         select(CampaignLoreChatMessage)
@@ -1748,7 +1752,7 @@ def post_lore_dm_chat(
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
-    if char is None or char.owner_id != profile.id:
+    if char is None or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         require_lore_writable(camp)
@@ -1933,7 +1937,7 @@ def list_campaign_characters(campaign_id: str, request: Request, db: Session = D
     roster = []
     for m in members:
         char = db.get(Character, m.selected_character_id)
-        if char is None:
+        if char is None or char.is_deleted:
             continue
         sheet = db.execute(
             select(Dnd5eCharacterSheet)
@@ -2437,7 +2441,7 @@ def activate_pc_replacement(
     except ValueError:
         raise HTTPException(status_code=404, detail="Character not found")
     new_char = db.get(Character, char_id)
-    if new_char is None:
+    if new_char is None or new_char.is_deleted:
         raise HTTPException(status_code=404, detail="Character not found")
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
@@ -2453,7 +2457,7 @@ def activate_pc_replacement(
                 if fresh_member is None:
                     raise HTTPException(status_code=403, detail="Not a member of this campaign")
                 fresh_char = db.get(Character, char_id)
-                if fresh_char is None:
+                if fresh_char is None or fresh_char.is_deleted:
                     raise HTTPException(status_code=404, detail="Character not found")
                 _mutate.result = _activate(db, locked, fresh_member, fresh_char, actor_id=profile.id)  # type: ignore[attr-defined]
             except PcLifecycleError as exc:

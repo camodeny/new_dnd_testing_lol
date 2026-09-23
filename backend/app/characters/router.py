@@ -60,7 +60,11 @@ def _update_sheet(db: Session, char: Character, owner_id, payload: dict):
 @router.get("/api/characters")
 def list_characters(request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    chars = db.execute(select(Character).where(Character.owner_id == profile.id).order_by(Character.updated_at.desc())).scalars().all()
+    chars = db.execute(
+        select(Character)
+        .where(Character.owner_id == profile.id, Character.is_deleted.is_(False))
+        .order_by(Character.updated_at.desc())
+    ).scalars().all()
     result = []
     for c in chars:
         result.append(character_with_sheet(db, c))
@@ -163,7 +167,7 @@ def get_character(character_id: str, request: Request, db: Session = Depends(get
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid character id")
     char = db.get(Character, cid)
-    if not char or char.owner_id != profile.id:
+    if not char or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character not found")
     return {"character": character_with_sheet(db, char)}
 
@@ -176,7 +180,7 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid character id")
     char = db.get(Character, cid)
-    if not char or char.owner_id != profile.id:
+    if not char or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character not found")
     locked_campaign = _launch_locking_campaign(db, char.id)
     if locked_campaign:
@@ -241,7 +245,7 @@ def update_character_draft(character_id: str, payload: dict, request: Request, d
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid character id")
     char = db.get(Character, cid)
-    if not char or char.owner_id != profile.id:
+    if not char or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Draft not found")
     if char.status != "draft":
         raise HTTPException(status_code=409, detail="Character is no longer a draft")
@@ -273,6 +277,8 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
     char = db.get(Character, cid)
     if not char or char.owner_id != profile.id:
         raise HTTPException(status_code=404, detail="Character not found")
+    if char.is_deleted:
+        return {"ok": True}
     locked_campaign = _launch_locking_campaign(db, char.id)
     if locked_campaign:
         logger.warning(
@@ -303,6 +309,6 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
         m.selected_character_id = None
         m.is_ready = False
         m.ready_at = None
-    db.delete(char)
+    char.is_deleted = True
     db.commit()
     return {"ok": True}

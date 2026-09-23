@@ -34,7 +34,7 @@ def get_character_chat(character_id: str, request: Request, db: Session = Depend
     character_uuid = _resolve_or_404(character_id)
     if character_uuid is not None:
         char = db.get(Character, character_uuid)
-        if not char or char.owner_id != profile.id:
+        if not char or char.owner_id != profile.id or char.is_deleted:
             raise HTTPException(status_code=404, detail="Character not found")
     msgs = (
         db.execute(
@@ -62,7 +62,7 @@ def delete_character_chat(character_id: str, request: Request, db: Session = Dep
     character_uuid = _resolve_or_404(character_id)
     if character_uuid is not None:
         char = db.get(Character, character_uuid)
-        if not char or char.owner_id != profile.id:
+        if not char or char.owner_id != profile.id or char.is_deleted:
             raise HTTPException(status_code=404, detail="Character not found")
     db.execute(
         sa_delete(CharacterChatMessage).where(
@@ -79,7 +79,7 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
     character_uuid = _resolve_or_404(character_id)
     if character_uuid is not None:
         char = db.get(Character, character_uuid)
-        if not char or char.owner_id != profile.id:
+        if not char or char.owner_id != profile.id or char.is_deleted:
             raise HTTPException(status_code=404, detail="Character not found")
     # Optional party-aware creator context — issue #244. Resolved
     # server-side from the public lobby projection (member-only); the client
@@ -117,4 +117,3 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
             "X-Accel-Buffering": "no",
         },
     )
-

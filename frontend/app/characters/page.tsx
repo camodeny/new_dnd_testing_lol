@@ -290,8 +290,8 @@ export default function CharactersListPage() {
           <p style={{ margin: 0, lineHeight: 1.6 }}>
             Delete <strong>{deleteTarget?.name || 'Untitled Character'}</strong>?{' '}
             {deleteTarget?.status === 'draft'
-              ? 'This permanently removes the unfinished sheet from your library.'
-              : 'This permanently removes the character from your library and unassigns them from any campaigns.'}
+              ? 'This hides the unfinished character from your library. Its saved data will be retained.'
+              : 'This hides the character from your library and retains its saved sheet and history. Any lobby assignment will be cleared.'}
           </p>
           {deleteError && <ErrorMessage message={deleteError} />}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
