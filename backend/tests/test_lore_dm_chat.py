@@ -89,7 +89,7 @@ def _add_member(factory, camp_id, user_id):
         db.commit()
 
 
-def _mock_dm(monkeypatch, *, tokens=("Hel", "lo"), proposal="You owe a harbor debt."):
+def _mock_dm(monkeypatch, *, tokens=("Hel", "lo"), proposal="You owe a harbor debt.", captured_requests=None):
     import app.providers as providers_pkg
     from app.providers.contracts import NormalizedStreamEvent, NormalizedToolCall
 
@@ -101,6 +101,8 @@ def _mock_dm(monkeypatch, *, tokens=("Hel", "lo"), proposal="You owe a harbor de
             return "m"
 
     def _fake_stream(adapter, request):
+        if captured_requests is not None:
+            captured_requests.append(request)
         for t in tokens:
             yield NormalizedStreamEvent(kind="token", text=t)
         if proposal is not None:
@@ -138,7 +140,8 @@ def _sse_texts(body: str):
 
 def test_history_empty_and_post_streams_tokens_and_proposal(api, monkeypatch):
     client, factory, actor, owner_id, *_ = api
-    _mock_dm(monkeypatch)
+    captured_requests = []
+    _mock_dm(monkeypatch, captured_requests=captured_requests)
     camp = _create(client)
     char_id = _make_character(factory, owner_id)
 
@@ -148,6 +151,11 @@ def test_history_empty_and_post_streams_tokens_and_proposal(api, monkeypatch):
 
     response = client.post(_chat_url(camp["id"], char_id), json={"content": "I want a secret"})
     assert response.status_code == 200, response.text
+    user_turns = [
+        message for message in captured_requests[0].messages
+        if message["role"] == "user" and message["content"] == "I want a secret"
+    ]
+    assert len(user_turns) == 1
     events = _sse_texts(response.text)
     kinds = [e.get("type") for e in events]
     assert "token" in kinds

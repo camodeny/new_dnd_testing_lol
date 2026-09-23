@@ -1749,10 +1749,11 @@ def post_lore_dm_chat(
     except LoreStatusError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    db.add(CampaignLoreChatMessage(
+    user_message = CampaignLoreChatMessage(
         campaign_id=cid, character_id=char_id, user_id=profile.id,
         role="user", content=content,
-    ))
+    )
+    db.add(user_message)
     db.commit()
     prior = db.execute(
         select(CampaignLoreChatMessage)
@@ -1760,9 +1761,10 @@ def post_lore_dm_chat(
             CampaignLoreChatMessage.campaign_id == cid,
             CampaignLoreChatMessage.character_id == char_id,
             CampaignLoreChatMessage.user_id == profile.id,
+            CampaignLoreChatMessage.id != user_message.id,
         )
         .order_by(CampaignLoreChatMessage.created_at.desc())
-        .limit(13)
+        .limit(12)
     ).scalars().all()
     history = [{"role": m.role, "content": m.content} for m in reversed(prior)]
 
