@@ -16,7 +16,7 @@ const nextConfig = {
       },
       {
         source: '/assets/:path*',
-        destination: `${backendUrl}/assets/:path*`,
+        destination: `${rewriteBackendUrl}/assets/:path*`,
       },
     ]
   },
