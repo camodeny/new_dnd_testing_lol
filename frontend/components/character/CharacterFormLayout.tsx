@@ -15,6 +15,7 @@ interface Props {
   initial?: Partial<Character>
   onSaved: (character: Character) => void
   onCancel: () => void
+  onDraftCreated?: (character: Character) => void
   // Optional lobby campaign for party-aware creator advice (#244).
   campaignId?: string | null
 }
@@ -22,7 +23,7 @@ interface Props {
 const NEW_DRAFT_OPERATION_KEY = 'fireside:new-character-draft-operation'
 type DraftSaveStatus = 'pending' | 'saving' | 'saved' | 'error'
 
-export default function CharacterFormLayout({ characterId, initial, onSaved, onCancel, campaignId }: Props) {
+export default function CharacterFormLayout({ characterId, initial, onSaved, onCancel, onDraftCreated, campaignId }: Props) {
   const isNewCharacter = characterId === 'new'
   const [createdDraft, setCreatedDraft] = useState<Character | null>(null)
   const [createDraftError, setCreateDraftError] = useState('')
@@ -51,13 +52,14 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
       if (window.sessionStorage.getItem(NEW_DRAFT_OPERATION_KEY) === operationKey) {
         window.sessionStorage.removeItem(NEW_DRAFT_OPERATION_KEY)
       }
+      onDraftCreated?.(response.character)
       setCreatedDraft(response.character)
     } catch (error) {
       setCreateDraftError(error instanceof Error ? error.message : 'Could not start a character draft.')
     } finally {
       setCreatingDraft(false)
     }
-  }, [])
+  }, [onDraftCreated])
 
   useEffect(() => {
     if (isNewCharacter && !initial && !createdDraft) void createDraft()

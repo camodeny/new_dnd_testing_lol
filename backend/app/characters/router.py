@@ -50,9 +50,8 @@ def _update_sheet(db: Session, char: Character, owner_id, payload: dict):
             key = col.name
             if key in ("id", "character_id", "owner_id", "created_at"):
                 continue
-            value = getattr(updated, key, None)
-            if value is not None:
-                setattr(existing, key, value)
+            if key in updated.__dict__:
+                setattr(existing, key, getattr(updated, key))
     else:
         db.add(updated)
     return updated

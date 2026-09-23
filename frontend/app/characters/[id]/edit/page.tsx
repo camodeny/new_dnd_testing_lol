@@ -1,16 +1,17 @@
 'use client'
 
-import { useEffect, useState } from 'react'
-import { useParams, useRouter } from 'next/navigation'
+import { Suspense, useEffect, useState } from 'react'
+import { useParams, useRouter, useSearchParams } from 'next/navigation'
 import { characters as charactersApi } from '@/lib/api'
 import CharacterFormLayout from '@/components/character/CharacterFormLayout'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import type { Character } from '@/types'
 
-export default function CharacterEditPage() {
+function CharacterEditPageContent() {
   const { id } = useParams<{ id: string }>()
   const router = useRouter()
+  const campaignId = useSearchParams().get('campaign')
   const [character, setCharacter] = useState<Character | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -27,13 +28,27 @@ export default function CharacterEditPage() {
   if (loading) return <Loading />
   if (error) return <ErrorMessage message={error} />
   if (!character) return <ErrorMessage message="Character not found." />
+  const lobbyUrl = campaignId ? `/campaigns/${encodeURIComponent(campaignId)}` : null
 
   return (
     <CharacterFormLayout
       characterId={String(id)}
       initial={character}
-      onSaved={() => router.push(`/characters/${id}`)}
-      onCancel={() => router.push(`/characters/${id}`)}
+      campaignId={campaignId}
+      onSaved={(saved) => router.push(
+        lobbyUrl ? `${lobbyUrl}?selectCharacter=${encodeURIComponent(saved.id)}` : `/characters/${id}`,
+      )}
+      onCancel={() => router.push(
+        lobbyUrl ? lobbyUrl : character.status === 'draft' ? '/characters' : `/characters/${id}`,
+      )}
     />
+  )
+}
+
+export default function CharacterEditPage() {
+  return (
+    <Suspense fallback={<Loading />}>
+      <CharacterEditPageContent />
+    </Suspense>
   )
 }
