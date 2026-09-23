@@ -484,6 +484,43 @@ def test_private_event_visible_to_later_private_reasoning_not_shared(ctx):
         db.close()
 
 
+# A public event is campaign-wide history. If a private attempt cannot
+# authorize the thread-scoped record while it is still unprocessed, context
+# assembly must fail closed instead of silently omitting canonical history.
+def test_private_attempt_fails_closed_with_unprocessed_shared_event(ctx):
+    from app.dm.context import ContextAuthorizationError, LaneName, assemble_attempt_context
+
+    db = _db(ctx)
+    try:
+        shared_sub = accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["bob"],
+            raw_content="The party hears a bell.",
+            segments=[{"type": "ic", "text": "The party hears a bell."}],
+            thread_id=str(ctx["shared_id"]), audience="campaign")
+        db.commit()
+        coord = coordinate_turn(db, ctx["campaign_id"], str(ctx["shared_id"]),
+                                audience="campaign", commit=False)
+        db.commit()
+        assert coord is not None
+        shared_turn, shared_attempt = coord
+
+        result = execute_dm_attempt(
+            db, shared_attempt.id,
+            adjudicate=lambda packet, feedback=None: _respond_contract("A bell rings across the harbor."),
+            narrator="deterministic", decision_service=_failing_decision_service())
+        assert result is not None
+        assert result.event.visibility in {"public", "campaign"}
+
+        _, _, private_attempt = _submit_private(db, ctx, "I listen from the alley.")
+        with pytest.raises(ContextAuthorizationError, match="recent_unprocessed_history"):
+            assemble_attempt_context(
+                db, private_attempt.id,
+                supplemental_status={LaneName.CURRENT_SCENE: "not_applicable"})
+        _ = (shared_sub, shared_turn)
+    finally:
+        db.close()
+
+
 # ── Failure, idempotency, post-turn, access ────────────────────────────────
 
 def test_stale_private_candidate_escalates(ctx):

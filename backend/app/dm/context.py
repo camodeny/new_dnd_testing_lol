@@ -666,7 +666,12 @@ def _history_record_for_audience(
         priority=priority,
         post_turn_processed_through=post_turn_processed_through,
     )
-    if record is None or not _authorized(record, audience):
+    if record is None:
+        return None
+    # Cross-thread private events are ordinary audience filtering. Leave
+    # other required records untouched so packet validation still fails
+    # closed when authoritative history cannot be authorized for the attempt.
+    if record.visibility == "private" and not _authorized(record, audience):
         return None
     return record
 
