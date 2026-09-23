@@ -133,8 +133,11 @@ export default function CharactersListPage() {
   )
 
   const selectedCharacter =
-    characterList.find((c) => c.id === selectedId) ?? characterList[0] ?? null
-  const featuredCharacter = characterList[0] ?? null
+    characterList.find((c) => c.id === selectedId && c.status !== 'draft') ??
+    characterList.find((c) => c.status !== 'draft') ?? null
+  const draftCharacters = characterList.filter((c) => c.status === 'draft')
+  const completedCharacters = characterList.filter((c) => c.status !== 'draft')
+  const featuredCharacter = completedCharacters[0] ?? null
   const rosterLayout: 'strip' | 'grid' | 'sheet' | 'bars' =
     layout === 'grid' || layout === 'sheet' || layout === 'bars' ? layout : 'strip'
 
@@ -172,40 +175,84 @@ export default function CharactersListPage() {
           <p>Keep the people who carry your stories close at hand.</p>
         </div>
         <div className="character-library-tools">
-          <div className="layout-switcher" role="group" aria-label="Character list layout">
-            {LAYOUTS.map((l) => (
-              <button
-                key={l.id}
-                type="button"
-                aria-pressed={layout === l.id}
-                onClick={() => setLayout(l.id)}
-              >
-                {l.label}
-              </button>
-            ))}
-          </div>
+          {completedCharacters.length > 0 && (
+            <div className="layout-switcher" role="group" aria-label="Character list layout">
+              {LAYOUTS.map((l) => (
+                <button
+                  key={l.id}
+                  type="button"
+                  aria-pressed={layout === l.id}
+                  onClick={() => setLayout(l.id)}
+                >
+                  {l.label}
+                </button>
+              ))}
+            </div>
+          )}
           <Link href="/characters/new" className="btn btn-primary">
             <i className="bi bi-plus-lg" aria-hidden="true" /> Create character
           </Link>
         </div>
       </header>
 
-      {layout === 'feature' && featuredCharacter ? (
+      {draftCharacters.length > 0 && (
+        <section className="character-drafts" aria-labelledby="character-drafts-title">
+          <div className="character-drafts__heading">
+            <div>
+              <span className="wildwood-kicker">IN PROGRESS</span>
+              <h2 id="character-drafts-title">Character drafts</h2>
+            </div>
+            <p>Your unfinished sheets are saved here automatically.</p>
+          </div>
+          <div className="character-drafts__list" role="list" aria-label="Character drafts">
+            {draftCharacters.map((character) => {
+              const step = character.creator_step?.replaceAll('_', ' ') ?? 'identity'
+              const details = [character.race, character.classes?.map((cl) => cl.class_name).filter(Boolean).join(' / ')]
+                .filter(Boolean)
+                .join(' · ')
+              return (
+                <article className="character-draft-row" role="listitem" key={character.id}>
+                  <div className="character-draft-row__copy">
+                    <h3>{character.name || 'Untitled Character'}</h3>
+                    <p>{details || `Last step: ${step}`}</p>
+                  </div>
+                  <div className="character-draft-row__actions">
+                    <Link href={`/characters/${character.id}/edit`} className="btn btn-primary small">
+                      Continue draft
+                    </Link>
+                    <button
+                      type="button"
+                      className="btn btn-danger small character-card-delete-button"
+                      onClick={() => { setDeleteError(''); setDeleteTarget(character) }}
+                      aria-label={`Delete draft ${character.name || 'Untitled Character'}`}
+                      title="Delete draft"
+                    >
+                      <i className="bi bi-trash" aria-hidden="true" />
+                    </button>
+                  </div>
+                </article>
+              )
+            })}
+          </div>
+        </section>
+      )}
+
+      {completedCharacters.length > 0 && (layout === 'feature' && featuredCharacter ? (
         <div className="character-feature">
           <div className="feature-stage">
             <CharacterCard character={featuredCharacter} layout="feature" />
             {renderActions(featuredCharacter)}
           </div>
-          {characterList.length > 1 && (
+          {completedCharacters.length > 1 && (
             <div className="character-roster" data-layout="strip" role="list" aria-label="More characters">
-              {characterList.slice(1).map((c) => renderRow(c, 'strip'))}
+              {completedCharacters.slice(1).map((c) => renderRow(c, 'strip'))}
             </div>
           )}
         </div>
       ) : layout === 'spotlight' && selectedCharacter ? (
         <div className="character-spotlight">
           <div className="spotlight-list" role="listbox" aria-label="Characters">
-            {characterList.map((c) => {
+            {completedCharacters.map((c) => {
               const itemLabel = c.classes?.map((cl) => `${cl.class_name} ${cl.level}`).join(' / ') ?? ''
               const isActive = c.id === selectedCharacter.id
               return (
@@ -230,18 +277,21 @@ export default function CharactersListPage() {
         </div>
       ) : (
       <div className="character-roster" data-layout={rosterLayout} role="list" aria-label="Characters">
-        {characterList.map((c) => renderRow(c, rosterLayout))}
+        {completedCharacters.map((c) => renderRow(c, rosterLayout))}
       </div>
-      )}
+      ))}
 
       <Modal
         open={deleteTarget !== null}
         onClose={() => setDeleteTarget(null)}
-        title="Delete character"
+        title={deleteTarget?.status === 'draft' ? 'Delete character draft' : 'Delete character'}
       >
         <div style={{ display: 'grid', gap: 16 }}>
           <p style={{ margin: 0, lineHeight: 1.6 }}>
-            Delete <strong>{deleteTarget?.name}</strong>? This permanently removes the character from your library and unassigns them from any campaigns.
+            Delete <strong>{deleteTarget?.name || 'Untitled Character'}</strong>?{' '}
+            {deleteTarget?.status === 'draft'
+              ? 'This permanently removes the unfinished sheet from your library.'
+              : 'This permanently removes the character from your library and unassigns them from any campaigns.'}
           </p>
           {deleteError && <ErrorMessage message={deleteError} />}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>

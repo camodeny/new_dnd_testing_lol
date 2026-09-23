@@ -254,3 +254,39 @@ def test_flat_only_payload_still_maps_nested_fields():
     assert sheet.features_and_traits == "Feat"
     assert sheet.treasure == "Gold"
     assert (sheet.hit_points_max, sheet.hit_points_current, sheet.hit_points_temp) == (30, 20, 2)
+
+
+def test_update_sheet_persists_explicit_nulls_for_nullable_fields():
+    from types import SimpleNamespace
+
+    from app.characters.router import _update_sheet
+
+    owner_id = uuid.uuid4()
+    character_id = uuid.uuid4()
+    existing = Dnd5eCharacterSheet(
+        character_id=character_id,
+        owner_id=owner_id,
+        character_name="Null Test",
+        spell_save_dc=14,
+    )
+
+    class Result:
+        def scalars(self):
+            return self
+
+        def first(self):
+            return existing
+
+    class FakeSession:
+        def execute(self, *_args, **_kwargs):
+            return Result()
+
+    db = FakeSession()
+    character = SimpleNamespace(id=character_id)
+
+    _update_sheet(db, character, owner_id, {"spell_save_dc": 18})
+    assert existing.spell_save_dc == 18
+
+    _update_sheet(db, character, owner_id, {"spell_save_dc": None})
+    reloaded = Dnd5eCharacterSheet.from_frontend(existing.to_dict(), owner_id=owner_id)
+    assert reloaded.spell_save_dc is None

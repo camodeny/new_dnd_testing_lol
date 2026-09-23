@@ -129,10 +129,12 @@ describe('exported API surface', () => {
     expect(Object.keys(api.characters).sort()).toEqual([
       'chatStream',
       'create',
+      'createDraft',
       'delete',
       'get',
       'list',
       'update',
+      'updateDraft',
     ])
     expect(Object.keys(api.campaignMembers).sort()).toEqual([
       'acceptInvite',

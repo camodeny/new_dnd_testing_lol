@@ -37,6 +37,26 @@ def _launch_locking_campaign(db: Session, character_id) -> str | None:
     return None
 
 
+def _update_sheet(db: Session, char: Character, owner_id, payload: dict):
+    existing = db.execute(
+        select(Dnd5eCharacterSheet)
+        .where(Dnd5eCharacterSheet.character_id == char.id)
+        .order_by(Dnd5eCharacterSheet.updated_at.desc())
+    ).scalars().first()
+    updated = Dnd5eCharacterSheet.from_frontend(payload, owner_id=owner_id)
+    updated.character_id = char.id
+    if existing:
+        for col in Dnd5eCharacterSheet.__table__.columns:
+            key = col.name
+            if key in ("id", "character_id", "owner_id", "created_at"):
+                continue
+            if key in updated.__dict__:
+                setattr(existing, key, getattr(updated, key))
+    else:
+        db.add(updated)
+    return updated
+
+
 @router.get("/api/characters")
 def list_characters(request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
@@ -45,6 +65,48 @@ def list_characters(request: Request, db: Session = Depends(get_db)):
     for c in chars:
         result.append(character_with_sheet(db, c))
     return {"characters": result}
+
+
+@router.post("/api/characters/drafts", status_code=201)
+def create_character_draft(
+    request: Request,
+    response: Response,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        char = Character(
+            owner_id=profile.id,
+            system="dnd5e",
+            name="Untitled Character",
+            status="draft",
+            creator_step="identity",
+        )
+        db.add(char)
+        db.flush()
+        sheet = Dnd5eCharacterSheet.from_frontend(
+            {"name": "Untitled Character"}, owner_id=profile.id,
+        )
+        sheet.character_id = char.id
+        db.add(sheet)
+        db.flush()
+        return {"character": character_with_sheet(db, char)}
+
+    return execute_http_idempotent(
+        db,
+        response,
+        actor_id=profile.id,
+        idempotency_key=idempotency_key,
+        command_type="character.draft.create",
+        scope_type="user",
+        scope_id=profile.id,
+        payload=payload,
+        execute=_execute,
+    )
 
 
 @router.post("/api/characters")
@@ -137,30 +199,67 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
             status_code=409,
             detail="Fallen PCs are preserved as historical canon and cannot be edited",
         )
-    new_name = payload.get("name") or payload.get("character_name")
+    new_name = str(payload.get("name") or payload.get("character_name") or "").strip()
+    try:
+        updated_sheet = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
+        if char.status == "draft":
+            from types import SimpleNamespace
+
+            from app.campaigns.service import character_launch_validity
+
+            validity = character_launch_validity(
+                SimpleNamespace(name=new_name, status="complete"), updated_sheet,
+            )
+            if not validity["is_valid"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": f"Complete the required character fields: {', '.join(validity['missing'])}",
+                        "missing": validity["missing"],
+                    },
+                )
+        _update_sheet(db, char, profile.id, payload)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if new_name:
         char.name = new_name
-    sheet = db.execute(select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == char.id)).scalars().first()
-    if sheet:
-        try:
-            updated = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
-            for col in Dnd5eCharacterSheet.__table__.columns:
-                key = col.name
-                if key in ("id", "character_id", "owner_id", "created_at"):
-                    continue
-                val = getattr(updated, key, None)
-                if val is not None:
-                    setattr(sheet, key, val)
-            if new_name:
-                sheet.character_name = new_name
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
-    else:
-        sheet = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
-        sheet.character_id = char.id
-        db.add(sheet)
+    if char.status == "draft":
+        char.status = "complete"
+        char.creator_step = None
     db.commit()
     db.refresh(char)
+    return {"character": character_with_sheet(db, char)}
+
+
+@router.put("/api/characters/{character_id}/draft")
+def update_character_draft(character_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    try:
+        cid = uuid_lib.UUID(character_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid character id")
+    char = db.get(Character, cid)
+    if not char or char.owner_id != profile.id:
+        raise HTTPException(status_code=404, detail="Draft not found")
+    if char.status != "draft":
+        raise HTTPException(status_code=409, detail="Character is no longer a draft")
+    creator_step = payload.get("creator_step", char.creator_step or "identity")
+    allowed_steps = {"identity", "scores", "combat", "magic_gear", "story"}
+    if creator_step not in allowed_steps:
+        raise HTTPException(status_code=422, detail="Invalid character creator step")
+    new_name = str(payload.get("name") or payload.get("character_name") or "").strip()
+    try:
+        _update_sheet(db, char, profile.id, payload)
+        char.name = new_name or "Untitled Character"
+        char.creator_step = creator_step
+        db.commit()
+        db.refresh(char)
+    except Exception as exc:
+        db.rollback()
+        logger.exception("update character draft failed character_id=%s", cid)
+        raise HTTPException(status_code=400, detail="Could not save character draft") from exc
     return {"character": character_with_sheet(db, char)}
 
 
