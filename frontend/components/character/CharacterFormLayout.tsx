@@ -31,6 +31,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   const createOperationKeyRef = useRef<string | null>(null)
   const [draftSaveStatus, setDraftSaveStatus] = useState<DraftSaveStatus>('saved')
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const debouncePendingRef = useRef(false)
   const saveChainRef = useRef<Promise<void>>(Promise.resolve())
   const lastSaveFingerprintRef = useRef<string | null>(null)
   const latestSaveRef = useRef<{ characterId: string | number; payload: Record<string, unknown>; fingerprint: string } | null>(null)
@@ -93,6 +94,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current)
       saveTimerRef.current = null
+      debouncePendingRef.current = false
     }
     setDraftSaveStatus('saving')
     await queueDraftSave(latest.payload, latest.fingerprint)
@@ -114,8 +116,10 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     if (lastSaveFingerprintRef.current === fingerprint) return
     setDraftSaveStatus('pending')
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current)
+    debouncePendingRef.current = true
     saveTimerRef.current = setTimeout(() => {
       saveTimerRef.current = null
+      debouncePendingRef.current = false
       setDraftSaveStatus('saving')
       queueDraftSave(payload, fingerprint)
     }, 650)
@@ -125,7 +129,8 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   }, [activePage, draftSnapshot, isDraft, queueDraftSave])
 
   useEffect(() => () => {
-    const debounceWasPending = saveTimerRef.current !== null
+    const debounceWasPending = debouncePendingRef.current
+    debouncePendingRef.current = false
     if (saveTimerRef.current) {
       clearTimeout(saveTimerRef.current)
       saveTimerRef.current = null
@@ -153,6 +158,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
       if (saveTimerRef.current) {
         clearTimeout(saveTimerRef.current)
         saveTimerRef.current = null
+        debouncePendingRef.current = false
       }
       void charactersApi.updateDraft(activeCharacterId, latest.payload, { keepalive: true })
         .then(() => { lastSaveFingerprintRef.current = latest.fingerprint })
