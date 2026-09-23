@@ -19,18 +19,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _launch_locking_campaign(db: Session, character_id) -> str | None:
-    """Return campaign id if this character is a locked launch PC (status != lobby)."""
+def _launch_locking_campaign(
+    db: Session, character_id, *, exclude_soft_deleted_campaigns: bool = False,
+) -> str | None:
+    """Return a campaign locking this character; deletion can ignore soft-deleted campaigns."""
     from models.campaigns import Campaign, CampaignMember
 
-    rows = db.execute(
+    query = (
         select(Campaign)
         .join(CampaignMember, Campaign.id == CampaignMember.campaign_id)
         .where(CampaignMember.selected_character_id == character_id)
         .order_by(Campaign.id)
         .with_for_update(of=Campaign)
         .execution_options(populate_existing=True)
-    ).scalars().all()
+    )
+    if exclude_soft_deleted_campaigns:
+        query = query.where(Campaign.is_deleted.is_(False))
+    rows = db.execute(query).scalars().all()
     for camp in rows:
         if str(getattr(camp, "status", "lobby")) != "lobby":
             return str(camp.id)
@@ -279,7 +284,9 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
         raise HTTPException(status_code=404, detail="Character not found")
     if char.is_deleted:
         return {"ok": True}
-    locked_campaign = _launch_locking_campaign(db, char.id)
+    locked_campaign = _launch_locking_campaign(
+        db, char.id, exclude_soft_deleted_campaigns=True,
+    )
     if locked_campaign:
         logger.warning(
             "character delete rejected character_id=%s actor_id=%s campaign_id=%s reason=launch_locked",

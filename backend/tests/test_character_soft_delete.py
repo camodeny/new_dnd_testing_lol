@@ -175,3 +175,56 @@ def test_delete_draft_is_also_soft(api):
         assert draft is not None
         assert draft.status == "draft"
         assert draft.is_deleted is True
+
+
+def test_delete_launch_character_from_soft_deleted_campaign(api):
+    client, factory = api
+    with factory() as db:
+        active_character = Character(
+            owner_id=TEST_USER_ID, name="Active campaign PC", system="dnd5e",
+        )
+        deleted_campaign_character = Character(
+            owner_id=TEST_USER_ID, name="Deleted campaign PC", system="dnd5e",
+        )
+        db.add_all([active_character, deleted_campaign_character])
+        db.flush()
+
+        active_campaign = Campaign(
+            owner_id=TEST_USER_ID, name="Active campaign", status="starting",
+        )
+        deleted_campaign = Campaign(
+            owner_id=TEST_USER_ID, name="Deleted campaign", status="starting", is_deleted=True,
+        )
+        db.add_all([active_campaign, deleted_campaign])
+        db.flush()
+        db.add_all([
+            CampaignMember(
+                campaign_id=active_campaign.id,
+                user_id=TEST_USER_ID,
+                role="owner",
+                selected_character_id=active_character.id,
+            ),
+            CampaignMember(
+                campaign_id=deleted_campaign.id,
+                user_id=TEST_USER_ID,
+                role="owner",
+                selected_character_id=deleted_campaign_character.id,
+            ),
+        ])
+        active_character_id = active_character.id
+        deleted_campaign_character_id = deleted_campaign_character.id
+        db.commit()
+
+    active_delete = client.delete(f"/api/characters/{active_character_id}")
+    assert active_delete.status_code == 409
+    deleted_campaign_character_delete = client.delete(
+        f"/api/characters/{deleted_campaign_character_id}"
+    )
+    assert deleted_campaign_character_delete.status_code == 200
+
+    with factory() as db:
+        active_character = db.get(Character, active_character_id)
+        deleted_campaign_character = db.get(Character, deleted_campaign_character_id)
+        assert active_character is not None and active_character.is_deleted is False
+        assert deleted_campaign_character is not None
+        assert deleted_campaign_character.is_deleted is True
