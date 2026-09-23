@@ -95,7 +95,11 @@ def list_campaigns(request: Request, db: Session = Depends(get_db), include_arch
     profile = resolve_profile(request, db)
     member_rows = db.execute(select(CampaignMember.campaign_id).where(CampaignMember.user_id == profile.id)).scalars().all()
     member_ids = set(member_rows)
-    rows = db.execute(select(Campaign).order_by(Campaign.updated_at.desc())).scalars().all()
+    rows = db.execute(
+        select(Campaign)
+        .where(Campaign.is_deleted.is_(False))
+        .order_by(Campaign.updated_at.desc())
+    ).scalars().all()
     visible = [c for c in rows if c.owner_id == profile.id or c.id in member_ids]
     if not include_archived:
         visible = [c for c in visible if str(c.status or "").lower() != "archived"]
@@ -214,7 +218,7 @@ def get_campaign(campaign_id: str, request: Request, db: Session = Depends(get_d
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
     camp = db.get(Campaign, cid)
-    if not camp:
+    if not camp or camp.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, camp.id, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
@@ -241,9 +245,7 @@ def delete_campaign(campaign_id: str, request: Request, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can delete this campaign")
-    if list_campaign_events(db, cid, limit=1):
-        raise HTTPException(status_code=409, detail="Campaigns with domain-event history cannot be deleted")
-    db.delete(camp)
+    camp.is_deleted = True
     db.commit()
     return {"ok": True}
 
@@ -2616,7 +2618,7 @@ def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
         logger.info("invite lookup miss code_hash=%s", code_fingerprint(clean))
         raise HTTPException(status_code=404, detail="Invite not found")
     camp = db.get(Campaign, inv.campaign_id)
-    if not camp:
+    if not camp or camp.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
     usable, reason = invite_usability(inv)
     member_count = db.scalar(
@@ -2693,7 +2695,7 @@ def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session
     camp = db.execute(
         select(Campaign).where(Campaign.id == cid).with_for_update()
     ).scalars().first()
-    if not camp:
+    if not camp or camp.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
     code = str(payload.get("code") or "").strip().upper()
     if not code:
@@ -2730,7 +2732,7 @@ def accept_invite_by_code(payload: dict, request: Request, db: Session = Depends
     camp = db.execute(
         select(Campaign).where(Campaign.id == inv.campaign_id).with_for_update()
     ).scalars().first()
-    if not camp:
+    if not camp or camp.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
     # Revalidate the invite after acquiring the campaign serialization lock
     # (#242 review): revocation commits through the same campaign lock, so a
