@@ -15,7 +15,7 @@ vi.mock('./CharacterAIAssist', () => ({ default: () => null }))
 
 vi.mock('./CharacterFormPage', () => ({
   default: ({ onDraftChange }: { onDraftChange?: (draft: never) => void }) => (
-    <button type="button" onClick={() => onDraftChange?.({ name: 'Newest name' } as never)}>
+    <button data-testid="edit-draft" type="button" onClick={() => onDraftChange?.({ name: 'Newest name' } as never)}>
       Edit draft
     </button>
   ),
@@ -50,7 +50,7 @@ describe('character draft autosave', () => {
         onCancel={vi.fn()}
       />,
     ))
-    await act(async () => container.querySelector('button')!.click())
+    await act(async () => container.querySelector('[data-testid="edit-draft"]')!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
     await act(async () => {
       root?.unmount()
       root = null
