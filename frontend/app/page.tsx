@@ -23,6 +23,17 @@ function HeroLock() {
 
 type ActiveModal = 'create' | 'join' | 'delete' | null
 
+const CAMPAIGN_LAYOUT_STORAGE_KEY = 'fireside:campaign-layout'
+
+const CAMPAIGN_LAYOUTS = [
+  { id: 'rows', label: 'Rows' },
+  { id: 'compact', label: 'Compact' },
+  { id: 'grid', label: 'Grid' },
+  { id: 'feature', label: 'Feature' },
+] as const
+
+type CampaignLayout = (typeof CAMPAIGN_LAYOUTS)[number]['id']
+
 export default function HomePage() {
   const { user } = useAuthContext()
   const router = useRouter()
@@ -43,6 +54,16 @@ export default function HomePage() {
   const [campaignToDelete, setCampaignToDelete] = useState<Campaign | null>(null)
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+
+  const [layout, setLayout] = useState<CampaignLayout>(() => {
+    if (typeof window === 'undefined') return 'rows'
+    const saved = window.localStorage.getItem(CAMPAIGN_LAYOUT_STORAGE_KEY)
+    return CAMPAIGN_LAYOUTS.some((l) => l.id === saved) ? (saved as CampaignLayout) : 'rows'
+  })
+
+  useEffect(() => {
+    window.localStorage.setItem(CAMPAIGN_LAYOUT_STORAGE_KEY, layout)
+  }, [layout])
 
   useEffect(() => {
     // Pending-invite recovery (#242): an email-confirmation redirect may
@@ -156,6 +177,26 @@ export default function HomePage() {
     }
   }
 
+  const rosterLayout: 'rows' | 'compact' | 'grid' =
+    layout === 'feature' ? 'compact' : layout
+  const featuredCampaign = layout === 'feature' ? (campaignList[0] ?? null) : null
+
+  const renderCampaign = (campaign: Campaign, rl: 'rows' | 'compact' | 'grid' | 'feature') => {
+    const owned = String(user?.id) === String(campaign.owner_id)
+    return (
+      <CampaignCard
+        key={campaign.id}
+        campaign={campaign}
+        layout={rl}
+        isOwner={owned}
+        onArchive={(e: React.MouseEvent) => { e.preventDefault(); void handleArchive(campaign) }}
+        onRestore={(e: React.MouseEvent) => { e.preventDefault(); void handleRestore(campaign) }}
+        actionBusy={actionBusyId === campaign.id}
+        onDelete={owned ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) } : null}
+      />
+    )
+  }
+
   if (!user) {
     return <LandingPage />
   }
@@ -243,6 +284,18 @@ export default function HomePage() {
               <h2 className="campaigns-title">Return to the table</h2>
             </div>
             <div className="campaigns-header-actions">
+              <div className="layout-switcher" role="group" aria-label="Campaign list layout">
+                {CAMPAIGN_LAYOUTS.map((l) => (
+                  <button
+                    key={l.id}
+                    type="button"
+                    aria-pressed={layout === l.id}
+                    onClick={() => setLayout(l.id)}
+                  >
+                    {l.label}
+                  </button>
+                ))}
+              </div>
               <button className="btn btn-secondary small" onClick={() => { setInviteCode(''); setJoinError(''); setActiveModal('join') }}>
                 <i className="bi bi-key" aria-hidden="true" /> Join with code
               </button>
@@ -251,23 +304,22 @@ export default function HomePage() {
               </button>
             </div>
           </header>
-          <div className="campaigns-grid">
-            {campaignList.map((campaign) => (
-              <CampaignCard
-                key={campaign.id}
-                campaign={campaign}
-                isOwner={String(user?.id) === String(campaign.owner_id)}
-                onArchive={(e: React.MouseEvent) => { e.preventDefault(); void handleArchive(campaign) }}
-                onRestore={(e: React.MouseEvent) => { e.preventDefault(); void handleRestore(campaign) }}
-                actionBusy={actionBusyId === campaign.id}
-                onDelete={
-                  String(user?.id) === String(campaign.owner_id)
-                    ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }
-                    : null
-                }
-              />
-            ))}
-          </div>
+          {featuredCampaign ? (
+            <>
+              <div className="campaign-feature-stage">
+                {renderCampaign(featuredCampaign, 'feature')}
+              </div>
+              {campaignList.length > 1 && (
+                <div className="campaigns-grid" data-layout="compact">
+                  {campaignList.slice(1).map((campaign) => renderCampaign(campaign, 'compact'))}
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="campaigns-grid" data-layout={rosterLayout}>
+              {campaignList.map((campaign) => renderCampaign(campaign, rosterLayout))}
+            </div>
+          )}
           {actionError && <ErrorMessage message={actionError} />}
         </>
       )}
@@ -281,22 +333,8 @@ export default function HomePage() {
               <h2 className="campaigns-title">Rest when you need to</h2>
             </div>
           </header>
-          <div className="campaigns-grid">
-            {archivedList.map((campaign) => (
-              <CampaignCard
-                key={campaign.id}
-                campaign={campaign}
-                isOwner={String(user?.id) === String(campaign.owner_id)}
-                onArchive={(e: React.MouseEvent) => { e.preventDefault(); void handleArchive(campaign) }}
-                onRestore={(e: React.MouseEvent) => { e.preventDefault(); void handleRestore(campaign) }}
-                actionBusy={actionBusyId === campaign.id}
-                onDelete={
-                  String(user?.id) === String(campaign.owner_id)
-                    ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }
-                    : null
-                }
-              />
-            ))}
+          <div className="campaigns-grid" data-layout={rosterLayout}>
+            {archivedList.map((campaign) => renderCampaign(campaign, rosterLayout))}
           </div>
         </>
       )}
