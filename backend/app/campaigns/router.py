@@ -1405,6 +1405,7 @@ def get_character_lore(campaign_id: str, character_id: str, request: Request, db
     404 with no existence leak. Reads survive the start transition.
     """
     from app.campaigns.party_lore import LoreAuthorizationError, get_own_lore
+    from models.characters import Character
 
     profile = resolve_profile(request, db)
     try:
@@ -1417,6 +1418,9 @@ def get_character_lore(campaign_id: str, character_id: str, request: Request, db
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id or char.is_deleted:
+        raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         row = get_own_lore(db, campaign_id=cid, character_id=char_id, user_id=profile.id)
     except LoreAuthorizationError:
@@ -1615,7 +1619,7 @@ def delete_character_lore(
         except LoreStatusError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         fresh = db.get(_Character, char_id)
-        if fresh is None or fresh.owner_id != profile.id:
+        if fresh is None or fresh.owner_id != profile.id or fresh.is_deleted:
             raise HTTPException(status_code=404, detail="Character lore not found")
         existing = db.execute(
             select(CampaignCharacterLore).where(
@@ -1748,7 +1752,7 @@ def post_lore_dm_chat(
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
-    if char is None or char.owner_id != profile.id:
+    if char is None or char.owner_id != profile.id or char.is_deleted:
         raise HTTPException(status_code=404, detail="Character lore not found")
     try:
         require_lore_writable(camp)

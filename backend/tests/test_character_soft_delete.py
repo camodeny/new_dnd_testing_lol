@@ -18,7 +18,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models.campaigns import Campaign, CampaignMember  # noqa: E402
+from models.campaigns import Campaign, CampaignCharacterLore, CampaignLoreChatMessage, CampaignMember  # noqa: E402
 from models.characters import Character, CharacterChatMessage, Dnd5eCharacterSheet  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 
@@ -89,6 +89,19 @@ def test_delete_hides_character_and_retains_data_and_lobby_history(api):
             is_ready=True,
             ready_at=datetime.now(timezone.utc),
         ))
+        db.add(CampaignCharacterLore(
+            campaign_id=campaign.id,
+            character_id=char.id,
+            user_id=TEST_USER_ID,
+            content="A private setup secret.",
+        ))
+        db.add(CampaignLoreChatMessage(
+            campaign_id=campaign.id,
+            character_id=char.id,
+            user_id=TEST_USER_ID,
+            role="assistant",
+            content="A retained lore chat message.",
+        ))
         db.commit()
 
     response = client.delete(f"/api/characters/{character_id}")
@@ -98,6 +111,16 @@ def test_delete_hides_character_and_retains_data_and_lobby_history(api):
     assert client.get(f"/api/characters/{character_id}").status_code == 404
     assert client.get(f"/api/characters/{character_id}/chat").status_code == 404
     assert client.get(f"/api/campaigns/{campaign_id}/characters").json()["characters"] == []
+    assert client.get(
+        f"/api/campaigns/{campaign_id}/characters/{character_id}/lore"
+    ).status_code == 404
+    assert client.get(
+        f"/api/campaigns/{campaign_id}/characters/{character_id}/lore-chat"
+    ).status_code == 404
+    assert client.post(
+        f"/api/campaigns/{campaign_id}/characters/{character_id}/lore-chat",
+        json={"content": "Please help me write backstory."},
+    ).status_code == 404
     assert client.put(
         f"/api/campaigns/{campaign_id}/members/me/character",
         json={"expected_revision": 0, "character_id": str(character_id)},
@@ -115,6 +138,16 @@ def test_delete_hides_character_and_retains_data_and_lobby_history(api):
         assert db.scalar(
             select(func.count()).select_from(CharacterChatMessage).where(
                 CharacterChatMessage.character_id == character_id
+            )
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(CampaignCharacterLore).where(
+                CampaignCharacterLore.character_id == character_id
+            )
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(CampaignLoreChatMessage).where(
+                CampaignLoreChatMessage.character_id == character_id
             )
         ) == 1
         member = db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": TEST_USER_ID})
