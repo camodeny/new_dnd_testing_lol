@@ -208,10 +208,10 @@ def require_playable_campaign(campaign) -> None:
 
 
 def character_launch_validity(character, sheet) -> dict:
-    """Authoritative character setup/progress — issue #241.
+    """Authoritative character setup/progress — issues #241 and #425.
 
     Valid launch PC requires: non-empty name, non-empty race, and a class
-    (scalar char_class or non-empty classes list). Returns
+    (scalar char_class or non-empty classes list), plus a completed draft. Returns
     {is_valid, missing, progress}.
     """
     missing: list[str] = []
@@ -229,11 +229,14 @@ def character_launch_validity(character, sheet) -> dict:
     )
     if not has_class:
         missing.append("class")
+    is_draft = getattr(character, "status", "complete") == "draft"
+    reported_missing = [*missing, "draft"] if is_draft else missing
     total = 3
     completed = total - len(missing)
     return {
-        "is_valid": not missing,
-        "missing": missing,
+        "is_valid": not missing and not is_draft,
+        "missing": reported_missing,
+        "is_draft": is_draft,
         "progress": {
             "completed": completed,
             "total": total,
@@ -267,6 +270,9 @@ def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
             continue
         if char.owner_id != m.user_id:
             blockers.append(f"{label} selected character is not owned by the member")
+            continue
+        if char.status != "complete":
+            blockers.append(f"{label} character is still a draft")
             continue
         sheet = db.execute(
             select(Dnd5eCharacterSheet)

@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -12,15 +12,27 @@ from database import Base
 
 class Character(Base):
     __tablename__ = "characters"
+    __table_args__ = (CheckConstraint("status IN ('draft', 'complete')", name="ck_characters_status"),)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True)
     system: Mapped[str] = mapped_column(String(32), nullable=False, default="dnd5e")
     name: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="complete", server_default="complete")
+    creator_step: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
     def to_dict(self):
-        return {"id": str(self.id), "owner_id": str(self.owner_id), "system": self.system, "name": self.name}
+        return {
+            "id": str(self.id),
+            "owner_id": str(self.owner_id),
+            "system": self.system,
+            "name": self.name,
+            "status": self.status,
+            "creator_step": self.creator_step,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
 
 
 class CharacterChatMessage(Base):

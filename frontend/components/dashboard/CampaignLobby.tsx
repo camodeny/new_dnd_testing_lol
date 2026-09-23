@@ -58,6 +58,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setOrigin(window.location.origin)
   }, [])
   const [owned, setOwned] = useState<Character[]>([])
+  const [ownedDraftCount, setOwnedDraftCount] = useState(0)
   const [selectedId, setSelectedId] = useState('')
   const [charModalOpen, setCharModalOpen] = useState(false)
   // Public party composition + advisory gaps (#244). Composition comes from
@@ -139,7 +140,11 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   useEffect(() => {
     charactersApi
       .list()
-      .then((data) => setOwned((data as { characters?: Character[] }).characters ?? []))
+      .then((data) => {
+        const characters = (data as { characters?: Character[] }).characters ?? []
+        setOwned(characters.filter((character) => character.status !== 'draft'))
+        setOwnedDraftCount(characters.filter((character) => character.status === 'draft').length)
+      })
       .catch(() => {})
   }, [])
 
@@ -630,7 +635,9 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               disabled={busy || owned.length === 0}
               style={{ flex: '1 1 220px', padding: '8px 10px', borderRadius: 8 }}
             >
-              <option value="">{owned.length ? 'Choose a character…' : 'No characters yet — create one first'}</option>
+              <option value="">
+                {owned.length ? 'Choose a character…' : ownedDraftCount ? 'Finish a character draft first' : 'No characters yet — create one first'}
+              </option>
               {owned.map((c) => (
                 <option key={c.id} value={c.id}>{c.name}</option>
               ))}

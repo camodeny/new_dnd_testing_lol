@@ -1223,6 +1223,91 @@ select.input:focus,
 
 .character-library-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 
+.character-drafts {
+  margin: 28px 0 40px;
+}
+
+.character-drafts__heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 12px;
+}
+
+.character-drafts__heading h2 {
+  margin: 7px 0 0;
+  color: var(--ink-strong);
+  font: 650 1.35rem/1.2 var(--sans);
+  letter-spacing: -0.035em;
+}
+
+.character-drafts__heading p {
+  margin: 0 0 3px;
+  color: var(--ink-muted);
+  font-size: 0.82rem;
+}
+
+.character-drafts__list {
+  border-top: 1px solid var(--line);
+}
+
+.character-draft-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 78px;
+  padding: 13px 10px 13px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.character-draft-row__copy h3 {
+  margin: 0 0 5px;
+  color: var(--ink-strong);
+  font: 650 0.98rem/1.25 var(--sans);
+}
+
+.character-draft-row__copy p {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.76rem;
+  text-transform: capitalize;
+}
+
+.character-draft-row__actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.character-draft-save-status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 34px;
+  margin: 0 0 12px;
+  color: var(--ink-muted);
+  font-size: 0.76rem;
+}
+
+.character-draft-save-status.is-saved { color: var(--ink-faint); }
+.character-draft-save-status.is-error { color: var(--danger); }
+
+.character-draft-start {
+  display: grid;
+  min-height: 50vh;
+  place-items: center;
+}
+
+.character-draft-start__message {
+  display: grid;
+  justify-items: center;
+  gap: 12px;
+  max-width: 440px;
+}
+
 .layout-switcher {
   display: inline-flex;
   padding: 3px;
@@ -1537,6 +1622,13 @@ select.input:focus,
 
 @media (max-width: 900px) {
   .character-spotlight { grid-template-columns: 1fr; }
+  .character-drafts__heading { align-items: start; flex-direction: column; gap: 8px; }
+  .character-draft-row { align-items: start; }
+}
+
+@media (max-width: 560px) {
+  .character-draft-row { flex-direction: column; }
+  .character-draft-row__actions { width: 100%; justify-content: space-between; }
 }
 
 .character-empty-state { max-width: 620px; padding: 74px 0; }

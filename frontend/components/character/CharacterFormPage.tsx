@@ -39,6 +39,8 @@ interface CharacterFormPageProps {
   aiCollapsed?: boolean
   onDraftChange?: (draft: CharacterDraft) => void
   onActivePageChange?: (page: string) => void
+  draftSaveStatus?: 'pending' | 'saving' | 'saved' | 'error'
+  onRetryDraftSave?: () => void
 }
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(
@@ -91,7 +93,7 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, onOpenAI, aiCollapsed, onDraftChange, onActivePageChange }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, onOpenAI, aiCollapsed, onDraftChange, onActivePageChange, draftSaveStatus, onRetryDraftSave }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
   const aiPatchRef = useRef(0)
   const prevInitialRef = useRef<string | undefined>(undefined)
@@ -148,7 +150,10 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
     })
     onAiPatchApplied?.()
   }, [aiPatch, onAiPatchApplied])
-  const [activePageIndex, setActivePageIndex] = useState(0)
+  const [activePageIndex, setActivePageIndex] = useState(() => {
+    const savedIndex = CHARACTER_FORM_PAGES.findIndex((page) => page.key === initial?.creator_step)
+    return Math.max(0, savedIndex)
+  })
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const formRef = useRef<HTMLFormElement>(null)
@@ -281,6 +286,21 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
       onSubmit={handleSubmit}
     >
       <ErrorMessage message={error} />
+      {draftSaveStatus && (
+        <div className={`character-draft-save-status is-${draftSaveStatus}`} role="status" aria-live="polite">
+          <span>
+            {draftSaveStatus === 'pending' && 'Unsaved changes'}
+            {draftSaveStatus === 'saving' && 'Saving draft…'}
+            {draftSaveStatus === 'saved' && 'Draft saved'}
+            {draftSaveStatus === 'error' && 'Draft could not be saved.'}
+          </span>
+          {draftSaveStatus === 'error' && onRetryDraftSave && (
+            <button type="button" className="btn btn-secondary small" onClick={onRetryDraftSave}>
+              Retry save
+            </button>
+          )}
+        </div>
+      )}
       <nav className="character-form-wizard__step-nav" aria-label="Character form steps">
         <ol className="character-form-wizard__step-list">
           {CHARACTER_FORM_PAGES.map((page, pageIndex) => {
@@ -353,7 +373,7 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
           </Button>
           {isLastPage ? (
             <Button type="submit" variant="primary" loading={saving}>
-              {isEdit ? 'Save Changes' : 'Create Character'}
+              {initial?.status === 'draft' ? 'Create Character' : isEdit ? 'Save Changes' : 'Create Character'}
             </Button>
           ) : (
             <Button type="submit" variant="primary" disabled={saving}>

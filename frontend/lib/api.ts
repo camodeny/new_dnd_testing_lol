@@ -150,6 +150,18 @@ export const campaigns = {
 export const characters = {
   list: () => apiFetch<{ characters: import('@/types').Character[] }>('/characters'),
   get: (id: number | string) => apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`),
+  createDraft: (idempotencyKey: string) =>
+    apiFetch<{ character: import('@/types').Character }>('/characters/drafts', {
+      method: 'POST',
+      body: JSON.stringify({ operation_id: idempotencyKey }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+  updateDraft: (id: number | string, payload: Record<string, unknown>, options: { keepalive?: boolean } = {}) =>
+    apiFetch<{ character: import('@/types').Character }>(`/characters/${id}/draft`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+      keepalive: options.keepalive,
+    }),
   create: (payload: Record<string, unknown>, idempotencyKey: string) =>
     apiFetch<{ character: import('@/types').Character }>('/characters', {
       method: 'POST',

@@ -1122,6 +1122,8 @@ def select_own_character(
             cid, profile.id, char_id,
         )
         raise HTTPException(status_code=403, detail="Only your own character can be selected")
+    if char.status != "complete":
+        raise HTTPException(status_code=409, detail="Finish the character draft before selecting it")
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
@@ -1154,6 +1156,8 @@ def select_own_character(
             raise HTTPException(status_code=404, detail="Character not found")
         if fresh.owner_id != profile.id:
             raise HTTPException(status_code=403, detail="Only your own character can be selected")
+        if fresh.status != "complete":
+            raise HTTPException(status_code=409, detail="Finish the character draft before selecting it")
         current.selected_character_id = fresh.id
         # Selection change requires re-ready.
         current.is_ready = False

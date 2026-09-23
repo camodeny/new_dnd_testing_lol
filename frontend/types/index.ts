@@ -23,6 +23,8 @@ export interface Campaign {
 export interface Character {
   id: string
   name: string
+  status?: 'draft' | 'complete'
+  creator_step?: string | null
   race?: string
   background?: string
   alignment?: string
@@ -37,6 +39,7 @@ export interface Character {
   charisma?: number
   classes?: CharacterClass[]
   created_at?: string
+  updated_at?: string
 }
 
 export interface CharacterClass {
