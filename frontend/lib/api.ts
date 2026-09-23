@@ -202,6 +202,8 @@ export const campaignMembers = {
       body: JSON.stringify({ expected_revision: expectedRevision }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
+  getLoreDmChat: (campaignId: string | number, characterId: string) =>
+    apiFetch<{ messages: import('@/types').LoreDmMessage[] }>(`/campaigns/${campaignId}/characters/${characterId}/lore-chat`),
   selectCharacter: (campaignId: string | number, expectedRevision: number, characterId: string, idempotencyKey: string) =>
     apiFetch(`/campaigns/${campaignId}/members/me/character`, {
       method: 'PUT',

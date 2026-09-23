@@ -121,6 +121,17 @@ export interface CharacterLore {
   updated_at?: string | null
 }
 
+// Private lore-DM setup thread: one player's guided back-and-forth per
+// character. DM replies are advisory only — proposals become canon solely
+// through the standard lore write.
+export interface LoreDmMessage {
+  id?: string
+  role: 'user' | 'assistant'
+  content: string
+  proposal?: string
+  created_at?: string | null
+}
+
 // Lobby invitations — issue #242. Owner list entries carry the full
 // record; lobby projections mask emails for non-owners; lookup returns
 // only the minimal safe pre-membership metadata.

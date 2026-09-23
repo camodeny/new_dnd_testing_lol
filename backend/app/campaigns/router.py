@@ -4,6 +4,7 @@ import uuid as uuid_lib
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
@@ -1654,6 +1655,166 @@ def delete_character_lore(
             status_code=409, detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
+
+
+@router.get("/api/campaigns/{campaign_id}/characters/{character_id}/lore-chat")
+def get_lore_dm_chat(campaign_id: str, character_id: str, request: Request, db: Session = Depends(get_db)):
+    """Read own lore-DM setup thread.
+
+    Fail-closed: another player's character (even for the campaign owner)
+    returns 404 with no existence leak. Reads survive the start transition;
+    only writes lock with the lobby.
+    """
+    from models.campaigns import CampaignLoreChatMessage
+    from models.characters import Character
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    # Ownership gate BEFORE any thread lookup: same no-oracle rule as lore.
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id:
+        raise HTTPException(status_code=404, detail="Character lore not found")
+    rows = db.execute(
+        select(CampaignLoreChatMessage)
+        .where(
+            CampaignLoreChatMessage.campaign_id == cid,
+            CampaignLoreChatMessage.character_id == char_id,
+            CampaignLoreChatMessage.user_id == profile.id,
+        )
+        .order_by(CampaignLoreChatMessage.created_at.asc())
+    ).scalars().all()
+    return {"messages": [m.to_dict() for m in rows]}
+
+
+@router.post("/api/campaigns/{campaign_id}/characters/{character_id}/lore-chat")
+def post_lore_dm_chat(
+    campaign_id: str,
+    character_id: str,
+    payload: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """One guided lore-DM turn — lobby-only.
+
+    Saves the player's message, streams the DM reply (tokens + at most one
+    lore proposal). The DM side is advisory only: proposals become canon
+    solely through the standard lore PUT. Locks with lore writes (409) once
+    the campaign leaves the lobby.
+    """
+    from models.campaigns import CampaignLoreChatMessage
+    from models.characters import Character, Dnd5eCharacterSheet
+
+    from app.campaigns.lore_dm_chat import (
+        LoreChatValidationError,
+        build_lore_dm_context,
+        lore_dm_chat_sync_generator,
+        validate_lore_chat_content,
+    )
+    from app.campaigns.party_lore import (
+        LoreStatusError,
+        build_party_advice,
+        build_party_composition,
+        require_lore_writable,
+    )
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    try:
+        content = validate_lore_chat_content(payload)
+    except LoreChatValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    char = db.get(Character, char_id)
+    if char is None or char.owner_id != profile.id:
+        raise HTTPException(status_code=404, detail="Character lore not found")
+    try:
+        require_lore_writable(camp)
+    except LoreStatusError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    db.add(CampaignLoreChatMessage(
+        campaign_id=cid, character_id=char_id, user_id=profile.id,
+        role="user", content=content,
+    ))
+    db.commit()
+    prior = db.execute(
+        select(CampaignLoreChatMessage)
+        .where(
+            CampaignLoreChatMessage.campaign_id == cid,
+            CampaignLoreChatMessage.character_id == char_id,
+            CampaignLoreChatMessage.user_id == profile.id,
+        )
+        .order_by(CampaignLoreChatMessage.created_at.desc())
+        .limit(13)
+    ).scalars().all()
+    history = [{"role": m.role, "content": m.content} for m in reversed(prior)]
+
+    sheet = db.execute(
+        select(Dnd5eCharacterSheet)
+        .where(Dnd5eCharacterSheet.character_id == char_id)
+        .order_by(Dnd5eCharacterSheet.updated_at.desc())
+    ).scalars().first()
+    identity_bits = []
+    if sheet is not None:
+        for label, val in (
+            ("race", getattr(sheet, "race", None)),
+            ("classes", ", ".join(
+                str(c.get("class_name") or "") for c in (getattr(sheet, "classes", None) or [])
+                if isinstance(c, dict) and str(c.get("class_name") or "")
+            ) or getattr(sheet, "char_class", None)),
+            ("level", getattr(sheet, "level", None)),
+            ("background", getattr(sheet, "background", None)),
+            ("alignment", getattr(sheet, "alignment", None)),
+        ):
+            if val:
+                identity_bits.append(f"{label} {val}")
+    members = db.execute(
+        select(CampaignMember).where(CampaignMember.campaign_id == cid)
+    ).scalars().all()
+    composition = build_party_composition(db, list(members))
+    from app.characters.chat.service import build_party_advisory_text
+
+    context = build_lore_dm_context(
+        campaign_name=camp.name or "",
+        campaign_description=camp.description,
+        campaign_seed=camp.random_seed,
+        character_name=char.name or "",
+        character_identity="; ".join(identity_bits),
+        party_advisory=build_party_advisory_text(composition, build_party_advice(composition)),
+    )
+    logger.info(
+        "lore_dm_chat campaign_id=%s actor_id=%s character_id=%s content_length=%s",
+        cid, profile.id, char_id, len(content),
+    )
+    return StreamingResponse(
+        lore_dm_chat_sync_generator(
+            campaign_id=cid, character_id=char_id, user_id=profile.id,
+            content=content, history=history, context=context,
+        ),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.delete("/api/campaigns/{campaign_id}/members/{user_id}")

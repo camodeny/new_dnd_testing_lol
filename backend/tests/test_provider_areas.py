@@ -37,8 +37,14 @@ def test_character_chat_pinned(keys):
     assert model == "muse-spark-1.3-contributor"
 
 
+def test_lore_dm_chat_pinned(keys):
+    _, model, name = resolve_area("lore_dm_chat")
+    assert name == "meta"
+    assert model == "muse-spark-1.3-contributor"
+
+
 def test_areas_known(keys):
-    assert set(AREAS) == {"dm", "narrator", "character_chat"}
+    assert set(AREAS) == {"dm", "narrator", "character_chat", "lore_dm_chat"}
 
 
 def test_missing_key_fails_clearly(keys, monkeypatch):
