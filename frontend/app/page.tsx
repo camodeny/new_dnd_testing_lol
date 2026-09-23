@@ -324,6 +324,18 @@ export default function HomePage() {
         </>
       )}
 
+      {!hasCampaigns && archivedList.length > 0 && (
+        <header className="campaigns-header">
+          <div>
+            <span className="section-kicker">YOUR CAMPAIGNS</span>
+            <h2 className="campaigns-title">Start a new adventure</h2>
+          </div>
+          <button className="btn btn-primary small" onClick={() => setActiveModal('create')}>
+            <i className="bi bi-plus-lg" aria-hidden="true" /> New campaign
+          </button>
+        </header>
+      )}
+
       {/* Archived tables — dormant, restorable to the same table */}
       {archivedList.length > 0 && (
         <>

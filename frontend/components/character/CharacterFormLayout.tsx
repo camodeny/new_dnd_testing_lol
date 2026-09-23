@@ -168,6 +168,12 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     return () => window.removeEventListener('pagehide', saveBeforePageHide)
   }, [activeCharacterId, isDraft])
 
+  const handleGenerated = useCallback((draft: Partial<CharacterDraft>) => {
+    setAiPatch({ ...draft })
+  }, [])
+
+  const handleAiPatchApplied = useCallback(() => setAiPatch(null), [])
+
   const handleSaved = useCallback((character: Character) => {
     draftCompletedRef.current = true
     onSaved(character)
@@ -177,7 +183,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     try {
       const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
       const backendBase =
-        (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
+        (typeof process !== 'undefined' && process.env.BACKEND_URL) ||
         (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
       const url = backendBase
         ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(activeCharacterId)}/chat`
@@ -243,14 +249,8 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
                 activePage={activePage}
                 clearTrigger={clearTrigger}
                 campaignId={campaignId ?? null}
-                onGenerated={(draft) => setAiPatch({ ...draft } as Partial<CharacterDraft>)}
+                onGenerated={handleGenerated}
               />
-              {aiPatch && (
-                <div className="character-ai-banner">
-                  <i className="bi bi-check-circle-fill" aria-hidden="true" /> Draft applied
-                  <button type="button" className="link-button" onClick={() => setAiPatch(null)}>Clear</button>
-                </div>
-              )}
             </div>
           </aside>
         )}
@@ -259,6 +259,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
           <CharacterFormPage
             initial={resolvedInitial}
             aiPatch={aiPatch}
+            onAiPatchApplied={handleAiPatchApplied}
             onSaved={handleSaved}
             onCancel={handleCancel}
             onToggleAI={() => setAiCollapsed((v) => !v)}
