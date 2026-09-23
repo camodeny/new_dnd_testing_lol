@@ -1,7 +1,8 @@
 'use client'
 
-import { useState, useCallback, useEffect } from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import Modal from '@/components/common/Modal'
+import LoreDmChat from '@/components/campaign/LoreDmChat'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
 import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyAdvice, PartyComposition, User } from '@/types'
 
@@ -72,6 +73,9 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [invitesModalOpen, setInvitesModalOpen] = useState(false)
   const [busy, setBusy] = useState(false)
   const [lobbyError, setLobbyError] = useState('')
+  // Guided lore-DM back-and-forth (helps unsure players draft private lore).
+  const [dmChatOpen, setDmChatOpen] = useState(false)
+  const [applyingProposal, setApplyingProposal] = useState(false)
 
   const refreshLobby = useCallback(async () => {
     try {
@@ -101,6 +105,37 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     const timer = window.setInterval(() => void refreshLobby(), 2_000)
     return () => window.clearInterval(timer)
   }, [refreshLobby])
+
+  // Returning from the character creator with ?selectCharacter=<id>:
+  // select it once, then strip the param so refreshes don't re-apply.
+  const autoSelectDone = useRef(false)
+  useEffect(() => {
+    if (autoSelectDone.current) return
+    const params = new URLSearchParams(window.location.search)
+    const charId = params.get('selectCharacter')
+    if (!charId) return
+    autoSelectDone.current = true
+    params.delete('selectCharacter')
+    const url = new URL(window.location.href)
+    url.search = params.toString()
+    window.history.replaceState(null, '', url.toString())
+    setSelectedId(charId)
+    void (async () => {
+      setBusy(true)
+      setLobbyError('')
+      try {
+        const lobby = await membersApi.getLobby(campaign.id)
+        const rev = lobby.campaign?.revision ?? campaign.revision
+        await membersApi.selectCharacter(campaign.id, rev, charId, newKey())
+        await refreshLobby()
+      } catch (err) {
+        await refreshLobby()
+        setLobbyError((err as Error).message)
+      } finally {
+        setBusy(false)
+      }
+    })()
+  }, [])
 
   useEffect(() => {
     charactersApi
@@ -209,6 +244,10 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
 
   const me = members.find((m) => m.user_id === currentUser?.id) ?? null
   const myCharId = me?.selected_character_id ?? me?.character_id ?? null
+  // Lore (doc + DM chat) belongs to the SELECTED character only: the seed
+  // ignores abandoned characters' secrets, so writing lore for an
+  // unselected one would silently do nothing.
+  const loreCharId = me?.selected_character_id ?? null
 
   useEffect(() => {
     if (myCharId && !selectedId) setSelectedId(myCharId)
@@ -247,18 +286,18 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // Private setup lore (#244): load own lore when the selected character
   // changes; save/delete are lobby-only and fail closed for others.
   useEffect(() => {
-    if (!myCharId) { setLore(''); setLoreSaved(false); return }
-    membersApi.getCharacterLore(campaign.id, myCharId)
+    if (!loreCharId) { setLore(''); setLoreSaved(false); return }
+    membersApi.getCharacterLore(campaign.id, loreCharId)
       .then((data) => { setLore((data.lore as { content?: string }).content ?? ''); setLoreSaved(true) })
       .catch(() => { setLore(''); setLoreSaved(false) })
-  }, [campaign.id, myCharId])
+  }, [campaign.id, loreCharId])
 
   const handleSaveLore = useCallback(async () => {
-    if (!myCharId || loreBusy || launchLocked) return
+    if (!loreCharId || loreBusy || launchLocked) return
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.putCharacterLore(campaign.id, myCharId, revision, lore, newKey())
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, lore, newKey())
       setLoreSaved(true)
       await refreshLobby()
     } catch (err) {
@@ -267,14 +306,14 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     } finally {
       setLoreBusy(false)
     }
-  }, [myCharId, loreBusy, launchLocked, campaign.id, revision, lore, refreshLobby])
+  }, [loreCharId, loreBusy, launchLocked, campaign.id, revision, lore, refreshLobby])
 
   const handleDeleteLore = useCallback(async () => {
-    if (!myCharId || loreBusy || launchLocked) return
+    if (!loreCharId || loreBusy || launchLocked) return
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.deleteCharacterLore(campaign.id, myCharId, revision, newKey())
+      await membersApi.deleteCharacterLore(campaign.id, loreCharId, revision, newKey())
       setLore('')
       setLoreSaved(false)
       await refreshLobby()
@@ -284,7 +323,27 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     } finally {
       setLoreBusy(false)
     }
-  }, [myCharId, loreBusy, launchLocked, campaign.id, revision, refreshLobby])
+  }, [loreCharId, loreBusy, launchLocked, campaign.id, revision, refreshLobby])
+
+  // Apply a lore-DM proposal: same versioned, lobby-locked write as a
+  // hand-typed save — chat output becomes canon only through this path.
+  const handleApplyProposal = useCallback(async (proposal: string) => {
+    if (!loreCharId || loreBusy || applyingProposal || launchLocked) return
+    setApplyingProposal(true)
+    setLoreError('')
+    try {
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, proposal, newKey())
+      setLore(proposal)
+      setLoreSaved(true)
+      setDmChatOpen(false)
+      await refreshLobby()
+    } catch (err) {
+      await refreshLobby()
+      setLoreError((err as Error).message)
+    } finally {
+      setApplyingProposal(false)
+    }
+  }, [loreCharId, loreBusy, applyingProposal, launchLocked, campaign.id, revision, refreshLobby])
 
   const handleLoadAdvice = useCallback(async () => {
     try {
@@ -312,13 +371,22 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
 
   const filledSlots = members.length
   const totalSlots = (campaign as { required_players?: number }).required_players ?? members.length
+  // Solo tables seat only the host: party counts, party advice, and the
+  // whole invite flow are meaningless — hide them instead of showing a
+  // party of one an empty dance floor. required_players is the source of
+  // truth: anything that isn't exactly 1 needs a party lobby.
+  const isSolo = (campaign as { required_players?: number }).required_players === 1
   const activeInvites = invites.filter((inv) => inv.usable !== false && inv.status === 'active')
   const canBegin = isOwner && (eligibility?.eligible ?? false)
+
+  // Solo tables render the standard two-column lobby with party chrome
+  // (counts, advice, invites) hidden — there is nobody to invite and no
+  // party to advise. required_players is the source of truth.
 
   return (
     <div className="lobby-page">
       <div className="lobby-container">
-        <div className="lobby-card">
+        <div className={`lobby-card${isSolo ? ' lobby-solo' : ''}${loreCharId && !launchLocked ? ' has-lore' : ''}`}>
           {/* Left: hero panel */}
           <div className="lobby-hero">
             <h1 className="lobby-title">{campaign.name}</h1>
@@ -369,7 +437,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                       <div className="lobby-slot-role">{member.character_name}</div>
                     )}
                     <div style={{ fontSize: '0.7rem', color: member.is_ready ? 'var(--ember-hover)' : 'var(--ink-faint)' }}>
-                      {member.is_ready ? 'Ready' : charId ? 'Not ready' : 'No character'}
+                      {member.is_ready ? 'Ready' : charId ? 'Not ready' : (isSolo ? 'Choose your character' : 'No character')}
                     </div>
                     {member.role === 'owner' && (
                       <span style={{ position: 'absolute', top: 6, right: 6, fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '3px 6px', borderRadius: 4, background: 'var(--ember-soft)', color: 'var(--ember-hover)' }}>Host</span>
@@ -388,8 +456,8 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                 </div>
               ))}
             </div>
-            {/* Public party composition (#244): class/role coverage only. */}
-            {composition && (
+            {/* Public party composition (#244): hidden on all solo tables. */}
+            {composition && !isSolo && (
               <div style={{ marginTop: 12, fontSize: '0.78rem', color: 'var(--ink-faint)' }}>
                 <span>Party: {composition.ready_count}/{composition.size} ready</span>
                 {Object.entries(composition.class_counts ?? {}).map(([cls, n]) => (
@@ -400,7 +468,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                 </button>
               </div>
             )}
-            {advice && (
+            {advice && !isSolo && (
               <ul style={{ marginTop: 8, fontSize: '0.78rem' }}>
                 {advice.suggestions.map((s, i) => <li key={i}>{s}</li>)}
               </ul>
@@ -408,7 +476,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
           </section>
 
           {/* Private character lore (#244): your secrets for the DM only. */}
-          {myCharId && !launchLocked && (
+          {loreCharId && !launchLocked && (
             <section className="lobby-lore-section" aria-label="Private character lore">
               <div className="lobby-section-header">
                 <span className="lobby-section-label">
@@ -418,27 +486,47 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               <textarea
                 value={lore}
                 onChange={(e) => setLore(e.target.value)}
-                placeholder="Secrets, backstory hooks, personal goals — hidden from the party and the host"
+                placeholder={isSolo
+                  ? 'Secrets, backstory hooks, personal goals — only you and the DM will ever see this'
+                  : 'Secrets, backstory hooks, personal goals — hidden from the party and the host'}
                 rows={4}
                 maxLength={4000}
                 style={{ width: '100%' }}
                 aria-label="Private character lore"
               />
               {loreError && <div style={{ color: 'var(--danger)', fontSize: '0.75rem' }}>{loreError}</div>}
-              <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                <button type="button" onClick={() => void handleSaveLore()} disabled={loreBusy} aria-label="Save private lore">
+              <div className="lobby-lore-actions" style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                <button type="button" className="lobby-generate-btn" onClick={() => void handleSaveLore()} disabled={loreBusy} aria-label="Save private lore">
                   {loreSaved ? 'Update private lore' : 'Save private lore'}
                 </button>
                 {loreSaved && (
-                  <button type="button" onClick={() => void handleDeleteLore()} disabled={loreBusy} aria-label="Delete private lore">
+                  <button type="button" className="lobby-generate-btn" onClick={() => void handleDeleteLore()} disabled={loreBusy} aria-label="Delete private lore">
                     Delete
                   </button>
                 )}
+                <button
+                  type="button"
+                  className="lobby-copy-btn"
+                  onClick={() => setDmChatOpen((open) => !open)}
+                  aria-expanded={dmChatOpen}
+                  aria-label="Work out lore with the DM"
+                >
+                  <i className="bi bi-chat-dots" aria-hidden="true" /> {dmChatOpen ? 'Hide DM chat' : 'Ask the DM'}
+                </button>
               </div>
+              {dmChatOpen && loreCharId && (
+                <LoreDmChat
+                  campaignId={campaign.id}
+                  characterId={loreCharId}
+                  onUseLore={(proposal) => void handleApplyProposal(proposal)}
+                  applying={applyingProposal}
+                />
+              )}
             </section>
           )}
 
-          {/* Invite section — issue #242 */}
+          {/* Invite section — issue #242. Hidden on all solo tables. */}
+          {!isSolo && (
           <section className="lobby-invite-section">
             <div className="lobby-invite-card">
               <div className="lobby-section-header" style={{ marginBottom: 16 }}>
@@ -513,6 +601,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               )}
             </div>
           </section>
+          )}
 
           {/* Footer: begin */}
           <footer className="lobby-footer">
@@ -564,7 +653,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               Select
             </button>
             <a className="lobby-copy-btn" href={`/characters/new?campaign=${encodeURIComponent(campaign.id)}`}>
-              New with party advice
+              {isSolo ? 'New character' : 'New with party advice'}
             </a>
             {me?.is_ready ? (
               <button type="button" className="lobby-copy-btn" onClick={() => void handleReadiness(false)} disabled={busy}>

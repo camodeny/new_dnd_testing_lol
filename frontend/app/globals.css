@@ -934,19 +934,7 @@ select.input:focus,
    this the date at the footer's right edge slides underneath them. */
 .campaign-card-v2.has-actions .campaign-card-inner { padding-right: 100px; }
 
-.campaign-card-header { display: flex; align-items: center; gap: 13px; }
-
-.campaign-avatar {
-  display: grid;
-  width: 42px;
-  height: 42px;
-  flex: 0 0 auto;
-  place-items: center;
-  border-radius: 8px;
-  background: var(--surface-muted) !important;
-  color: var(--ember-hover);
-  font: 700 0.7rem/1 var(--mono);
-}
+.campaign-card-header { display: flex; align-items: center; }
 
 .campaign-title {
   margin: 0;
@@ -1231,6 +1219,324 @@ select.input:focus,
   border-color: transparent;
   background: var(--danger-soft);
   color: var(--danger);
+}
+
+.character-library-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+
+.layout-switcher {
+  display: inline-flex;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+}
+
+.layout-switcher button {
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink-muted);
+  font-size: 0.72rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  padding: 6px 13px;
+  cursor: pointer;
+}
+
+.layout-switcher button:hover { color: var(--ink-strong); }
+
+.layout-switcher button[aria-pressed="true"] {
+  background: var(--ink-strong);
+  color: #fff8ec;
+}
+
+@media (min-width: 901px) {
+  /* The link wrapper drops its 3-col grid so each variant lays out full-width */
+  .character-card-link--strip,
+  .character-card-link--grid,
+  .character-card-link--sheet,
+  .character-card-link--bars { display: block; min-height: 0; }
+
+  /* Compact: identity + class chips on one row, abilities as a single strip below */
+  .character-card--strip {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "identity stats" "abilities abilities";
+    gap: 8px 20px;
+  }
+
+  .character-card--strip .card-identity { grid-area: identity; }
+  .character-card--strip .card-stats { grid-area: stats; align-self: center; }
+  .character-card--strip .card-abilities {
+    grid-area: abilities;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 16px;
+  }
+
+  /* Grid + Sheet: bordered cards, 2–3 across */
+  .character-roster[data-layout="grid"],
+  .character-roster[data-layout="sheet"] {
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 16px;
+  }
+
+  .character-roster[data-layout="grid"] .card-wrapper,
+  .character-roster[data-layout="sheet"] .card-wrapper {
+    grid-template-columns: 1fr;
+    gap: 0;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface-paper);
+  }
+
+  .character-roster[data-layout="grid"] .card-wrapper:hover,
+  .character-roster[data-layout="grid"] .card-wrapper:focus-within,
+  .character-roster[data-layout="sheet"] .card-wrapper:hover,
+  .character-roster[data-layout="sheet"] .card-wrapper:focus-within {
+    background: var(--surface-paper);
+  }
+
+  .character-card--grid {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 20px 20px 10px;
+  }
+
+  .character-card--grid .card-stats { grid-column: auto; grid-row: auto; flex-wrap: wrap; }
+  .character-card--grid .card-abilities { grid-column: auto; grid-row: auto; }
+
+  .character-roster[data-layout="grid"] .card-actions,
+  .character-roster[data-layout="sheet"] .card-actions {
+    justify-content: flex-end;
+    padding: 0 14px 14px;
+  }
+
+  /* Sheet: mini D&D character sheets */
+  .character-card--sheet {
+    grid-template-columns: 1fr;
+    gap: 12px;
+    padding: 20px 20px 14px;
+  }
+
+  .character-card--sheet .card-identity h3 { font-size: 1.1rem; }
+  .character-card--sheet .card-stats { grid-column: auto; grid-row: auto; flex-wrap: wrap; }
+
+  .sheet-scores {
+    display: grid;
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .score-box {
+    display: grid;
+    gap: 3px;
+    justify-items: center;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: transparent;
+    padding: 8px 4px;
+  }
+
+  .score-label {
+    color: var(--ink-faint);
+    font: 700 0.58rem/1 var(--mono);
+    letter-spacing: 0.08em;
+  }
+
+  .score-mod {
+    color: var(--ink-strong);
+    font: 700 1.05rem/1 var(--sans);
+  }
+
+  .score-value { color: var(--ink-muted); font: 600 0.68rem/1 var(--mono); }
+
+  /* Bars: ability meters instead of printed numbers */
+  .character-card--bars {
+    grid-template-columns: minmax(200px, 0.9fr) minmax(0, 1.6fr);
+    align-items: center;
+    gap: 20px;
+  }
+
+  .card-stats--inline { margin-top: 10px; }
+
+  .bars-block {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px 18px;
+  }
+
+  .bar-row {
+    display: grid;
+    grid-template-columns: 30px minmax(0, 1fr) 28px;
+    align-items: center;
+    gap: 8px;
+    color: var(--ink-muted);
+    font: 600 0.64rem/1 var(--mono);
+  }
+
+  .bar-track {
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-muted);
+    overflow: hidden;
+  }
+
+  .bar-fill { display: block; height: 100%; border-radius: 999px; background: var(--ink-strong); }
+  .bar-mod { color: var(--ink); text-align: right; }
+
+  /* Feature: first character big, rest compact */
+  .feature-stage {
+    margin-bottom: 8px;
+    border: 1px solid var(--line);
+    border-radius: 16px;
+    background: var(--surface-paper);
+    padding: 28px;
+  }
+
+  .character-card--feature {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "identity stats" "abilities abilities";
+    gap: 10px 20px;
+  }
+
+  .character-card--feature .card-identity { grid-area: identity; }
+
+  .character-card--feature .card-identity h3 { margin-bottom: 4px; font-size: 1.6rem; }
+
+  .character-card--feature .card-identity h3 a { color: inherit; text-decoration: none; }
+  .character-card--feature .card-identity h3 a:hover { text-decoration: underline; }
+
+  .character-card--feature .card-stats { grid-area: stats; align-self: center; }
+
+  .character-card--feature .card-abilities {
+    grid-area: abilities;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 16px;
+  }
+
+  .feature-stage .spotlight-actions { margin-top: 20px; }
+
+  /* Spotlight: master-detail */
+  .character-spotlight {
+    display: grid;
+    grid-template-columns: minmax(220px, 0.8fr) minmax(0, 1.6fr);
+    gap: 20px;
+    align-items: start;
+  }
+
+  .spotlight-list { display: grid; gap: 2px; }
+
+  .spotlight-item {
+    display: grid;
+    gap: 2px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    padding: 10px 14px;
+    cursor: pointer;
+    text-align: left;
+    color: inherit;
+    font: inherit;
+  }
+
+  .spotlight-item:hover { background: rgba(255, 253, 248, 0.5); }
+  .spotlight-item[aria-selected="true"] { background: var(--surface-muted); }
+
+  .spotlight-item-name {
+    color: var(--ink-strong);
+    font: 650 0.95rem/1.2 var(--sans);
+    letter-spacing: -0.02em;
+  }
+
+  .spotlight-item-sub { color: var(--ink-muted); font-size: 0.72rem; }
+
+  .spotlight-detail {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface-paper);
+    padding: 24px;
+  }
+
+  .character-card--spotlight { display: grid; gap: 14px; min-height: 0; padding: 0; }
+
+  .character-card--spotlight .card-identity h3 {
+    margin-bottom: 4px;
+    font-size: 1.4rem;
+  }
+
+  .character-card--spotlight .card-stats { grid-column: auto; grid-row: auto; flex-wrap: wrap; }
+  .character-card--spotlight .card-abilities { grid-column: auto; grid-row: auto; }
+
+  .spotlight-actions { display: flex; gap: 8px; margin-top: 18px; }
+
+  /* ── Campaign list layout variants ── */
+  .campaigns-grid[data-layout="grid"] {
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 16px;
+    border-top: 0;
+  }
+
+  .campaigns-grid[data-layout="grid"] .campaign-card-v2,
+  .campaign-feature-stage {
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    background: var(--surface-paper);
+  }
+
+  .campaigns-grid[data-layout="grid"] .campaign-card-v2:hover,
+  .campaigns-grid[data-layout="grid"] .campaign-card-v2:focus-within {
+    border-color: var(--line);
+    background: var(--surface-paper);
+  }
+
+  /* Compact: denser rows, one-line descriptions */
+  .campaign-card--compact .campaign-card-inner {
+    min-height: 0;
+    grid-template-columns: minmax(180px, 0.9fr) minmax(0, 1.5fr) auto;
+    gap: 16px;
+    padding: 14px 100px 14px 10px;
+  }
+
+  .campaign-card--compact .campaign-title { font-size: 0.95rem; }
+  .campaign-card--compact .campaign-desc { -webkit-line-clamp: 1; font-size: 0.78rem; }
+
+  /* Grid: stacked cards */
+  .campaign-card--grid .campaign-card-inner {
+    min-height: 0;
+    grid-template-columns: 1fr;
+    gap: 10px;
+    padding: 20px 20px 16px;
+  }
+
+  .campaign-card--grid .campaign-desc { -webkit-line-clamp: 3; }
+  .campaign-card--grid .campaign-footer { margin-top: 4px; }
+
+  /* Feature: first campaign big, rest compact */
+  .campaign-feature-stage { margin-bottom: 8px; }
+  .campaign-feature-stage .campaign-card-v2 { border-bottom: 0; }
+
+  .campaign-card--feature .campaign-card-inner {
+    min-height: 0;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: "title meta" "desc desc";
+    gap: 10px 20px;
+    padding: 28px 28px 28px 28px;
+  }
+
+  .campaign-card--feature .campaign-card-header { grid-area: title; }
+  .campaign-card--feature .campaign-title { font-size: 1.5rem; }
+  .campaign-card--feature .campaign-desc {
+    display: block;
+    overflow: visible;
+    grid-area: desc;
+    font-size: 0.9rem;
+  }
+  .campaign-card--feature .campaign-footer { grid-area: meta; }
+}
+
+@media (max-width: 900px) {
+  .character-spotlight { grid-template-columns: 1fr; }
 }
 
 .character-empty-state { max-width: 620px; padding: 74px 0; }
@@ -1771,6 +2077,115 @@ a.automation-list-item:focus-visible {
 .lobby-footer,
 .lobby-card > .llm-manager-card { grid-column: 2; }
 
+/* Solo tables seat only the host: same two-column lobby, party chrome
+   (counts, advice, invites) hidden, the single seat filling the column. */
+.lobby-card.lobby-solo .lobby-party-section { display: flex; flex-direction: column; }
+.lobby-card.lobby-solo .lobby-players-grid { display: flex; flex: 1; }
+.lobby-card.lobby-solo .lobby-players-grid .lobby-player-slot { flex: 1; min-height: 220px; }
+
+/* Private lore box: pinned to the right column with matching padding and a
+   themed textarea. Shared by solo and multi lobbies. */
+.lobby-lore-section { grid-column: 2; padding: 0 28px; }
+.lobby-lore-section textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 110px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-paper);
+  color: var(--ink);
+  font: 400 0.82rem/1.55 var(--sans);
+  resize: vertical;
+}
+.lobby-lore-section textarea::placeholder { color: var(--ink-faint); }
+.lobby-lore-section textarea:focus { outline: none; border-color: var(--line-strong); }
+
+/* Wide screens: grow to three columns when lore is present instead of
+   stacking it under the party seat. */
+@media (min-width: 1101px) {
+  .lobby-card.has-lore { grid-template-columns: minmax(260px, 0.85fr) minmax(0, 1fr) minmax(0, 1fr); }
+  .lobby-card.has-lore .lobby-party-section { padding-right: 0; padding-bottom: 0; }
+  .lobby-card.has-lore .lobby-lore-section {
+    grid-column: 3;
+    /* Same rows as party+footer combined, so the textarea flex-fills
+       exactly what the seat flex-fills — equal boxes. */
+    grid-row: 1 / span 2;
+    display: flex;
+    flex-direction: column;
+    /* Equal content widths with party (both 1fr cols): party drops right
+       pad, lore drops right pad — single 28px middle gutter, both outer
+       edges at card-pad. */
+    padding: 24px 0 0 28px;
+  }
+  .lobby-card.has-lore .lobby-lore-section textarea { flex: 1; }
+  /* 8+46 matches the lore buttons row (8+46) so both boxes compute equal. */
+  .lobby-card.has-lore .lobby-footer { padding: 8px 28px 0; }
+  /* One organized action row per column: Begin fills its column, the
+     lore pair splits theirs evenly. Shared left/right edges, one height. */
+  .lobby-card.has-lore .lobby-footer .lobby-begin-btn { width: 100%; }
+  .lobby-card.has-lore .lobby-lore-actions > button { flex: 1 1 0; min-width: 0; }
+  .lobby-card.has-lore .lobby-generate-btn,
+  .lobby-card.has-lore .lobby-copy-btn { min-height: 46px; }
+}
+
+/* Guided lore-DM back-and-forth (shared by solo and multi lobbies). */
+.lobby-lore-chat { display: grid; gap: 10px; margin-top: 12px; }
+.lobby-lore-chat-log {
+  display: grid;
+  gap: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface-raised);
+}
+.lobby-lore-chat-msg { display: grid; gap: 6px; justify-items: start; }
+.lobby-lore-chat-msg.is-user { justify-items: end; }
+.lobby-lore-chat-bubble {
+  max-width: 90%;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-paper);
+  color: var(--ink);
+  font-size: 0.8rem;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+.lobby-lore-chat-msg.is-user .lobby-lore-chat-bubble { background: var(--surface-muted); }
+.lobby-lore-proposal {
+  display: grid;
+  gap: 8px;
+  max-width: 95%;
+  padding: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 9px;
+  background: var(--surface-paper);
+}
+.lobby-lore-proposal-label {
+  color: var(--ember-hover);
+  font-size: 0.62rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.lobby-lore-proposal-text { margin: 0; color: var(--ink-strong); font-size: 0.82rem; line-height: 1.55; white-space: pre-wrap; }
+.lobby-lore-chat-error { color: var(--danger); font-size: 0.75rem; }
+.lobby-lore-chat-composer { display: flex; gap: 8px; }
+.lobby-lore-chat-composer input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--ink);
+  font-size: 0.82rem;
+}
+.lobby-lore-chat-composer input:focus { outline: none; border-color: var(--line-strong); }
+
 .lobby-party-section { margin: 0; padding: 24px 28px; }
 
 .lobby-section-header {
@@ -1853,6 +2268,9 @@ a.automation-list-item:focus-visible {
 }
 
 .lobby-copy-btn, .lobby-generate-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   min-height: 44px;
   padding: 0 15px;
   border: 1px solid var(--line);
@@ -2295,6 +2713,7 @@ a.automation-list-item:focus-visible {
   .lobby-hero { min-height: 410px; grid-row: auto; border-radius: 10px; }
   .lobby-party-section,
   .lobby-invite-section,
+  .lobby-lore-section,
   .lobby-footer { grid-column: 1; }
   .modal-panel { width: calc(100% - 20px); border-radius: 12px; max-height: min(92svh, 760px); }
   .modal-header { min-height: 54px; padding: 12px 16px; }
