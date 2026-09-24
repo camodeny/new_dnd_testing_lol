@@ -46,6 +46,8 @@ export default function CampaignViewPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [mode, setMode] = useState<CampaignMode | null>(null)
+  const [startPending, setStartPending] = useState(false)
+  const [worldPrepared, setWorldPrepared] = useState(false)
 
   const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
   const liveTable = useLiveTableRealtime({
@@ -118,11 +120,12 @@ export default function CampaignViewPage() {
   }, [loadData])
 
   const handleStartSession = useCallback(async () => {
-    if (!id) return
+    if (!id || startPending || worldPrepared) return
+    setError('')
+    setStartPending(true)
     try {
       // Solo start path (#245): seed the production world (lobby -> starting).
-      // The live-table opening arrives with #246; until then the seeded
-      // campaign stays in the lobby/detail view.
+      // Opening the live table is handled separately by #246.
       const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
       if (solo) {
         const key =
@@ -134,6 +137,7 @@ export default function CampaignViewPage() {
           seed: unknown
         }
         setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
+        setWorldPrepared(true)
         return
       }
       const data = await sessionsApi.start(String(id)) as { session: Session }
@@ -141,8 +145,10 @@ export default function CampaignViewPage() {
       setMode('session')
     } catch (err) {
       setError((err as Error).message)
+    } finally {
+      setStartPending(false)
     }
-  }, [id, campaign])
+  }, [id, campaign, startPending, worldPrepared])
 
   const handleSendMessage = useCallback(async (content: string) => {
     if (!id || !session?.id || !activeThreadId) return
@@ -274,18 +280,42 @@ export default function CampaignViewPage() {
               <i className="bi bi-globe2" aria-hidden="true" />
             </div>
             <h2 style={{ margin: '0 0 12px', fontSize: 'clamp(2rem, 4vw, 2.8rem)', letterSpacing: '-0.05em' }}>
-              Light the fire
+              {worldPrepared ? 'World prepared' : 'Light the fire'}
             </h2>
-            <p style={{ color: 'var(--ink-muted)', marginBottom: 24 }}>
-              The AI DM will open a new session and begin your adventure.
-            </p>
-            <button
-              type="button"
-              className="btn btn-primary"
-              onClick={handleStartSession}
-            >
-              <i className="bi bi-fire" aria-hidden="true" /> Begin adventure
-            </button>
+            {error && (
+              <p role="alert" className="error-message" style={{ margin: '0 0 20px' }}>
+                {error}
+              </p>
+            )}
+            {worldPrepared ? (
+              <p role="status" style={{ color: 'var(--ink-muted)', marginBottom: 24 }}>
+                Your world is ready and saved. The live session has not started yet.
+              </p>
+            ) : (
+              <p style={{ color: 'var(--ink-muted)', marginBottom: 24 }}>
+                {isSolo
+                  ? 'The AI DM will prepare your world and starting situation.'
+                  : 'The AI DM will open a new session and begin your adventure.'}
+              </p>
+            )}
+            {worldPrepared ? (
+              <button type="button" className="btn btn-primary" disabled>
+                <i className="bi bi-check2" aria-hidden="true" /> World ready
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleStartSession}
+                disabled={startPending}
+                aria-busy={startPending}
+              >
+                <i className={startPending ? 'bi bi-hourglass-split' : 'bi bi-fire'} aria-hidden="true" />{' '}
+                {startPending
+                  ? (isSolo ? 'Preparing world…' : 'Starting adventure…')
+                  : (isSolo ? 'Prepare world' : 'Begin adventure')}
+              </button>
+            )}
           </div>
         </div>
       </div>
