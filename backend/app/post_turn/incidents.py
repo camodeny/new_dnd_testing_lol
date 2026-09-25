@@ -875,6 +875,7 @@ def verify_post_turn_consistency(
     operation_id: str | None = None,
     dm_internal: bool = True,
     commit: bool = True,
+    durable_session_factory: Any = None,
 ) -> dict[str, Any]:
     """Verify one post-turn range and persist consistency incidents.
 
@@ -885,9 +886,21 @@ def verify_post_turn_consistency(
     deferred incidents. Only a catastrophic verifier failure raises (after
     recording an operational incident), so the range is never silently
     marked complete.
+
+    ``durable_session_factory`` (when supplied) owns incident persistence on
+    an independent transaction while detection keeps reading the caller's
+    flushed-but-uncommitted ``db`` state: the verifier then never commits
+    ``db`` itself, so a blocked range rolls back the caller's consolidation
+    writes while incidents stay durable for repair. The caller owns ``db``'s
+    transaction (commit on success, rollback on ``ConsistencyBlocked``).
+    Without it, ``commit`` controls ``db`` directly (legacy behavior).
     """
     started = time.monotonic()
     campaign_id = campaign_id if isinstance(campaign_id, uuid.UUID) else uuid.UUID(str(campaign_id))
+    durable_db: Session | None = (
+        durable_session_factory() if durable_session_factory is not None else None
+    )
+    store_db = durable_db if durable_db is not None else db
     max_seq = _max_sequence(db, campaign_id)
     events = _load_range_events(db, campaign_id, from_sequence, to_sequence)
     stored: list[PostTurnConsistencyIncident] = []
@@ -906,7 +919,7 @@ def verify_post_turn_consistency(
         deterministic_findings += detect_summary_contradictions(db, campaign_id)
         for finding in deterministic_findings:
             row, _created = _store_incident(
-                db, campaign_id, from_sequence, to_sequence,
+                store_db, campaign_id, from_sequence, to_sequence,
                 incident_type=finding["incident_type"], category=finding["category"],
                 severity=finding["severity"], status="open",
                 detection_path=DETERMINISTIC,
@@ -930,7 +943,7 @@ def verify_post_turn_consistency(
                 # never sent to the judge from a non-DM caller — the pair
                 # stays unresolved instead.
                 row, _c = _store_incident(
-                    db, campaign_id, from_sequence, to_sequence,
+                    store_db, campaign_id, from_sequence, to_sequence,
                     incident_type=SEMANTIC_DEFERRED, category="semantic",
                     severity="standard", status="deferred",
                     detection_path=SEMANTIC,
@@ -947,7 +960,7 @@ def verify_post_turn_consistency(
                 continue
             if decision_service is None:
                 row, _c = _store_incident(
-                    db, campaign_id, from_sequence, to_sequence,
+                    store_db, campaign_id, from_sequence, to_sequence,
                     incident_type=SEMANTIC_DEFERRED, category="semantic",
                     severity="standard", status="deferred",
                     detection_path=SEMANTIC,
@@ -969,7 +982,7 @@ def verify_post_turn_consistency(
             pair_policy = dict(INCIDENT_POLICY)
             if verdict.selected_id == CONTRADICTION:
                 row, _c = _store_incident(
-                    db, campaign_id, from_sequence, to_sequence,
+                    store_db, campaign_id, from_sequence, to_sequence,
                     incident_type=SEMANTIC_CONTRADICTION, category="semantic",
                     severity="standard", status="open",
                     detection_path=SEMANTIC,
@@ -1010,7 +1023,7 @@ def verify_post_turn_consistency(
                     )
             else:
                 row, _c = _store_incident(
-                    db, campaign_id, from_sequence, to_sequence,
+                    store_db, campaign_id, from_sequence, to_sequence,
                     incident_type=SEMANTIC_DEFERRED, category="semantic",
                     severity="standard", status="deferred",
                     detection_path=SEMANTIC,
@@ -1028,7 +1041,7 @@ def verify_post_turn_consistency(
         # Verifier failure is operational/retryable — never a silent complete.
         try:
             row, _c = _store_incident(
-                db, campaign_id, from_sequence, to_sequence,
+                store_db, campaign_id, from_sequence, to_sequence,
                 incident_type=VERIFIER_FAILURE, category="operational",
                 severity="operational", status="verifier_failed",
                 detection_path=OPERATIONAL,
@@ -1042,28 +1055,58 @@ def verify_post_turn_consistency(
         except Exception:
             pass
         try:
-            if commit:
+            if durable_db is not None:
+                # Incidents stay durable for repair; the caller's
+                # transaction is only flushed — its owner rolls back
+                # the failed range's consolidation writes.
+                durable_db.commit()
+                db.flush()
+            elif commit:
                 db.commit()
             else:
                 db.flush()
         except Exception:
             pass
+        finally:
+            if durable_db is not None:
+                durable_db.close()
         logger.warning("post_turn consistency verifier failed campaign=%s range=%s-%s error=%s",
                        campaign_id, from_sequence, to_sequence, exc)
         raise
 
-    if commit:
-        db.commit()
-    else:
+    if durable_db is not None:
+        # Materialize payloads before the durable commit (a caller factory
+        # may expire attributes on commit), then commit incidents on their
+        # own transaction. The caller's session is flush-only: it must not
+        # become durable ahead of the range's atomic checkpoint commit.
+        incidents = [r.to_dict() for r in stored]
+        try:
+            durable_db.commit()
+        except Exception:
+            try:
+                durable_db.rollback()
+            except Exception:
+                pass
+            durable_db.close()
+            logger.warning("post_turn consistency durable commit failed campaign=%s range=%s-%s",
+                           campaign_id, from_sequence, to_sequence)
+            raise
+        durable_db.close()
         db.flush()
-    unresolved = [r for r in stored if r.status in UNRESOLVED_STATUSES]
+    else:
+        if commit:
+            db.commit()
+        else:
+            db.flush()
+        incidents = [r.to_dict() for r in stored]
+    unresolved = [i for i in incidents if i["status"] in UNRESOLVED_STATUSES]
     complete = not unresolved and is_range_complete(
         db, campaign_id, from_sequence, to_sequence)
     structured_log(
         logger, logging.INFO if complete else logging.WARNING,
         "post_turn_consistency_verified",
         campaign_id=str(campaign_id), source_range=[from_sequence, to_sequence],
-        incidents=len(stored), unresolved=len(unresolved), complete=complete,
+        incidents=len(incidents), unresolved=len(unresolved), complete=complete,
         decision_distribution=dict(distribution),
         decision_model=semantic_model,
         detection_latency_ms=_elapsed_ms(),
@@ -1072,7 +1115,7 @@ def verify_post_turn_consistency(
         "complete": complete,
         "from_sequence": from_sequence,
         "to_sequence": to_sequence,
-        "incidents": [r.to_dict() for r in stored],
+        "incidents": incidents,
         "unresolved": len(unresolved),
         "decision_distribution": dict(distribution),
         "decision_model": semantic_model,

@@ -455,3 +455,150 @@ def test_clean_range_completes_with_no_incidents():
         "detection_latency_ms": out["detection_latency_ms"],
     }
     assert is_range_complete(db, c.id, e1.sequence, e2.sequence) is True
+
+
+# ── 16/17. blocked runs: durable incidents, untouched checkpoint ────────────
+
+def test_blocked_run_keeps_incidents_durable_without_advancing_checkpoint():
+    """Reviewer regression (pipeline half): an incident-blocked run leaves
+    the checkpoint put while the incident stays durable for #221 repair,
+    and a retry re-detects idempotently (repeat_count bumps) instead of
+    consuming a partially consolidated range.
+
+    The isolated incident store simulates the independent pooled
+    connection production uses (SQLite shares one connection per engine,
+    so same-DB sessions cannot isolate concurrent transactions).
+    """
+    from app.world import clocks as C
+
+    from app.post_turn.incidents import ConsistencyBlocked
+
+    _F_main, db, c = _setup()
+    eng_iso = create_engine("sqlite://", connect_args={"check_same_thread": False},
+                            poolclass=StaticPool)
+    Base.metadata.create_all(bind=eng_iso)
+    F_iso = sessionmaker(bind=eng_iso, expire_on_commit=False)
+
+    camp = db.get(Campaign, c.id)
+    C.create_clock_authoritative(
+        db, c.id, _rev(db, c), name="Ritual", threshold=5,
+        advancement_criteria={"kind": "deterministic", "event_types": ["game.play"],
+                              "required_count": 10, "max_advance": 3},
+        status="active", progress=0, provenance={"source": "test"})
+    e1 = _commit(db, c)
+    e2 = _commit(db, c)
+    e3 = _commit(db, c)
+    fact, _ = create_fact_inline(
+        db, camp, content="The vault is sealed.", epistemic_state="confirmed",
+        visibility="campaign", source_event_id=e2.id,
+        operation_id="iso-220", idempotency_key="iso-220")
+    db.flush()
+    # Simulate a truth row whose source no longer exists: a deterministic
+    # source_conflict blocks the range.
+    fact.source_event_id = uuid.uuid4()
+    db.commit()
+
+    with pytest.raises(ConsistencyBlocked):
+        run_post_turn_range(db, c.id, 1, e3.sequence,
+                            clock_telemetry_factory=F_iso)
+    assert int(get_checkpoint(db, c.id, commit=False).processed_through_sequence or 0) == 0
+    iso = F_iso()
+    try:
+        rows = iso.execute(select(PostTurnConsistencyIncident).where(
+            PostTurnConsistencyIncident.campaign_id == c.id)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].incident_type == "source_conflict"
+        assert rows[0].status == "open"
+    finally:
+        iso.close()
+
+    # Retry re-detects the same conflict idempotently; the checkpoint is
+    # still put so the range converges after #221 repair.
+    with pytest.raises(ConsistencyBlocked):
+        run_post_turn_range(db, c.id, 1, e3.sequence,
+                            clock_telemetry_factory=F_iso)
+    assert int(get_checkpoint(db, c.id, commit=False).processed_through_sequence or 0) == 0
+    iso = F_iso()
+    try:
+        rows = iso.execute(select(PostTurnConsistencyIncident).where(
+            PostTurnConsistencyIncident.campaign_id == c.id)).scalars().all()
+        assert len(rows) == 1
+        assert int(rows[0].repeat_count or 0) == 2
+    finally:
+        iso.close()
+
+
+def test_verify_with_durable_store_never_commits_caller_session(tmp_path):
+    """Reviewer regression (contract half): with a durable incident store,
+    the verifier never commits the caller's session — even with
+    commit=True — so a blocked range's consolidation writes stay with the
+    worker transaction (rollback wipes them) while incidents persist
+    independently.
+
+    File-backed stores give each session its own connection (SQLite
+    shares one connection per in-memory engine, on which a fresh
+    session would see the other's uncommitted writes).
+    """
+    from models.profiles import Profile
+
+    main_eng = create_engine(f"sqlite:///{tmp_path}/main.db",
+                             connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=main_eng)
+    F_main = sessionmaker(bind=main_eng, expire_on_commit=False)
+    iso_eng = create_engine(f"sqlite:///{tmp_path}/iso.db",
+                            connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=iso_eng)
+    F_iso = sessionmaker(bind=iso_eng, expire_on_commit=False)
+
+    db = F_main()
+    owner = uuid.uuid4()
+    db.add(Profile(id=owner, email="owner@x.com"))
+    db.flush()
+    c = Campaign(owner_id=owner, name="incidents-nocommit-220")
+    db.add(c)
+    db.flush()
+    db.commit()
+    e1 = _commit(db, c)
+    camp = db.get(Campaign, c.id)
+    fact, _ = create_fact_inline(
+        db, camp, content="The vault is sealed.", epistemic_state="confirmed",
+        visibility="campaign", source_event_id=e1.id,
+        operation_id="nocmt-220", idempotency_key="nocmt-220")
+    db.flush()
+    fact.source_event_id = uuid.uuid4()
+    db.commit()
+    # Pending caller write (simulates flushed consolidation state).
+    probe = CampaignSummary(
+        id=uuid.uuid4(), campaign_id=c.id, scope="running",
+        from_sequence=e1.sequence, to_sequence=e1.sequence,
+        source_revision=e1.sequence, status="current", visibility="campaign",
+        prose="probe", claims=[], claim_count=0,
+    )
+    db.add(probe)
+    db.flush()
+
+    out = verify_post_turn_consistency(
+        db, c.id, e1.sequence, e1.sequence,
+        durable_session_factory=F_iso, commit=True,
+    )
+    assert out["complete"] is False
+    assert len(out["incidents"]) == 1
+    # The caller write is still uncommitted: invisible to an independent
+    # connection even though commit=True was passed.
+    fresh = F_main()
+    try:
+        assert fresh.get(CampaignSummary, probe.id) is None
+    finally:
+        fresh.close()
+    # The incident is durable on the independent store regardless.
+    iso = F_iso()
+    try:
+        rows = iso.execute(select(PostTurnConsistencyIncident).where(
+            PostTurnConsistencyIncident.campaign_id == c.id)).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "open"
+    finally:
+        iso.close()
+    # And the caller's rollback still wipes the pending write.
+    db.rollback()
+    db.close()

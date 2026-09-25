@@ -590,15 +590,26 @@ def run_post_turn_range(
             # Custom consolidate_fn callers own their content and opt out.
             from app.post_turn.incidents import ConsistencyBlocked, verify_post_turn_consistency
 
+            from app.observability.service import telemetry_factory_for
+
+            incident_factory = (
+                clock_telemetry_factory
+                if clock_telemetry_factory is not None
+                else telemetry_factory_for(db)
+            )
             consistency = verify_post_turn_consistency(
                 db, campaign_id, effective_from, to_sequence,
                 decision_service=clock_decision_service,
                 session_factory=clock_telemetry_factory,
                 operation_id=operation_id,
-                # Commit here: the ConsistencyBlocked raise below fails the
-                # run (whose handler rolls back pending state), and the
-                # incidents must stay durable for #221 repair regardless.
-                commit=True,
+                # Incidents persist on an independent transaction: the
+                # ConsistencyBlocked raise below fails the run (whose
+                # handler rolls back this range's materialization/clock
+                # writes), while incidents stay durable for #221 repair.
+                # The worker session is flush-only here; the checkpoint
+                # commit below persists a successful range atomically.
+                durable_session_factory=incident_factory,
+                commit=False,
             )
             patch["consistency"] = {
                 "complete": consistency["complete"],
