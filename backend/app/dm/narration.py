@@ -2,7 +2,9 @@
 
 Narration is a projection of adjudication, never an independent truth source.
 The narrator receives ONLY the deterministic allowlisted projection of an
-already-validated ``dm_turn_contract_v1`` (never broad hidden context) and is
+already-validated ``dm_turn_contract_v1`` (never broad hidden context) plus
+the recent visible conversation for coherence (accepted submissions and
+completed narrations the player already saw — never private lanes), and is
 not trusted to self-censor secrets it never needed.
 
 Pipeline (critical path optimized for TTFT after validation):
@@ -102,6 +104,18 @@ ORDER — mixed discussion and action in one turn:
    table_chat_intent), then beats, then any roll prompt, with
    open_player_choice last. The player asked before acting; answer before
    resolving.
+
+RECENT CONVERSATION — coherence context, never a source of truth:
+10. A trailing RECENT CONVERSATION section holds the last few visible chat
+    messages (oldest first), ending with the player input this turn answers.
+    Expand the structured beats above as your direct response IN that
+    conversation: do not re-greet, do not repeat what was already said, and
+    address the speaker as their character. The beats remain the sole
+    source of truth for new developments.
+11. Names, places, numbers, and quoted speech already present in the recent
+    conversation may be reused for coherence (rule 5 notwithstanding);
+    never introduce ones from history that the beats do not state, and
+    never assert new consequences from history.
 """
 
 PROVIDER_DETERMINISTIC = "deterministic-template-v1"
@@ -242,13 +256,184 @@ def serialize_narration_projection(projection: dict[str, Any]) -> str:
     return json.dumps(projection, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
-def build_narrator_prompt(projection: dict[str, Any]) -> str:
-    """Assemble the full narrator prompt: contract + projection.
+def build_narrator_prompt(
+    projection: dict[str, Any],
+    history: list[dict[str, str]] | None = None,
+) -> str:
+    """Assemble the full narrator prompt: contract + projection + history.
 
     The contract is always prepended so provider-backed narrators inherit
-    the no-readjudication / no-invention obligations.
+    the no-readjudication / no-invention obligations. ``history`` is the
+    recent visible conversation from :func:`build_recent_conversation`
+    (coherence only — the beats stay the sole source of truth).
     """
-    return NARRATOR_CONTRACT + "\nSTRUCTURED TURN (sole source of truth):\n" + serialize_narration_projection(projection)
+    prompt = (
+        NARRATOR_CONTRACT
+        + "\nSTRUCTURED TURN (sole source of truth):\n"
+        + serialize_narration_projection(projection)
+    )
+    rendered = format_recent_conversation(history or [])
+    if rendered:
+        prompt += "\n" + rendered
+    return prompt
+
+
+# ── Recent conversation history (narrator coherence) ─────────────────────────
+#
+# The narrator/expander used to see only the current turn's beats, so it
+# re-greeted and repeated itself whenever the beats restated an opening.
+# It now receives the last few visible chat messages for conversational
+# coherence. This is strictly audience-visible material (accepted/resolved
+# submissions + completed narrations in the same thread/audience — the
+# same chat the player sees), never private lanes: failed streams stay
+# excluded (failed-visible audit is never promoted to history) and the
+# campaign-start system opener is not conversation.
+
+#: Visible messages supplied to the narrator for coherence.
+RECENT_HISTORY_MESSAGE_LIMIT = 8
+
+#: Per-message cap so one long submission cannot dominate the prompt.
+RECENT_HISTORY_CHARS_PER_MESSAGE = 1500
+
+
+def build_recent_conversation(
+    db: Session,
+    *,
+    campaign_id: Any,
+    thread_id: Any,
+    audience: str = "campaign",
+    limit: int = RECENT_HISTORY_MESSAGE_LIMIT,
+) -> list[dict[str, str]]:
+    """Return the last ``limit`` visible chat messages, oldest first.
+
+    Each entry is ``{"speaker": ..., "role": "player"|"dm", "text": ...}``.
+    Player entries carry the raw message verbatim (OOC table talk included —
+    the narrator needs the literal question a table-chat turn answers);
+    speaker is the character name when the submission links one, else the
+    author's username. Pure read — safe to run before any persistence.
+    """
+    from sqlalchemy import or_ as _or
+    from sqlalchemy import select as _select
+
+    from models.characters import Character as _Character
+    from models.dm import DMStream as _DMStream
+    from models.profiles import Profile as _Profile
+    from models.threads import PlayerSubmission as _PlayerSubmission
+
+    from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
+
+    try:
+        thread_uuid = thread_id if isinstance(thread_id, uuid.UUID) else uuid.UUID(str(thread_id))
+    except (ValueError, TypeError, AttributeError):
+        thread_uuid = None
+    thread_str = str(thread_id)
+
+    submissions = list(
+        db.scalars(
+            _select(_PlayerSubmission)
+            .where(
+                _PlayerSubmission.campaign_id == campaign_id,
+                _PlayerSubmission.thread_id == thread_str,
+                _PlayerSubmission.audience == audience,
+                _PlayerSubmission.resolution_status.in_(["accepted", "resolved"]),
+                _or(
+                    _PlayerSubmission.source != _OPENING_SOURCE,
+                    _PlayerSubmission.source.is_(None),
+                ),
+            )
+            .order_by(_PlayerSubmission.sequence.desc())
+            .limit(limit * 4)
+        ).all()
+    )
+    streams: list = []
+    if thread_uuid is not None:
+        streams = list(
+            db.scalars(
+                _select(_DMStream)
+                .where(
+                    _DMStream.campaign_id == campaign_id,
+                    _DMStream.thread_id == thread_uuid,
+                    _DMStream.audience == audience,
+                    _DMStream.status == "completed",
+                    _DMStream.final_text.is_not(None),
+                )
+                .order_by(_DMStream.completed_at.desc().nulls_last(), _DMStream.created_at.desc())
+                .limit(limit * 4)
+            ).all()
+        )
+
+    character_ids = {s.character_id for s in submissions if s.character_id}
+    characters = (
+        {c.id: c for c in db.scalars(
+            _select(_Character).where(_Character.id.in_(character_ids))
+        ).all()}
+        if character_ids
+        else {}
+    )
+    user_ids = {s.user_id for s in submissions if s.user_id}
+    profiles = (
+        {p.id: p for p in db.scalars(
+            _select(_Profile).where(_Profile.id.in_(user_ids))
+        ).all()}
+        if user_ids
+        else {}
+    )
+
+    def _player_speaker(submission) -> str:
+        if submission.character_id and submission.character_id in characters:
+            name = (characters[submission.character_id].name or "").strip()
+            if name:
+                return name
+        profile = profiles.get(submission.user_id)
+        if profile is not None:
+            username = (profile.username or "").strip()
+            if username:
+                return username
+            if profile.email and "@" in profile.email:
+                return profile.email.split("@")[0]
+        return "Player"
+
+    merged: list[tuple[Any, str, dict[str, str]]] = []
+    for submission in submissions:
+        text = (submission.raw_content or "").strip()
+        if not text:
+            continue
+        when = submission.accepted_at
+        merged.append((when, f"sub:{submission.id}", {
+            "speaker": _player_speaker(submission),
+            "role": "player",
+            "text": text[:RECENT_HISTORY_CHARS_PER_MESSAGE],
+        }))
+    for stream in streams:
+        text = (stream.final_text or "").strip()
+        if not text:
+            continue
+        when = stream.completed_at or stream.created_at
+        merged.append((when, f"dm:{stream.id}", {
+            "speaker": "Dungeon Master",
+            "role": "dm",
+            "text": text[:RECENT_HISTORY_CHARS_PER_MESSAGE],
+        }))
+    merged.sort(key=lambda item: (
+        item[0].isoformat() if item[0] is not None else "",
+        item[1],
+    ))
+    return [entry for _, _, entry in merged[-limit:]] if limit > 0 else []
+
+
+def format_recent_conversation(history: list[dict[str, str]]) -> str:
+    """Render history entries as the narrator prompt's trailing section."""
+    lines = [
+        f"{entry.get('speaker', 'Player')}: {entry.get('text', '')}".strip()
+        for entry in history or []
+    ]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    return (
+        "RECENT CONVERSATION (last visible messages, oldest first — "
+        "coherence only, not a source of new developments):\n" + "\n".join(lines)
+    )
 
 
 # ── 2. Deterministic template narrator (no provider) ──────────────────────────
@@ -315,10 +500,10 @@ class NarratorRequest:
     """Typed provider input — contract-bound narration request.
 
     The service always builds ``prompt`` via :func:`build_narrator_prompt`
-    (``NARRATOR_CONTRACT`` + canonical projection), so a model-backed
-    provider cannot receive narration input without the no-readjudication /
-    no-invention obligations. ``projection`` is included structured for
-    providers that prefer JSON over prompt text.
+    (``NARRATOR_CONTRACT`` + canonical projection + recent conversation),
+    so a model-backed provider cannot receive narration input without the
+    no-readjudication / no-invention obligations. ``projection`` is included
+    structured for providers that prefer JSON over prompt text.
     """
 
     prompt: str
@@ -470,12 +655,19 @@ def validate_narration_fidelity(
     *,
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Check narration against the structured result; return violations.
 
     Categories: ``secret_leakage``, ``unsupported_addition``,
     ``agency_violation``, ``contradiction``, ``internal_jargon``. Empty
     list means pass. Pure function — safe to run before any persistence.
+
+    ``history`` is the recent visible conversation from
+    :func:`build_recent_conversation`. Numbers and quoted speech already
+    present there are established (the player saw them), so reusing them
+    for coherence is grounded, not invented. New consequences asserted
+    from history stay violations — only the beats may develop the world.
     """
     violations: list[dict[str, Any]] = []
     text = narration or ""
@@ -520,10 +712,18 @@ def validate_narration_fidelity(
     # — Unsupported additions: numbers / consequences / invented speech —
     # Number grounding comes from the ENTIRE audience-safe projection (all
     # public fields: beat claims, roll_request.reason_public/label,
-    # open_player_choice, clarify_question, safe_prelude, table_chat_intent),
-    # never from intentionally-private lanes. A legitimate number the
+    # open_player_choice, clarify_question, safe_prelude, table-chat
+    # intent) plus established history text (the player already saw those
+    # numbers — reusing them is coherence, not invention), never from
+    # intentionally-private lanes. A legitimate number the
     # deterministic renderer emits from any public field must not be
     # rejected as unsupported.
+    history_blob = "\n".join(
+        str(entry.get("text") or "") for entry in history or []
+    )
+    history_numbers = set(re.findall(r"\d+", history_blob))
+    history_texts = [_norm(entry.get("text") or "") for entry in history or []]
+    history_texts = [text for text in history_texts if text]
     narration_numbers = set(re.findall(r"\d+", text))
     claim_numbers = set(re.findall(r"\d+", claim_blob))
     try:
@@ -533,7 +733,7 @@ def validate_narration_fidelity(
         projection_numbers = set(re.findall(r"\d+", allowed_blob))
     except Exception:
         projection_numbers = set()
-    grounded_numbers = claim_numbers | projection_numbers
+    grounded_numbers = claim_numbers | projection_numbers | history_numbers
     for num in sorted(narration_numbers - grounded_numbers):
         violations.append({
             "category": "unsupported_addition", "code": "unsupported_number",
@@ -550,6 +750,11 @@ def validate_narration_fidelity(
     for match in _SPEECH_ATTRIBUTION_RE.finditer(text):
         quoted = _norm(match.group(3))
         if quoted and not any(quoted in ct or ct in quoted for ct in claim_texts if ct):
+            # Verbatim recent history is quotable (answering the player's
+            # literal question, recalling an NPC line) — inventing new
+            # quoted speech is not.
+            if any(quoted in ht or ht in quoted for ht in history_texts):
+                continue
             violations.append({
                 "category": "unsupported_addition", "code": "invented_dialogue",
                 "message": f"Narration invents dialogue not in structured beats: {match.group(3)[:60]!r}",
@@ -647,6 +852,7 @@ def build_narration_judge_evidence(
     pc_names: dict[str, str] | None = None,
     evidence_revision: str = "",
     knowledge_restricted_texts: set[str] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> Any:
     """Assemble code-owned judge evidence from a narration + contract.
 
@@ -695,6 +901,13 @@ def build_narration_judge_evidence(
             value = projection.get(key)
             if isinstance(value, str) and value.strip():
                 public_claims.append(value.strip())
+        # Recent visible history grounds coherence references (names,
+        # numbers, recalled lines the player already saw) so the
+        # unsupported-addition question never flags legitimate continuity.
+        for entry in history or []:
+            text = entry.get("text") if isinstance(entry, dict) else None
+            if isinstance(text, str) and text.strip():
+                public_claims.append(text.strip())
     else:  # projection unavailable: fall back to direct contract fields
         for beat in contract.beats:
             if getattr(beat, "speaker_public_name", None):
@@ -757,6 +970,7 @@ def shadow_judge_narration(
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
     knowledge_restricted_texts: set[str] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> Any | None:
     """Run semantic judges in shadow mode over one full narration candidate.
 
@@ -778,6 +992,7 @@ def shadow_judge_narration(
             pc_names=pc_names,
             evidence_revision=str(trace_id or ""),
             knowledge_restricted_texts=knowledge_restricted_texts,
+            history=history,
         )
         violations = list(deterministic_violations or [])
         return shadow_judge(
@@ -807,9 +1022,11 @@ def check_narration_fidelity_or_raise(
     campaign_id: Any | None = None,
     turn_id: Any | None = None,
     knowledge_restricted_texts: set[str] | None = None,
+    history: list[dict[str, str]] | None = None,
 ) -> None:
     violations = validate_narration_fidelity(
-        narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
+        narration, contract, extra_secrets=extra_secrets, pc_names=pc_names,
+        history=history,
     )
     # Shadow-first semantic judgment (issue #384): calibration only, never
     # gates. Deterministic failures stay final below.
@@ -1040,9 +1257,23 @@ def stream_narration(
     proj_bytes = projection_size_bytes(projection)
     _metrics["projection_bytes_samples"].append(proj_bytes)
 
+    # Recent visible conversation for narrator coherence (fail-soft: a
+    # history-query failure must never break narration — the beats alone
+    # still narrate, just with less continuity).
+    try:
+        history = build_recent_conversation(
+            db, campaign_id=campaign_id, thread_id=thread_id, audience=audience,
+        )
+    except Exception as exc:
+        logger.warning(
+            "narration history unavailable campaign_id=%s thread_id=%s error=%s",
+            campaign_id, thread_id, exc,
+        )
+        history = []
+
     # — Contract-bound provider request (built once, always carries the contract) —
     request = NarratorRequest(
-        prompt=build_narrator_prompt(projection),
+        prompt=build_narrator_prompt(projection, history),
         projection=projection,
     )
     # Visibility probe for failover-capable narrators: durable persisted
@@ -1270,7 +1501,8 @@ def stream_narration(
 
         # — Authoritative full-output validation at completion —
         violations = validate_narration_fidelity(
-            narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names
+            narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names,
+            history=history,
         )
         # Shadow-first semantic judgment (#384): full-candidate checkpoint
         # only — never per delta, so TTFT/buffering policy holds. Verdict is
@@ -1287,6 +1519,7 @@ def stream_narration(
             campaign_id=campaign_id,
             turn_id=turn_id,
             knowledge_restricted_texts=knowledge_restricted_texts,
+            history=history,
         )
         if violations:
             _tally_fidelity_violations(violations)
@@ -1729,13 +1962,17 @@ def continue_partial_stream(
     return result
 
 
-def build_continuation_prompt(projection: dict[str, Any], visible_prefix: str) -> str:
+def build_continuation_prompt(
+    projection: dict[str, Any],
+    visible_prefix: str,
+    history: list[dict[str, str]] | None = None,
+) -> str:
     """Build a regeneration prompt constrained to continue the prefix.
 
     The persisted prefix is quoted verbatim with an instruction to continue
     exactly from it without contradicting or restating it differently.
     """
-    base = build_narrator_prompt(projection)
+    base = build_narrator_prompt(projection, history)
     return (
         base + "\nALREADY VISIBLE (do not rewrite, contradict, or restate):\n"
         + (visible_prefix or "")[:4000]

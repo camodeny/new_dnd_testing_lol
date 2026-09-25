@@ -21,15 +21,18 @@ from models.threads import CampaignThread  # noqa: E402
 from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
 from app.dm.narration import (  # noqa: E402
     NARRATOR_CONTRACT,
+    RECENT_HISTORY_MESSAGE_LIMIT,
     NarratorGenerationError,
     NarratorRequest,
     NarrationFidelityError,
     NarrationStreamError,
     build_narration_projection,
     build_narrator_prompt,
+    build_recent_conversation,
     check_narration_fidelity_or_raise,
     chunk_narration_text,
     execute_validated_turn,
+    format_recent_conversation,
     get_narration_metrics,
     materialize_final_narration,
     render_deterministic_narration,
@@ -1098,3 +1101,154 @@ def test_narrator_contract_briefs_table_chat():
 def test_adjudication_prompt_sequences_mixed_turns():
     from app.dm.adjudication import FORWARD_DM_SYSTEM
     assert "MIXED DISCUSSION + ACTION" in FORWARD_DM_SYSTEM
+
+
+# ── recent conversation history (narrator coherence) ──────────────────────────
+
+def _history_seed(db):
+    """Two submissions + two completed streams interleaved across t0..t3,
+    plus rows that must stay excluded: the campaign-start opener, a failed
+    stream, a streaming stream, a private-audience stream, and an
+    other-thread submission."""
+    from datetime import datetime, timedelta, timezone
+
+    from models.characters import Character
+    from models.threads import PlayerSubmission
+
+    from app.runtime.submissions import accept_submission
+
+    s, camp_id, thread_id = db
+    owner = s.execute(select(Profile)).scalars().first()
+    bryn = Character(id=uuid.uuid4(), owner_id=owner.id, system="dnd5e", name="Bryn")
+    s.add(bryn)
+    s.flush()
+    # One campaign thread per campaign: the other-thread exclusion row lives
+    # in a second campaign.
+    other_camp_id = uuid.uuid4()
+    other_thread_id = uuid.uuid4()
+    s.add(Campaign(id=other_camp_id, owner_id=owner.id, name="Elsewhere", revision=0))
+    s.add(CampaignThread(
+        id=other_thread_id, campaign_id=other_camp_id, thread_type="campaign",
+        created_by=owner.id,
+    ))
+    s.flush()
+
+    base = datetime(2026, 9, 25, 20, 0, tzinfo=timezone.utc)
+    accept_submission(
+        s, campaign_id=camp_id, user_id=owner.id, character_id=bryn.id,
+        raw_content="I draw my blade.", segments=[{"type": "ic", "text": "I draw my blade."}],
+        thread_id=str(thread_id), source="campaign-start-246",
+    )
+    sub1 = accept_submission(
+        s, campaign_id=camp_id, user_id=owner.id, character_id=bryn.id,
+        raw_content="I draw my blade.", segments=[{"type": "ic", "text": "I draw my blade."}],
+        thread_id=str(thread_id),
+    )
+    sub2 = accept_submission(
+        s, campaign_id=camp_id, user_id=owner.id,
+        raw_content="Which way?", segments=[{"type": "ooc", "text": "Which way?"}],
+        thread_id=str(thread_id),
+    )
+    accept_submission(
+        s, campaign_id=other_camp_id, user_id=owner.id,
+        raw_content="Elsewhere talk.", segments=[{"type": "ooc", "text": "Elsewhere talk."}],
+        thread_id=str(other_thread_id),
+    )
+    s.flush()
+    for sub, at in ((sub1, base), (sub2, base + timedelta(minutes=2))):
+        row = s.get(PlayerSubmission, sub.id)
+        row.accepted_at = at
+    streams = []
+    for turn, attempt, status, audience, text, at in (
+        ("t1", "a1", "completed", "campaign", "The fog thickens.", base + timedelta(minutes=1)),
+        ("t3", "a3", "completed", "campaign", "A lantern gutters.", base + timedelta(minutes=3)),
+        ("tf", "af", "failed", "campaign", "Failed draft.", base + timedelta(minutes=4)),
+        ("ts", "as_", "streaming", "campaign", "Partial draft.", base + timedelta(minutes=5)),
+        ("tp", "ap", "completed", "private", "Private aside.", base + timedelta(minutes=6)),
+    ):
+        stream = DMStream(
+            campaign_id=camp_id, thread_id=thread_id, turn_id=turn, attempt_id=attempt,
+            status=status, audience=audience, final_text=text, completed_at=at,
+        )
+        s.add(stream)
+        streams.append(stream)
+    s.commit()
+    return s, camp_id, thread_id
+
+
+def test_recent_conversation_returns_visible_chat_oldest_first(db):
+    s, camp_id, thread_id = _history_seed(db)
+    history = build_recent_conversation(s, campaign_id=camp_id, thread_id=thread_id)
+    assert [(h["speaker"], h["role"]) for h in history] == [
+        ("Bryn", "player"),
+        ("Dungeon Master", "dm"),
+        ("owner", "player"),
+        ("Dungeon Master", "dm"),
+    ]
+    assert history[0]["text"] == "I draw my blade."
+    assert history[1]["text"] == "The fog thickens."
+    assert history[2]["text"] == "Which way?"
+    assert history[3]["text"] == "A lantern gutters."
+
+
+def test_recent_conversation_respects_limit(db):
+    s, camp_id, thread_id = _history_seed(db)
+    history = build_recent_conversation(s, campaign_id=camp_id, thread_id=thread_id, limit=2)
+    assert [h["text"] for h in history] == ["Which way?", "A lantern gutters."]
+    assert RECENT_HISTORY_MESSAGE_LIMIT == 8
+
+
+def test_recent_conversation_empty_without_visible_chat(db):
+    s, camp_id, thread_id = db
+    assert build_recent_conversation(s, campaign_id=camp_id, thread_id=thread_id) == []
+    assert format_recent_conversation([]) == ""
+
+
+def test_narrator_prompt_appends_history_block():
+    c = _respond([_narr_beat("The vault door stands shut.")])
+    projection = build_narration_projection(c)
+    # The contract names the concept, but no history block renders without entries.
+    assert "Bryn: I have 3 torches." not in build_narrator_prompt(projection)
+    history = [
+        {"speaker": "Bryn", "role": "player", "text": "I have 3 torches."},
+        {"speaker": "Dungeon Master", "role": "dm", "text": "Welcome, Bryn."},
+    ]
+    prompt = build_narrator_prompt(projection, history)
+    assert "RECENT CONVERSATION (last visible messages" in prompt
+    assert "Bryn: I have 3 torches." in prompt
+    assert "Dungeon Master: Welcome, Bryn." in prompt
+    assert "do not re-greet" in prompt
+
+
+def test_fidelity_grounds_history_numbers_and_quotes():
+    c = _respond([_narr_beat("The vault door stands shut.")])
+    history = [{"speaker": "Bryn", "role": "player", "text": "I have 3 torches and I shout."}]
+    good = 'The vault door stands shut. You count 3 torches. Bryn shouts "I have 3 torches" into the dark.'
+    assert validate_narration_fidelity(good, c, history=history) == []
+
+
+def test_fidelity_still_rejects_novel_numbers_and_quotes():
+    c = _respond([_narr_beat("The vault door stands shut.")])
+    history = [{"speaker": "Bryn", "role": "player", "text": "I have 3 torches."}]
+    bad_number = "The vault door stands shut. It takes 7 damage."
+    assert any(
+        v["code"] == "unsupported_number"
+        for v in validate_narration_fidelity(bad_number, c, history=history)
+    )
+    bad_quote = 'The vault door stands shut. Bryn shouts "open sesame" loudly.'
+    assert any(
+        v["code"] == "invented_dialogue"
+        for v in validate_narration_fidelity(bad_quote, c, history=history)
+    )
+
+
+def test_stream_narration_builds_history_on_template_path(db):
+    s, camp_id, thread_id = _history_seed(db)
+    c = _respond([_narr_beat("The vault door stands shut.")])
+    result = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id,
+        turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+        contract=c, narrator=None, publish_realtime=False,
+    )
+    assert result.completed is True
+    assert "vault door stands shut" in (result.final_text or "")
