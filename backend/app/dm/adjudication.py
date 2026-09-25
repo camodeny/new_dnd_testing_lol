@@ -317,6 +317,7 @@ def adjudicate_with_failover(
                 json_schema=contract_json_schema_strict(),
                 json_schema_name="dm_turn_contract_v1",
                 timeout_seconds=timeout_seconds, temperature=0,
+                reasoning_effort=FORWARD_DM_REASONING_EFFORT,
             )
             structured_log(
                 logger, logging.INFO, "forward_dm_provider_start",

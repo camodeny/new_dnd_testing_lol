@@ -180,6 +180,41 @@ def _load_packet(s, attempt_id):
     return _assemble_production_context(s, attempt_id)
 
 
+def test_failover_path_requests_low_reasoning_effort(db, monkeypatch):
+    """Policy-path adjudication carries the low-effort cap (not just the seam)."""
+    import json
+
+    import app.dm.adjudication as adj
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    packet = _load_packet(s, attempt.id)
+
+    contract_json = json.dumps(_contract().model_dump(mode="json"))
+    seen = []
+
+    def _fake_execute(adapter, request):
+        seen.append(request)
+        return _ok_response(contract_json)
+
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    from app.providers import registry as reg
+
+    monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
+    import app.providers as providers_pkg
+
+    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+
+    contract, _ = adj.adjudicate_with_failover(packet, db=None, role="forward_dm")
+    assert contract.mode == "respond"
+    assert seen and all(r.reasoning_effort == adj.FORWARD_DM_REASONING_EFFORT == "low"
+                        for r in seen)
+
+
 # ── Narration-only survival + independent retry ───────────────────────────────
 
 def test_narration_only_failure_preserves_contract_and_retries_independently(db):
