@@ -1,7 +1,7 @@
 """Contested secret actions against other PCs (issue #249).
 
 Revision ID: s249contest01
-Revises: s246start01
+Revises: s220inc01
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "s249contest01"
-down_revision: Union[str, Sequence[str], None] = "s246start01"
+down_revision: Union[str, Sequence[str], None] = "s220inc01"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
