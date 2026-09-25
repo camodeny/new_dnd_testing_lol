@@ -115,6 +115,7 @@ describe('exported API surface', () => {
     ])
     expect(Object.keys(api.auth).sort()).toEqual(['getConfig', 'me'])
     expect(Object.keys(api.campaigns).sort()).toEqual([
+      'campaignStart',
       'create',
       'delete',
       'get',

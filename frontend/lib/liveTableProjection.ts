@@ -20,7 +20,11 @@ export function projectLiveTableMessages({
   currentUser,
   sessionId = '',
 }: ProjectionOptions): Message[] {
-  const players = submissions.map((event): Message => {
+  // System-originated submissions (e.g. the #246 campaign-start opener) are
+  // DM instructions, not player speech — never render them as chat.
+  const players = submissions
+    .filter((event) => (event.source ?? null) !== 'campaign-start-246')
+    .map((event): Message => {
     const character = characters.find((candidate) => String(candidate.id) === String(event.character_id ?? ''))
     const isCurrentUser = currentUser && String(event.user_id ?? '') === String(currentUser.id)
     const segments = Array.isArray(event.segments) ? event.segments : []

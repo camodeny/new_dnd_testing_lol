@@ -1029,3 +1029,72 @@ def test_restarted_worker_finds_streaming_locked_never_prepared_chunked(db):
     s.commit()
     with pytest.raises(StreamBoundaryError):
         coordinate_turn(s, camp_id, str(thread_id))
+
+
+# ── table talk is first-class: no-beat modes, jargon guard, mixed order ────
+
+def _table_chat(**over):
+    payload = {
+        "contract_version": CONTRACT_VERSION, "mode": "table_chat",
+        "reason": "ooc chat", "beats": [],
+        "table_chat_intent": "Welcome back to the table.",
+    }
+    payload.update(over)
+    return normalize_contract(payload)
+
+
+def test_observed_jargon_sentence_rejected():
+    c = _table_chat(table_chat_intent="Greet the player warmly.")
+    bad = "No narration is available: the structured turn contains no beats."
+    violations = validate_narration_fidelity(bad, c)
+    assert any(v["code"] == "internal_system_jargon" for v in violations)
+    with pytest.raises(NarrationFidelityError) as ei:
+        check_narration_fidelity_or_raise(bad, c)
+    assert any(v["category"] == "internal_jargon" for v in ei.value.violations)
+
+
+def test_jargon_guard_ignores_fiction():
+    c = _respond([_narr_beat("His heart beats on as the drums beat.")])
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert validate_narration_fidelity(text, c) == []
+
+
+def test_jargon_guard_incremental_fails_fast():
+    from app.dm.narration import validate_narration_incremental
+    c = _table_chat()
+    violations = validate_narration_incremental("The structured turn says hi.", c)
+    assert any(v["category"] == "internal_jargon" for v in violations)
+
+
+def test_mixed_clarify_renders_before_beats():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "respond",
+        "reason": "mixed question and action",
+        "beats": [_narr_beat("Borin strides toward the shuttered stall.")],
+        "clarify_question": "The watcher noticed you — still approach?",
+    })
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert validate_narration_fidelity(text, c) == []
+    assert text.index("still approach?") < text.index("shuttered stall")
+
+
+def test_mixed_table_chat_intent_renders_before_beats():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "respond",
+        "reason": "mixed chat and action",
+        "beats": [_narr_beat("Borin strides toward the shuttered stall.")],
+        "table_chat_intent": "Good question — the debt was settled years ago.",
+    })
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert validate_narration_fidelity(text, c) == []
+    assert text.index("settled years ago") < text.index("shuttered stall")
+
+
+def test_narrator_contract_briefs_table_chat():
+    assert "table_chat_intent IS your brief" in NARRATOR_CONTRACT
+    assert "never comment on their absence" in NARRATOR_CONTRACT
+
+
+def test_adjudication_prompt_sequences_mixed_turns():
+    from app.dm.adjudication import FORWARD_DM_SYSTEM
+    assert "MIXED DISCUSSION + ACTION" in FORWARD_DM_SYSTEM

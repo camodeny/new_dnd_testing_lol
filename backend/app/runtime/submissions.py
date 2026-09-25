@@ -111,6 +111,7 @@ def accept_submission(
     character_id: uuid.UUID | None = None,
     thread_id: str = "main",
     audience: str = "campaign",
+    source: str | None = None,
 ) -> PlayerSubmission:
     started = time.monotonic()
     # The campaign lock serializes sequence allocation without treating acceptance
@@ -153,6 +154,7 @@ def accept_submission(
             audience=audience,
             sequence=prior + 1,
             raw_content=raw_content,
+            source=source,
             resolution_status="accepted",
         )
         try:

@@ -1,9 +1,10 @@
 """Runtime transport — live-table submissions, threads, and session stubs."""
 
 import logging
+import os
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign
@@ -45,6 +46,7 @@ def create_player_submission(
     payload: dict,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
 ):
     profile = resolve_profile(request, db)
@@ -301,22 +303,20 @@ def create_player_submission(
         )
     # Immediate execution is scoped to this submission's coordinated attempt.
     # Direct player conversations have no DM attempt and never trigger DM work.
-    try:
-        import os
+    # Local-dev pump (DM_INLINE_EXECUTE): schedule post-response execution in
+    # this process instead of blocking the request on it. A blocking inline
+    # run holds the HTTP request for the full multi-model pipeline (60s+),
+    # which proxies kill (~30s) with a 500 the backend never sees — while
+    # the turn still succeeds server-side. BackgroundTasks returns 201 in
+    # milliseconds; the client polls the turn to completion. Prod leaves
+    # execution to the cron sweep/workers.
+    attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
+    if (attempt_data and attempt_data.get("id")
+            and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+        from app.dm.recovery import execute_committed_attempt
 
-        attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
-        if (attempt_data and attempt_data.get("id")
-                and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
-            from database import SessionLocal
-            from app.dm.execution import execute_dm_attempt
-
-            if SessionLocal is not None:
-                with SessionLocal() as execution_db:
-                    execute_dm_attempt(execution_db, uuid.UUID(str(attempt_data["id"])))
-    except Exception as exc:
-        logger.warning(
-            "dm inline execute guard failed campaign_id=%s error=%s",
-            campaign.id, exc,
+        background_tasks.add_task(
+            execute_committed_attempt, str(attempt_data["id"])
         )
     return result
 

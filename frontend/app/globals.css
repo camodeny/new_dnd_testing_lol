@@ -2499,19 +2499,19 @@ a.automation-list-item:focus-visible {
 /* ── Campaign dashboard (full-screen session) ────────────────────────── */
 
 .dashboard-page {
-  --bg-dark: #0f1415;
-  --bg-panel: #151b1c;
-  --bg-panel-elevated: #1a2021;
-  --bg-input: #1d2425;
-  --border-color: rgba(238, 228, 212, 0.11);
-  --border-color-hover: rgba(238, 228, 212, 0.2);
-  --text-main: #c9c7bf;
-  --text-muted: #8e928d;
-  --text-dim: #888c87;
-  --text-bright: #f3ecdf;
-  --color-primary: #d16b48;
-  --color-primary-hover: #e27a56;
-  --color-primary-glow: rgba(209, 107, 72, 0.16);
+  --bg-dark: var(--surface-canvas);
+  --bg-panel: var(--surface-paper);
+  --bg-panel-elevated: var(--surface-raised);
+  --bg-input: var(--surface-raised);
+  --border-color: var(--line);
+  --border-color-hover: var(--line-strong);
+  --text-main: var(--ink);
+  --text-muted: var(--ink-muted);
+  --text-dim: var(--ink-faint);
+  --text-bright: var(--ink-strong);
+  --color-primary: var(--ember);
+  --color-primary-hover: var(--ember-hover);
+  --color-primary-glow: rgba(200, 95, 61, 0.2);
   position: relative;
   height: 100svh;
   overflow: hidden;
@@ -2522,7 +2522,7 @@ a.automation-list-item:focus-visible {
 .dashboard-layout {
   display: grid;
   height: 100svh;
-  grid-template-columns: 264px minmax(0, 1fr) 310px;
+  grid-template-columns: 264px minmax(0, 1fr);
   overflow: hidden;
   background: var(--bg-dark);
 }
@@ -2533,7 +2533,7 @@ a.automation-list-item:focus-visible {
   overflow: auto;
   background: var(--bg-panel) !important;
   color: var(--text-main);
-  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  scrollbar-color: var(--line-strong) transparent;
 }
 
 .dashboard-left {
@@ -2550,22 +2550,29 @@ a.automation-list-item:focus-visible {
 
 .dashboard-center {
   min-width: 0;
-  background: var(--bg-dark) !important;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-panel) !important;
 }
 
 .dashboard-top-header {
   min-height: 64px;
   padding: 0 20px;
   border-bottom: 1px solid var(--border-color);
-  background: rgba(21, 27, 28, 0.94);
+  background: rgba(248, 245, 238, 0.94);
   backdrop-filter: blur(12px);
 }
 
 .session-messages {
-  background:
-    radial-gradient(circle at 50% -20%, rgba(209, 107, 72, 0.045), transparent 30rem),
-    var(--bg-dark);
+  min-height: 0;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  background: var(--bg-panel);
 }
+
+.session-messages::-webkit-scrollbar { display: none; }
 
 .session-msg {
   padding: 14px 20px !important;
@@ -2573,8 +2580,12 @@ a.automation-list-item:focus-visible {
   background: transparent !important;
 }
 
+.session-panel {
+  min-height: 0;
+}
+
 .session-msg + .session-msg {
-  border-top: 1px solid rgba(238, 228, 212, 0.055) !important;
+  border-top: 1px solid var(--line) !important;
 }
 
 .session-input-area {
@@ -2585,19 +2596,32 @@ a.automation-list-item:focus-visible {
 }
 
 .session-input-shell {
-  border-color: var(--border-color) !important;
+  border-color: transparent !important;
   border-radius: 8px !important;
-  background: var(--bg-input) !important;
+  background: transparent !important;
 }
 
 .session-input-shell:focus-within {
-  border-color: rgba(209, 107, 72, 0.58) !important;
-  box-shadow: 0 0 0 3px rgba(209, 107, 72, 0.09) !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
 }
 
+/* The shell already carries the focus ring — a second global
+   focus-visible outline on the field itself reads as an error. */
+.session-input-editable:focus-visible {
+  outline: none !important;
+}
+
+/* Composer scrolls without showing a bar, like the message pane. */
+.session-input-editable {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.session-input-editable::-webkit-scrollbar { display: none; }
+
 .session-send-btn {
-  min-width: 44px;
-  min-height: 40px;
+  min-width: 36px;
+  min-height: 32px;
   border-radius: 7px !important;
   background: var(--color-primary) !important;
   color: #fff8ee !important;
@@ -2610,6 +2634,74 @@ a.automation-list-item:focus-visible {
   margin-top: 22px;
   padding-top: 18px;
   border-top: 1px solid var(--border-color);
+}
+
+.sidebar-nav-label {
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: .62rem;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+}
+
+.campaign-logo-header { margin-bottom: 14px; }
+
+.campaign-logo {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  place-items: center;
+  border-radius: 10px;
+  background: var(--ember);
+  color: #fff8ee;
+  font-size: .72rem;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+
+.campaign-logo-title {
+  color: var(--text-bright);
+  font-size: .85rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.campaign-logo-subtitle {
+  color: var(--text-dim);
+  font-size: .68rem;
+  margin-top: 1px;
+}
+
+.sidebar-nav-item {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: .78rem;
+  text-align: left;
+  cursor: pointer;
+}
+
+.sidebar-nav-item:hover {
+  border-color: rgba(209, 107, 72, .24);
+  background: rgba(209, 107, 72, .08);
+  color: var(--text-bright);
+}
+
+.sidebar-nav-item > i { color: var(--ember); }
+
+.widget-header h3 {
+  color: var(--text-bright);
+  font-size: .8rem;
+  font-weight: 700;
+  letter-spacing: .02em;
 }
 
 .private-thread-nav-heading {
@@ -2642,7 +2734,7 @@ a.automation-list-item:focus-visible {
   color: var(--text-bright);
 }
 
-.private-thread-nav-item > i { color: #d98a6c; }
+.private-thread-nav-item > i { color: var(--ember); }
 .private-thread-nav-item > span { display: grid; min-width: 0; gap: 2px; }
 .private-thread-nav-item strong { overflow: hidden; font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
 .private-thread-nav-item small { color: var(--text-dim); font-size: .62rem; }
@@ -2650,7 +2742,7 @@ a.automation-list-item:focus-visible {
 .private-thread-create {
   justify-content: center;
   margin-top: 2px;
-  border-color: rgba(238, 228, 212, .12);
+  border-color: var(--line);
   font-size: .72rem;
 }
 .private-thread-create:hover:not(:disabled) { border-color: rgba(209, 107, 72, .42); color: var(--text-bright); }
@@ -2670,17 +2762,17 @@ a.automation-list-item:focus-visible {
 .private-thread-direct-create select { padding: 0 7px; }
 .private-thread-direct-create button { color: var(--text-bright); cursor: pointer; }
 .private-thread-direct-create button:disabled { opacity: .42; cursor: default; }
-.private-thread-nav-error { margin: 2px 0 0; color: #f1aa91; font-size: .68rem; line-height: 1.4; }
+.private-thread-nav-error { margin: 2px 0 0; color: var(--danger); font-size: .68rem; line-height: 1.4; }
 
 .private-thread-conversation { display: flex; height: 100%; flex-direction: column; }
 .private-thread-header { flex: 0 0 auto; }
-.private-thread-eyebrow { margin-bottom: 4px; color: #da8768; font: 700 .58rem/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.private-thread-eyebrow { margin-bottom: 4px; color: var(--ember); font: 700 .58rem/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 .private-thread-subtitle { margin-top: 3px; color: var(--text-dim); font-size: .69rem; }
 .private-thread-messages { flex: 1; overflow-y: auto; padding: 22px clamp(18px, 4.5vw, 72px) 34px; }
 .private-thread-empty { display: grid; min-height: 100%; place-content: center; place-items: center; color: var(--text-dim); text-align: center; }
-.private-thread-empty i { margin-bottom: 10px; color: #d98a6c; font-size: 1.5rem; }
+.private-thread-empty i { margin-bottom: 10px; color: var(--ember); font-size: 1.5rem; }
 .private-thread-empty p { max-width: 320px; margin: 0; font-size: .82rem; }
-.private-thread-reconnect { margin: 0 auto 14px; padding: 8px 12px; border: 1px solid rgba(209, 107, 72, .25); border-radius: 7px; color: #eab09b; font-size: .7rem; }
+.private-thread-reconnect { margin: 0 auto 14px; padding: 8px 12px; border: 1px solid rgba(200, 95, 61, .25); border-radius: 7px; color: var(--ember-hover); font-size: .7rem; }
 .private-thread-message { display: grid !important; grid-template-columns: 38px minmax(0, 1fr); gap: 12px; max-width: 900px; margin-inline: auto; }
 .private-thread-message .session-msg-avatar {
   display: grid;
@@ -2694,7 +2786,7 @@ a.automation-list-item:focus-visible {
   font-size: .62rem;
   font-weight: 700;
 }
-.private-thread-message .session-msg-avatar.dm-avatar { background: #542f24; color: #f6d6c6; }
+.private-thread-message .session-msg-avatar.dm-avatar { background: var(--ember); color: #fff8ee; }
 .private-thread-message-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
 .private-thread-message-meta strong { color: var(--text-bright); font-size: .8rem; }
 .private-thread-message-meta time,
@@ -2750,7 +2842,7 @@ a.automation-list-item:focus-visible {
   .app-header { grid-template-columns: auto 1fr auto; }
   .user-identity { display: none; }
   .campaign-hero-copy { width: min(760px, 72%); }
-  .dashboard-layout { grid-template-columns: 230px minmax(0, 1fr) 270px; }
+  .dashboard-layout { grid-template-columns: 230px minmax(0, 1fr); }
 }
 
 @media (max-width: 900px) {
@@ -2800,7 +2892,7 @@ a.automation-list-item:focus-visible {
     justify-content: space-around !important;
     padding: 5px 8px calc(5px + env(safe-area-inset-bottom)) !important;
     border-top: 1px solid var(--border-color) !important;
-    background: rgba(18, 23, 24, 0.96) !important;
+    background: rgba(248, 245, 238, 0.96) !important;
     backdrop-filter: blur(18px) !important;
   }
 
@@ -2895,21 +2987,19 @@ a.automation-list-item:focus-visible {
 
 @media (min-width: 901px) {
   .dashboard-layout {
-    grid-template-columns: 236px minmax(0, 1fr) 300px;
+    grid-template-columns: 236px minmax(0, 1fr);
     transition: grid-template-columns 220ms cubic-bezier(.2, .75, .25, 1);
   }
   .dashboard-layout.context-collapsed {
     grid-template-columns: 236px minmax(0, 1fr);
   }
   .dashboard-layout.context-collapsed .dashboard-right { display: none; }
-  .dashboard-left { padding: 18px 16px; background: #111718 !important; }
-  .dashboard-right { padding: 0 18px 24px; background: #12191a !important; }
+  .dashboard-left { padding: 18px 16px; background: var(--bg-panel) !important; }
+  .dashboard-right { padding: 0 18px 24px; background: var(--bg-panel) !important; }
   .dashboard-top-header { min-height: 70px; padding: 0 clamp(18px, 2.4vw, 34px); }
   .session-messages {
     padding: 22px clamp(18px, 4.5vw, 72px) 34px;
-    background:
-      radial-gradient(circle at 48% -15%, rgba(209, 107, 72, .065), transparent 32rem),
-      #0f1415;
+    background: var(--bg-panel);
   }
   .session-msg {
     max-width: 900px;
@@ -2919,13 +3009,20 @@ a.automation-list-item:focus-visible {
   }
   .session-input-area {
     width: min(900px, calc(100% - 36px));
-    margin: 0 auto 16px;
-    padding: 9px !important;
+    margin: 0 auto 18px;
+    padding: 4px !important;
     border: 1px solid rgba(238, 228, 212, .13) !important;
     border-radius: 12px;
-    background: rgba(24, 31, 32, .96);
-    box-shadow: 0 16px 44px rgba(0, 0, 0, .24);
+    background: var(--surface-raised);
+    box-shadow: 0 3px 12px rgba(62, 66, 64, 0.10);
   }
+}
+
+/* One box: the outer area carries the focus glow, the inner shell stays
+   permanently invisible so focus never reads as a box within a box. */
+.session-input-area:focus-within {
+  border-color: rgba(209, 107, 72, 0.55) !important;
+  box-shadow: none !important;
 }
 
 /* Character folio form controls and repeatable records */
@@ -3319,4 +3416,13 @@ a.automation-list-item:focus-visible {
   .character-ai-sidebar { position: static; }
   .character-ai-sidebar__collapsed-hint { display: none !important; }
   .character-create-layout.is-collapsed .character-ai-sidebar__content { display: block; }
+}
+
+/* EXPERIMENTAL (revert me): borderless session table. Kills every line on
+   the page via color only, so layout doesn't shift when this goes away. */
+.dashboard-page .dashboard-layout,
+.dashboard-page .dashboard-layout *,
+.dashboard-page .dashboard-layout *::before,
+.dashboard-page .dashboard-layout *::after {
+  border-color: transparent !important;
 }

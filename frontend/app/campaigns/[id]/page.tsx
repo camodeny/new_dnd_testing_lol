@@ -7,7 +7,6 @@ import { useAuthContext } from '@/contexts/AuthContext'
 import {
   campaigns as campaignsApi,
   campaignMembers,
-  sessions as sessionsApi,
   apiFetch,
 } from '@/lib/api'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
@@ -120,28 +119,40 @@ export default function CampaignViewPage() {
   }, [loadData])
 
   const handleStartSession = useCallback(async () => {
-    if (!id || startPending || worldPrepared) return
+    if (!id || startPending) return
     setError('')
     setStartPending(true)
     try {
-      // Solo start path (#245): seed the production world (lobby -> starting).
-      // Opening the live table is handled separately by #246.
-      const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
-      if (solo) {
-        const key =
-          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-            ? crypto.randomUUID()
-            : `${Date.now()}-${Math.random().toString(36).slice(2)}`
-        const data = await campaignsApi.worldSeed(String(id), key) as {
-          campaign: Campaign
-          seed: unknown
+      const newKey = () =>
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      // Production start (#245 → #246): seed the world (lobby -> starting),
+      // then open the live table (starting -> active + opening DM turn).
+      const status = campaign?.status
+      if (status !== 'starting' && status !== 'active' && !worldPrepared) {
+        const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
+        if (solo || status === 'lobby' || !status) {
+          const data = await campaignsApi.worldSeed(String(id), newKey()) as {
+            campaign: Campaign
+            seed: unknown
+          }
+          setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
+          setWorldPrepared(true)
+          return
         }
-        setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
-        setWorldPrepared(true)
-        return
       }
-      const data = await sessionsApi.start(String(id)) as { session: Session }
-      setSession(data.session)
+      // Seeded (starting): open the live table through the production path.
+      const data = await campaignsApi.campaignStart(String(id), newKey()) as {
+        campaign: Campaign
+      }
+      setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
+      setSession({
+        id: `solo-${String(id)}`,
+        campaign_id: String(id),
+        status: 'active',
+        created_at: new Date().toISOString(),
+      })
       setMode('session')
     } catch (err) {
       setError((err as Error).message)
@@ -299,8 +310,15 @@ export default function CampaignViewPage() {
               </p>
             )}
             {worldPrepared ? (
-              <button type="button" className="btn btn-primary" disabled>
-                <i className="bi bi-check2" aria-hidden="true" /> World ready
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={handleStartSession}
+                disabled={startPending}
+                aria-busy={startPending}
+              >
+                <i className={startPending ? 'bi bi-hourglass-split' : 'bi bi-fire'} aria-hidden="true" />{' '}
+                {startPending ? 'Opening live table…' : 'Open live table'}
               </button>
             ) : (
               <button
