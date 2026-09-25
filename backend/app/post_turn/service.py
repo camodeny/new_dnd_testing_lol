@@ -582,6 +582,38 @@ def run_post_turn_range(
                 session_factory=clock_telemetry_factory,
                 operation_id=operation_id,
             )
+            # Issue #220 — consistency verification is required consolidation:
+            # deterministic + semantic contradictions against committed canon
+            # become explicit incidents instead of silent normalization. A
+            # required unresolved incident fails the run (checkpoint stays
+            # put; #221 repair resolves, then a cumulative retry converges).
+            # Custom consolidate_fn callers own their content and opt out.
+            from app.post_turn.incidents import ConsistencyBlocked, verify_post_turn_consistency
+
+            consistency = verify_post_turn_consistency(
+                db, campaign_id, effective_from, to_sequence,
+                decision_service=clock_decision_service,
+                session_factory=clock_telemetry_factory,
+                operation_id=operation_id,
+                # Commit here: the ConsistencyBlocked raise below fails the
+                # run (whose handler rolls back pending state), and the
+                # incidents must stay durable for #221 repair regardless.
+                commit=True,
+            )
+            patch["consistency"] = {
+                "complete": consistency["complete"],
+                "incidents": len(consistency["incidents"]),
+                "unresolved": consistency["unresolved"],
+                "decision_distribution": consistency["decision_distribution"],
+            }
+            if not consistency["complete"]:
+                ids = [i["id"] for i in consistency["incidents"]
+                       if i["status"] in ("open", "deferred", "verifier_failed")]
+                raise ConsistencyBlocked(
+                    ids,
+                    f"range {effective_from}-{to_sequence} has "
+                    f"{len(ids)} unresolved consistency incident(s)",
+                )
         if not isinstance(patch, dict):
             raise RuntimeError("consolidate_fn must return a dict")
 
@@ -856,11 +888,20 @@ def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
     except Exception as exc:  # noqa: BLE001 — observability must not break status
         backpressure = {"blocked": True, "reason": "estimation_failed",
                         "error": str(exc)[:300]}
+    # Issue #220 — required unresolved consistency incidents alongside the
+    # checkpoint span. Guarded: status reporting never raises.
+    try:
+        from app.post_turn.incidents import get_consistency_stats
+
+        consistency = get_consistency_stats(db, campaign_id)
+    except Exception as exc:  # noqa: BLE001 — observability must not break status
+        consistency = {"unresolved": 0, "error": str(exc)[:300]}
     return {
         "campaign_id": str(campaign_id),
         "checkpoint": int(cp.processed_through_sequence or 0),
         "outstanding": span,
         "backpressure": backpressure,
+        "consistency": consistency,
         "run_attempts": len(runs),
         "retry_count": retry_count,
         "last_run": last.to_dict() if last else None,
