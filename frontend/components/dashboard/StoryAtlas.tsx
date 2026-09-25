@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import MarkdownContent from '@/components/common/MarkdownContent'
 import PrivateThreadConversation from '@/components/dashboard/PrivateThreadConversation'
 import { campaignMembers, gameplayThreads } from '@/lib/api'
+import type { CapacityUiEvent } from '@/lib/capacity'
 import { privateThreadLabel, upsertVisibleThread } from '@/lib/privateThreads'
 import type { Campaign, CampaignMember, CampaignThread, Character, Session, Message, EncounterMap, User } from '@/types'
 
@@ -25,6 +26,14 @@ interface StoryAtlasProps {
   liveError?: string | null
   loadingOlderMessages?: boolean
   isOwner: boolean
+  /** Issue #255: new AI narration is paused on shared campaign capacity.
+   *  Non-AI surfaces (history, sheets, threads) stay usable; the composer
+   *  stays editable but submissions are held as a local draft. */
+  aiPaused?: boolean
+  /** Issue #255: capacity meter / pause notice slot rendered above the table. */
+  capacitySlot?: ReactNode
+  /** Issue #255: telemetry for submission attempts made while paused. */
+  onCapacityEvent?: (event: CapacityUiEvent) => void
   onSendMessage: (content: string) => Promise<void>
   onLoadOlderMessages: () => Promise<void>
   onRetryLiveTable?: () => Promise<unknown>
@@ -57,6 +66,9 @@ export default function StoryAtlas({
   liveError = null,
   loadingOlderMessages = false,
   isOwner,
+  aiPaused = false,
+  capacitySlot,
+  onCapacityEvent,
   onSendMessage,
   onLoadOlderMessages,
   onRetryLiveTable,
@@ -159,6 +171,12 @@ export default function StoryAtlas({
   const handleSend = async () => {
     const content = input.trim()
     if (!content || sending) return
+    if (aiPaused) {
+      // Paused: the draft stays editable and is never represented as
+      // accepted/processing work. The attempt is tracked; nothing is sent.
+      onCapacityEvent?.({ type: 'paused_submit_attempt' })
+      return
+    }
     const draft = input
     setInput('')
     setSending(true)
@@ -311,6 +329,10 @@ export default function StoryAtlas({
               )}
             </header>
 
+            {/* Capacity meter / pause notice (#255): a quiet strip above the
+                table. Non-AI surfaces below stay fully usable while paused. */}
+            {capacitySlot}
+
             {/* Messages */}
             <div ref={messagesContainerRef} className="session-messages" style={{ flex: 1, overflowY: 'auto', padding: '22px clamp(18px, 4.5vw, 72px) 24px' }}>
               {(liveStatus === 'reconnecting' || liveStatus === 'reconciling') && (
@@ -411,19 +433,26 @@ export default function StoryAtlas({
               <div ref={messagesEndRef} />
             </div>
 
-            {/* Input area */}
+            {/* Input area: the draft stays editable while AI narration is
+                paused; only submission as accepted AI work is held back. */}
             {session && (
               <div className="session-input-area" style={{ flexShrink: 0 }}>
+                {aiPaused && (
+                  <p role="status" style={{ margin: '0 0 6px', fontSize: '0.74rem', color: 'var(--text-muted)', textAlign: 'center' }}>
+                    AI narration is paused — your words stay here as a draft until capacity returns.
+                  </p>
+                )}
                 <div className="session-input-shell" style={{ display: 'flex', alignItems: 'flex-end', gap: 8, padding: '3px 4px 3px 10px' }}>
                   <textarea
                     ref={inputRef}
                     className="session-input-editable"
-                    placeholder="What do you do?"
+                    placeholder={aiPaused ? 'Draft while paused…' : 'What do you do?'}
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyDown}
                     rows={1}
                     disabled={sending || aiThinking}
+                    aria-label={aiPaused ? 'Message draft (AI narration paused)' : 'Message'}
                     style={{
                       flex: 1, background: 'transparent', border: 'none', resize: 'none',
                       color: 'var(--text-bright)', fontSize: '0.9rem', lineHeight: 1.5,
@@ -434,8 +463,9 @@ export default function StoryAtlas({
                     type="button"
                     className="session-send-btn"
                     onClick={handleSend}
-                    disabled={!input.trim() || sending || aiThinking}
-                    aria-label="Send message"
+                    disabled={!input.trim() || sending || aiThinking || aiPaused}
+                    aria-label={aiPaused ? 'Send unavailable while AI narration is paused' : 'Send message'}
+                    title={aiPaused ? 'AI narration is paused — your draft is kept' : undefined}
                   >
                     <i className="bi bi-send-fill" aria-hidden="true" />
                   </button>
