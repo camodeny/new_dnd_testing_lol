@@ -136,6 +136,12 @@ class LLMProviderAdapter:
         if options.get('thinking_enabled'):
             payload['thinking'] = options['thinking']
             payload['reasoning_effort'] = options['reasoning_effort']
+        elif request.reasoning_effort is not None:
+            # Top-level effort for providers whose reasoning is always on
+            # and server-defaulted (e.g. Meta Muse Spark): caps hidden
+            # thinking without a thinking block. Only sent when explicitly
+            # requested — never by default.
+            payload['reasoning_effort'] = request.reasoning_effort
         if request.json_schema:
             payload['response_format'] = {
                 'type': 'json_schema',

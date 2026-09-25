@@ -13,6 +13,12 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
+#: Reasoning effort for forward-DM adjudication. Muse Spark always reasons
+#: server-side; the default burns ~3k hidden thinking tokens (~30-40s) on a
+#: schema-constrained contract call. "low" holds ~14s with first-try valid
+#: contracts (measured 2026-09-25); "none" is rejected (400) for Muse models.
+FORWARD_DM_REASONING_EFFORT = "low"
+
 FORWARD_DM_SYSTEM = """\
 You are the Dungeon Master adjudicating a D&D 5e table turn. You receive the
 authoritative forward-DM context packet (player inputs, protected PCs, scene,
@@ -98,30 +104,18 @@ def build_forward_dm_messages(packet) -> list[dict]:
             ensure_ascii=False,
             sort_keys=True,
         )
+    # Minimal semantic hint: strict JSON schema enforces structure, but not
+    # these conditional rules. (Full prose hint removed — it duplicated the
+    # schema at ~1.4k chars; unhinted output violates the narration-beat
+    # null-field rule, so this stump stays.)
     schema_hint = (
-        "Return dm_turn_contract_v1 JSON with keys: contract_version "
-        "('dm_turn_contract_v1'), mode, reason, beats[], open_player_choice, "
-        "narration_hints, adjudication_input, new_entities[], staged_effects[], "
-        "evidence_requests[], roll_request, table_chat_intent, safe_prelude, "
-        "clarify_question. beats is REQUIRED except in need_evidence, "
-        "table_chat, and silent modes: respond needs 1-8 beats, clarify at "
-        "most 2 setup beats. Every beat needs id, type, and 1+ claims; beat "
-        "type is ONLY narration or npc_dialogue, never anything else; never "
-        "emit an empty beats array with mode respond. Every claim is an "
-        "OBJECT, never a bare string: "
-        '{"text": "...", "claim_kind": "observation|world_fact|npc_utterance|'
-        'player_declaration|roll_instruction|roll_outcome", "origin": '
-        '"player_transcript|established_state|resolver_evidence|'
-        'dm_adjudication|roll_adjudication"}. Scene description claims use '
-        'claim_kind=observation with origin=established_state. '
-        'player_declaration claims REQUIRE actor_ref {"type": "character", '
-        '"id": "<speaking PC id from the packet>"} with origin '
-        'player_transcript and evidence_refs containing its source submission. '
-        'If the speaker id is unknown, do not assert a PC action. '
-        'open_player_choice is a plain STRING question like "What do you '
-        'do?", never an object. On narration beats, speaker_ref, '
-        'speaker_public_name, truth_status, and dm_private_context must all '
-        'be null (they belong to npc_dialogue beats only).'
+        "Mode/beat rules: respond needs 1-8 beats (never empty); "
+        "need_evidence, table_chat, and silent need none. "
+        "player_declaration claims REQUIRE actor_ref {\"type\": \"character\", "
+        "\"id\": \"<speaking PC id from the packet>\"} with origin "
+        "player_transcript, or do not assert a PC action. On narration "
+        "beats, speaker_ref, speaker_public_name, truth_status, and "
+        "dm_private_context must all be null (npc_dialogue beats only)."
     )
     return [
         {"role": "system", "content": FORWARD_DM_SYSTEM + "\n" + schema_hint},
@@ -191,6 +185,7 @@ def adjudicate_with_provider(
         # Deterministic adjudication: structured contracts need exact schema
         # adherence, not sampling variance.
         temperature=0,
+        reasoning_effort=FORWARD_DM_REASONING_EFFORT,
     )
     structured_log(
         logger, logging.INFO, "forward_dm_provider_start",
