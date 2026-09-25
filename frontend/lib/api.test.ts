@@ -109,6 +109,7 @@ describe('exported API surface', () => {
       'auth',
       'campaignMembers',
       'campaigns',
+      'capacity',
       'characters',
       'gameplayThreads',
       'sessions',
@@ -163,6 +164,17 @@ describe('exported API surface', () => {
       'submit',
     ])
     expect(Object.keys(api.sessions)).toEqual(['start'])
+    expect(Object.keys(api.capacity)).toEqual(['getState'])
+  })
+
+  it('fetches the participant-safe capacity projection without secrets', async () => {
+    const payload = { campaign_id: 'c', percent_used: 42, ai_paused: false, grace_active: false }
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(payload, 200))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.capacity.getState('c')).resolves.toEqual(payload)
+    expect(fetchMock).toHaveBeenCalledOnce()
+    expect(String(fetchMock.mock.calls[0][0])).toBe('/api/campaigns/c/capacity-state')
   })
 
   it('does not expose removed legacy groups or blob transport', () => {

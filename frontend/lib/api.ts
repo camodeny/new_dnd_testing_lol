@@ -292,6 +292,14 @@ export const gameplayThreads = {
     }),
 }
 
+// ── Campaign capacity ───────────────────────────────────────────────────
+// Participant-safe aggregate projection: the #254 capacity-state hook
+// rendered by the #255 usage UI as a simple percentage/state.
+export const capacity = {
+  getState: (campaignId: string | number) =>
+    apiFetch<import('@/lib/capacity').CapacityStatePayload>(`/campaigns/${campaignId}/capacity-state`),
+}
+
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 export const sessions = {

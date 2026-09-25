@@ -10,6 +10,9 @@ import {
   apiFetch,
 } from '@/lib/api'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
+import { useCampaignCapacity } from '@/hooks/useCampaignCapacity'
+import { CapacityMeterView } from '@/components/dashboard/CapacityMeter'
+import { isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
 import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
@@ -64,6 +67,21 @@ export default function CampaignViewPage() {
   const streamingDmText = activeDmText(liveTable.dmState, liveTable.dmMessages)
   const aiThinking = Boolean(liveTable.dmState?.streaming || liveTable.dmStatus?.type === 'dm.thinking')
   const aiThinkingStatus = typeof liveTable.dmStatus?.status === 'string' ? liveTable.dmStatus.status : ''
+
+  // Issue #255: shared campaign capacity projection. Polls the
+  // participant-safe capacity-state hook while the live table is open;
+  // a pause never blocks non-AI surfaces and resyncs automatically.
+  const capacity = useCampaignCapacity({
+    campaignId: id ? String(id) : null,
+    enabled: Boolean(session),
+  })
+  const capacityPaused = capacity.view.state === 'paused'
+
+  const handleCapacityEvent = useCallback((event: CapacityUiEvent) => {
+    // Resync from the authoritative projection on paused submit attempts
+    // (possible restore race); other events are observed via the meter.
+    if (event.type === 'paused_submit_attempt') void capacity.refresh()
+  }, [capacity.refresh])
 
   const loadData = useCallback(async () => {
     if (!id) return
@@ -179,10 +197,18 @@ export default function CampaignViewPage() {
       })
       await liveTable.refresh()
     } catch (err) {
-      setError((err as Error).message)
+      if (isCapacityPausedError(err)) {
+        // Lost a capacity race after the meter's last poll: keep the draft
+        // (StoryAtlas restores it) and resync from the authoritative
+        // projection instead of showing raw accounting detail.
+        void capacity.refresh()
+        setError('AI narration just paused for the campaign — your draft is kept. It will send when capacity returns.')
+      } else {
+        setError((err as Error).message)
+      }
       throw err
     }
-  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable.refresh])
+  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable.refresh, capacity.refresh])
 
   const handleLoadOlderMessages = useCallback(async () => {
     await liveTable.loadOlder()
@@ -386,6 +412,17 @@ export default function CampaignViewPage() {
           liveError={liveError}
           loadingOlderMessages={liveTable.loadingOlder}
           isOwner={isOwner}
+          aiPaused={capacityPaused}
+          capacitySlot={session ? (
+            <CapacityMeterView
+              view={capacity.view}
+              loading={capacity.loading}
+              error={capacity.error}
+              hasProjection={capacity.payload !== null}
+              onRetry={() => void capacity.refresh()}
+            />
+          ) : undefined}
+          onCapacityEvent={handleCapacityEvent}
           onSendMessage={handleSendMessage}
           onLoadOlderMessages={handleLoadOlderMessages}
           onRetryLiveTable={liveTable.refresh}
