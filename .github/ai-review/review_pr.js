@@ -105,13 +105,33 @@ function findBrowserExecutable() {
   return candidates.find((candidate) => fs.existsSync(candidate));
 }
 
+function projectRowWrapper(page, projectName) {
+  return page
+    .locator("div[data-project-row-wrapper]")
+    .filter({ has: page.getByText(projectName, { exact: true }) })
+    .first();
+}
+
+function projectNewChatButton(page, projectName) {
+  return projectRowWrapper(page, projectName)
+    .getByRole("button", { name: /start new chat in project/i })
+    .first();
+}
+
 function projectLocatorEntries(page, projectName) {
   const exactProjectText = page.getByText(projectName, { exact: true });
   return [
-    // The Projects directory currently renders project names in a grid cell.
-    // This is the important distinction from the similarly named recent-chat
-    // label in the sidebar. The cell does not always expose an accessible
-    // name, so scope an exact text match inside the semantic cell/row.
+    // The Projects directory (redesigned ~Sep 2026) renders project names as
+    // plain text inside div[data-project-row-wrapper]. Clicking the row only
+    // expands it in place, so open the project through its
+    // "Start new chat in project" button, which navigates to the project
+    // route. The wrapper entry itself is diagnostics-only: never click it.
+    ["project new chat button", projectNewChatButton(page, projectName)],
+    ["project row wrapper", projectRowWrapper(page, projectName)],
+    // Older layouts rendered project names in a grid cell. This is the
+    // important distinction from the similarly named recent-chat label in
+    // the sidebar. The cell does not always expose an accessible name, so
+    // scope an exact text match inside the semantic cell/row.
     [
       "project grid cell",
       page.locator('[role="gridcell"]').filter({ has: exactProjectText }).first(),
@@ -197,6 +217,31 @@ async function pageDiagnostics(page, projectName) {
   };
 }
 
+async function waitForProjectOpen(page, label) {
+  // The Projects surface is an SPA and can render the project in place (or
+  // update history after the document commit). A route is preferred, but a
+  // visible composer is also a valid readiness signal for an in-place UI.
+  const timeout = envNumber("CHATGPT_PROJECT_TIMEOUT_MS", DEFAULT_PROJECT_TIMEOUT_MS);
+  const deadline = Date.now() + timeout;
+  while (Date.now() < deadline) {
+    if (PROJECT_ROUTE_RE.test(page.url())) {
+      return { mode: "route", locator: label, url: page.url() };
+    }
+
+    if (await visibleLocator(composerLocators(page))) {
+      return { mode: "composer", locator: label, url: page.url() };
+    }
+
+    await delay(250);
+  }
+
+  throw new ReviewerError(
+    "PROJECT_NAVIGATION",
+    `ChatGPT did not open project "${label}" after selecting ${label}.`,
+    await pageDiagnostics(page, label),
+  );
+}
+
 async function openProject(page, projectName) {
   // Navigate directly to the Projects surface. Do not use the sidebar's
   // Projects control because it has changed between in-place and route-based
@@ -212,11 +257,31 @@ async function openProject(page, projectName) {
   }
   await waitPastChallenge(page);
 
-  const entries = projectLocatorEntries(page, projectName);
+  const selectorTimeout = envNumber("CHATGPT_SELECTOR_TIMEOUT_MS", DEFAULT_SELECTOR_TIMEOUT_MS);
+
+  // Current layout: open the project through its row's
+  // "Start new chat in project" button. Do not click the row or the project
+  // name text itself: that only expands the row in place.
+  try {
+    const newChatButton = projectNewChatButton(page, projectName);
+    await newChatButton.waitFor({ state: "visible", timeout: selectorTimeout });
+    await newChatButton.click();
+    return await waitForProjectOpen(page, projectName);
+  } catch (error) {
+    if (error instanceof ReviewerError) {
+      throw error;
+    }
+    // The button is missing (older layout or another redesign): fall back to
+    // the legacy project locators below.
+  }
+
+  const entries = projectLocatorEntries(page, projectName).filter(
+    ([label]) => label !== "project new chat button" && label !== "project row wrapper",
+  );
   const project = await firstVisible(
     entries.map(([, locator]) => locator),
     `project "${projectName}"`,
-    envNumber("CHATGPT_SELECTOR_TIMEOUT_MS", DEFAULT_SELECTOR_TIMEOUT_MS),
+    selectorTimeout,
   );
   const selectedEntry = entries.find(([, locator]) => locator === project);
 
@@ -230,33 +295,26 @@ async function openProject(page, projectName) {
     );
   }
 
-  // The Projects surface is an SPA and can render the project in place (or
-  // update history after the document commit). A route is preferred, but a
-  // visible composer is also a valid readiness signal for an in-place UI.
-  const timeout = envNumber("CHATGPT_PROJECT_TIMEOUT_MS", DEFAULT_PROJECT_TIMEOUT_MS);
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    if (PROJECT_ROUTE_RE.test(page.url())) {
-      return { mode: "route", locator: selectedEntry?.[0], url: page.url() };
+  try {
+    return await waitForProjectOpen(page, projectName);
+  } catch (error) {
+    if (error instanceof ReviewerError && error.code === "PROJECT_NAVIGATION") {
+      throw new ReviewerError(
+        "PROJECT_NAVIGATION",
+        `ChatGPT did not open project "${projectName}" after selecting ${selectedEntry?.[0] || "a project locator"}.`,
+        error.details,
+      );
     }
-
-    if (await visibleLocator(composerLocators(page))) {
-      return { mode: "composer", locator: selectedEntry?.[0], url: page.url() };
-    }
-
-    await delay(250);
+    throw error;
   }
-
-  throw new ReviewerError(
-    "PROJECT_NAVIGATION",
-    `ChatGPT did not open project "${projectName}" after selecting ${selectedEntry?.[0] || "a project locator"}.`,
-    await pageDiagnostics(page, projectName),
-  );
 }
 
 async function getSendButton(page) {
   return firstEnabled(
     [
+      // Redesigned composer (~Sep 2026): an icon-only button with the exact
+      // accessible name "Send" and no testid, visible once text is entered.
+      page.getByRole("button", { name: /^send$/i }).first(),
       page.getByRole("button", { name: /send (prompt|message)/i }).first(),
       page.locator('button[data-testid="send-button"]').first(),
       page.locator('button[aria-label*="send" i]').first(),
@@ -298,6 +356,7 @@ function assistantMessages(page) {
 
 async function isGenerating(page) {
   const stopButtons = [
+    page.getByRole("button", { name: /^stop$/i }),
     page.locator('button[aria-label*="stop" i]'),
     page.locator('button[data-testid*="stop" i]'),
     page.getByRole("button", { name: /stop generating/i }),
@@ -308,25 +367,56 @@ async function isGenerating(page) {
   return false;
 }
 
+async function conversationText(page) {
+  // The thread no longer lives inside <main> (~Sep 2026 redesign: <main>
+  // holds only the composer chrome while messages render in a sibling
+  // virtualized container), so track the rendered body text. This stays
+  // markup-agnostic across redesigns.
+  try {
+    return await page.locator("body").innerText({ timeout: 8000 });
+  } catch {
+    return "";
+  }
+}
+
 async function waitForAssistantCompletion(page, initialCount) {
   const timeout = envNumber("CHATGPT_RESPONSE_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
   const deadline = Date.now() + timeout;
   const messages = assistantMessages(page);
+  const initialText = await conversationText(page);
   let lastText = "";
   let stableSince = 0;
 
   while (Date.now() < deadline) {
-    const count = await messages.count();
-    if (count > initialCount) {
-      const text = (await messages.nth(count - 1).innerText()).trim();
-      if (text && text !== lastText) {
-        lastText = text;
-        stableSince = Date.now();
+    // Prefer the per-message signal when ChatGPT exposes message nodes;
+    // otherwise fall back to whole-conversation text, which survives
+    // markup redesigns (the data-message-author-role attribute is gone
+    // as of ~Sep 2026).
+    let text = "";
+    try {
+      const count = await messages.count();
+      if (count > initialCount) {
+        text = (await messages.nth(count - 1).innerText({ timeout: 5000 })).trim();
       }
+    } catch {
+      text = "";
+    }
+    if (!text) {
+      text = await conversationText(page);
+    }
 
-      if (lastText && stableSince && Date.now() - stableSince >= 3000 && !(await isGenerating(page))) {
-        return;
-      }
+    if (text && text.length > initialText.length && text !== lastText) {
+      lastText = text;
+      stableSince = Date.now();
+    }
+
+    if (
+      lastText &&
+      lastText.length > initialText.length &&
+      Date.now() - stableSince >= 5000 &&
+      !(await isGenerating(page))
+    ) {
+      return;
     }
     await page.waitForTimeout(750);
   }
@@ -715,6 +805,8 @@ module.exports = {
   escapeRegExp,
   parseArgs,
   projectLocatorEntries,
+  projectNewChatButton,
+  projectRowWrapper,
 };
 
 if (require.main === module) {
