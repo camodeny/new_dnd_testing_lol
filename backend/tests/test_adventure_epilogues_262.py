@@ -537,3 +537,64 @@ def test_closed_phase_is_terminal(table):
             open_epilogues(db, camp_id, adv_id)
         with pytest.raises(EpilogueStateError):
             skip_epilogue(db, camp_id, adv_id, user_id=alice, character_id=alice_pc)
+
+
+def test_roll_through_mismatched_route_resolves_nothing(table, monkeypatch):
+    """Rolling an epilogue through another adventure's route must 404 BEFORE
+    any canonical mutation: still awaiting_roll, no event, no revision change."""
+    from fastapi import HTTPException
+
+    import app.adventures.router as adv_router
+
+    factory, camp_id, adv_id, _, alice, _, alice_pc, _ = table
+    _open(factory, camp_id, adv_id)
+    epi_id = _submit_climb(factory, camp_id, adv_id, alice, alice_pc, "op-climb-scope")
+    with factory() as db:
+        start_adventure(db, camp_id, "Second arc")
+        camp = db.get(Campaign, camp_id)
+        adv2, _ = complete_adventure(
+            db, camp_id, outcome="victory", reason="Second arc done",
+            public_summary="Second arc safe.",
+            operation_id="op-complete-262-second",
+            expected_revision=int(camp.revision),
+        )
+        open_epilogues(db, camp_id, adv2.id)
+        db.commit()
+        adv2_id = adv2.id
+        revision_before = int(db.get(Campaign, camp_id).revision)
+        events_before = db.execute(
+            select(CampaignDomainEvent).where(
+                CampaignDomainEvent.campaign_id == camp_id,
+                CampaignDomainEvent.event_type == EPILOGUE_EVENT,
+            )
+        ).scalars().all()
+    monkeypatch.setattr(
+        adv_router, "resolve_profile", lambda request, db: db.get(Profile, alice)
+    )
+    with factory() as db:
+        with pytest.raises(HTTPException) as excinfo:
+            adv_router.fulfill_epilogue_roll_endpoint(
+                str(camp_id), str(adv2_id), str(epi_id),
+                {"die_value": 15, "modifier": 2, "expected_revision": revision_before},
+                request=None, db=db,
+            )
+        assert excinfo.value.status_code == 404
+        db.rollback()
+    with factory() as db:
+        row = db.get(AdventureEpilogue, epi_id)
+        assert row.status == "awaiting_roll"
+        assert row.roll_result is None and row.outcome_text is None
+        assert int(db.get(Campaign, camp_id).revision) == revision_before
+        assert db.execute(
+            select(CampaignDomainEvent).where(
+                CampaignDomainEvent.campaign_id == camp_id,
+                CampaignDomainEvent.event_type == EPILOGUE_EVENT,
+            )
+        ).scalars().all() == events_before
+        # The real route still resolves normally afterwards.
+        row, event = fulfill_epilogue_roll(
+            db, epi_id, user_id=alice, die_value=15, modifier=2,
+            expected_revision=revision_before,
+        )
+        db.commit()
+        assert row.status == "resolved" and event is not None

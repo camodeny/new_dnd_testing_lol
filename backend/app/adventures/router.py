@@ -41,7 +41,7 @@ from app.campaigns.service import (
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
-from models.campaigns import Adventure, AdventureSummary, Campaign
+from models.campaigns import Adventure, AdventureEpilogue, AdventureSummary, Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -443,6 +443,16 @@ def fulfill_epilogue_roll_endpoint(
         modifier = int(body.get("modifier", 0))
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="modifier must be an integer")
+    # Ownership check BEFORE any mutation: the epilogue row must belong to the
+    # route's campaign/adventure, otherwise a caller could resolve an epilogue
+    # in another adventure/campaign through this route (the mutation commits).
+    existing = db.get(AdventureEpilogue, eid)
+    if (
+        existing is None
+        or str(existing.adventure_id) != str(aid)
+        or str(existing.campaign_id) != str(cid)
+    ):
+        raise HTTPException(status_code=404, detail="Epilogue not found")
     try:
         row, event = fulfill_epilogue_roll(
             db, eid,
