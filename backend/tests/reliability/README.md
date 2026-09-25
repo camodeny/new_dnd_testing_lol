@@ -14,6 +14,17 @@ be enabled through an application route or production configuration.
 | Provider transport is transiently unavailable | Provider transport retries within policy and then succeeds | Retry hook fires once; no real network/model call is made |
 | Provider returns a terminal failure | Provider transport stops immediately | No retry occurs; the terminal error remains visible to the caller |
 | Fault DB URL points outside an allowlisted local disposable database | Suite aborts before connecting | Fault tooling cannot target a remote or production-named database |
+| API response is lost after the command commits | Idempotent retry replays the committed result; key reuse with a different payload conflicts | One handler call, duplicate replay flag, no silent overwrite |
+| DB transaction fails mid-mutation | Whole mutation rolls back atomically | Revision unchanged, no domain event, no outbox row |
+| Worker crashes after claiming but before completion | The stuck-execution sweeper resets the expired lease and redelivery runs once | One handler call, one revision bump, execution succeeds |
+| Stale writer races a committed mutation | Stale commit raises a revision conflict | Revision and event history reflect only the winner |
+| Worker hits terminal poison work | Execution goes to dead letter, stays inspectable, replays after correction | Failed-work ledger lists it; corrected replay succeeds under the same job ID |
+| Provider-like transient failure hits the worker | Worker records a retriable failure and the retry succeeds | Failed-then-succeeded ledger trail; no real network call |
+| Provider-like terminal failure hits the worker | Execution goes straight to dead letter with one attempt | No retry storm on poison |
+| Telemetry backend fails during a gameplay commit | Gameplay commits on its own session; telemetry is marked dropped | Revision, domain event, and outbox persist; trace shows `telemetry_dropped` |
+
+Billing / recovery-accounting assertions are skipped pending open #259
+(`test_provider_failure_non_billing_accounting`).
 
 Each scenario emits `FAULT_DIAGNOSTIC` JSON. Set `FAULT_ARTIFACT_PATH` to also
 append the timeline to a JSONL artifact.
