@@ -19,6 +19,7 @@ from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
 from models.campaigns import CampaignMember
+from models.characters import Character
 from models.profiles import Profile
 from models.reliability import IdempotentCommand
 from models.threads import PlayerSubmission
@@ -178,5 +179,56 @@ def test_tag_parser_does_not_flatten_outside_text_into_ic():
     ]
     with pytest.raises(SubmissionValidationError):
         parse_tagged_content("<ooc>broken</ic>")
+
+
+def _select_character(api, character_id):
+    _, factory, _ = api
+    with factory() as db:
+        member = db.execute(
+            select(CampaignMember).where(CampaignMember.user_id == TEST_USER_ID)
+        ).scalars().first()
+        member.selected_character_id = character_id
+        db.commit()
+
+
+def test_omitted_character_defaults_to_selected_pc(api):
+    client, factory, campaign_id = api
+    character_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Character(id=character_id, owner_id=TEST_USER_ID, system="dnd5e", name="Bryn"))
+        db.commit()
+    _select_character(api, character_id)
+    response = client.post(
+        f"/api/campaigns/{campaign_id}/submissions",
+        json={"content": "I look around."},
+        headers={"Idempotency-Key": "default-speaker"},
+    )
+    assert response.status_code == 201
+    assert response.json()["submission"]["character_id"] == str(character_id)
+
+
+def test_omitted_character_stays_null_without_selection(api):
+    client, _, campaign_id = api
+    response = client.post(
+        f"/api/campaigns/{campaign_id}/submissions",
+        json={"content": "Table talk."},
+        headers={"Idempotency-Key": "no-selection"},
+    )
+    assert response.status_code == 201
+    assert response.json()["submission"]["character_id"] is None
+
+
+def test_explicit_unowned_character_is_rejected(api):
+    client, factory, campaign_id = api
+    foreign_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Character(id=foreign_id, owner_id=uuid.uuid4(), system="dnd5e", name="Stranger"))
+        db.commit()
+    response = client.post(
+        f"/api/campaigns/{campaign_id}/submissions",
+        json={"content": "Forged voice.", "character_id": str(foreign_id)},
+        headers={"Idempotency-Key": "forged-speaker"},
+    )
+    assert response.status_code == 422
     with pytest.raises(SubmissionValidationError):
         parse_tagged_content("<ic>fiction <ooc>table talk</ooc></ic>")

@@ -12,6 +12,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models.campaigns import Campaign
+from models.campaigns import CampaignMember
 from models.characters import Character
 from models.threads import PlayerSubmission
 from models.threads import PlayerSubmissionSegment
@@ -131,6 +132,35 @@ def accept_submission(
         character = db.get(Character, character_id)
         if character is None or character.owner_id != user_id:
             raise SubmissionValidationError("character_id must identify one of your characters")
+    else:
+        # Default speaker: the sender's selected launch character. A live-table
+        # submission with no explicit character speaks as the sender's PC, so
+        # DM context always carries the player<->character linkage (protected
+        # PCs lane) even for clients holding a stale roster. Explicit claims
+        # above stay the only override path.
+        member = (
+            db.execute(
+                select(CampaignMember).where(
+                    CampaignMember.campaign_id == campaign_id,
+                    CampaignMember.user_id == user_id,
+                )
+            )
+            .scalars()
+            .first()
+        )
+        selected = member.selected_character_id if member is not None else None
+        if selected is not None:
+            character = db.get(Character, selected)
+            if character is not None and character.owner_id == user_id:
+                character_id = selected
+            else:
+                logger.warning(
+                    "player_submission selected character unusable "
+                    "campaign_id=%s user_id=%s selected_character_id=%s",
+                    campaign_id,
+                    user_id,
+                    selected,
+                )
 
     prior = None
     submission = None

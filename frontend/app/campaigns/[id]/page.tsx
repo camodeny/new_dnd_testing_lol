@@ -14,13 +14,23 @@ import { useCampaignCapacity } from '@/hooks/useCampaignCapacity'
 import { CapacityMeterView } from '@/components/dashboard/CapacityMeter'
 import { isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
 import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
+import { mergeOptimisticMessages } from '@/lib/optimisticMessages'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import CampaignLobby from '@/components/dashboard/CampaignLobby'
 import StoryAtlas from '@/components/dashboard/StoryAtlas'
-import type { Campaign, Character, Session, EncounterMap } from '@/types'
+import type { Campaign, Character, Message, Session, EncounterMap } from '@/types'
 
 type CampaignMode = 'lobby' | 'planning' | 'world-building' | 'session'
+
+// Launch roster entries carry character_id instead of id — normalize once
+// so keys, current-character lookup, and projection all match.
+function normalizeRosterCharacters(entries: Character[] | undefined): Character[] {
+  return (entries ?? []).map((c) => ({
+    ...c,
+    id: c.id ?? (c as unknown as { character_id?: string }).character_id ?? '',
+  }))
+}
 
 function determineCampaignMode(
   campaign: Campaign & { active_session?: Session | null; world?: unknown },
@@ -50,6 +60,10 @@ export default function CampaignViewPage() {
   const [mode, setMode] = useState<CampaignMode | null>(null)
   const [startPending, setStartPending] = useState(false)
   const [worldPrepared, setWorldPrepared] = useState(false)
+  // Optimistic player messages: rendered instantly on send, retired once
+  // the matching server echo arrives in the live-table projection (or on
+  // send failure). Never persisted — server state stays authoritative.
+  const [pendingMessages, setPendingMessages] = useState<Message[]>([])
 
   const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
   const liveTable = useLiveTableRealtime({
@@ -57,13 +71,16 @@ export default function CampaignViewPage() {
     threadId: activeThreadId,
     enabled: Boolean(session && activeThreadId),
   })
-  const messages = useMemo(() => projectLiveTableMessages({
-    submissions: liveTable.messages,
-    dmMessages: liveTable.dmMessages,
-    characters,
-    currentUser: user,
-    sessionId: session?.id,
-  }), [liveTable.messages, liveTable.dmMessages, characters, user, session?.id])
+  const messages = useMemo(() => mergeOptimisticMessages(
+    projectLiveTableMessages({
+      submissions: liveTable.messages,
+      dmMessages: liveTable.dmMessages,
+      characters,
+      currentUser: user,
+      sessionId: session?.id,
+    }),
+    pendingMessages,
+  ), [liveTable.messages, liveTable.dmMessages, characters, user, session?.id, pendingMessages])
   const streamingDmText = activeDmText(liveTable.dmState, liveTable.dmMessages)
   const aiThinking = Boolean(liveTable.dmState?.streaming || liveTable.dmStatus?.type === 'dm.thinking')
   const aiThinkingStatus = typeof liveTable.dmStatus?.status === 'string' ? liveTable.dmStatus.status : ''
@@ -94,12 +111,7 @@ export default function CampaignViewPage() {
 
       const camp = campData.campaign
       setCampaign(camp)
-      // Launch roster entries carry character_id instead of id — normalize
-      // once so keys, current-character lookup, and projection all match.
-      setCharacters((charData.characters ?? []).map((c) => ({
-        ...c,
-        id: c.id ?? (c as unknown as { character_id?: string }).character_id ?? '',
-      })))
+      setCharacters(normalizeRosterCharacters(charData.characters))
       const campaignThread = channelData.channels.find((channel) => channel.thread_type === 'campaign')
       if (!campaignThread) throw new Error('The campaign live table is not available.')
       setActiveThreadId(campaignThread.thread_id)
@@ -135,6 +147,24 @@ export default function CampaignViewPage() {
   useEffect(() => {
     loadData()
   }, [loadData])
+
+  // The roster above is fetched at page mount — often the pre-selection
+  // lobby — so refresh it when the live table opens. Otherwise the sender
+  // resolves to no character (messages unattributed, DM unaware the speaker
+  // is their selected PC) for anyone who picked their character after mount.
+  useEffect(() => {
+    if (!id || !session) return
+    let cancelled = false
+    campaignMembers.listCharacters(String(id))
+      .then((charData) => {
+        if (!cancelled) setCharacters(normalizeRosterCharacters(charData.characters))
+      })
+      .catch(() => {
+        // Keep the mount-time roster; the server defaults unattributed
+        // submissions to the sender's selected PC.
+      })
+    return () => { cancelled = true }
+  }, [id, session?.id])
 
   const handleStartSession = useCallback(async () => {
     if (!id || startPending) return
@@ -181,6 +211,19 @@ export default function CampaignViewPage() {
 
   const handleSendMessage = useCallback(async (content: string) => {
     if (!id || !session?.id || !activeThreadId) return
+    const pendingId = `pending:${typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+    const optimistic: Message = {
+      id: pendingId,
+      session_id: session.id,
+      role: 'player',
+      content,
+      created_at: new Date().toISOString(),
+      sender_name: currentCharacter?.name ?? user?.username ?? 'Player',
+    }
+    // Show instantly; the server echo replaces this via the merge above.
+    setPendingMessages((current) => [...current, optimistic])
     try {
       const idempotencyKey =
         typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
@@ -197,6 +240,9 @@ export default function CampaignViewPage() {
       })
       await liveTable.refresh()
     } catch (err) {
+      // Send failed: withdraw the optimistic entry (StoryAtlas restores the
+      // draft) so a failed send is never displayed as accepted work.
+      setPendingMessages((current) => current.filter((entry) => entry.id !== pendingId))
       if (isCapacityPausedError(err)) {
         // Lost a capacity race after the meter's last poll: keep the draft
         // (StoryAtlas restores it) and resync from the authoritative
@@ -208,7 +254,7 @@ export default function CampaignViewPage() {
       }
       throw err
     }
-  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable.refresh, capacity.refresh])
+  }, [id, session?.id, activeThreadId, currentCharacter?.id, currentCharacter?.name, user, liveTable.refresh, capacity.refresh])
 
   const handleLoadOlderMessages = useCallback(async () => {
     await liveTable.loadOlder()
