@@ -318,6 +318,10 @@ class Adventure(Base):
             "closing_status IN ('pending', 'succeeded', 'failed')",
             name="ck_adventures_closing_status",
         ),
+        CheckConstraint(
+            "epilogue_status IN ('none', 'open', 'closed')",
+            name="ck_adventures_epilogue_status",
+        ),
         # Idempotency: one completion operation closes at most one adventure
         # record per campaign; retries hit the same row.
         UniqueConstraint("campaign_id", "operation_id", name="uq_adventures_campaign_operation"),
@@ -362,6 +366,13 @@ class Adventure(Base):
     closing_status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     closing_attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     closing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional post-adventure epilogue phase (issue #262): 'none' until the
+    # DM opens epilogues after completion, 'open' while players may
+    # submit/skip, 'closed' once the DM closes the phase. Completion never
+    # waits for epilogues; closing never requires full participation.
+    epilogue_status: Mapped[str] = mapped_column(String(16), nullable=False, default="none", server_default="none")
+    epilogues_opened_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    epilogues_closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -386,6 +397,9 @@ class Adventure(Base):
             "closing_status": self.closing_status,
             "closing_attempts": self.closing_attempts,
             "closing_error": self.closing_error,
+            "epilogue_status": self.epilogue_status,
+            "epilogues_opened_at": self.epilogues_opened_at.isoformat() if self.epilogues_opened_at else None,
+            "epilogues_closed_at": self.epilogues_closed_at.isoformat() if self.epilogues_closed_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -572,3 +586,124 @@ class CampaignPcLifecycle(Base):
             "introduction_status": self.introduction_status,
             "introduced_at": self.introduced_at.isoformat() if self.introduced_at else None,
         }
+
+
+class AdventureEpilogue(Base):
+    """Optional per-PC post-adventure epilogue — issue #262.
+
+    After an adventure completes, each relevant player may optionally submit
+    what their character does next (or explicitly skip). Entries are player
+    authored: the submitting user must own the character, so the DM never
+    invents voluntary PC epilogue choices.
+
+    Two kinds, both durable canon once resolved:
+
+    - ``simple``: no mechanical uncertainty; the entry resolves immediately
+      into a canonical ``adventure.epilogue`` domain event (post-turn input
+      like any other event).
+    - ``adjudicated``: mechanically uncertain; the entry waits for a human
+      roll fulfilled through the deterministic epilogue roll cycle
+      (die 1–20 + modifier vs DC, code-owned arithmetic), then resolves
+      into the same canonical event path.
+
+    Duplicate protection: one row per (adventure, character), plus
+    (campaign, operation_id) idempotency for retried submissions. Failure
+    never touches the already-completed adventure row.
+    """
+
+    __tablename__ = "adventure_epilogues"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('submitted', 'awaiting_roll', 'resolved', 'skipped')",
+            name="ck_adventure_epilogues_status",
+        ),
+        CheckConstraint(
+            "kind IN ('simple', 'adjudicated')",
+            name="ck_adventure_epilogues_kind",
+        ),
+        CheckConstraint(
+            "visibility IN ('public', 'private')",
+            name="ck_adventure_epilogues_visibility",
+        ),
+        UniqueConstraint(
+            "adventure_id", "character_id",
+            name="uq_adventure_epilogues_adventure_character",
+        ),
+        UniqueConstraint(
+            "campaign_id", "operation_id",
+            name="uq_adventure_epilogues_campaign_operation",
+        ),
+        Index("ix_adventure_epilogues_adventure", "adventure_id"),
+        Index("ix_adventure_epilogues_campaign", "campaign_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    adventure_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("adventures.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="simple", server_default="simple")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="submitted", server_default="submitted")
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="public", server_default="public")
+    # The player's voluntary epilogue choice/action, in their own words.
+    content: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Adjudicated entries: deterministic roll spec + fulfilled result.
+    # Spec: {roll_kind, ability_or_skill, label, dc, modifier_hint}.
+    roll_spec: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Result: {die_value, modifier, total, success, natural}.
+    roll_result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Canonical resolved outcome text (committed to the domain event).
+    outcome_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Authoritative provenance: the canonical epilogue domain event.
+    source_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaign_domain_events.id", ondelete="SET NULL"), nullable=True
+    )
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self, *, include_content: bool = True):
+        d = {
+            "id": str(self.id),
+            "adventure_id": str(self.adventure_id),
+            "campaign_id": str(self.campaign_id),
+            "character_id": str(self.character_id),
+            "user_id": str(self.user_id),
+            "kind": self.kind,
+            "status": self.status,
+            "visibility": self.visibility,
+            "has_roll": self.roll_spec is not None,
+            "roll_spec": self.roll_spec,
+            "roll_result": self.roll_result,
+            "outcome_text": self.outcome_text,
+            "source_event_id": str(self.source_event_id) if self.source_event_id else None,
+            "operation_id": self.operation_id,
+            "attempts": self.attempts,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+        if include_content:
+            d["content"] = self.content
+        return d
+
+    def to_public_dict(self):
+        """Member-safe projection.
+
+        Private epilogue content stays restricted to the owning player (and
+        the owner/DM); everyone else sees only participation metadata.
+        """
+        d = self.to_dict(include_content=False)
+        d["authority"] = "canon once resolved: adventure.epilogue domain event"
+        return d
