@@ -718,17 +718,14 @@ def campaign_start(
         execute=_execute,
     )
     # Immediate execution of the staged opening turn, scoped to this start's
-    # coordinated attempt. Same DM_INLINE_EXECUTE local-dev gate as player
-    # submissions, scheduled post-response: a blocking inline run would hold
-    # the request for the full pipeline and proxies kill slow requests with
-    # a 500 the backend never sees. Prod leaves execution to the cron
-    # sweep/workers, so a slow provider never holds the start request open.
+    # coordinated attempt, dispatched post-response: a blocking inline run
+    # would hold the request for the full pipeline and proxies kill slow
+    # requests with a 500 the backend never sees. Best-effort — a start whose
+    # post-response work does not finish leaves the attempt ``prepared`` for
+    # ``/api/cron/dm-execute`` to reconcile.
     try:
-        import os
-
         attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
-        if (attempt_data and attempt_data.get("id")
-                and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+        if attempt_data and attempt_data.get("id"):
             from app.dm.recovery import execute_committed_attempt
 
             background_tasks.add_task(
@@ -736,8 +733,9 @@ def campaign_start(
             )
     except Exception as exc:
         logger.warning(
-            "campaign start inline execute guard failed campaign_id=%s error=%s",
-            cid, exc,
+            "campaign start immediate execute guard failed campaign_id=%s error=%s",
+            cid,
+            exc,
         )
     return result
 

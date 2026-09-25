@@ -385,7 +385,7 @@ def test_get_or_create_preserves_pending_work_through_shared_thread_race(api):
         assert db.query(CampaignThread).filter_by(campaign_id=campaign_id, thread_type="campaign").count() == 1
 
 
-def test_inline_execution_targets_new_attempt_and_skips_direct_messages(api, monkeypatch):
+def test_immediate_execution_targets_new_attempt_and_skips_direct_messages(api, monkeypatch):
     from app.dm.turns import coordinate_turn
     from app.runtime.submissions import accept_submission
     from models.dm import DmTurnAttempt
@@ -403,7 +403,7 @@ def test_inline_execution_targets_new_attempt_and_skips_direct_messages(api, mon
         _, old_attempt = coordinate_turn(db, other.id, str(thread.id))
         old_id = old_attempt.id
 
-    monkeypatch.setenv("DM_INLINE_EXECUTE", "1")
+    monkeypatch.setenv("DM_EXECUTE_DISPATCH", "1")
     monkeypatch.setattr("database.SessionLocal", factory)
     executed = []
     monkeypatch.setattr("app.dm.execution.execute_dm_attempt", lambda db, aid: executed.append(aid))

@@ -53,3 +53,20 @@ def _pin_stub_embeddings(monkeypatch: pytest.MonkeyPatch):
     for var in _PROVIDER_ENV_VARS:
         monkeypatch.delenv(var, raising=False)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _disable_immediate_dm_execution(monkeypatch: pytest.MonkeyPatch):
+    """Keep post-response DM execution out of the default test path.
+
+    Submission/start/retry/roll routes dispatch ``execute_committed_attempt``
+    after the response. Left enabled, that would open a real ``SessionLocal``
+    session (``backend/.env`` points at a live Supabase pooler) for attempts
+    that only exist in a test's in-memory DB.
+
+    Tests that deliberately assert dispatch opt back in with
+    ``monkeypatch.setenv("DM_EXECUTE_DISPATCH", "1")`` — which stacks on top of
+    this fixture, same as ``_pin_stub_embeddings``.
+    """
+    monkeypatch.setenv("DM_EXECUTE_DISPATCH", "0")
+    yield

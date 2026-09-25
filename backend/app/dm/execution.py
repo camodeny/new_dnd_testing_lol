@@ -24,9 +24,13 @@ staged effects are never committed without a valid DM result.
 Entry points:
 - :func:`execute_dm_attempt` — execute one attempt (idempotent).
 - :func:`run_dm_execute_sweep` — claim + execute oldest prepared attempts;
-  used by the ``/api/cron/dm-execute`` trigger and by the post-submission
-  best-effort hook. A DB sweep (not queue-only) keeps serverless runtimes
-  autonomous without a push-consumer trigger.
+  used by the ``/api/cron/dm-execute`` reconciliation trigger. A DB sweep
+  (not queue-only) keeps serverless runtimes autonomous without a
+  push-consumer trigger.
+- ``app.dm.recovery.execute_committed_attempt`` — best-effort post-response
+  execution of the attempt coordinated by a new submission, campaign start,
+  retry, or roll fulfillment, so prepared work does not wait for the sweep
+  (disable with ``DM_EXECUTE_DISPATCH=0``).
 - ``dm.turn.execute`` queue handler — same orchestrator behind the worker
   envelope path for when a queue trigger is registered (#208 hardening).
 """

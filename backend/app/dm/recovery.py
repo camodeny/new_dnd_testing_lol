@@ -300,8 +300,36 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     return final_turn, final_attempt, event
 
 
+def immediate_execution_enabled() -> bool:
+    """Whether a newly prepared attempt is dispatched immediately.
+
+    Enabled by default so an accepted submission (or campaign start) begins
+    execution right after the response instead of waiting up to a full cron
+    interval. Set ``DM_EXECUTE_DISPATCH=0`` to fall back to sweep-only
+    execution (operational kill switch for saturated providers, and the
+    hermetic default in tests). The cron sweep reconciles either way.
+    """
+    import os
+
+    return os.getenv("DM_EXECUTE_DISPATCH", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
 def execute_committed_attempt(attempt_id):
-    """Best-effort post-response execution; prepared work stays sweepable."""
+    """Best-effort post-response execution; prepared work stays sweepable.
+
+    Idempotent: ``execute_dm_attempt`` no-ops on terminal/streaming attempts,
+    so this never double-executes work the sweep already claimed. A runtime
+    that does not finish post-response work leaves the attempt ``prepared``
+    for ``/api/cron/dm-execute`` to reconcile.
+    """
+    if not immediate_execution_enabled():
+        logger.info("post-response DM execution disabled attempt_id=%s", attempt_id)
+        return
     from database import SessionLocal
     from app.dm.execution import execute_dm_attempt
     try:
