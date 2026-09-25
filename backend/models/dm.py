@@ -1,9 +1,9 @@
-"""DM turns, streams, and player-roll domain models."""
+"""DM turns, streams, player-roll, and secret-contest domain models."""
 
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -177,6 +177,13 @@ class PlayerRollRequest(Base):
     advantage_state: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default="normal")
     reason_public: Mapped[str] = mapped_column(String(600), nullable=False)
     dc_private: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Issue #249 — hidden-cause roll linkage. A target-PC roll requested as
+    # part of a contested secret action points at its SecretContest; ordinary
+    # #204 rolls keep NULL. Never serialized to unauthorized readers.
+    secret_contest_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("secret_contests.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", index=True)
     replacement_of_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="SET NULL"), nullable=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -209,3 +216,75 @@ class PlayerRollFulfillment(Base):
         if include_private or self.visibility == "public":
             value.update(raw_rolls=self.raw_rolls or [], modifier=self.modifier, total=self.total, raw_metadata=self.raw_metadata)
         return value
+
+
+class SecretContest(Base):
+    """Contested secret action against other PCs — issue #249.
+
+    Orchestration between a private initiating turn (canonical #248 private
+    action) and one or more affected human PCs. The DM needs a check/save/
+    contest from a target player without revealing the hidden cause; both
+    sides' dice stay player-supplied and the initiating player can never
+    author the target PC's roll or voluntary behavior.
+
+    ``hidden_cause`` is DM-only context (never projected, never logged).
+    Target rolls are ordinary #204 ``PlayerRollRequest`` rows linked via
+    ``secret_contest_id``; their public ``to_dict()`` projection already
+    redacts ``dc_private``. Outcome branch facts commit with restricted
+    visibility; reveal expands visibility explicitly via #211 grants.
+    """
+
+    __tablename__ = "secret_contests"
+    __table_args__ = (
+        UniqueConstraint("initiating_turn_id", "contest_key", name="uq_secret_contests_turn_key"),
+        CheckConstraint("status IN ('pending','resolved','cancelled')", name="ck_secret_contests_status"),
+        CheckConstraint("mode IN ('opposed','target_vs_dc')", name="ck_secret_contests_mode"),
+        Index("ix_secret_contests_campaign_status", "campaign_id", "status"),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
+    initiating_turn_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("dm_turns.id", ondelete="CASCADE"), nullable=False, index=True)
+    initiating_attempt_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("dm_turn_attempts.id", ondelete="SET NULL"), nullable=True)
+    initiator_user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=False, index=True)
+    initiator_character_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("characters.id", ondelete="RESTRICT"), nullable=False)
+    contest_key: Mapped[str] = mapped_column(String(48), nullable=False)
+    mode: Mapped[str] = mapped_column(String(24), nullable=False, default="opposed", server_default="opposed")
+    dc_private: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    initiator_roll_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="SET NULL"), nullable=True)
+    target_user_ids: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    target_roll_request_ids: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    # DM-only hidden cause. Never projected, never logged, never in realtime.
+    hidden_cause: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reveal_on_success: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    reveal_on_failure: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # Branch knowledge outcomes: [{content, visibility, epistemic_state}].
+    success_facts: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    failure_facts: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", index=True)
+    outcome: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    revealed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    resolved_event_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("campaign_domain_events.id", ondelete="SET NULL"), nullable=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self):
+        # DM/audit shape only — never served to players. Excludes hidden_cause.
+        return {
+            "id": str(self.id), "campaign_id": str(self.campaign_id),
+            "initiating_turn_id": str(self.initiating_turn_id),
+            "initiating_attempt_id": str(self.initiating_attempt_id) if self.initiating_attempt_id else None,
+            "initiator_user_id": str(self.initiator_user_id),
+            "initiator_character_id": str(self.initiator_character_id),
+            "contest_key": self.contest_key, "mode": self.mode,
+            "target_user_ids": list(self.target_user_ids or []),
+            "target_roll_request_ids": list(self.target_roll_request_ids or []),
+            "reveal_on_success": bool(self.reveal_on_success),
+            "reveal_on_failure": bool(self.reveal_on_failure),
+            "status": self.status, "outcome": self.outcome,
+            "revealed": bool(self.revealed),
+            "resolved_event_id": str(self.resolved_event_id) if self.resolved_event_id else None,
+            "operation_id": self.operation_id,
+            "requested_at": self.requested_at.isoformat() if self.requested_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
