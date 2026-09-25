@@ -158,12 +158,14 @@ def _started_snapshot(db: Session, campaign, *, replayed: bool) -> dict:
     thread = get_or_create_campaign_thread(db, campaign.id, created_by=campaign.owner_id)
     thread_id_str = str(thread.id)
     turn, attempt, _ = _find_opening_turn(db, campaign.id, thread_id_str)
+    from app.campaigns.opening_intro import get_opening_intro_state
     body: dict = {
         "campaign": campaign.to_dict(),
         "thread_id": thread_id_str,
         "thread": thread.to_dict(),
         "replayed": replayed,
         "eligibility": eligibility,
+        "opening_intro": get_opening_intro_state(db, campaign.id),
     }
     if turn is not None:
         body["dm_turn"] = turn.to_dict()
@@ -234,6 +236,26 @@ def run_campaign_start(
             f"Campaign start not eligible: {'; '.join(eligibility.get('blockers') or [])}"
         )
 
+    # Opening-introduction order: the deterministic launch party frozen for
+    # the intro cursor (opening_intro.py). Eligibility above guarantees every
+    # member holds a valid named character.
+    from models.characters import Character as _Character
+
+    _launch_chars = {
+        str(c.id): c for c in db.execute(
+            _select(_Character).where(_Character.id.in_(
+                [m.selected_character_id for m in members]
+            ))
+        ).scalars().all()
+    }
+    intro_order = [
+        {
+            "character_id": str(m.selected_character_id),
+            "character_name": _launch_chars[str(m.selected_character_id)].name,
+        }
+        for m in members
+    ]
+
     # Shared gameplay thread — durable, reused across retries/reconnects.
     thread = get_or_create_campaign_thread(db, campaign.id, created_by=actor_id)
     db.flush()
@@ -260,6 +282,7 @@ def run_campaign_start(
             "from": from_status,
             "to": "active",
             "thread_id": thread_id_str,
+            "intro_order": intro_order,
         },
         operation_id=f"{operation_id}:started",
         actor_id=actor_id,

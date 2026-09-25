@@ -1512,6 +1512,19 @@ def commit_turn(
     db.flush()
     if commit:
         db.commit()
+    if commit:
+        # Issue #246 — advance the opening-introduction cursor. Best-effort
+        # derived state: failures (including revision races) only defer the
+        # cursor, which self-heals on the next commit. Never breaks a turn.
+        try:
+            from app.campaigns.opening_intro import maybe_advance_opening_intro
+
+            maybe_advance_opening_intro(db, turn.campaign_id)
+        except Exception as exc:
+            logger.warning(
+                "dm_turn opening intro advance skipped campaign_id=%s turn_id=%s error=%s",
+                turn.campaign_id, turn.id, exc,
+            )
     db.refresh(turn)
     db.refresh(attempt)
     db.refresh(campaign_after)
