@@ -305,3 +305,215 @@ def adventure_closing_cron_get(request: Request, db: Session = Depends(get_db)):
 @router.post("/api/cron/adventure-closing")
 def adventure_closing_cron_post(request: Request, db: Session = Depends(get_db)):
     return adventure_closing_cron_get(request=request, db=db)
+
+
+# ── Optional player epilogues (issue #262) ────────────────────────────────────
+#
+# Canonical post-adventure play: players optionally submit what their PCs do
+# next (or skip) after DM-declared completion. Simple entries resolve
+# immediately into canonical ``adventure.epilogue`` domain events;
+# adjudicated entries wait for the owning player's deterministic roll.
+# The DM never authors voluntary PC choices — submit/roll accept only the
+# character's owning player (enforced in the service).
+
+
+def _epilogue_error_response(exc: Exception):
+    from app.adventures.epilogues import (
+        EpilogueAuthorizationError,
+        EpilogueDuplicateError,
+        EpilogueStateError,
+    )
+
+    if isinstance(exc, EpilogueAuthorizationError):
+        raise HTTPException(status_code=403, detail=str(exc))
+    if isinstance(exc, (EpilogueStateError, EpilogueDuplicateError)):
+        raise HTTPException(status_code=409, detail=str(exc))
+    if isinstance(exc, RevisionConflictError):
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        )
+    if isinstance(exc, CampaignArchivedError):
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    raise HTTPException(status_code=400, detail=str(exc))
+
+
+def _require_int(body: dict, name: str) -> int:
+    try:
+        return int(body[name])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail=f"{name} must be an integer")
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/open")
+def open_epilogues_endpoint(campaign_id: str, adventure_id: str, request: Request, db: Session = Depends(get_db)):
+    """Open the optional epilogue phase for a completed adventure (owner/DM-only)."""
+    from app.adventures.epilogues import epilogue_stats, open_epilogues
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_owner(camp, profile)
+    _adventure_or_404(db, cid, aid)
+    try:
+        adv = open_epilogues(db, cid, aid)
+        db.refresh(adv)
+    except Exception as exc:  # noqa: BLE001 — mapped to status codes below
+        _epilogue_error_response(exc)
+    return {"adventure": adv.to_dict(), "stats": epilogue_stats(db, aid)}
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/submit")
+def submit_epilogue_endpoint(
+    campaign_id: str, adventure_id: str, payload: dict,
+    request: Request, db: Session = Depends(get_db),
+):
+    """Submit the caller's voluntary epilogue choice for their own PC.
+
+    Body: character_id, content, visibility (public|private),
+    needs_adjudication + roll_spec ({roll_kind, ability_or_skill, label, dc})
+    for mechanically uncertain actions, optional operation_id for idempotent
+    retry, and required expected_revision (canonical fictional mutation).
+    """
+    from app.adventures.epilogues import submit_epilogue
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_member(db, camp, profile)
+    _adventure_or_404(db, cid, aid)
+    body = payload or {}
+    try:
+        character_id = uuid_lib.UUID(str(body.get("character_id") or ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="character_id must be a UUID")
+    if "expected_revision" not in body:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    expected = _require_int(body, "expected_revision")
+    try:
+        row, event = submit_epilogue(
+            db, cid, aid,
+            user_id=profile.id,
+            character_id=character_id,
+            content=str(body.get("content") or ""),
+            visibility=str(body.get("visibility") or "public"),
+            needs_adjudication=bool(body.get("needs_adjudication")),
+            roll_spec=body.get("roll_spec"),
+            operation_id=(str(body.get("operation_id") or "").strip() or None),
+            expected_revision=expected,
+        )
+    except Exception as exc:  # noqa: BLE001 — mapped to status codes below
+        _epilogue_error_response(exc)
+    return {
+        "epilogue": row.to_dict(),
+        "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/{epilogue_id}/roll")
+def fulfill_epilogue_roll_endpoint(
+    campaign_id: str, adventure_id: str, epilogue_id: str, payload: dict,
+    request: Request, db: Session = Depends(get_db),
+):
+    """Fulfill the caller's human roll for their PC's adjudicated epilogue.
+
+    Body: die_value (1–20), modifier (-10…+30), required expected_revision.
+    Code-owned arithmetic decides success; the outcome commits canonically.
+    """
+    from app.adventures.epilogues import fulfill_epilogue_roll
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_member(db, camp, profile)
+    _adventure_or_404(db, cid, aid)
+    try:
+        eid = uuid_lib.UUID(str(epilogue_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid epilogue id")
+    body = payload or {}
+    if "expected_revision" not in body:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    expected = _require_int(body, "expected_revision")
+    try:
+        die = int(body.get("die_value"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="die_value must be an integer between 1 and 20")
+    try:
+        modifier = int(body.get("modifier", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="modifier must be an integer")
+    try:
+        row, event = fulfill_epilogue_roll(
+            db, eid,
+            user_id=profile.id,
+            die_value=die,
+            modifier=modifier,
+            expected_revision=expected,
+        )
+    except Exception as exc:  # noqa: BLE001 — mapped to status codes below
+        _epilogue_error_response(exc)
+    if str(row.adventure_id) != str(aid) or str(row.campaign_id) != str(cid):
+        raise HTTPException(status_code=404, detail="Epilogue not found")
+    return {
+        "epilogue": row.to_dict(),
+        "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/skip")
+def skip_epilogue_endpoint(
+    campaign_id: str, adventure_id: str, payload: dict,
+    request: Request, db: Session = Depends(get_db),
+):
+    """Record an explicit decline for a PC (owner of the PC, or campaign owner)."""
+    from app.adventures.epilogues import skip_epilogue
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_member(db, camp, profile)
+    _adventure_or_404(db, cid, aid)
+    body = payload or {}
+    try:
+        character_id = uuid_lib.UUID(str(body.get("character_id") or ""))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="character_id must be a UUID")
+    try:
+        row = skip_epilogue(db, cid, aid, user_id=profile.id, character_id=character_id)
+    except Exception as exc:  # noqa: BLE001 — mapped to status codes below
+        _epilogue_error_response(exc)
+    return {"epilogue": row.to_dict()}
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/close")
+def close_epilogues_endpoint(campaign_id: str, adventure_id: str, request: Request, db: Session = Depends(get_db)):
+    """Close the epilogue phase (owner/DM-only). Partial participation is fine."""
+    from app.adventures.epilogues import close_epilogues
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_owner(camp, profile)
+    _adventure_or_404(db, cid, aid)
+    try:
+        stats = close_epilogues(db, cid, aid)
+    except Exception as exc:  # noqa: BLE001 — mapped to status codes below
+        _epilogue_error_response(exc)
+    return {"stats": stats}
+
+
+@router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues")
+def list_epilogues_endpoint(campaign_id: str, adventure_id: str, request: Request, db: Session = Depends(get_db)):
+    """Visibility-filtered epilogue roster + participation stats (member-readable)."""
+    from app.adventures.epilogues import epilogue_stats, list_epilogues
+
+    profile = resolve_profile(request, db)
+    cid, aid = _parse_ids(campaign_id, adventure_id)
+    camp = _campaign_or_404(db, cid)
+    _require_member(db, camp, profile)
+    _adventure_or_404(db, cid, aid)
+    entries = list_epilogues(
+        db, aid, viewer_id=profile.id, is_owner=(camp.owner_id == profile.id)
+    )
+    return {"epilogues": entries, "stats": epilogue_stats(db, aid)}
