@@ -102,6 +102,7 @@ def build_submission_event(
         "user_id": str(submission.user_id),
         "audience": submission.audience,
         "raw_content": submission.raw_content,
+        "source": submission.source,
         "segments": seg_dicts,
         "accepted_at": submission.accepted_at.isoformat() if submission.accepted_at else None,
         "timestamp": _utcnow_iso(),
@@ -964,6 +965,7 @@ def apply_events_to_snapshot(
                         "sequence": ev.get("sequence"),
                         "thread_id": ev.get("thread_id"),
                         "raw_content": ev.get("raw_content"),
+                        "source": ev.get("source"),
                         "segments": ev.get("segments"),
                     }
                 )

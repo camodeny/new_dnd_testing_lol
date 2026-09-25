@@ -12,7 +12,7 @@ either. Only API keys come from the environment
 
 AREA_CONFIG = {
     "dm": ("meta", "muse-spark-1.3-contributor"),
-    "narrator": ("openai", "gpt-5.6-luna"),
+    "narrator": ("openai", "gpt-6-luna"),
     "character_chat": ("meta", "muse-spark-1.3-contributor"),
     "lore_dm_chat": ("meta", "muse-spark-1.3-contributor"),
 }

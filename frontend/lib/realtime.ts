@@ -26,6 +26,7 @@ export interface RealtimeEvent {
   // payload specifics
   id?: string
   raw_content?: string
+  source?: string | null
   user_id?: string
   character_id?: string | null
   accepted_at?: string | null

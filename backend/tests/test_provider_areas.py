@@ -27,7 +27,7 @@ def test_dm_pinned_to_meta(keys):
 def test_narrator_pinned_to_openai(keys):
     adapter, model, name = resolve_area("narrator")
     assert name == "openai"
-    assert model == "gpt-5.6-luna"
+    assert model == "gpt-6-luna"
     assert adapter.name == "openai"
 
 

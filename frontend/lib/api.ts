@@ -143,6 +143,14 @@ export const campaigns = {
       body: JSON.stringify({ operation_id: idempotencyKey }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
+  // Production campaign start (#246): ensures the shared live-table thread,
+  // stages the opening DM turn, and moves starting -> active atomically.
+  campaignStart: (id: string | number, idempotencyKey: string) =>
+    apiFetch<{ campaign: import('@/types').Campaign; thread_id: string }>(`/campaigns/${id}/campaign-start`, {
+      method: 'POST',
+      body: JSON.stringify({ operation_id: idempotencyKey }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
 }
 
 // ── Characters ────────────────────────────────────────────────────────────

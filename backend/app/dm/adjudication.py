@@ -47,6 +47,13 @@ Preserve established facts and player agency, but advance the world in response
 to the action. Missing prewritten story detail is not a reason to freeze play.
 Unmarked narration in player inputs can declare actions even when its segment
 is ooc; table_chat is for actual discussion of the game, not action declarations.
+MIXED DISCUSSION + ACTION: when one input asks an OOC question and declares an
+IC action, answer first via clarify_question (or table_chat_intent) AND emit
+beats for the action in the same contract — the answer must be able to stand
+before the resolution. If the honest answer makes the declared action
+impossible, moot, or uninformed in a way the player would reconsider, do NOT
+emit beats for an action that never happens: use clarify mode with the answer
+and let the player redeclare.
 
 REFERENCES:
 EntityRef.id is the exact durable character/entity UUID in the packet, never

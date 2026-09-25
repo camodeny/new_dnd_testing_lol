@@ -3,7 +3,7 @@ import logging
 import uuid as uuid_lib
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
@@ -655,6 +655,91 @@ def world_seed_campaign(
         payload=payload,
         execute=_execute,
     )
+
+
+@router.post("/api/campaigns/{campaign_id}/campaign-start")
+def campaign_start(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """Production campaign start — issue #246.
+
+    Owner-only. Requires the #245 world seed and a fully ready launch party.
+    Ensures the shared live-table thread, stages the opening DM turn through
+    the production submission/turn pipeline, and moves starting -> active
+    atomically. Idempotent: an existing start event converges without new
+    writes. Failures leave the campaign startable with an owed opening turn.
+    """
+    from app.campaigns.campaign_start import CampaignStartError, run_campaign_start
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        try:
+            return run_campaign_start(
+                db, cid, actor_id=profile.id,
+                operation_id=operation_id or idempotency_key,
+            )
+        except CampaignStartError as exc:
+            msg = str(exc)
+            if msg == "Campaign not found":
+                raise HTTPException(status_code=404, detail=msg) from exc
+            if msg.startswith("Only the owner"):
+                raise HTTPException(status_code=403, detail=msg) from exc
+            raise HTTPException(status_code=409, detail=msg) from exc
+        except RevisionConflictError as exc:
+            # Concurrent-start loser: the whole idempotent command (including
+            # its record) rolled back atomically, so retrying converges.
+            raise HTTPException(
+                status_code=409,
+                detail="Concurrent campaign start conflicted; retry the request",
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
+
+    result = execute_http_idempotent(
+        db,
+        response,
+        actor_id=profile.id,
+        idempotency_key=idempotency_key,
+        command_type="campaign.start_246",
+        scope_type="campaign",
+        scope_id=cid,
+        payload=payload,
+        execute=_execute,
+    )
+    # Immediate execution of the staged opening turn, scoped to this start's
+    # coordinated attempt. Same DM_INLINE_EXECUTE local-dev gate as player
+    # submissions, scheduled post-response: a blocking inline run would hold
+    # the request for the full pipeline and proxies kill slow requests with
+    # a 500 the backend never sees. Prod leaves execution to the cron
+    # sweep/workers, so a slow provider never holds the start request open.
+    try:
+        import os
+
+        attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
+        if (attempt_data and attempt_data.get("id")
+                and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+            from app.dm.recovery import execute_committed_attempt
+
+            background_tasks.add_task(
+                execute_committed_attempt, str(attempt_data["id"])
+            )
+    except Exception as exc:
+        logger.warning(
+            "campaign start inline execute guard failed campaign_id=%s error=%s",
+            cid, exc,
+        )
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/mutations")

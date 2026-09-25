@@ -84,8 +84,24 @@ HARD RULES — violating any rule invalidates your output:
    player-authored declarations with attribution; do not extend them.
 4. NPC dialogue: render the given utterance text only. Never reveal whether the
    NPC is truthful, mistaken, or deceptive, and never state hidden motives.
-5. No numbers, names, places, or quoted speech beyond the structured beats.
-6. You have no game-state authority: your words change nothing by themselves.
+ 5. No numbers, names, places, or quoted speech beyond the structured beats.
+ 6. You have no game-state authority: your words change nothing by themselves.
+
+MODES WITHOUT BEATS — table talk is first-class, not an error:
+ 7. When the turn mode is table_chat, the table_chat_intent IS your brief:
+   render it warmly in your own words as the DM speaking out of character,
+   using any scene detail present in the brief. There are no beats to
+   narrate and that is expected — never comment on their absence.
+8. NEVER use internal system vocabulary in player-visible text: structured
+   turn, beats, contract, table_chat, staged effects, claims, adjudication.
+   If you have nothing to say, the turn is silent — but you are never asked
+   to narrate silence; every prompt given to you has something to render.
+
+ORDER — mixed discussion and action in one turn:
+9. Render out-of-character answers first (clarify_question,
+   table_chat_intent), then beats, then any roll prompt, with
+   open_player_choice last. The player asked before acting; answer before
+   resolving.
 """
 
 PROVIDER_DETERMINISTIC = "deterministic-template-v1"
@@ -252,9 +268,24 @@ def render_deterministic_narration(
     render as ``Name says: "utterance"`` (utterance text only — never the
     private truth status); roll prompts append the public reason; open
     player choice closes the narration. No new facts are introduced.
+    Discussion leads action: clarify answers and table-chat intents render
+    before beats so a mixed question + action reads answer-first.
     """
     beats = projection.get("beats") or []
     parts: list[str] = []
+    # Mixed discussion + action answers first: the player asked before
+    # acting, so clarification/table chat leads and beats follow. With no
+    # discussion lanes present this is just beats, as before.
+    prelude = projection.get("safe_prelude")
+    if prelude:
+        parts.append(str(prelude).strip())
+    choice = projection.get("open_player_choice")
+    clarify = projection.get("clarify_question")
+    if clarify and not choice:
+        parts.append(str(clarify).strip())
+    table_chat = projection.get("table_chat_intent")
+    if table_chat:
+        parts.append(str(table_chat).strip())
     for beat in beats:
         claims = beat.get("claims") or []
         texts = [c.get("text", "") for c in claims if c.get("text")]
@@ -270,18 +301,8 @@ def render_deterministic_narration(
     if isinstance(roll, dict) and roll.get("reason_public"):
         label = str(roll.get("label") or "a roll").strip()
         parts.append(f"{str(roll['reason_public']).strip()} [{label}]")
-    choice = projection.get("open_player_choice")
     if choice:
         parts.append(str(choice).strip())
-    clarify = projection.get("clarify_question")
-    if clarify and not choice:
-        parts.append(str(clarify).strip())
-    prelude = projection.get("safe_prelude")
-    if prelude:
-        parts.insert(0, str(prelude).strip())
-    table_chat = projection.get("table_chat_intent")
-    if table_chat:
-        parts.append(str(table_chat).strip())
     text = " ".join(p for p in parts if p).strip()
     if not text and (contract is not None or projection.get("mode") in ("silent", "unsupported")):
         # Silent/unsupported modes intentionally narrate nothing.
@@ -369,6 +390,26 @@ _ANTONYMS: tuple[tuple[str, str], ...] = (
     ("full", "empty"), ("safe", "trapped"), ("calm", "hostile"),
 )
 
+#: Pipeline vocabulary that must never reach player-visible text. Matched
+#: with word boundaries (see _contains_phrase) and kept to multi-word or
+#: underscore terms so fiction ("his heart beats on", "the contract on the
+#: table") cannot trip the gate.
+_INTERNAL_JARGON_PHRASES = (
+    "structured turn",
+    "no beats",
+    "empty beats",
+    "table_chat",
+    "table chat intent",
+    "dm turn contract",
+    "dm_turn_contract",
+    "contract v1",
+    "staged effect",
+    "claim kind",
+    "claim_kind",
+    "evidence_refs",
+    "trigger_refs",
+)
+
 #: Temporary playtesting kill-switch for the narration PC-agency gate.
 #: Adjudication validators still guard agency; this only stops the narrator
 #: fidelity check from rejecting invented voluntary PC action/speech.
@@ -433,9 +474,12 @@ def validate_narration_fidelity(
     """Check narration against the structured result; return violations.
 
     Categories: ``secret_leakage``, ``unsupported_addition``,
-    ``agency_violation``, ``contradiction``. Empty list means pass.
-    Pure function — safe to run before any persistence.
+    ``agency_violation``, ``contradiction``, ``internal_jargon``. Empty
+    list means pass. Pure function — safe to run before any persistence.
     """
+    violations: list[dict[str, Any]] = []
+    text = narration or ""
+    low = text.lower()
     violations: list[dict[str, Any]] = []
     text = narration or ""
     low = text.lower()
@@ -458,6 +502,18 @@ def validate_narration_fidelity(
             violations.append({
                 "category": "secret_leakage", "code": "internal_id_leakage",
                 "message": f"Narration leaks internal provenance id {internal_id!r}",
+            })
+            break
+
+    # — Internal system jargon: pipeline vocabulary is never player-visible —
+    # A narrator with no beats must render the table-chat brief (contract
+    # rule 7), never comment on the absence of beats in system terms.
+    # Word-boundary matched so fiction ("his heart beats on") is unaffected.
+    for jargon in _INTERNAL_JARGON_PHRASES:
+        if _contains_phrase(low, jargon):
+            violations.append({
+                "category": "internal_jargon", "code": "internal_system_jargon",
+                "message": f"Narration uses internal system vocabulary {jargon!r}",
             })
             break
 
@@ -785,11 +841,11 @@ def check_narration_fidelity_or_raise(
 # ── Incremental fidelity policy (streaming providers) ─────────────────────────
 
 #: Violation categories enforced per delta, before each durable persist.
-#: Cheap fail-fast subset of the full gate: secrets and agency violations
-#: must never become visible, even briefly. The remaining categories
-#: (unsupported additions, contradictions) need whole-output context and
-#: run authoritatively at provider completion.
-_INCREMENTAL_CATEGORIES = ("secret_leakage", "agency_violation")
+#: Cheap fail-fast subset of the full gate: secrets, agency violations, and
+#: internal jargon must never become visible, even briefly. The remaining
+#: categories (unsupported additions, contradictions) need whole-output
+#: context and run authoritatively at provider completion.
+_INCREMENTAL_CATEGORIES = ("secret_leakage", "agency_violation", "internal_jargon")
 
 
 def validate_narration_incremental(
@@ -801,10 +857,11 @@ def validate_narration_incremental(
 ) -> list[dict[str, Any]]:
     """Cheap per-delta gate over the cumulative visible text.
 
-    Returns the ``secret_leakage`` / ``agency_violation`` subset of
-    :func:`validate_narration_fidelity` — computed by the same function so
-    incremental and full gates cannot disagree on those categories.
-    Pure function — safe to run before each persist.
+    Returns the ``secret_leakage`` / ``agency_violation`` /
+    ``internal_jargon`` subset of :func:`validate_narration_fidelity` —
+    computed by the same function so incremental and full gates cannot
+    disagree on those categories. Pure function — safe to run before each
+    persist.
     """
     return [
         v

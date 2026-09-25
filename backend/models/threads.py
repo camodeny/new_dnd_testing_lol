@@ -95,12 +95,16 @@ class PlayerSubmission(Base):
     audience: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_content: Mapped[str] = mapped_column(Text, nullable=False)
+    #: Origin marker. NULL = player-sent. System flows (e.g. the #246
+    #: campaign-start opener) tag their submissions so projections can hide
+    #: system instructions instead of rendering them as player speech.
+    source: Mapped[str | None] = mapped_column(String(64), nullable=True, default=None)
     resolution_status: Mapped[str] = mapped_column(String(32), nullable=False, default="accepted", server_default="accepted", index=True)
     accepted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self, segments=None):
-        result = {"id": str(self.id), "campaign_id": str(self.campaign_id), "user_id": str(self.user_id), "character_id": str(self.character_id) if self.character_id else None, "thread_id": self.thread_id, "audience": self.audience, "sequence": self.sequence, "raw_content": self.raw_content, "resolution_status": self.resolution_status, "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None, "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None}
+        result = {"id": str(self.id), "campaign_id": str(self.campaign_id), "user_id": str(self.user_id), "character_id": str(self.character_id) if self.character_id else None, "thread_id": self.thread_id, "audience": self.audience, "sequence": self.sequence, "raw_content": self.raw_content, "source": self.source, "resolution_status": self.resolution_status, "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None, "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None}
         if segments is not None:
             result["segments"] = [segment.to_dict() for segment in segments]
         return result

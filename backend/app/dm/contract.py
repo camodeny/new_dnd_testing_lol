@@ -923,12 +923,12 @@ class DmTurnContractV1(StrictModel):
                 raise ValueError("respond must not have roll_request")
             if self.evidence_requests:
                 raise ValueError("respond must not have evidence_requests")
-            if self.table_chat_intent is not None:
-                raise ValueError("table_chat_intent only valid in table_chat mode")
             if self.safe_prelude is not None:
                 raise ValueError("safe_prelude only valid in need_evidence mode")
-            if self.clarify_question is not None:
-                raise ValueError("clarify_question only valid in clarify mode")
+            # Mixed discussion + action: clarify_question / table_chat_intent
+            # may accompany beats as answer-first lanes (narration renders
+            # them before the resolution). They must never smuggle rulings:
+            # the beats remain the sole fictional payload.
         elif m == "await_roll":
             if not has_beats:
                 raise ValueError("await_roll requires 1-8 beats")
@@ -1132,12 +1132,14 @@ def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:
         "mode": contract.mode,
     }
 
-    # Audience-visible intent / hints (mode-specific)
-    if contract.mode == "table_chat" and contract.table_chat_intent is not None:
+    # Audience-visible intent / hints (mode-specific, plus mixed-turn
+    # companions: respond may carry clarify_question / table_chat_intent
+    # as answer-first lanes alongside beats)
+    if contract.table_chat_intent is not None and contract.mode in ("table_chat", "respond"):
         result["table_chat_intent"] = contract.table_chat_intent
     if contract.mode == "need_evidence" and contract.safe_prelude is not None:
         result["safe_prelude"] = contract.safe_prelude
-    if contract.mode == "clarify":
+    if contract.mode in ("clarify", "respond"):
         if contract.clarify_question is not None:
             result["clarify_question"] = contract.clarify_question
         # open_player_choice is audience-visible in clarify as well

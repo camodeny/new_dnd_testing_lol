@@ -75,7 +75,18 @@ export default function StoryAtlas({
   const [threadError, setThreadError] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
   const lastMessageIdRef = useRef<string | null>(null)
+
+  // Auto-grow the composer with newlines, up to ~10 rows, then scroll.
+  useEffect(() => {
+    const ta = inputRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    const max = Math.round(10 * 0.9 * 16 * 1.5)
+    ta.style.height = `${Math.min(ta.scrollHeight, max)}px`
+    ta.style.overflowY = ta.scrollHeight > max ? 'auto' : 'hidden'
+  }, [input])
 
   useEffect(() => {
     const lastMessageId = messages.length ? String(messages[messages.length - 1].id) : null
@@ -301,7 +312,7 @@ export default function StoryAtlas({
             </header>
 
             {/* Messages */}
-            <div ref={messagesContainerRef} className="session-messages" style={{ flex: 1, overflowY: 'auto', padding: '22px clamp(18px, 4.5vw, 72px) 0' }}>
+            <div ref={messagesContainerRef} className="session-messages" style={{ flex: 1, overflowY: 'auto', padding: '22px clamp(18px, 4.5vw, 72px) 24px' }}>
               {(liveStatus === 'reconnecting' || liveStatus === 'reconciling') && (
                 <div role="status" style={{ textAlign: 'center', marginBottom: 12, color: 'var(--text-dim)', fontSize: '0.72rem' }}>
                   {liveStatus === 'reconciling' ? 'Reconciling with the live table…' : 'Reconnecting to the live table…'}
@@ -349,8 +360,8 @@ export default function StoryAtlas({
                     style={{
                       width: 38, height: 38, borderRadius: '50%', flexShrink: 0,
                       border: '1px solid var(--border-color)',
-                      background: msg.role === 'dm' ? '#542f24' : 'rgba(255,255,255,0.06)',
-                      color: msg.role === 'dm' ? '#f6d6c6' : 'var(--text-muted)',
+                      background: msg.role === 'dm' ? 'var(--ember)' : 'var(--surface-muted)',
+                      color: msg.role === 'dm' ? '#fff8ee' : 'var(--ink-muted)',
                       display: 'grid', placeItems: 'center', fontSize: '0.62rem', fontWeight: 700,
                     }}
                   >
@@ -380,8 +391,8 @@ export default function StoryAtlas({
                 <div className="session-msg" style={{ display: 'flex', alignItems: 'flex-start', gap: 12, maxWidth: 900, width: '100%', marginInline: 'auto' }}>
                   <div style={{
                     width: 38, height: 38, borderRadius: '50%', flexShrink: 0,
-                    border: '1px solid rgba(209, 107, 72, 0.34)',
-                    background: '#542f24', color: '#f6d6c6',
+                    border: '1px solid var(--ember-hover)',
+                    background: 'var(--ember)', color: '#fff8ee',
                     display: 'grid', placeItems: 'center', fontSize: '0.62rem', fontWeight: 700,
                   }}>DM</div>
                   <div style={{ flex: 1, padding: '4px 0' }}>
@@ -403,8 +414,9 @@ export default function StoryAtlas({
             {/* Input area */}
             {session && (
               <div className="session-input-area" style={{ flexShrink: 0 }}>
-                <div className="session-input-shell" style={{ display: 'flex', alignItems: 'flex-end', gap: 8, padding: '8px 10px' }}>
+                <div className="session-input-shell" style={{ display: 'flex', alignItems: 'flex-end', gap: 8, padding: '3px 4px 3px 10px' }}>
                   <textarea
+                    ref={inputRef}
                     className="session-input-editable"
                     placeholder="What do you do?"
                     value={input}
@@ -415,7 +427,7 @@ export default function StoryAtlas({
                     style={{
                       flex: 1, background: 'transparent', border: 'none', resize: 'none',
                       color: 'var(--text-bright)', fontSize: '0.9rem', lineHeight: 1.5,
-                      maxHeight: '200px', overflowY: 'auto',
+                      maxHeight: '216px', overflowY: 'hidden', marginBlock: 'auto',
                     }}
                   />
                   <button
@@ -434,39 +446,9 @@ export default function StoryAtlas({
           )}
         </div>
 
-        {/* Right sidebar */}
-        <aside className="dashboard-right">
-          <div className="right-sidebar-widget" style={{ padding: '18px 0' }}>
-            <div className="widget-header" style={{ marginBottom: 16 }}>
-              <h3 style={{ margin: 0 }}>Party</h3>
-            </div>
-            {characters.length === 0 ? (
-              <p style={{ color: 'var(--text-dim)', fontSize: '0.8rem' }}>No characters in this campaign yet.</p>
-            ) : (
-              <div style={{ display: 'grid', gap: 10 }}>
-                {characters.map((c) => (
-                  <div
-                    key={c.id}
-                    style={{
-                      padding: 12, borderRadius: 8, border: '1px solid var(--border-color)',
-                      background: 'rgba(255,255,255,0.025)',
-                    }}
-                  >
-                    <div style={{ fontWeight: 700, color: 'var(--text-bright)', fontSize: '0.83rem', marginBottom: 3 }}>{c.name}</div>
-                    <div style={{ color: 'var(--text-muted)', fontSize: '0.7rem' }}>
-                      {[c.race, c.classes?.map((cl) => `${cl.class_name} ${cl.level}`).join('/')].filter(Boolean).join(' · ')}
-                    </div>
-                    {c.hit_points != null && (
-                      <div style={{ marginTop: 6, color: 'var(--text-dim)', fontSize: '0.68rem' }}>
-                        ❤ {c.hit_points} HP
-                      </div>
-                    )}
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </aside>
+        {/* Right sidebar dropped: the party roster was read-only and earned
+            neither the space nor the mobile tab. Reintroduce here (and the
+            grid column + Party tab below) when it carries live status. */}
       </div>
 
       {/* Mobile bottom nav */}
@@ -486,14 +468,6 @@ export default function StoryAtlas({
         >
           <i className="bi bi-chat-text" aria-hidden="true" />
           <span>Chat</span>
-        </button>
-        <button
-          type="button"
-          className={`mobile-nav-item${mobileTab === 'party' ? ' active' : ''}`}
-          onClick={() => setMobileTab('party')}
-        >
-          <i className="bi bi-people" aria-hidden="true" />
-          <span>Party</span>
         </button>
       </nav>
     </div>
