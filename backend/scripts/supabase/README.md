@@ -14,10 +14,13 @@ In Vault, create `dm_execute_base_url` with the public HTTPS backend origin and
 This is explicit environment setup, outside Alembic, so previews and disposable
 CI databases never acquire production schedules or secrets.
 
-Enable `DM_INLINE_EXECUTE=1` for immediate execution of the newly accepted
-submission's own attempt. Direct player conversations do not trigger execution.
-Otherwise the minute sweep provides the handoff. Provider credentials/model
-must be configured on the backend, never in the cron job.
+A newly accepted submission's own attempt is executed immediately after the
+response (best-effort, post-response) so it does not wait for the next minute
+sweep; direct player conversations do not trigger execution. The minute sweep
+remains the reconciliation path for anything the post-response dispatch did
+not finish. Set `DM_EXECUTE_DISPATCH=0` to disable immediate dispatch and rely
+on the sweep alone. Provider credentials/model must be configured on the
+backend, never in the cron job.
 
 The cron job queues an asynchronous HTTP request; inspect `net._http_response`
 as well as Cron history and the backend attempt status. A successful Cron run

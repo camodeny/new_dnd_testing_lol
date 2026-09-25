@@ -1,7 +1,6 @@
 """Runtime transport — live-table submissions, threads, and session stubs."""
 
 import logging
-import os
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
@@ -303,16 +302,15 @@ def create_player_submission(
         )
     # Immediate execution is scoped to this submission's coordinated attempt.
     # Direct player conversations have no DM attempt and never trigger DM work.
-    # Local-dev pump (DM_INLINE_EXECUTE): schedule post-response execution in
-    # this process instead of blocking the request on it. A blocking inline
-    # run holds the HTTP request for the full multi-model pipeline (60s+),
-    # which proxies kill (~30s) with a 500 the backend never sees — while
-    # the turn still succeeds server-side. BackgroundTasks returns 201 in
-    # milliseconds; the client polls the turn to completion. Prod leaves
-    # execution to the cron sweep/workers.
+    # Dispatch post-response instead of waiting for the next cron sweep (~60s).
+    # BackgroundTasks returns 201 in milliseconds and runs the pipeline after
+    # the response; a blocking inline run would hold the request for the full
+    # multi-model pipeline (60s+), which proxies kill (~30s) with a 500 the
+    # backend never sees — while the turn still succeeds server-side. Best
+    # effort: if the runtime does not finish post-response work, the attempt
+    # stays ``prepared`` and ``/api/cron/dm-execute`` reconciles it.
     attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
-    if (attempt_data and attempt_data.get("id")
-            and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+    if attempt_data and attempt_data.get("id"):
         from app.dm.recovery import execute_committed_attempt
 
         background_tasks.add_task(
