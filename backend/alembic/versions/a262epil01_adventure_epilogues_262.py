@@ -1,7 +1,7 @@
 """adventure epilogues — issue #262 (additive).
 
 Revision ID: a262epil01
-Revises: s246start01
+Revises: s249contest01
 
 Additive only: optional per-PC post-adventure epilogue rows plus the
 epilogue phase columns on adventures. Does not touch existing tables'
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "a262epil01"
-down_revision: Union[str, Sequence[str], None] = "s246start01"
+down_revision: Union[str, Sequence[str], None] = "s249contest01"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
