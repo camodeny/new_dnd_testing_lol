@@ -16,7 +16,7 @@ from database import Base
 from models.rules import RulesCorpus, RulesCorpusImport, RulesEmbedding, RulesSection
 from app.rules.ids import derive_rule_id_with_path, derive_source_section_id, slugify, check_collisions
 from app.rules.metadata import ATTRIBUTION, CORPUS_ID, CORPUS_VERSION, LICENSE, OFFICIAL_SRD_URL
-from app.rules.ingest import import_fixture_sections, normalize_raw_sections
+from app.rules.ingest import import_fixture_sections, normalize_raw_sections, parse_cantilux_json
 from app.rules.store import hybrid_search, lookup_by_rule_id, lookup_by_locator, search_lexical
 from app.rules.embeddings import build_embeddings
 from app.rules.evidence_tools import handle_lookup_rule, handle_search_rules
@@ -443,3 +443,45 @@ def test_stub_embeddings_log_explicit_degradation(db, monkeypatch, caplog):
     assert bid == "stub-log-1"
     assert any("stub" in r.message.lower() and ("lexical" in r.message.lower() or "fallback" in r.message.lower()) for r in caplog.records), \
         "stub fallback must log explicit degradation"
+
+
+def test_parse_cantilux_json_maps_fields_and_drops_containers():
+    data = {"sections": [
+        {"id": "spells-fireball", "documentId": "spells", "title": "Fireball",
+         "level": 4, "path": ["Spells", "Spell Descriptions", "Fireball"],
+         "text": "A bright streak flashes. weapon mastery", "content": "", "tables": [],
+         "childIds": [], "parentId": "spells-spell-descriptions"},
+        {"id": "spells", "documentId": "spells", "title": "Spells",
+         "level": 2, "path": ["Spells"], "text": "", "content": "", "tables": [],
+         "childIds": ["spells-fireball"], "parentId": None},
+    ]}
+    secs = parse_cantilux_json(data)
+    assert len(secs) == 1  # navigation-only container dropped
+    sec = secs[0]
+    assert sec["document"] == "spells"
+    assert sec["heading_path"] == ["Spells", "Spell Descriptions", "Fireball"]
+    assert "bright streak" in sec["body"]
+
+
+def test_parse_cantilux_json_disambiguates_repeated_stat_blocks():
+    # Two spells each with a same-path 'Traits' summoned-creature block.
+    def block(order):
+        return {"id": f"spells-x-{order}", "documentId": "spells", "title": "Traits",
+                "level": 4, "path": ["Spells", "Spell Descriptions", "Traits"],
+                "text": f"trait text {order} weapon mastery", "content": "", "tables": [],
+                "childIds": [], "parentId": "spells-spell-descriptions", "order": order}
+
+    def spell(name, order):
+        return {"id": f"spells-{order}", "documentId": "spells", "title": name,
+                "level": 4, "path": ["Spells", "Spell Descriptions", name],
+                "text": f"{name} spell weapon mastery", "content": "", "tables": [],
+                "childIds": [], "parentId": "spells-spell-descriptions", "order": order}
+
+    data = {"sections": [spell("Giant Insect", 1), block(2), spell("Draconic Spirit", 3), block(4)]}
+    secs = parse_cantilux_json(data)
+    recs = normalize_raw_sections(secs)  # must not raise Collision
+    assert len(recs) == 4
+    ids = [r.rule_id for r in recs]
+    assert len(set(ids)) == 4
+    assert recs[1].rule_id.endswith(".spell-descriptions.traits")
+    assert recs[3].rule_id.endswith(".traits.draconic-spirit")

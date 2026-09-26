@@ -547,7 +547,39 @@ def parse_cantilux_json(data: dict) -> list[dict]:
 
     Handles various shapes: top-level list, dict with 'sections'/'documents', nested.
     Falls back to treating each entry as a raw section.
+
+    Cantilux section fields are mapped to the canonical raw shape expected by
+    normalize_raw_sections: documentId -> document, path -> heading_path,
+    text/content -> body. Sections sharing one (document, path) — e.g. per-spell
+    summoned-creature 'Traits'/'Actions' stat blocks — get the enclosing spell
+    appended to heading_path so derived IDs stay unique without aliases.
+    Deterministic for a pinned source file; record CANTILUX_COMMIT in provenance.
     """
+    raw = _extract_cantilux_raw(data)
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            out.append({"title": str(entry), "body": str(entry), "document": "srd", "heading_path": [str(entry)]})
+            continue
+        sec = dict(entry)
+        sec.setdefault("document", entry.get("documentId") or entry.get("source_document") or "srd")
+        if "heading_path" not in sec and isinstance(entry.get("path"), list):
+            sec["heading_path"] = [str(h) for h in entry["path"]]
+        if "body" not in sec:
+            body = entry.get("text") or entry.get("content") or ""
+            sec["body"] = body
+        # Drop navigation-only containers: no own text and no tables. Their
+        # children carry the citable content and keep the container name in
+        # heading_path, so nothing retrievable is lost. (import_corpus
+        # fail-closes on empty bodies by design.)
+        if not str(sec["body"]).strip() and not sec.get("tables") and (entry.get("childIds") or entry.get("sections")):
+            continue
+        out.append(sec)
+    _disambiguate_cantilux_paths(out)
+    return out
+
+
+def _extract_cantilux_raw(data: dict) -> list:
     if isinstance(data, list):
         return data
     if isinstance(data, dict):
@@ -555,7 +587,7 @@ def parse_cantilux_json(data: dict) -> list[dict]:
         for key in ("sections", "documents", "rules", "data"):
             if key in data and isinstance(data[key], list):
                 # Flatten documents -> sections
-                out: list[dict] = []
+                flat: list = []
                 for doc in data[key]:
                     if isinstance(doc, dict) and "sections" in doc:
                         for sec in doc["sections"]:
@@ -565,13 +597,13 @@ def parse_cantilux_json(data: dict) -> list[dict]:
                                 # ensure heading_path
                                 if "heading_path" not in sec and "path" in sec:
                                     sec["heading_path"] = sec["path"]
-                                out.append(sec)
+                                flat.append(sec)
                             else:
-                                out.append({"title": str(sec), "body": str(sec), "document": "srd", "heading_path": [str(sec)]})
+                                flat.append(sec)
                     elif isinstance(doc, dict):
-                        out.append(doc)
-                if out:
-                    return out
+                        flat.append(doc)
+                if flat:
+                    return flat
         # fallback: single doc dict
         if "title" in data or "body" in data:
             return [data]
@@ -580,6 +612,43 @@ def parse_cantilux_json(data: dict) -> list[dict]:
         if vals:
             return vals
     return []
+
+
+# Generic stat-block labels that repeat across spells and never own a section.
+_CANTILUX_GENERIC_BLOCKS = frozenset({"Actions", "Traits", "Bonus Actions", "Reactions"})
+
+
+def _disambiguate_cantilux_paths(sections: list[dict]) -> None:
+    """Append the enclosing spell to heading_path for repeated (document, path).
+
+    Mutates later occurrences in place; first occurrence keeps the bare path.
+    Owner = nearest preceding level-4 section with a 3-element path whose title
+    is not a generic stat-block label.
+    """
+    from collections import Counter
+
+    counts = Counter(
+        (str(s.get("document") or "srd"), tuple(s.get("heading_path") or [])) for s in sections
+    )
+    seen: set[tuple[str, tuple]] = set()
+    for i, sec in enumerate(sections):
+        key = (str(sec.get("document") or "srd"), tuple(sec.get("heading_path") or []))
+        if counts[key] < 2:
+            continue
+        if key in seen:
+            # Later occurrence of a repeated path: qualify with enclosing spell.
+            owner = None
+            for j in range(i - 1, max(-1, i - 30), -1):
+                prev = sections[j]
+                ppath = prev.get("heading_path") or []
+                if prev.get("level") == 4 and len(ppath) == 3 and (ppath[-1] not in _CANTILUX_GENERIC_BLOCKS):
+                    owner = str(ppath[-1])
+                    break
+            if owner:
+                sec["heading_path"] = list(sec.get("heading_path") or []) + [owner]
+        else:
+            # First occurrence keeps the bare path.
+            seen.add(key)
 
 
 def import_markdown_text(db: Session, md_text: str, **kwargs) -> tuple[str, list[CanonicalRecord]]:
