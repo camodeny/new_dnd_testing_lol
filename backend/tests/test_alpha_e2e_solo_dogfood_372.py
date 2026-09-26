@@ -1,12 +1,14 @@
 """Issue #372 — Alpha E2E Phase 0 solo dogfood scenario through reconnect.
 
 Production solo slice: synthetic setup -> character select/ready -> start via
-the production #245 world seed -> (opening AI-DM turn and continued play
-resume once #246 opens the live table).
+the production #245 world seed -> #246 campaign-start live-table opening ->
+opening AI-DM turn -> multiple freeform submissions/replies -> refresh/
+reconnect -> identical authoritative transcript/state -> continued play.
 
 Boundaries exercised (no test-only gameplay engine, no alternate DM
 orchestration path):
-- HTTP campaign creation, character select/readiness, world-seed start.
+- HTTP campaign creation, character select/readiness, world-seed start,
+  campaign-start live-table opening (#246).
 - HTTP player-submission acceptance + production ``coordinate_turn``.
 - Production ``run_dm_execute_sweep`` (the same sweeper behind the
   ``/api/cron/dm-execute`` trigger) through context assembly, contract
@@ -21,8 +23,8 @@ Explicit non-goals owned by sibling issues (do NOT absorb them here):
   stable campaign/turn/attempt/stream identifiers and stage-tagged assertion
   context in failure messages/logs instead.
 - #245 landed the production world seed path used by
-  ``start_production_play``. #246 owns the live-table opening; play phases
-  below stay skipped until it lands. Only that seam changes; the harness stays.
+  ``start_production_play``. #246 landed the live-table opening used by
+  ``open_live_table``; there is exactly one production start path.
 
 Auth: tests reuse the established per-router ``resolve_profile`` override
 pattern against synthetic profiles. Production Supabase JWT is untouched —
@@ -52,6 +54,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
+from app.campaigns.campaign_start import OPENING_OOC_TEXT  # noqa: E402
 from app.dm.fake_provider import build_phase0_provider  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
 from app.dm.turns import list_turns  # noqa: E402
@@ -120,7 +123,10 @@ def phase0_provider(monkeypatch):
     provider = build_phase0_provider(
         freeform_turns=tuple(FREEFORM_TURNS),
         post_reconnect_turn=POST_RECONNECT_TURN,
-        opening_inputs=(),
+        # The #246 opener is OOC system text staged through the production
+        # submission pipeline. The fixture also matches an input-free
+        # packet, so this covers both packet shapes.
+        opening_inputs=(OPENING_OOC_TEXT,),
     )
     provider.install(monkeypatch)
     return provider
@@ -523,11 +529,11 @@ def setup_solo_campaign(scn: Scenario, char_id: str) -> str:
 
 
 def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
-    """Production-start seam — #245 world seed (live-table opening is #246).
+    """Production-start seam — #245 world seed.
 
     The #355 temporary bootstrap is deleted. Seeding stages durable canon
-    and moves the campaign to ``starting``; opening turns and continued play
-    resume here once #246 opens the live table.
+    and moves the campaign to ``starting``; the live-table opening is the
+    #246 ``open_live_table`` step below.
     """
     scn.note("start")
     assert scn.campaign_id is not None
@@ -543,6 +549,33 @@ def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
     scn.check((body.get("seed") or {}).get("scene_present") is True, "start", "no starting scene")
     scn.check((body.get("seed") or {}).get("clock_count", 0) >= 1, "start", "no pressure clock")
     scn.check("solo-bootstrap" not in r.text, "start", "temporary scaffold state leaked")
+    return body
+
+
+def open_live_table(scn: Scenario, *, operation_key: str) -> dict:
+    """Production live-table opening — #246 campaign-start.
+
+    Owner-only transition from seeded ``starting`` to ``active`` through
+    the single production start path. Stages the opening DM turn (returned
+    as ``dm_turn``/``dm_attempt``) on the durable shared thread.
+    Idempotent: a repeated key converges without new writes.
+    """
+    scn.note("start")
+    assert scn.campaign_id is not None
+    r = scn.client.post(
+        f"/api/campaigns/{scn.campaign_id}/campaign-start",
+        json={"operation_id": operation_key},
+        headers={"Idempotency-Key": operation_key},
+    )
+    scn.check(r.status_code == 200, "start", f"campaign start failed (status={r.status_code})")
+    body = r.json()
+    scn.check(body["campaign"]["status"] == "active", "start", "campaign not active")
+    scn.check((body.get("dm_turn") or {}).get("id"), "start", "no opening DM turn staged")
+    scn.check(body.get("thread_id"), "start", "no live-table thread")
+    scn.check(
+        "solo-bootstrap" not in r.text, "start", "temporary scaffold state leaked"
+    )
+    scn.ids["thread_id"] = body["thread_id"]
     return body
 
 
@@ -919,13 +952,14 @@ def run_phase0_solo_scenario(
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
 
-    # Start through the production #245 world-seed seam.
-    opening = start_production_play(scn, operation_key="phase0-start-372")
+    # Start through the production #245 world-seed seam, then open the
+    # live table through the production #246 campaign-start seam.
+    start_production_play(scn, operation_key="phase0-start-372")
     assert_ordering_invariants(scn, "start")
-    # Live-table opening and continued play resume here once #246 lands
-    # (which restores dm_turn/dm_attempt to the start response).
-    pytest.skip("continued live-table play requires #246 (campaign seeds to starting)")
-    opening_turn_id = (opening.get("dm_turn") or {}).get("id")
+    started = open_live_table(scn, operation_key="phase0-open-372")
+    assert_ordering_invariants(scn, "start")
+    opening_turn_id = (started.get("dm_turn") or {}).get("id")
+    scn.check(bool(opening_turn_id), "start", "campaign start staged no opening turn")
 
     # Opening DM turn completes through the production execution path.
     scn.note("opening")
@@ -1093,6 +1127,90 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_pr
     run_phase0_solo_scenario(scn, provider_calls=phase0_provider.calls)
 
 
+# ── issue #443: production-start migration proofs ────────────────────────────
+
+
+def test_production_start_is_idempotent_under_duplicate_start(scn, phase0_provider):
+    """Duplicate seed/start with the same keys stages exactly one opening.
+
+    Retried starts converge (replayed) without new writes: one opening
+    submission, one opening turn, monotonic revisions.
+    """
+    char_id = make_synthetic_character(scn)
+    setup_solo_campaign(scn, char_id)
+    start_production_play(scn, operation_key="phase0-dup-seed")
+    first = open_live_table(scn, operation_key="phase0-dup-open")
+    first_turn_id = (first.get("dm_turn") or {}).get("id")
+    scn.check(bool(first_turn_id), "start", "first start staged no opening turn")
+
+    # Same keys again: both seams converge without duplicating gameplay.
+    start_production_play(scn, operation_key="phase0-dup-seed")
+    second = open_live_table(scn, operation_key="phase0-dup-open")
+    scn.check(
+        (second.get("dm_turn") or {}).get("id") == first_turn_id,
+        "start",
+        "duplicate start staged a second opening turn",
+    )
+    # A fresh key after the start event converges on the same opening.
+    third = open_live_table(scn, operation_key="phase0-dup-open-retry")
+    scn.check(
+        (third.get("dm_turn") or {}).get("id") == first_turn_id,
+        "start",
+        "restated start staged a second opening turn",
+    )
+    assert_single_result_per_submission(scn, "start", 1)
+    assert_ordering_invariants(scn, "start")
+
+    # The single opening still commits exactly once through production run.
+    outcome = drain_dm_execution(scn, "opening")
+    scn.check_sweep(outcome, "opening")
+    await_committed_reply(scn, "opening", first_turn_id)
+    assert_single_result_per_submission(scn, "opening", 1)
+
+
+def test_disconnect_during_start_recovers_same_opening(scn, phase0_provider):
+    """A fresh client after start reconstructs the same opening; play continues.
+
+    Covers disconnect between campaign-start and opening execution: the
+    reconnected snapshot matches, the opening commits exactly once, and a
+    fresh session can play afterward.
+    """
+    char_id = make_synthetic_character(scn)
+    setup_solo_campaign(scn, char_id)
+    start_production_play(scn, operation_key="phase0-disc-seed")
+    started = open_live_table(scn, operation_key="phase0-disc-open")
+    opening_turn_id = (started.get("dm_turn") or {}).get("id")
+    scn.check(bool(opening_turn_id), "start", "start staged no opening turn")
+
+    # Disconnect before the opening executes: fresh sessions see the same
+    # staged opening with no duplicate turn.
+    fresh_client = TestClient(app)
+    before = read_snapshot(scn, "start")
+    after = read_snapshot(scn, "start", client=fresh_client)
+    assert_same_authoritative_projection(scn, "start", before, after)
+    assert_single_result_per_submission(scn, "start", 1, client=fresh_client)
+
+    outcome = drain_dm_execution(scn, "opening")
+    scn.check_sweep(outcome, "opening")
+    await_committed_reply(scn, "opening", opening_turn_id)
+    assert_single_result_per_submission(scn, "opening", 1)
+
+    # Reconnect after the opening commit: identical state, play continues
+    # on the fresh session.
+    committed = read_snapshot(scn, "reconnect")
+    later_client = TestClient(app)
+    again = read_snapshot(scn, "reconnect", client=later_client)
+    assert_same_authoritative_projection(scn, "reconnect", committed, again)
+    submitted = submit_player_turn(
+        scn, FREEFORM_TURNS[0], "phase0-disc-1", client=later_client
+    )
+    outcome = drain_dm_execution(scn, "play-1")
+    scn.check_sweep(outcome, "play-1")
+    await_committed_reply(scn, "play-1", submitted["dm_turn"]["id"])
+    assert_single_result_per_submission(scn, "play-1", 2, client=later_client)
+    assert_ordering_invariants(scn, "play-1", client=later_client)
+
+
 # ── intentional-break proofs: each sabotage must fail at its assertion ────────
 
 
@@ -1100,9 +1218,8 @@ def _run_to_opening_reply(scn: Scenario):
     """Shared prefix for break proofs: setup -> start -> committed opening."""
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
-    opening = start_production_play(scn, operation_key="phase0-break-start")
-    # Live-table opening turns resume here once #246 lands.
-    pytest.skip("opening-turn break proofs require #246 (campaign seeds to starting)")
+    start_production_play(scn, operation_key="phase0-break-start")
+    opening = open_live_table(scn, operation_key="phase0-break-open")
     outcome = drain_dm_execution(scn, "opening")
     assert not outcome.get("failed"), outcome
     await_committed_reply(scn, "opening", opening["dm_turn"]["id"])
