@@ -29,6 +29,24 @@ NEW_ENTITY = "NEW_ENTITY"
 KEEP_DISTINCT = "KEEP_DISTINCT"
 DEFER = "DEFER"
 
+
+class IdentityDeferredError(ValueError):
+    """Identity decision deferred: fail-closed signal with retry context.
+
+    Subclasses :class:`ValueError` so existing fail-closed handling (and
+    tests matching ``"deferred"``) behaves identically — no entity is
+    inserted. Carries the deferred proposal plus the domain candidate
+    labels the decision weighed, so explicit-retry re-adjudication can
+    disambiguate the proposal instead of looping on the same frame.
+    """
+
+    def __init__(self, temp_id: str, *, proposal: dict | None = None,
+                 candidate_labels: list | None = None):
+        super().__init__(f"identity resolution deferred for new entity {temp_id!r}")
+        self.temp_id = temp_id
+        self.proposal = dict(proposal or {})
+        self.candidate_labels = list(candidate_labels or [])
+
 register_policy(DecisionClassPolicy(
     decision_class=IDENTITY_DECISION_CLASS,
     min_probability_direct=.85, min_confidence_direct=.8,

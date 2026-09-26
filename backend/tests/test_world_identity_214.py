@@ -379,9 +379,17 @@ def test_pre_narration_defer_aborts_before_anything_durable():
         resolve_new_entity_identities_pre_narration(
             db, campaign, turn, attempt, attempt.contract_snapshot,
             identity_decision_service=service)
-    # All-or-nothing: no outcome persisted, no entity created.
-    assert attempt.identity_resolutions is None
+    # Fail-closed: no entity created — but a deferral memo persists on the
+    # attempt so explicit-retry re-adjudication can disambiguate the
+    # proposal instead of replaying the identical frame into the same
+    # DEFER (deterministic adjudication would otherwise loop forever).
     assert [row.id for row in db.query(type(original)).all()] == [original.id]
+    memos = attempt.identity_resolutions
+    assert isinstance(memos, list) and len(memos) == 1
+    assert memos[0]["temp_id"] == "tmp"
+    assert memos[0]["outcome"] == DEFER
+    assert memos[0]["via"] == "deferred"
+    assert memos[0]["proposal"]["public_name"] == "Mara"
 
 
 def test_stored_outcome_stale_revision_fails_closed_at_commit():
@@ -499,13 +507,18 @@ def test_ambiguous_identity_defer_leaves_no_visible_narration():
             db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
             publish_realtime=False, identity_decision_service=defer_service)
     # Abort happened before the first visible chunk: no stream, no chunks,
-    # no failed-visible audit, no stranded duplicate.
+    # no failed-visible audit, no stranded duplicate. A deferral memo
+    # persists so explicit-retry re-adjudication can disambiguate.
     assert db.query(DMStream).count() == 0
     assert db.query(DMStreamChunk).count() == 0
     assert [row.name for row in db.query(_WorldEntity).all()] == ["Mara Venn"]
     fresh_attempt = db.get(DmTurnAttempt, attempt.id)
     assert fresh_attempt.status not in ("streaming", "failed_visible", "succeeded")
-    assert fresh_attempt.identity_resolutions is None
+    memos = fresh_attempt.identity_resolutions
+    assert isinstance(memos, list) and len(memos) == 1
+    assert memos[0]["temp_id"] == "tmp_npc_1"
+    assert memos[0]["outcome"] == DEFER
+    assert memos[0]["via"] == "deferred"
     assert fresh_attempt.stream_id is None
     fresh_turn = db.get(DmTurn, turn.id)
     assert fresh_turn.status not in ("streaming", "failed_visible", "succeeded")
