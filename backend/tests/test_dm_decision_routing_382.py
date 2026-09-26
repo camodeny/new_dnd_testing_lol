@@ -450,3 +450,102 @@ def test_degraded_signal_read_escalates_without_direct_execution():
     assert outcome.contract is None
     assert outcome.trace.get("decision_skipped") is True
     assert adapter.calls == []
+
+
+def test_no_deferral_memo_no_retry_primer(db):
+    s, camp_id, thread_id = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    assert routing.build_retry_deferral_primer(s, attempt) is None
+
+
+def test_attach_primer_label_note_override():
+    import copy
+    from types import SimpleNamespace
+
+    from app.dm.context import LaneName
+
+    lane = SimpleNamespace(name=LaneName.PLAYER_INPUTS, records=[])
+    packet = SimpleNamespace(
+        audience=SimpleNamespace(campaign_id="c1", thread_id="t1"),
+        lanes=[lane],
+        model_copy=lambda deep=True: copy.deepcopy(packet),
+    )
+    primed = routing.attach_primer(
+        packet,
+        {
+            "frame_id": routing.IDENTITY_DEFERRAL_FRAME_ID,
+            "selected_id": "identity-disambiguation",
+            "label": "Disambiguate the deferred identity",
+            "note": "The Watchful Figure could not be resolved.",
+        },
+    )
+    assert primed.lanes[0].records[0].record_id == "decision-primer:identity-deferral"
+    assert primed.lanes[0].records[0].value["label"] == "Disambiguate the deferred identity"
+    assert primed.lanes[0].records[0].value["note"] == "The Watchful Figure could not be resolved."
+    # Original packet untouched.
+    assert packet.lanes[0].records == []
+
+
+def test_identity_deferral_memo_reaches_retry_adjudication_as_primer(db):
+    from app.dm.context import LaneName
+    from app.dm.execution import execute_dm_attempt
+
+    s, camp_id, thread_id = db
+    turn, old = _submit(s, camp_id, thread_id)
+    old.identity_resolutions = [
+        {
+            "temp_id": "tmp_npc_1", "outcome": "DEFER", "via": "deferred",
+            "jit_key": "jit",
+            "proposal": {
+                "kind": "npc", "public_name": "Watchful Figure",
+                "role": None, "public_summary": "A silent watcher",
+            },
+            "candidate_labels": ["Ember Compact (group)"],
+        }
+    ]
+    old.status = "abandoned"
+    old.abandonment_reason = "explicit_retry"
+    child = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn.id, campaign_id=camp_id,
+        thread_id=str(thread_id), audience="campaign",
+        attempt_number=old.attempt_number + 1, parent_attempt_id=old.id,
+        status="prepared", source_revision=0,
+        input_set_revision=turn.input_set_revision,
+        submission_ids=list(old.submission_ids or []),
+        roll_evidence=[], staged_effects=[],
+    )
+    s.add(child)
+    turn.current_attempt_id = child.id
+    turn.status = "pending"
+    s.commit()
+
+    seen = {}
+
+    def _generative(packet, feedback=None):
+        seen["packet"] = packet
+        from app.dm.contract import CONTRACT_VERSION, normalize_contract
+        return normalize_contract(
+            {
+                "contract_version": CONTRACT_VERSION,
+                "mode": "silent",
+                "reason": "retry disambiguates after deferral advisory",
+            }
+        )
+
+    service = DecisionService(
+        FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: OPEN_ENDED_DM_CANDIDATE_ID})
+    )
+    result = execute_dm_attempt(
+        s, child.id, adjudicate=_generative, narrator="deterministic",
+        decision_service=service,
+    )
+    assert result.mode == "silent"
+    lane = next(ln for ln in seen["packet"].lanes if ln.name == LaneName.PLAYER_INPUTS)
+    primers = [
+        r for r in lane.records
+        if r.record_id == "decision-primer:identity-deferral"
+    ]
+    assert len(primers) == 1
+    assert primers[0].use == "adjudication_only"
+    assert "Watchful Figure" in primers[0].value["note"]
+    assert "Ember Compact" in primers[0].value["note"]

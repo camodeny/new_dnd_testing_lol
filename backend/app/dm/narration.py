@@ -1699,7 +1699,9 @@ def execute_validated_turn(
        ``new_entities`` identity AFTER contract normalization but BEFORE
        the first visible chunk, and persist the attempt-local outcomes.
        ``DEFER`` raises here with nothing visible persisted (freely
-       retryable); commit only revalidates/applies. No campaign lock is
+       retryable) but leaves a deferral memo on the attempt so
+       explicit-retry re-adjudication can disambiguate; commit only
+       revalidates/applies. No campaign lock is
        held, so fail-soft telemetry may use ``identity_session_factory``
        (defaults to the configured ``SessionLocal`` when available).
     3. ``stream_narration`` with a crash-atomic first-chunk boundary — deltas

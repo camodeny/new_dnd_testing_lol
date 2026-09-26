@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
+from app.world.identity import DEFER, IdentityDeferredError
 from models.campaigns import Campaign
 from models.world import CampaignCurrentScene, WorldEntity
 
@@ -744,13 +745,13 @@ def _resolve_identity_proposal(
     No durable entity write happens here. Returns ``(frame, selected_id,
     reused_entity, decision_service)`` where ``reused_entity`` is set for
     deterministic stable UUID/alias hits (reuse with zero model calls) and
-    ``frame``/``selected_id`` otherwise. Raises ``ValueError`` fail-closed
-    (no insert) on ``DEFER`` or on plain ``NEW_ENTITY`` against an exact
-    canonical collision. The returned service is the (lazily constructed)
-    service to reuse for subsequent proposals.
+    ``frame``/``selected_id`` otherwise. Raises
+    :class:`~app.world.identity.IdentityDeferredError` fail-closed
+    (no insert) on ``DEFER`` or ``ValueError`` on plain ``NEW_ENTITY``
+    against an exact canonical collision. The returned service is the
+    (lazily constructed) service to reuse for subsequent proposals.
     """
     from app.world.identity import (
-        DEFER,
         KEEP_DISTINCT,
         NEW_ENTITY,
         _candidate_label,
@@ -815,7 +816,20 @@ def _resolve_identity_proposal(
         # still revalidated against the frame immediately before insert.
         selected_id = NEW_ENTITY
     if selected_id == DEFER:
-        raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+        candidate_labels = [
+            str(candidate.label)
+            for candidate in frame.candidates
+            if candidate.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}
+        ][:8]
+        raise IdentityDeferredError(
+            temp_id,
+            proposal={
+                "kind": kind,
+                "public_name": public_name if isinstance(public_name, str) else str(public_name or ""),
+                "location_ref": location_value,
+            },
+            candidate_labels=candidate_labels,
+        )
     if collision is not None and selected_id == NEW_ENTITY:
         # Exact canonical collision: only policy-approved KEEP_DISTINCT
         # (same-name distinct entity) or reuse of the canonical entity
@@ -852,10 +866,15 @@ def _apply_stored_identity_outcome(
     or illegal outcomes fail closed with no insert.
     """
     from app.world.identity import DEFER, create_entity_after_resolution, exact_identity_match, rebuild_identity_frame
+    from app.world.identity import IdentityDeferredError as _Deferred
     temp_id = proposal["temp_id"]
     selected_id = str(outcome.get("outcome") or "")
     if not selected_id or selected_id == DEFER:
-        raise ValueError(f"identity resolution deferred for new entity {temp_id!r}")
+        raise _Deferred(temp_id, proposal={
+            "kind": proposal.get("kind"),
+            "public_name": proposal.get("public_name"),
+            "location_ref": _location_value(proposal.get("location_ref")),
+        })
     if outcome.get("frame"):
         # Bounded NEW_ENTITY / KEEP_DISTINCT (or reuse-by-selection):
         # rebuild the original frame so revision drift fails closed as
@@ -908,8 +927,9 @@ def resolve_new_entity_identities_pre_narration(
     applies, but pre-narration: ambiguous proposals ``DEFER`` here — before
     any #197 chunk can persist — instead of stranding visible narration
     that the later commit then refuses. Selected attempt-local outcomes
-    persist on the attempt row (all-or-nothing; ``DEFER`` raises before
-    anything is stored); commit-time
+    persist on the attempt row (all-or-nothing for resolutions;
+    a ``DEFER`` memo persists alone so explicit-retry re-adjudication can
+    disambiguate instead of looping); commit-time
     :func:`promote_new_entities_from_contract` only revalidates/applies
     them against fresh state with no second model call.
 
@@ -939,14 +959,41 @@ def resolve_new_entity_identities_pre_narration(
                 "via": "idempotent_reuse", "jit_key": jit_key,
             })
             continue
-        frame, selected_id, reused, service = _resolve_identity_proposal(
-            db, campaign, temp_id=temp_id, kind=proposal["kind"],
-            public_name=proposal["public_name"], location_ref=proposal["location_ref"],
-            turn_id=turn_id, attempt_id=attempt_id,
-            identity_decision_service=service,
-            identity_session_factory=identity_session_factory,
-            identity_telemetry_outbox=None,
-        )
+        try:
+            frame, selected_id, reused, service = _resolve_identity_proposal(
+                db, campaign, temp_id=temp_id, kind=proposal["kind"],
+                public_name=proposal["public_name"], location_ref=proposal["location_ref"],
+                turn_id=turn_id, attempt_id=attempt_id,
+                identity_decision_service=service,
+                identity_session_factory=identity_session_factory,
+                identity_telemetry_outbox=None,
+            )
+        except IdentityDeferredError as exc:
+            # Fail closed (no insert) but persist a deferral memo on the
+            # attempt before raising: explicit-retry re-adjudication reads
+            # it to disambiguate the proposal instead of replaying the
+            # identical frame (deterministic adjudication + near-tie DEFER
+            # would otherwise loop forever). Memo content is DM-prompt-safe
+            # (public proposal fields + canonical candidate labels only).
+            outcomes.append({
+                "temp_id": temp_id, "outcome": DEFER,
+                "via": "deferred", "jit_key": jit_key,
+                "proposal": {
+                    "kind": proposal.get("kind"),
+                    "public_name": proposal.get("public_name"),
+                    "role": proposal.get("role"),
+                    "public_summary": (str(proposal.get("public_summary") or "")[:500] or None),
+                },
+                "candidate_labels": list(getattr(exc, "candidate_labels", []) or [])[:8],
+            })
+            attempt.identity_resolutions = outcomes
+            db.flush()
+            try:
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+            raise
         if reused is not None:
             outcomes.append({
                 "temp_id": temp_id, "outcome": str(reused.id),

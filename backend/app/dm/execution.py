@@ -950,16 +950,38 @@ def _execute_owned_attempt(
                 "reason": f"router error: {exc}",
             }
 
-    if _route_primer is not None and adjudicate is not None:
+    # Identity-deferral retry feedback: when an abandoned explicit-retry
+    # parent deferred a new-entity identity (deterministic adjudication
+    # would otherwise replay the identical frame into the same DEFER),
+    # advise re-adjudication to disambiguate. Advisory only — the
+    # generative DM stays authoritative. Fail-soft: no advisory on error.
+    _deferral_primer: dict | None = None
+    if _snapshot_contract is None:
+        try:
+            from app.dm import decision_routing as _deferral_routing
+
+            _deferral_primer = _deferral_routing.build_retry_deferral_primer(db, attempt)
+            if _deferral_primer is not None:
+                structured_log(
+                    logger, logging.INFO, "dm_execute_deferral_primer",
+                    turn_id=str(turn.id), attempt_id=str(attempt.id),
+                    trace_id=tid,
+                )
+        except Exception as exc:
+            logger.warning("dm_execute deferral primer failed: %s", exc)
+            _deferral_primer = None
+
+    _primers = [p for p in (_route_primer, _deferral_primer) if p is not None]
+    if _primers and adjudicate is not None:
         _base_adjudicate = adjudicate
-        _primer = _route_primer
 
         def adjudicate(packet, feedback=None):  # type: ignore[misc]
-            try:
-                primed_packet = _routing.attach_primer(packet, _primer)
-            except Exception as exc:
-                logger.warning("dm_execute primer attach failed: %s", exc)
-                primed_packet = packet
+            primed_packet = packet
+            for _primer_item in _primers:
+                try:
+                    primed_packet = _routing.attach_primer(primed_packet, _primer_item)
+                except Exception as exc:
+                    logger.warning("dm_execute primer attach failed: %s", exc)
             return _base_adjudicate(primed_packet, feedback=feedback)
 
     try:

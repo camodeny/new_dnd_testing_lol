@@ -665,6 +665,10 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
     (``adjudication_only`` records are stripped from the narration
     projection). Raises :exc:`DecisionError` (malformed) when the packet
     shape is unexpected — callers escalate without the primer in that case.
+
+    ``primer`` may carry ``label``/``note`` overrides (used for retry
+    feedback such as identity-deferral advisories); otherwise the label
+    defaults to the bounded-route lean.
     """
     from app.dm.context import (
         AuthorizationScope,
@@ -717,7 +721,8 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
         record_id=record_id,
         value={
             "advisory_route": primer.get("selected_id"),
-            "label": f"Bounded routing leans toward {primer.get('selected_id')}",
+            "label": primer.get("label") or f"Bounded routing leans toward {primer.get('selected_id')}",
+            "note": primer.get("note"),
             "probability": primer.get("probability"),
             "confidence": primer.get("confidence"),
             "margin": primer.get("margin"),
@@ -744,6 +749,108 @@ def attach_primer(packet: Any, primer: dict[str, Any]) -> Any:
     primed = packet.model_copy(deep=True)
     primed.lanes[lane_index].records.append(record)
     return primed
+
+
+#: Stable primer frame for identity-deferral retry feedback. One record per
+#: packet (idempotent by record ID); the note enumerates each deferral.
+IDENTITY_DEFERRAL_FRAME_ID = "identity-deferral"
+
+#: Bounds for the deferral advisory: attempts walked up the retry chain,
+#: deferral records surfaced, and per-field character caps.
+_DEFERRAL_MAX_LEVELS = 5
+_DEFERRAL_MAX_RECORDS = 3
+
+
+def build_retry_deferral_primer(db: Any, attempt: Any) -> dict[str, Any] | None:
+    """Build an advisory primer from abandoned-parent identity deferrals.
+
+    Walks the explicit-retry parent chain (abandoned ``explicit_retry``
+    attempts) collecting ``via == "deferred"`` identity-resolution memos
+    left by :func:`app.world.service.resolve_new_entity_identities_pre_narration`.
+    Returns an :func:`attach_primer`-compatible dict, or ``None`` when the
+    chain holds no deferral memo.
+
+    Never raises: unreadable ancestry means no advisory, never a blocked
+    turn. Memo content is DM-prompt-safe by construction (public proposal
+    fields + canonical candidate labels only — never player secrets).
+    """
+    try:
+        from models.dm import DmTurnAttempt as _Attempt
+    except Exception:
+        return None
+    try:
+        memos: list[dict[str, Any]] = []
+        current = attempt
+        for _ in range(_DEFERRAL_MAX_LEVELS):
+            parent_id = getattr(current, "parent_attempt_id", None)
+            if not parent_id:
+                break
+            try:
+                parent = db.get(_Attempt, parent_id)
+            except Exception:
+                break
+            if parent is None:
+                break
+            for item in getattr(parent, "identity_resolutions", None) or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("outcome") == "DEFER"
+                    and item.get("via") == "deferred"
+                ):
+                    memos.append(item)
+            if not (
+                getattr(parent, "status", None) == "abandoned"
+                and (getattr(parent, "abandonment_reason", None) or "") == "explicit_retry"
+            ):
+                break
+            current = parent
+    except Exception:
+        return None
+    # Dedupe repeat deferrals of the same proposal across the chain.
+    unique: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for memo in memos:
+        proposal = memo.get("proposal") if isinstance(memo.get("proposal"), dict) else {}
+        key = f"{memo.get('temp_id')}|{proposal.get('public_name')}|{proposal.get('kind')}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique.append(memo)
+        if len(unique) >= _DEFERRAL_MAX_RECORDS:
+            break
+    if not unique:
+        return None
+    parts: list[str] = []
+    for memo in unique:
+        proposal = memo.get("proposal") if isinstance(memo.get("proposal"), dict) else {}
+        name = str(proposal.get("public_name") or memo.get("temp_id") or "the figure")[:120]
+        kind = str(proposal.get("kind") or "entity")[:40]
+        labels = [str(label)[:120] for label in (memo.get("candidate_labels") or [])][:5]
+        hint = (
+            f"'{name}' ({kind})"
+            + (f" resembled existing: {', '.join(labels)}" if labels else "")
+        )
+        parts.append(hint)
+    note = (
+        "A previous attempt could not determine whether "
+        + "; ".join(parts)
+        + " is an already-established entity or someone new, so the turn could not "
+        "proceed. If it is an established canonical entity, reference it by exact "
+        "canonical name or alias in entity references instead of proposing a new "
+        "entity. If it is genuinely new, describe it with distinguishing detail "
+        "(appearance, role, location, group affiliation) so it cannot be confused "
+        "with an existing entity."
+    )
+    return {
+        "frame_id": IDENTITY_DEFERRAL_FRAME_ID,
+        "selected_id": "identity-disambiguation",
+        "label": "A previous attempt deferred an entity identity — disambiguate",
+        "note": note[:2000],
+        "authority": (
+            "advisory only: the adjudicator weighs this prior against "
+            "the full authoritative context and is not bound by it"
+        ),
+    }
 
 
 def _record_routing_telemetry(
