@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -484,6 +484,111 @@ def test_reordered_refund_before_confirm_resolves_once(ctx):
     assert db.get(CampaignFundingOperation, op_id).status == "confirmed"
     assert db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").count() == 1
     assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    db.close()
+
+
+def _refund_item(refund_id, amount_cents, status="succeeded"):
+    item = {"id": refund_id, "object": "refund", "amount": amount_cents, "currency": "usd"}
+    if status is not None:
+        item["status"] = status
+    return item
+
+
+def _charge_refunded_obj(db, camp, op_id, refund_items):
+    op = db.get(CampaignFundingOperation, op_id)
+    return {
+        "id": "ch_test_partial", "object": "charge",
+        "amount": op.amount_cents, "currency": "usd",
+        "payment_intent": op.stripe_payment_intent_id,
+        "refunds": {"object": "list", "data": list(refund_items)},
+        "metadata": {"campaign_id": str(camp), "funding_operation_id": str(op_id)},
+    }
+
+
+def _refund_mirror_count(db, camp):
+    return db.query(CampaignUsageEntry).filter(
+        CampaignUsageEntry.campaign_id == camp,
+        CampaignUsageEntry.entry_type == "admin_adjustment",
+        CampaignUsageEntry.amount_cents < 0,
+    ).count()
+
+
+def test_two_partial_refunds_mirror_each_idempotently(ctx):
+    """Review regression (PR #451): charge.refunded re-emits the whole refund
+    list, so every refund id must mirror — not just the first."""
+    fac, camp, owner, _member, fake = ctx
+    op_id = _start(fac, camp, owner, fake, amount=500)
+    db = _db(fac)
+    funding.handle_stripe_event(
+        db, _webhook_event("evt-pay-part", "checkout.session.completed",
+                           _session_completed_obj(db, op_id, paid=True)))
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    op = db.get(CampaignFundingOperation, op_id)
+
+    def _per_refund_event(event_id, refund_id, amount_cents, status="succeeded"):
+        return _webhook_event(
+            event_id, "refund.created",
+            {**_refund_item(refund_id, amount_cents, status),
+             "payment_intent": op.stripe_payment_intent_id,
+             "metadata": {"campaign_id": str(camp), "funding_operation_id": str(op_id)}})
+
+    # 1. First partial refund mirrors on its own per-refund event.
+    assert funding.handle_stripe_event(
+        db, _per_refund_event("evt-part-a", "re_part_a", 200))["status"] == "refunded"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 300
+
+    # 2. charge.refunded re-emits the FULL list [A, B]: A replays, B mirrors.
+    #    The old first-item-only code returned duplicate here and lost B.
+    both = _charge_refunded_obj(db, camp, op_id,
+                                [_refund_item("re_part_a", 200), _refund_item("re_part_b", 150)])
+    assert funding.handle_stripe_event(
+        db, _webhook_event("evt-part-charge", "charge.refunded", both))["status"] == "refunded"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert _refund_mirror_count(db, camp) == 2
+
+    # 3. Same event id redelivered → duplicate, no movement.
+    assert funding.handle_stripe_event(
+        db, _webhook_event("evt-part-charge", "charge.refunded", both))["status"] == "duplicate"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+
+    # 4. New event id, same charge payload (both ids already mirrored) → duplicate.
+    assert funding.handle_stripe_event(
+        db, _webhook_event("evt-part-charge-2", "charge.refunded", both))["status"] == "duplicate"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+
+    # 5. Reordered per-refund event for B alone → duplicate replay.
+    assert funding.handle_stripe_event(
+        db, _per_refund_event("evt-part-b-late", "re_part_b", 150))["status"] == "duplicate"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert _refund_mirror_count(db, camp) == 2
+
+    # 6. Cumulative cap: 350 already mirrored; a further 400 would exceed the
+    #    500 funding → refused, capacity untouched.
+    with pytest.raises(funding.FundingValidationError):
+        funding.handle_stripe_event(db, _per_refund_event("evt-part-over", "re_part_c", 400))
+    db.rollback()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert _refund_mirror_count(db, camp) == 2
+
+    # 7. Non-final (pending) refunds move no money: ignored until final.
+    pending_only = _charge_refunded_obj(db, camp, op_id, [_refund_item("re_part_d", 50, "pending")])
+    ignored = funding.handle_stripe_event(
+        db, _webhook_event("evt-part-pending", "charge.refunded", pending_only))
+    db.commit()
+    assert ignored["status"] == "ignored"
+    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    # ... and its later succeeded delivery mirrors exactly once.
+    assert funding.handle_stripe_event(
+        db, _per_refund_event("evt-part-d-final", "re_part_d", 50))["status"] == "refunded"
+    db.commit()
+    assert get_capacity_summary(db, camp)["funded_cents"] == 100
+    assert _refund_mirror_count(db, camp) == 3
     db.close()
 
 

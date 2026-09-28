@@ -59,7 +59,6 @@ from models.funding import (
     FUNDING_STATUS_FAILED,
     FUNDING_STATUS_PENDING,
     FUNDING_TERMINAL_STATUSES,
-    WEBHOOK_APPLIED_DUPLICATE,
     WEBHOOK_APPLIED_IGNORED,
     WEBHOOK_APPLIED_PROCESSED,
     CampaignFundingOperation,
@@ -811,56 +810,106 @@ def _dispatch_event(db: Session, *, event_id: str, event_type: str, obj: dict[st
     return {"status": "ignored", "applied": WEBHOOK_APPLIED_IGNORED, "campaign_id": None}
 
 
-def _refund_identifiers(obj: dict[str, Any]) -> tuple[str | None, int | None, str | None, str | None]:
-    """Extract (refund_id, refund_amount_cents, payment_intent_id, currency).
-
-    Strict integer cents: non-integer amounts are treated as unusable rather
-    than truncated, so a shifted/ambiguous value can never drive accounting.
-    """
-    def _cents(value: Any) -> int | None:
-        if isinstance(value, bool) or not isinstance(value, int):
-            return None
-        return value
-
-    def _currency(*candidates: Any) -> str | None:
-        for candidate in candidates:
-            if isinstance(candidate, str) and candidate:
-                return candidate.lower()
+def _cents(value: Any) -> int | None:
+    """Strict integer cents: non-integer amounts are unusable, never truncated."""
+    if isinstance(value, bool) or not isinstance(value, int):
         return None
+    return value
 
+
+def _lower(value: Any) -> str | None:
+    return value.lower() if isinstance(value, str) and value else None
+
+
+def _refund_final(item: dict[str, Any]) -> bool:
+    """Whether a refund object actually moved money.
+
+    Only ``succeeded`` refunds (or objects carrying no status at all, as in
+    minimal ``charge.refunded`` nests) mirror into accounting. Pending,
+    failed, or canceled refunds move nothing; their final state arrives via
+    a later ``refund.updated`` / ``charge.refunded`` delivery.
+    """
+    status = item.get("status")
+    return not isinstance(status, str) or status == "succeeded"
+
+
+def _refund_items(obj: dict[str, Any]) -> tuple[list[tuple[str, int, str | None, bool]], str | None]:
+    """Every identifiable refund in a refund-ish object + the payment intent id.
+
+    Returns ``([(refund_id, amount_cents, currency, moves_money), ...],
+    payment_intent_id)``. A ``charge.refunded`` charge re-emits its whole
+    ``refunds.data`` list on every delivery, so every item — not just the
+    first — is returned; each is mirrored idempotently by refund id
+    downstream. Items without a usable id or positive integer amount are
+    dropped (never guessed). ``moves_money`` is false for pending/failed/
+    canceled refunds, which are ignored until their final state arrives.
+    """
+    items: list[tuple[str, int, str | None, bool]] = []
+    payment_intent = obj.get("payment_intent")
+    payment_intent_id = payment_intent if isinstance(payment_intent, str) else None
     if obj.get("object") == "refund":
         refund_id = obj.get("id") if isinstance(obj.get("id"), str) else None
-        payment_intent = obj.get("payment_intent")
-        return refund_id, _cents(obj.get("amount")), \
-            payment_intent if isinstance(payment_intent, str) else None, \
-            _currency(obj.get("currency"))
-    # charge.refunded: refunds live under obj["refunds"]["data"].
+        amount = _cents(obj.get("amount"))
+        if refund_id and amount is not None and amount > 0:
+            items.append((refund_id, amount, _lower(obj.get("currency")), _refund_final(obj)))
+        return items, payment_intent_id
+    # charge.refunded: refunds live under obj["refunds"]["data"] — Stripe
+    # re-sends the full list (e.g. two partial refunds), so process all.
     refunds = obj.get("refunds")
     data = refunds.get("data") if isinstance(refunds, dict) else None
-    first = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
-    if first is not None:
-        refund_id = first.get("id") if isinstance(first.get("id"), str) else None
-        payment_intent = obj.get("payment_intent")
-        return refund_id, _cents(first.get("amount")), \
-            payment_intent if isinstance(payment_intent, str) else None, \
-            _currency(first.get("currency"), obj.get("currency"))
-    payment_intent = obj.get("payment_intent")
-    return None, None, payment_intent if isinstance(payment_intent, str) else None, \
-        _currency(obj.get("currency"))
+    if isinstance(data, list):
+        seen: set[str] = set()
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            refund_id = item.get("id") if isinstance(item.get("id"), str) else None
+            amount = _cents(item.get("amount"))
+            if not refund_id or amount is None or amount <= 0 or refund_id in seen:
+                continue
+            seen.add(refund_id)
+            items.append((refund_id, amount,
+                          _lower(item.get("currency")) or _lower(obj.get("currency")),
+                          _refund_final(item)))
+    return items, payment_intent_id
+
+
+def _mirrored_refund_total_cents(db: Session, operation: CampaignFundingOperation) -> int:
+    """Cumulative already-mirrored refund cents for one funding operation."""
+    from models.usage import CampaignUsageEntry
+
+    candidates = db.scalars(
+        select(CampaignUsageEntry).where(
+            CampaignUsageEntry.campaign_id == operation.campaign_id,
+            CampaignUsageEntry.entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT,
+            CampaignUsageEntry.amount_cents < 0,
+        )
+    ).all()
+    total = 0
+    for entry in candidates:
+        metadata = entry.entry_metadata or {}
+        if (str(metadata.get("funding_operation_id") or "") == str(operation.id)
+                and metadata.get("stripe_refund_id")):
+            total += abs(int(entry.amount_cents))
+    return total
 
 
 def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: dict[str, Any],
                           stripe_client: StripeClient | None) -> dict[str, Any]:
     """Mirror Stripe money-returned state into campaign accounting, idempotently.
 
-    A Stripe refund means funds left the campaign pool, so it is mirrored as
-    a signed negative correction (never a positive credit, and never by
-    editing history). The ledger key ``stripe_refund:{refund_id}`` makes
-    redelivery a replay. If the funding operation is still pending when the
-    refund arrives (reordered delivery), state is reconciled against Stripe
-    first so the refund applies to the confirmed credit, never to nothing.
+    A Stripe refund means funds left the campaign pool, so each refund is
+    mirrored as a signed negative correction (never a positive credit, and
+    never by editing history). Every refund id gets its own ledger key
+    ``stripe_refund:{refund_id}``: a ``charge.refunded`` delivery re-emits
+    the charge's whole refund list, so already-mirrored ids replay as
+    duplicates while newly-appearing partial refunds are mirrored — no
+    ordering or batching can double-mirror or skip one. The cumulative
+    mirrored total can never exceed the confirmed funding amount
+    (fail closed on excess). If the funding operation is still pending when
+    the refund arrives (reordered delivery), state is reconciled against
+    Stripe first so refunds apply to the confirmed credit, never to nothing.
     """
-    refund_id, refund_amount, payment_intent_id, refund_currency = _refund_identifiers(obj)
+    items, payment_intent_id = _refund_items(obj)
     operation = _resolve_operation(db, obj, payment_intent_id=payment_intent_id)
     if operation is None:
         logger.warning("funding refund references unknown operation event_id=%s", event_id)
@@ -880,54 +929,69 @@ def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: d
                      stripe_event_id=event_id, detail=operation.status)
         return {"status": "ignored", "applied": WEBHOOK_APPLIED_IGNORED,
                 "campaign_id": operation.campaign_id, "operation": operation}
-    if refund_id is None:
+    if not items:
         _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
                      stripe_event_id=event_id, detail="refund_without_identifier")
         raise FundingValidationError("stripe refund event carries no refund identifier")
-    if refund_amount is None or refund_amount <= 0:
-        _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
-                     stripe_event_id=event_id, detail="refund_without_amount")
-        raise FundingValidationError("stripe refund event carries no usable amount")
-    if refund_currency and refund_currency != operation.currency.lower():
-        _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
-                     stripe_event_id=event_id, detail="refund_currency_mismatch")
-        raise FundingValidationError("stripe refund currency does not match funding operation")
-    if refund_amount > operation.amount_cents:
-        _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
-                     stripe_event_id=event_id, detail="refund_exceeds_funding")
-        raise FundingValidationError("stripe refund exceeds funded amount")
-    key = f"stripe_refund:{refund_id}"
     from models.usage import CampaignUsageEntry
 
-    replayed = db.scalar(
-        select(CampaignUsageEntry).where(
-            CampaignUsageEntry.campaign_id == operation.campaign_id,
-            CampaignUsageEntry.idempotency_key == key,
+    mirrored_total = _mirrored_refund_total_cents(db, operation)
+    mirrored_new = 0
+    replayed = 0
+    for refund_id, refund_amount, refund_currency, moves_money in items:
+        if not moves_money:
+            # Pending/failed/canceled: moves no money yet. Its final state
+            # arrives via a later refund.updated / charge.refunded delivery.
+            _funding_log(logging.INFO, "funding.refund_not_final", operation,
+                         stripe_event_id=event_id, stripe_refund_id=refund_id)
+            continue
+        if refund_currency and refund_currency != operation.currency.lower():
+            _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
+                         stripe_event_id=event_id, detail="refund_currency_mismatch")
+            raise FundingValidationError("stripe refund currency does not match funding operation")
+        key = f"stripe_refund:{refund_id}"
+        if db.scalar(
+            select(CampaignUsageEntry).where(
+                CampaignUsageEntry.campaign_id == operation.campaign_id,
+                CampaignUsageEntry.idempotency_key == key,
+            )
+        ) is not None:
+            _funding_log(logging.INFO, "funding.refund_duplicate", operation,
+                         stripe_event_id=event_id, stripe_refund_id=refund_id)
+            replayed += 1
+            continue
+        if mirrored_total + refund_amount > operation.amount_cents:
+            _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
+                         stripe_event_id=event_id, detail="refund_exceeds_funding")
+            raise FundingValidationError(
+                "stripe refunds cumulatively exceed the funded amount: refusing to mirror"
+            )
+        _ledger.record_entry(
+            db,
+            campaign_id=operation.campaign_id,
+            entry_type=ENTRY_TYPE_ADMIN_ADJUSTMENT,
+            amount_cents=-refund_amount,
+            idempotency_key=key,
+            contributor_user_id=operation.contributor_user_id,
+            note="Stripe refund mirrored: funds returned to payer",
+            entry_metadata={
+                "funding_operation_id": str(operation.id),
+                "stripe_refund_id": refund_id,
+                "stripe_event_id": event_id,
+            },
         )
-    )
-    if replayed is not None:
-        _funding_log(logging.INFO, "funding.refund_duplicate", operation,
-                     stripe_event_id=event_id, stripe_refund_id=refund_id)
+        db.flush()
+        mirrored_total += refund_amount
+        mirrored_new += 1
+        _funding_log(logging.INFO, "funding.refund_mirrored", operation,
+                     stripe_event_id=event_id, stripe_refund_id=refund_id,
+                     refund_amount_cents=refund_amount)
+    if mirrored_new:
+        return {"status": "refunded", "operation": operation}
+    if replayed:
         return {"status": "duplicate", "operation": operation}
-    _ledger.record_entry(
-        db,
-        campaign_id=operation.campaign_id,
-        entry_type=ENTRY_TYPE_ADMIN_ADJUSTMENT,
-        amount_cents=-refund_amount,
-        idempotency_key=key,
-        contributor_user_id=operation.contributor_user_id,
-        note="Stripe refund mirrored: funds returned to payer",
-        entry_metadata={
-            "funding_operation_id": str(operation.id),
-            "stripe_refund_id": refund_id,
-            "stripe_event_id": event_id,
-        },
-    )
-    db.flush()
-    _funding_log(logging.INFO, "funding.refund_mirrored", operation,
-                 stripe_event_id=event_id, stripe_refund_id=refund_id,
-                 refund_amount_cents=refund_amount)
-    return {"status": "refunded", "operation": operation}
+    return {"status": "ignored", "applied": WEBHOOK_APPLIED_IGNORED,
+            "campaign_id": operation.campaign_id, "operation": operation}
 
 
 # ── One-time re-credit for failed/abandoned counted work ──────────────────────
