@@ -25,7 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
-from app.world.identity import DEFER, IdentityDeferredError
+from app.world.identity import DEFER, IdentityDeferredError, IdentityReuseRequiresReadjudication
 from models.campaigns import Campaign
 from models.world import CampaignCurrentScene, WorldEntity
 
@@ -979,13 +979,15 @@ def resolve_new_entity_identities_pre_narration(
     a ``DEFER`` memo persists alone so explicit-retry re-adjudication can
     disambiguate instead of looping); commit-time
     :func:`promote_new_entities_from_contract` only revalidates/applies
-    them against fresh state with no second model call.
+    them against fresh state with no second model call. Reuse of an
+    existing canonical entity raises before narration so the adjudicator
+    can rewrite the contract with that identity.
 
     No campaign lock is held here, so fail-soft telemetry may write on its
     own session via ``identity_session_factory``. Commits the attempt
     update; pre-visibility failure stays freely retryable.
     """
-    from app.world.identity import serialize_identity_frame
+    from app.world.identity import KEEP_DISTINCT, NEW_ENTITY, serialize_identity_frame
     proposals = _extract_identity_proposals(contract)
     if not proposals:
         return []
@@ -1045,24 +1047,30 @@ def resolve_new_entity_identities_pre_narration(
                 db.rollback()
                 raise
             raise
-        if reused is not None:
-            outcomes.append({
-                "temp_id": temp_id, "outcome": str(reused.id),
-                "via": "exact_stable", "jit_key": jit_key,
-            })
-        else:
-            outcome_record = {
-                "temp_id": temp_id, "outcome": selected_id,
-                "via": "bounded_decision" if frame is not None and any(
-                    c.id not in {"NEW_ENTITY", "KEEP_DISTINCT", "DEFER"}
-                    for c in frame.candidates
-                ) else "deterministic_no_candidate",
-                "jit_key": jit_key,
-                "frame": serialize_identity_frame(frame) if frame is not None else None,
-            }
-            if runner_up_applied:
-                outcome_record["runner_up_fallback"] = True
-            outcomes.append(outcome_record)
+        # A contract that proposes an introduction cannot be narrated as-is
+        # when identity resolution chooses an existing person. Re-adjudication
+        # must rewrite the beats against the canonical ref before visibility.
+        if reused is not None or selected_id not in {NEW_ENTITY, KEEP_DISTINCT}:
+            canonical = reused or db.get(WorldEntity, uuid.UUID(selected_id))
+            if canonical is None or canonical.campaign_id != campaign.id or canonical.superseded_by_id:
+                raise ValueError("resolved canonical entity is no longer live")
+            raise IdentityReuseRequiresReadjudication(
+                temp_id=temp_id,
+                proposed_name=str(proposal["public_name"]),
+                entity=canonical,
+            )
+        outcome_record = {
+            "temp_id": temp_id, "outcome": selected_id,
+            "via": "bounded_decision" if frame is not None and any(
+                c.id not in {"NEW_ENTITY", "KEEP_DISTINCT", "DEFER"}
+                for c in frame.candidates
+            ) else "deterministic_no_candidate",
+            "jit_key": jit_key,
+            "frame": serialize_identity_frame(frame) if frame is not None else None,
+        }
+        if runner_up_applied:
+            outcome_record["runner_up_fallback"] = True
+        outcomes.append(outcome_record)
     attempt.identity_resolutions = outcomes
     db.flush()
     try:

@@ -1046,6 +1046,19 @@ def route_attempt(
             decision_skipped=True,
             signal_error=signals.signal_error,
         )
+    # Silence is currently the only directly executable bounded route. An IC
+    # declaration (including a mixed IC/OOC submission) needs the open-ended
+    # DM, so a decision call cannot save time on this path. Keep this gate
+    # tied to the enumerated route set: adding a future IC-capable route makes
+    # those turns eligible for the router without changing execution wiring.
+    direct_ids = {candidate.id for candidate in enumerate_route_candidates(signals)}
+    if direct_ids == {ROUTE_SILENT_ID} and any(
+        segment.get("type") == "ic" for segment in signals.segments
+    ):
+        return _escalate(
+            "IC input with only the silent direct route available; generative escape",
+            decision_skipped=True,
+        )
     try:
         frame = build_route_frame(signals)
     except DecisionError as exc:
@@ -1176,6 +1189,7 @@ def path_info_fields(outcome: RoutingOutcome) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "decision_path": outcome.trace.get("decision_path"),
         "decision_directive": outcome.directive,
+        "decision_skipped": outcome.decision_skipped,
     }
     if outcome.selected_id is not None:
         fields["decision_selected"] = outcome.selected_id
