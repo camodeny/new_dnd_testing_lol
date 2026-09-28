@@ -817,11 +817,13 @@ def _resolve_identity_proposal(
             prior_deferrals=prior_deferrals,
         )
         selected_id = decision.selected_id
+        runner_up_applied = decision.runner_up_applied
     else:
         # Exhaustive deterministic search found no plausible identity.
         # NEW_ENTITY is therefore an explicit code-owned bounded outcome,
         # still revalidated against the frame immediately before insert.
         selected_id = NEW_ENTITY
+        runner_up_applied = False
     if selected_id == DEFER:
         candidate_labels = [
             str(candidate.label)
@@ -844,7 +846,7 @@ def _resolve_identity_proposal(
         raise ValueError(
             f"new entity {temp_id!r} collides with canonical identity {collision.id}"
         )
-    return frame, selected_id, None, identity_decision_service, decision.runner_up_applied
+    return frame, selected_id, None, identity_decision_service, runner_up_applied
 
 
 def _stored_identity_outcomes(attempt: Any) -> dict:
