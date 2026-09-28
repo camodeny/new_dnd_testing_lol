@@ -1,7 +1,7 @@
 'use client'
 
 import DmTurnControls from '@/components/dashboard/DmTurnControls'
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import {
@@ -11,6 +11,7 @@ import {
 } from '@/lib/api'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
 import { useCampaignCapacity } from '@/hooks/useCampaignCapacity'
+import { useCampaignFunding } from '@/hooks/useCampaignFunding'
 import { CapacityMeterView } from '@/components/dashboard/CapacityMeter'
 import { isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
 import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
@@ -99,6 +100,39 @@ export default function CampaignViewPage() {
     // (possible restore race); other events are observed via the meter.
     if (event.type === 'paused_submit_attempt') void capacity.refresh()
   }, [capacity.refresh])
+
+  // Issue #256: authorized add-funds flow. Starts a server-side Stripe
+  // checkout (card data stays on Stripe-hosted pages) and resyncs from the
+  // authoritative projection when the payer returns to this live table.
+  const funding = useCampaignFunding({
+    campaignId: id ? String(id) : null,
+    onEvent: handleCapacityEvent,
+  })
+
+  // Stripe-redirect return: reconcile-then-resync from the authoritative
+  // projection (redirect state alone never credits), then clean the URL so
+  // a refresh does not re-trigger the sync. Guarded by ref so live-table
+  // re-renders never restart the one-shot sync.
+  const fundingReturnHandled = useRef(false)
+  useEffect(() => {
+    if (!id || !session || typeof window === 'undefined') return
+    const ret = new URLSearchParams(window.location.search).get('funding')
+    if ((ret !== 'success' && ret !== 'cancel') || fundingReturnHandled.current) return
+    fundingReturnHandled.current = true
+    let cancelled = false
+    void (async () => {
+      try {
+        if (ret === 'success') await funding.syncAfterReturn()
+      } catch {
+        // Status stays authoritative server-side; the meter below shows
+        // whatever the projection confirms.
+      }
+      if (cancelled) return
+      await capacity.refresh()
+      router.replace(`/campaigns/${id}`)
+    })()
+    return () => { cancelled = true }
+  }, [id, session])
 
   const loadData = useCallback(async () => {
     if (!id) return
@@ -466,6 +500,11 @@ export default function CampaignViewPage() {
               error={capacity.error}
               hasProjection={capacity.payload !== null}
               onRetry={() => void capacity.refresh()}
+              funding={{
+                onStartFunding: (amountCents) => void funding.startAddFunds(amountCents),
+                fundingBusy: funding.starting,
+                fundingError: funding.error,
+              }}
             />
           ) : undefined}
           onCapacityEvent={handleCapacityEvent}

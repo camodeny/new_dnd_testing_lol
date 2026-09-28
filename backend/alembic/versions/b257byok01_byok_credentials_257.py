@@ -1,7 +1,7 @@
 """BYOK provider credentials + campaign policy — issue #257 (additive).
 
 Revision ID: b257byok01
-Revises: rename_source_checksum
+Revises: 9f4a25600001
 
 Additive only: provider_credentials + campaign_byok_policies tables and a
 nullable ai_runs.credential_id trace column (credential IDs only, never key
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "b257byok01"
-down_revision: Union[str, Sequence[str], None] = "rename_source_checksum"
+down_revision: Union[str, Sequence[str], None] = "9f4a25600001"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
