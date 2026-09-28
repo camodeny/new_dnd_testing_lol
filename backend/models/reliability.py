@@ -231,5 +231,10 @@ class AIRun(Base):
     cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
     result_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # BYOK credential selection trace — issue #257. Credential ID only, never
+    # key material: NULL for platform-funded runs, set for user-credential
+    # runs (which are non-billable to the platform by construction). No FK so
+    # credential removal preserves the audit trail instead of nulling it.
+    credential_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
     content_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)

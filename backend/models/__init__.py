@@ -6,9 +6,10 @@ should be imported directly from there, e.g. ``from models.campaigns import
 Campaign``. This module intentionally does not re-export the classes.
 """
 
-from . import campaigns, characters, combat, dm, post_turn, profiles, reliability, rules, threads, usage, world
+from . import byok, campaigns, characters, combat, dm, post_turn, profiles, reliability, rules, threads, usage, world
 
 __all__ = [
+    "byok",
     "campaigns",
     "characters",
     "combat",

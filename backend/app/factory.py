@@ -62,6 +62,7 @@ def create_app() -> FastAPI:
     # Import routers lazily to avoid import cycles at module load time
     # if domain modules ever import factory for typing.
     from app.auth.router import router as auth_router
+    from app.byok.router import router as byok_router
     from app.campaigns.router import router as campaigns_router
     from app.combat.router import router as combat_router
     from app.characters.chat.router import router as chat_router
@@ -82,6 +83,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(byok_router)
     app.include_router(characters_router)
     app.include_router(chat_router)
     app.include_router(campaigns_router)

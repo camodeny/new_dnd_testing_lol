@@ -242,6 +242,34 @@ def is_high_intensity(
 # ── Gate ──────────────────────────────────────────────────────────────────────
 
 
+def _byok_relief(
+    db: Session, campaign_id: uuid.UUID, byok_roles: tuple[str, ...] | None
+) -> str | None:
+    """Issue #257 — BYOK capacity relief (read-only, fail-soft).
+
+    Returns the satisfying role when the campaign's authorized credential
+    offers an approved BYOK-eligible route for the owed/new work, else
+    None. Any evaluation error fails closed to None (pause stands).
+    """
+    if not byok_roles:
+        return None
+    try:
+        from app.byok.service import byok_satisfies_role
+
+        for role in byok_roles:
+            try:
+                if byok_satisfies_role(db, campaign_id, role):
+                    return role
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning(
+            "resolution_guarantee byok probe failed campaign_id=%s error=%s",
+            campaign_id, exc,
+        )
+    return None
+
+
 def evaluate_new_work(
     db: Session,
     campaign_id: uuid.UUID,
@@ -249,11 +277,18 @@ def evaluate_new_work(
     *,
     now: datetime | None = None,
     on_policy_error: str = "allow",
+    byok_roles: tuple[str, ...] | None = ("forward_dm", "narration"),
 ) -> dict:
     """Decide whether a NEW AI obligation may start (read-only).
 
     Returns a decision dict with ``allowed`` plus the aggregate inputs
     (cost/timing/entitlement only).
+
+    Issue #257 — when funded capacity is exhausted but the campaign's
+    authorized BYOK credential offers an approved route for ``byok_roles``,
+    new work is allowed (``reason="byok_capacity"``): BYOK runs are
+    user-funded and consume no platform pool, and enabling a key
+    mid-campaign immediately satisfies the pause with no state reset.
 
     Failure posture: a policy-evaluation error never abandons already accepted
     work — owed continuations bypass this gate by construction, and the
@@ -363,6 +398,22 @@ def evaluate_new_work(
         consumed_cents=consumed,
         funded_cents=funded,
     )
+    # Issue #257 — a mid-campaign BYOK credential with an approved route
+    # for the owed/new work satisfies the pause immediately (no state
+    # reset, no recovery wizard): user-funded runs touch no platform pool.
+    relief_role = _byok_relief(db, campaign_id, byok_roles)
+    if relief_role is not None:
+        structured_log(
+            logger,
+            logging.INFO,
+            "resolution.byok_relief",
+            campaign_id=str(campaign_id),
+            thread_id=str(thread_id) if thread_id else None,
+            role=relief_role,
+        )
+        return {**base, "allowed": True, "reason": "byok_capacity",
+                "ai_paused": False, "grace_active": False,
+                "byok_role": relief_role}
     return {**base, "allowed": False, "reason": "capacity_exhausted_paused",
             "ai_paused": True, "grace_active": False}
 
@@ -373,6 +424,7 @@ def require_new_ai_work(
     thread_id: str | None = None,
     *,
     now: datetime | None = None,
+    byok_roles: tuple[str, ...] | None = ("forward_dm", "narration"),
 ) -> dict:
     """Enforce the new-obligation boundary; raise when AI-paused.
 
@@ -382,7 +434,10 @@ def require_new_ai_work(
     fails closed here (a broken meter authorizes no fresh AI work) while
     owed continuations remain ungated.
     """
-    decision = evaluate_new_work(db, campaign_id, thread_id, now=now, on_policy_error="deny")
+    decision = evaluate_new_work(
+        db, campaign_id, thread_id, now=now, on_policy_error="deny",
+        byok_roles=byok_roles,
+    )
     if not decision["allowed"]:
         decision["owed"] = describe_owed_work(db, campaign_id, thread_id)
         raise CapacityPausedError(campaign_id, decision)
@@ -404,10 +459,13 @@ def capacity_state_payload(
     """
     public = _ledger.public_capacity(db, campaign_id)
     decision = evaluate_new_work(db, campaign_id, thread_id)
+    byok_role = decision.get("byok_role")
     return {
         **public,
         "ai_paused": bool(decision["ai_paused"]),
         "grace_active": bool(decision.get("grace_active", False)),
         "gate_reason": decision["reason"],
         "overage_allowance_cents": decision.get("overage_allowance_cents", 0),
+        "byok_available": byok_role is not None,
+        **({"byok_role": byok_role} if byok_role is not None else {}),
     }

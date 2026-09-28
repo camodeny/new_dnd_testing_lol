@@ -59,6 +59,26 @@ def retry_backoff_seconds(retry_count: int) -> int:
     return min(30 * (2 ** (count - 1)), 600)
 
 
+def _resolve_byok_for_role(db, campaign_id, role: str):
+    """Authorized BYOK context for a generative role, or None.
+
+    Issue #257 — production turn execution resolves the campaign's
+    owner-authorized credential server-side (never caller-supplied), so
+    the capacity gate's ``byok_capacity`` relief and actual execution
+    agree: user-funded first attempt or funded/provider fallback. Any
+    resolution failure returns None (platform path proceeds); a BYOK
+    failure must never break or stall a turn.
+    """
+    if db is None or campaign_id is None:
+        return None
+    try:
+        from app.byok.service import resolve_byok_execution
+
+        return resolve_byok_execution(db, campaign_id, role=role)
+    except Exception:
+        return None
+
+
 def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool:
     """True only when positively identified: no scene row established.
 
@@ -920,6 +940,11 @@ def _execute_owned_attempt(
                     # work is never double-charged.
                     is_retry=_is_recovery_retry,
                     campaign_id=campaign_id,
+                    # Issue #257 — authorized campaign credential (if any)
+                    # serves the first attempt through the approved
+                    # generative route; None falls back to funded/provider
+                    # routing. Resolution is fail-soft by construction.
+                    byok=_resolve_byok_for_role(db, campaign_id, "forward_dm"),
                 )
                 path_info.update(info)
                 return contract
@@ -1189,6 +1214,9 @@ def _execute_owned_attempt(
                 timeout_seconds=timeout_seconds,
                 db=db, trace_id=tid, is_retry=_is_recovery_retry,
                 campaign_id=campaign_id,
+                # Issue #257 — same authorized-credential first attempt as
+                # adjudication above (narration role approval applies).
+                byok=_resolve_byok_for_role(db, campaign_id, "narration"),
             )
         except Exception as exc:
             db.rollback()

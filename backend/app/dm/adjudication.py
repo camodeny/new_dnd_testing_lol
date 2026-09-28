@@ -218,6 +218,7 @@ def adjudicate_with_failover(
     model: str | None = None,
     is_retry: bool = False,
     campaign_id=None,
+    byok=None,
 ):
     """Adjudicate through the role policy path with bounded failover.
 
@@ -229,6 +230,18 @@ def adjudicate_with_failover(
     recorded as non-billable AI runs when ``db`` is given; only a first
     try's primary call is ``primary``/billable. Runs are finished
     (succeeded/failed) instead of left running.
+
+    Issue #257 — ``byok`` (``app.byok.accounting.ByokExecution``) routes
+    the first attempt through the user's credential when its
+    provider/model is approved for ``role`` (unapproved combinations raise
+    clearly instead of executing). Production callers must build ``byok``
+    via ``app.byok.service.resolve_byok_execution`` (the campaign
+    authorization boundary); caller-constructed contexts are test-only.
+    BYOK attempts are always non-billable
+    to the platform and carry the credential ID trace; a succeeded BYOK
+    run writes a zero-amount ``byok_marker``. An invalid/expired
+    credential fails through normal recovery: the attempt continues down
+    the funded/provider path instead of corrupting gameplay state.
 
     Returns ``(contract, path_info)`` where path_info holds
     ``provider``/``model``/``attempt_index``/``failover_reasons``.
@@ -253,6 +266,14 @@ def adjudicate_with_failover(
         except Exception:
             telemetry = None
 
+    if byok is not None and (adapter is not None or model is not None):
+        from app.byok.errors import ByokError
+
+        raise ByokError(
+            "byok cannot be combined with a pinned adapter/model attempt; "
+            "pass one execution path, not both",
+            kind="malformed",
+        )
     if adapter is not None and model is not None:
         # Injected seam (tests): single pinned attempt, no failover chain.
         if not role_policy.is_model_approved(role, adapter.name, model):
@@ -273,6 +294,126 @@ def adjudicate_with_failover(
     path = role_policy.execution_path(role)
     failover_reasons: list[str] = []
     last_exc: BaseException | None = None
+    # Issue #257 — BYOK first attempt. Approval is config-time: an
+    # unapproved provider/model/role combination raises here (clearly)
+    # instead of executing anywhere. Transport-time auth failures fall
+    # through to the funded/provider path below (normal recovery).
+    if byok is not None:
+        from app.byok.adapters import wrap_generative_adapter
+        from app.byok.routing import resolve_generative_route
+
+        # Retry lineage matches the funded path: an explicit-Retry BYOK
+        # attempt is recovery (still non-billable) so a retried turn never
+        # grows a second primary run.
+        _byok_classification = "recovery" if is_retry else "primary"
+        byok_route = resolve_generative_route(
+            role, provider=byok.provider, model=policy.primary_model
+        )
+        try:
+            byok_adapter = wrap_generative_adapter(byok_route.provider, byok.secret)
+        except Exception as exc:
+            raise RuntimeError(
+                f"BYOK provider {byok_route.provider!r} has no executable adapter "
+                f"for role {role!r}"
+            ) from exc
+        byok_run = None
+        if telemetry is not None:
+            try:
+                from app.observability.service import start_ai_run
+
+                byok_run = start_ai_run(
+                    telemetry, logical_operation="forward_dm_adjudicate",
+                    role=role, provider=byok_adapter.name, model=byok_route.model,
+                    attempt=1, classification=_byok_classification, billable=False,
+                    credential_id=byok.credential_id, trace_id=tid,
+                )
+            except Exception:
+                byok_run = None
+        try:
+            from app.dm.contract import contract_json_schema_strict, normalize_contract
+
+            messages = build_forward_dm_messages(packet)
+            request = ProviderRequest(
+                messages=messages, model=byok_route.model,
+                json_schema=contract_json_schema_strict(),
+                json_schema_name="dm_turn_contract_v1",
+                timeout_seconds=timeout_seconds, temperature=0,
+                reasoning_effort=FORWARD_DM_REASONING_EFFORT,
+            )
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_start",
+                provider=byok_adapter.name, model=byok_route.model,
+                trace_id=tid, attempt=1, classification=_byok_classification,
+                credential_id=str(byok.credential_id),
+            )
+            response = execute_chat(byok_adapter, request)
+            raw = parse_contract_json(response.content)
+            contract = normalize_contract(raw)
+            if byok_run is not None and telemetry is not None:
+                try:
+                    from app.billing.config import cost_usd_for, tokens_from_usage
+                    from app.observability.service import finish_ai_run
+
+                    usage = getattr(response, "usage", None)
+                    in_tokens, out_tokens = tokens_from_usage(usage)
+                    finish_ai_run(telemetry, byok_run.id, status="succeeded",
+                                  result_code="contract_ok",
+                                  input_tokens=in_tokens, output_tokens=out_tokens,
+                                  cost_usd=cost_usd_for(byok_adapter.name, byok_route.model, usage),
+                                  campaign_id=None)
+                except Exception:
+                    pass
+            from app.byok.accounting import mark_byok_run_fail_soft
+
+            mark_byok_run_fail_soft(
+                telemetry, campaign_id=byok.campaign_id,
+                ai_run_id=getattr(byok_run, "id", None),
+                credential_id=byok.credential_id,
+                execution_class="generative", role=role,
+                provider=byok_adapter.name, model=byok_route.model,
+            )
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_contract",
+                provider=byok_adapter.name, model=byok_route.model,
+                mode=contract.mode, trace_id=tid,
+                credential_id=str(byok.credential_id),
+            )
+            return contract, {
+                "provider": byok_adapter.name, "model": byok_route.model,
+                "attempt_index": 0, "failover_reasons": [],
+                "ttft_added_ms": 0.0,
+                "credential_id": str(byok.credential_id),
+            }
+        except Exception as exc:
+            last_exc = exc
+            if byok_run is not None and telemetry is not None:
+                try:
+                    from app.observability.service import finish_ai_run
+
+                    finish_ai_run(telemetry, byok_run.id, status="failed",
+                                  error_type=type(exc).__name__[:128])
+                except Exception:
+                    pass
+            from app.byok.accounting import is_auth_failure
+
+            _cls, reason = role_policy.classify_execution_failure(exc)
+            if is_auth_failure(exc):
+                reason = f"byok_auth_failure:{reason}"
+                try:
+                    from app.byok.service import flag_invalid_credential
+
+                    flag_invalid_credential(telemetry, byok.credential_id)
+                except Exception:
+                    pass
+            failover_reasons.append(reason)
+            role_policy.record_failover_attempt(
+                reason, byok_adapter.name, byok_route.model
+            )
+            if not is_auth_failure(exc) and _cls == "terminal":
+                role_policy.record_exhausted()
+                raise
+            # Retryable or auth failure: normal recovery continues down the
+            # funded/provider path with gameplay state intact.
     for index, (provider_name, candidate_model) in enumerate(path):
         if not role_policy.is_model_approved(role, provider_name, candidate_model):
             # Defense in depth: execution_path should never yield these.
@@ -392,6 +533,7 @@ def build_provider_narrator(
     role: str = "narration",
     is_retry: bool = False,
     campaign_id=None,
+    byok=None,
 ):
     """Streaming narrator backed by the role-policy provider path.
 
@@ -400,6 +542,15 @@ def build_provider_narrator(
     approved different-model fallbacks (unapproved substitution raises and
     is never executed). Returns a ``StreamingNarratorFn`` taking a
     contract-bound ``NarratorRequest`` and yielding text deltas.
+
+    Issue #257 — ``byok`` (``app.byok.accounting.ByokExecution``) prepends
+    one credential-bound attempt when its provider is approved for
+    ``role`` (unapproved combinations raise clearly). Production callers
+    must build ``byok`` via ``app.byok.service.resolve_byok_execution``.
+    BYOK attempts are
+    always non-billable with a credential-ID trace and a zero-amount
+    ``byok_marker`` on success; an invalid/expired credential fails
+    through to the funded/provider candidates (normal recovery).
 
     Failover preserves the visible-prefix invariant: provider switching
     happens ONLY before anything is durably player-visible (checked via the
@@ -432,6 +583,14 @@ def build_provider_narrator(
             telemetry = telemetry_factory_for(db)
         except Exception:
             telemetry = None
+    if byok is not None and (adapter is not None or model is not None):
+        from app.byok.errors import ByokError
+
+        raise ByokError(
+            "byok cannot be combined with a pinned adapter/model narrator; "
+            "pass one execution path, not both",
+            kind="malformed",
+        )
     if adapter is not None and model is not None:
         if not role_policy.is_model_approved(role, adapter.name, model):
             raise RuntimeError(
@@ -486,8 +645,36 @@ def build_provider_narrator(
             else:
                 assert policy_path is not None
                 entries = [(i, p, m, False) for i, (p, m) in enumerate(policy_path)]
-            resolved: list[tuple[int, object, str]] = []
+            resolved: list[tuple[int, object, str, bool]] = []
             first_error: BaseException | None = None
+            # Issue #257 — BYOK first candidate. Approval is config-time
+            # (unapproved provider/model/role raises clearly here); the
+            # bool flag marks credential-bound entries for non-billable
+            # accounting + credential-ID tracing below.
+            if byok is not None and pinned is None:
+                try:
+                    from app.byok.adapters import wrap_generative_adapter
+                    from app.byok.routing import resolve_generative_route
+
+                    _byok_policy = role_policy.get_role_policy(role)
+                    _byok_route = resolve_generative_route(
+                        role, provider=byok.provider, model=_byok_policy.primary_model
+                    )
+                    resolved.append(
+                        (-1, wrap_generative_adapter(
+                            _byok_route.provider, byok.secret),
+                         _byok_route.model, True)
+                    )
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    role_policy.record_failover_attempt(
+                        f"byok_unapproved:{role}", str(getattr(byok, "provider", "?")),
+                        str(getattr(byok, "provider", "?")),
+                    )
+                    # Unapproved BYOK is a clear rejection, not a silent
+                    # platform fallback: surface it instead of executing.
+                    raise
             for path_index, provider_ref, candidate_model, pre_resolved in entries:
                 try:
                     if pre_resolved:
@@ -503,18 +690,26 @@ def build_provider_narrator(
                         candidate_model,
                     )
                     continue
-                resolved.append((path_index, cand_adapter, cand_model))
+                resolved.append((path_index, cand_adapter, cand_model, False))
             if not resolved:
                 raise first_error if first_error is not None else RuntimeError(
                     f"No narration provider available for role {role!r}"
                 )
             failover_reasons: list[str] = []
-            for position, (path_index, cand_adapter, cand_model) in enumerate(resolved):
+            for position, (path_index, cand_adapter, cand_model, is_byok) in enumerate(resolved):
                 # Lineage follows the POLICY-PATH index: a skipped primary
                 # never promotes an alternate to billable primary work.
-                classification = (
-                    "recovery" if (path_index > 0 or is_retry) else "primary"
-                )
+                # BYOK entries are always non-billable (user-funded) with a
+                # credential-ID trace, never platform cost.
+                byok_ctx = byok if (is_byok and byok is not None) else None
+                if is_byok:
+                    classification = "primary" if position == 0 else "recovery"
+                    billable = False
+                else:
+                    classification = (
+                        "recovery" if (path_index > 0 or is_retry) else "primary"
+                    )
+                    billable = (classification == "primary")
                 ai_run = None
                 if telemetry is not None:
                     try:
@@ -525,7 +720,10 @@ def build_provider_narrator(
                             role=role, provider=cand_adapter.name,
                             model=cand_model, attempt=path_index + 1,
                             classification=classification,
-                            billable=(classification == "primary"),
+                            billable=billable,
+                            credential_id=(
+                                byok_ctx.credential_id if byok_ctx is not None else None
+                            ),
                             trace_id=tid,
                         )
                     except Exception:
@@ -544,6 +742,9 @@ def build_provider_narrator(
                     provider=cand_adapter.name, model=cand_model,
                     trace_id=tid, attempt=path_index + 1,
                     classification=classification,
+                    credential_id=(
+                        str(byok_ctx.credential_id) if byok_ctx is not None else None
+                    ),
                 )
                 yielded_downstream = False
                 stream_usage = None
@@ -565,9 +766,19 @@ def build_provider_narrator(
                                           input_tokens=in_tokens, output_tokens=out_tokens,
                                           cost_usd=cost_usd_for(cand_adapter.name, cand_model,
                                                                 stream_usage),
-                                          campaign_id=campaign_id)
+                                          campaign_id=None if byok_ctx is not None else campaign_id)
                         except Exception:
                             pass
+                    if byok_ctx is not None:
+                        from app.byok.accounting import mark_byok_run_fail_soft
+
+                        mark_byok_run_fail_soft(
+                            telemetry, campaign_id=byok_ctx.campaign_id,
+                            ai_run_id=getattr(ai_run, "id", None),
+                            credential_id=byok_ctx.credential_id,
+                            execution_class="generative", role=role,
+                            provider=cand_adapter.name, model=cand_model,
+                        )
                     return
                 except Exception as exc:
                     if ai_run is not None and telemetry is not None:
@@ -579,6 +790,25 @@ def build_provider_narrator(
                         except Exception:
                             pass
                     cls, reason = role_policy.classify_execution_failure(exc)
+                    # Issue #257 — an invalid/expired BYOK credential fails
+                    # through normal recovery: flag it (fail-soft) and offer
+                    # the funded/provider candidates instead of corrupting
+                    # gameplay state. Secret details never surface.
+                    byok_auth_failure = False
+                    if byok_ctx is not None:
+                        from app.byok.accounting import is_auth_failure
+
+                        if is_auth_failure(exc):
+                            byok_auth_failure = True
+                            reason = f"byok_auth_failure:{reason}"
+                            try:
+                                from app.byok.service import flag_invalid_credential
+
+                                flag_invalid_credential(
+                                    telemetry, byok_ctx.credential_id
+                                )
+                            except Exception:
+                                pass
                     failover_reasons.append(reason)
                     role_policy.record_failover_attempt(
                         reason, cand_adapter.name, cand_model
@@ -598,6 +828,10 @@ def build_provider_narrator(
                         pre_visible = not _durable_visible()
                     can_switch = (
                         cls == "retriable"
+                        and position < len(resolved) - 1
+                        and pre_visible
+                    ) or (
+                        byok_auth_failure
                         and position < len(resolved) - 1
                         and pre_visible
                     )
