@@ -1071,6 +1071,13 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
     - Applies per-mode structural validation.
     - Fills normalization defaults (e.g., unknown truth → safe private_context).
     - Version dispatch hook for future ``dm_turn_contract_v2`` etc.
+
+    Model-generated input validates LAX (``strict=False``): benign scalar
+    mistypings a reasoning model emits (``"14"`` for ``14``) coerce instead
+    of burning a full regeneration, while unknown fields, missing
+    required keys, bad enums, and un-coercible values still raise. The
+    twelve semantic validators downstream are unchanged — this only stops
+    trivia from costing model calls.
     """
     if not isinstance(raw, dict):
         raise ContractValidationError("not_an_object", "Contract must be a JSON object")
@@ -1086,7 +1093,9 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
         )
 
     try:
-        contract = DmTurnContractV1.model_validate(raw)
+        from pydantic import TypeAdapter as _TypeAdapter
+
+        contract = _TypeAdapter(DmTurnContractV1).validate_python(raw, strict=False)
     except Exception as exc:
         code = _validation_code_from_pydantic(exc)
         # Preserve pydantic error shape for debugging but surface a stable code

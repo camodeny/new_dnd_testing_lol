@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 from app.decisions import (
     ACTIVE, DIRECT_EXECUTE, CandidateRecord, DecisionClassPolicy, DecisionError,
     DecisionFrame, DecisionService, build_frame, build_record, evaluate_execution,
-    record_fail_soft, register_policy, revalidate_for_execution, to_decision_request,
+    get_policy, record_fail_soft, register_policy, revalidate_for_execution, to_decision_request,
 )
 from models.campaigns import Campaign
 from models.world import WorldEntity, WorldEntityAlias
@@ -271,17 +271,43 @@ class IdentityDecision:
     selected_id: str
     directive: str
     frame: DecisionFrame
+    runner_up_applied: bool = False
+
+
+def _near_tie_runner_up(probabilities: dict, *, exclude: set) -> tuple[str | None, float]:
+    """Best non-excluded candidate and its margin behind the top choice.
+
+    Returns ``(None, inf)`` when no legal runner-up exists.
+    """
+    ranked = sorted(
+        ((cid, float(p)) for cid, p in (probabilities or {}).items() if cid not in exclude),
+        key=lambda item: item[1], reverse=True,
+    )
+    if not ranked:
+        return None, float("inf")
+    top_selected = max((float(p) for p in (probabilities or {}).values()), default=0.0)
+    runner_id, runner_prob = ranked[0]
+    return runner_id, top_selected - runner_prob
 
 
 def decide_identity(
     db: Session, campaign: Campaign, frame: DecisionFrame, service: DecisionService,
     *, session_factory: Any = None, record_outbox: list | None = None,
+    prior_deferrals: int = 0,
 ) -> IdentityDecision:
     """Run, policy-check, revalidate, and record one bounded identity choice.
 
     Telemetry never opens an independent write while the caller holds the
     campaign lock: pass ``record_outbox`` to collect the record for a
     post-commit flush instead of ``session_factory`` on locked paths.
+
+    ``prior_deferrals`` counts earlier DEFER memos for the same proposal in
+    the retry chain. When positive and this decision also DEFERs on a
+    near-tie, the model's own runner-up is accepted (flagged
+    ``runner_up_applied``) instead of looping forever: the first DEFER
+    stays fail-closed, and every downstream revalidation (collision,
+    alias, revision) still applies unchanged. Confident DEFERs (margin
+    above the policy near-tie band) keep raising.
     """
     try:
         response = service.decide(to_decision_request(frame))
@@ -304,7 +330,25 @@ def decide_identity(
         else:
             record_fail_soft(session_factory, record)
     selected = result.selected_id if verdict.directive == DIRECT_EXECUTE else DEFER
-    return IdentityDecision(selected, verdict.directive, frame)
+    runner_up_applied = False
+    if selected == DEFER and prior_deferrals >= 1:
+        # Retry after a memoed DEFER: the disambiguated proposal still
+        # hedged. Accept the model's own near-tie runner-up rather than
+        # looping — a chronic hedger would otherwise never converge.
+        # Confident DEFERs and illegal runner-ups keep failing closed.
+        runner_id, margin = _near_tie_runner_up(result.probabilities, exclude={DEFER})
+        try:
+            near_tie_margin = float(get_policy(IDENTITY_DECISION_CLASS).near_tie_margin)
+        except Exception:
+            near_tie_margin = 0.25
+        if (
+            runner_id is not None
+            and runner_id in legal_ids
+            and margin <= near_tie_margin
+        ):
+            selected = runner_id
+            runner_up_applied = True
+    return IdentityDecision(selected, verdict.directive, frame, runner_up_applied)
 
 
 def create_entity_after_resolution(
