@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -529,3 +529,43 @@ def test_unknown_repair_type_rejected_at_creation():
     with _pytest.raises(ValueError):
         create_repair(db, c.id, repair_type="vibes", proposed_changes=[],
                       reason="x", commit=True)
+
+
+# ── 6. failed multi-domain repair must persist no partial state ───────────────
+
+def test_failed_multidomain_repair_persists_no_partial_state():
+    """First handler succeeds, later handler fails: committed DB state must
+    show the first domain unchanged (verified with a fresh session, not the
+    potentially dirty identity map)."""
+    from models.world import WorldEntity
+
+    _F, db, c, owner = _setup()
+    ent = _entity(db, c, name="Keep", summary="before", idempotency_key="rb-ent-1")
+    db.commit()
+    ent_id = ent.id
+    repair, _ = create_repair(
+        db, c.id, repair_type="deterministic_derived",
+        proposed_changes=[
+            {"domain": "entity", "target_id": str(ent.id),
+             "patch": {"summary": "MUTATED"}},
+            {"domain": "clock", "target_id": str(uuid.uuid4()),
+             "patch": {"progress": 1}},
+        ],
+        reason="first ok, second fails",
+        fingerprint="rb-1", operation_id="op-rb-1", commit=True,
+    )
+    out = apply_repair(db, c.id, repair.id, operation_id="op-rb-1", commit=True)
+    assert out["status"] == "failed"
+    assert "not found" in (out["error"] or "").lower()
+    repair_id = repair.id
+    db.close()
+    fresh = _F()
+    try:
+        row = fresh.get(WorldEntity, ent_id)
+        assert row.summary == "before"
+        assert row.revision == 1
+        rep = fresh.get(CampaignRepair, repair_id)
+        assert rep.status == "failed"
+        assert rep.applied_changes == []
+    finally:
+        fresh.close()
