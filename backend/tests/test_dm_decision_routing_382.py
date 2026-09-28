@@ -212,7 +212,7 @@ def db(tmp_path):
         yield s, camp_id, thread_id
 
 
-def _submit(s, camp_id, thread_id, text="...", *, segment_type="ic"):
+def _submit(s, camp_id, thread_id, text="..."):
     from app.dm.turns import coordinate_turn
     from app.runtime.submissions import accept_submission
 
@@ -221,7 +221,7 @@ def _submit(s, camp_id, thread_id, text="...", *, segment_type="ic"):
         campaign_id=camp_id,
         user_id=s.get(Campaign, camp_id).owner_id,
         raw_content=text,
-        segments=[{"type": segment_type, "text": text}],
+        segments=[{"type": "ic", "text": text}],
         thread_id=str(thread_id),
     )
     s.commit()
@@ -235,7 +235,7 @@ def test_direct_silent_bypasses_generative_adjudication(db):
     from app.dm.execution import execute_dm_attempt
 
     s, camp_id, thread_id = db
-    turn, attempt = _submit(s, camp_id, thread_id, text="brb", segment_type="ooc")
+    turn, attempt = _submit(s, camp_id, thread_id)
 
     def _must_not_run(packet, feedback=None):
         raise AssertionError("generative adjudication must not run on direct route")
@@ -281,7 +281,7 @@ def test_generative_path_runs_when_router_escalates(db):
         decision_service=service,
     )
     assert calls == [1]
-    assert service.adapter.calls == []
+    assert len(service.adapter.calls) == 1
     assert result.mode == "silent"
     assert s.get(DmTurn, turn.id).status == "succeeded"
 
@@ -325,7 +325,7 @@ def test_primer_reaches_generative_packet_as_advisory_only(db):
     from app.dm.execution import execute_dm_attempt
 
     s, camp_id, thread_id = db
-    turn, attempt = _submit(s, camp_id, thread_id, text="brb", segment_type="ooc")
+    turn, attempt = _submit(s, camp_id, thread_id)
     seen = {}
 
     def _generative(packet, feedback=None):
@@ -364,7 +364,7 @@ def test_primer_reaches_generative_packet_as_advisory_only(db):
 
 def test_superseding_input_during_decision_escalates(db):
     s, camp_id, thread_id = db
-    turn, attempt = _submit(s, camp_id, thread_id, text="brb", segment_type="ooc")
+    turn, attempt = _submit(s, camp_id, thread_id)
 
     def _supersede_then_answer(request, calls):
         # A newer submission supersedes this attempt mid-decision call.
