@@ -15,6 +15,7 @@ import { useCampaignFunding } from '@/hooks/useCampaignFunding'
 import { CapacityMeterView } from '@/components/dashboard/CapacityMeter'
 import { isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
 import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
+import { parseQuotedSegments } from '@/lib/icOoc'
 import { mergeOptimisticMessages } from '@/lib/optimisticMessages'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
@@ -255,7 +256,9 @@ export default function CampaignViewPage() {
       content,
       created_at: new Date().toISOString(),
       sender_name: currentCharacter?.name ?? user?.username ?? 'Player',
+      segments: parseQuotedSegments(content),
     }
+    optimistic.is_ic = (optimistic.segments ?? []).every((segment) => segment.type === 'ic')
     // Show instantly; the server echo replaces this via the merge above.
     setPendingMessages((current) => [...current, optimistic])
     try {
@@ -268,6 +271,7 @@ export default function CampaignViewPage() {
         headers: { 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({
           content,
+          segments: optimistic.segments,
           thread_id: activeThreadId,
           character_id: currentCharacter?.id ?? null,
         }),

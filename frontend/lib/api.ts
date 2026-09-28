@@ -284,10 +284,10 @@ export const gameplayThreads = {
       method: 'POST',
       body: JSON.stringify({ participant_id: participantId }),
     }),
-  submit: (campaignId: string | number, threadId: string, content: string, operationId: string) =>
+  submit: (campaignId: string | number, threadId: string, content: string, operationId: string, segments?: Array<{ type: 'ic' | 'ooc'; text: string }>) =>
     apiFetch(`/campaigns/${campaignId}/submissions`, {
       method: 'POST',
-      body: JSON.stringify({ thread_id: threadId, content, operation_id: operationId }),
+      body: JSON.stringify({ thread_id: threadId, content, operation_id: operationId, ...(segments ? { segments } : {}) }),
       headers: { 'Idempotency-Key': operationId },
     }),
 }

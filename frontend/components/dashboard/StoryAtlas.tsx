@@ -3,7 +3,9 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import MarkdownContent from '@/components/common/MarkdownContent'
+import IcOocText from '@/components/dashboard/IcOocText'
 import PrivateThreadConversation from '@/components/dashboard/PrivateThreadConversation'
+import { tokenizeForHighlight } from '@/lib/icOoc'
 import { campaignMembers, gameplayThreads } from '@/lib/api'
 import type { CapacityUiEvent } from '@/lib/capacity'
 import { privateThreadLabel, upsertVisibleThread } from '@/lib/privateThreads'
@@ -88,9 +90,15 @@ export default function StoryAtlas({
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
+  const highlightRef = useRef<HTMLDivElement>(null)
   const lastMessageIdRef = useRef<string | null>(null)
+  // Collapsed caret position in the composer (null when blurred or when a
+  // range is selected). The backdrop hides the glyph parked under the caret
+  // so the real caret never renders on top of backdrop text.
+  const [caret, setCaret] = useState<number | null>(null)
 
   // Auto-grow the composer with newlines, up to ~10 rows, then scroll.
+  // The highlight backdrop mirrors the textarea scroll position.
   useEffect(() => {
     const ta = inputRef.current
     if (!ta) return
@@ -98,7 +106,64 @@ export default function StoryAtlas({
     const max = Math.round(10 * 0.9 * 16 * 1.5)
     ta.style.height = `${Math.min(ta.scrollHeight, max)}px`
     ta.style.overflowY = ta.scrollHeight > max ? 'auto' : 'hidden'
+    if (highlightRef.current) {
+      highlightRef.current.scrollTop = ta.scrollTop
+      highlightRef.current.scrollLeft = ta.scrollLeft
+    }
   }, [input])
+
+  const syncHighlightScroll = () => {
+    const ta = inputRef.current
+    if (ta && highlightRef.current) {
+      highlightRef.current.scrollTop = ta.scrollTop
+      highlightRef.current.scrollLeft = ta.scrollLeft
+    }
+  }
+
+  const highlightTokens = tokenizeForHighlight(input)
+
+  const readCaret = (ta: HTMLTextAreaElement | null): number | null => {
+    if (!ta || ta.selectionStart !== ta.selectionEnd) return null
+    return ta.selectionStart
+  }
+
+  const handleComposerChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInput(e.target.value)
+    setCaret(readCaret(e.target))
+  }
+
+  const renderHighlight = (): ReactNode => {
+    const nodes: ReactNode[] = []
+    let offset = 0
+    let caretPlaced = caret === null
+    highlightTokens.forEach((token, index) => {
+      const start = offset
+      offset += token.text.length
+      let inner: ReactNode = token.text
+      if (!caretPlaced && caret !== null && caret >= start && caret <= start + token.text.length) {
+        // Split the token at the caret and park a fake caret marker there.
+        // The native caret is hidden; the marker is net-zero width so all
+        // glyphs stay visible and nothing drifts.
+        const local = caret - start
+        inner = (
+          <>
+            {token.text.slice(0, local)}
+            <span className="composer-fake-caret" />
+            {token.text.slice(local)}
+          </>
+        )
+        caretPlaced = true
+      }
+      nodes.push(token.ic
+        ? <span key={index} className="composer-ic">{inner}</span>
+        : <span key={index}>{inner}</span>)
+    })
+    if (!caretPlaced) {
+      // Empty composer with focus: the marker alone is the caret.
+      nodes.push(<span key="caret" className="composer-fake-caret" />)
+    }
+    return nodes
+  }
 
   useEffect(() => {
     const lastMessageId = messages.length ? String(messages[messages.length - 1].id) : null
@@ -402,7 +467,7 @@ export default function StoryAtlas({
                       {msg.role === 'dm' ? (
                         <MarkdownContent content={msg.content} />
                       ) : (
-                        <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{msg.content}</p>
+                        <IcOocText message={msg} />
                       )}
                     </div>
                   </div>
@@ -443,22 +508,36 @@ export default function StoryAtlas({
                   </p>
                 )}
                 <div className="session-input-shell" style={{ display: 'flex', alignItems: 'flex-end', gap: 8, padding: '3px 4px 3px 10px' }}>
-                  <textarea
-                    ref={inputRef}
-                    className="session-input-editable"
-                    placeholder={aiPaused ? 'Draft while paused…' : 'What do you do?'}
-                    value={input}
-                    onChange={(e) => setInput(e.target.value)}
-                    onKeyDown={handleKeyDown}
-                    rows={1}
-                    disabled={sending || aiThinking}
-                    aria-label={aiPaused ? 'Message draft (AI narration paused)' : 'Message'}
-                    style={{
-                      flex: 1, background: 'transparent', border: 'none', resize: 'none',
-                      color: 'var(--text-bright)', fontSize: '0.9rem', lineHeight: 1.5,
-                      maxHeight: '216px', overflowY: 'hidden', marginBlock: 'auto',
-                    }}
-                  />
+                  <div className="composer-wrap">
+                    <div ref={highlightRef} className="composer-backdrop" aria-hidden="true">
+                      {renderHighlight()}
+                      {/* Zero-width space preserves a trailing newline's height. */}
+                      {'\u200b'}
+                    </div>
+                    <textarea
+                      ref={inputRef}
+                      className="session-input-editable composer-transparent"
+                      placeholder={aiPaused ? 'Draft while paused…' : 'What do you do? "Say it" in quotes to speak.'}
+                      value={input}
+                      onChange={handleComposerChange}
+                      onSelect={(e) => setCaret(readCaret(e.target as HTMLTextAreaElement))}
+                      onFocus={(e) => setCaret(readCaret(e.target))}
+                      onBlur={() => setCaret(null)}
+                      onScroll={syncHighlightScroll}
+                      onKeyDown={handleKeyDown}
+                      rows={1}
+                      disabled={sending || aiThinking}
+                      aria-label={aiPaused ? 'Message draft (AI narration paused)' : 'Message'}
+                      spellCheck={false}
+                      style={{
+                        flex: 1, background: 'transparent', border: 'none', resize: 'none',
+                        color: 'transparent', caretColor: 'var(--text-bright)',
+                        fontSize: '0.9rem', lineHeight: 1.5,
+                        maxHeight: '216px', overflowY: 'hidden', margin: 0, width: '100%',
+                        position: 'relative', zIndex: 1,
+                      }}
+                    />
+                  </div>
                   <button
                     type="button"
                     className="session-send-btn"

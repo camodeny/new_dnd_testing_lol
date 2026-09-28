@@ -2619,6 +2619,115 @@ a.automation-list-item:focus-visible {
 }
 .session-input-editable::-webkit-scrollbar { display: none; }
 
+/* IC/OOC composer: the textarea text is transparent and a backdrop div
+   renders the same text with quoted IC spans in a colored box. Metrics
+   must match the textarea exactly (font-size, line-height, wrapping). */
+.composer-wrap {
+  position: relative;
+  flex: 1;
+  display: flex;
+  align-self: center;
+  min-width: 0;
+}
+
+.composer-backdrop {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+  color: var(--text-bright);
+  font-size: 0.9rem;
+  line-height: 1.5;
+  font-family: inherit;
+  letter-spacing: inherit;
+  pointer-events: none;
+  user-select: none;
+}
+
+.composer-backdrop .composer-ic {
+  background: var(--ember-soft);
+  border: 1px solid var(--ember);
+  border-radius: 5px;
+  /* Border + padding are exactly cancelled by negative margin so the
+     backdrop stays the same width as the plain textarea text — otherwise
+     the caret drifts from the highlight after the first quoted span. */
+  margin: 0 -4px;
+  padding: 0 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+  color: var(--ember-hover);
+}
+/* NOTE: no font-weight/font-style here — the backdrop must stay metrically
+   identical to the plain textarea or the caret drifts from the highlight. */
+
+/* Fake caret drawn in the highlight mirror at the real caret offset. The
+   native caret is hidden (transparent) because it would render underneath
+   backdrop glyphs. Net-zero width so text after it never drifts. */
+.composer-backdrop .composer-fake-caret {
+  display: inline-block;
+  width: 0;
+  height: 1.05em;
+  margin-left: -2px;
+  border-left: 2px solid var(--ink-strong);
+  vertical-align: text-bottom;
+  animation: composer-caret-blink 1.06s steps(2, start) infinite;
+}
+
+@keyframes composer-caret-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer-backdrop .composer-fake-caret {
+    animation: none;
+  }
+}
+
+.composer-transparent {
+  color: transparent;
+  /* Hidden: the mirror draws its own caret above the backdrop text. */
+  caret-color: transparent;
+}
+
+.composer-transparent::placeholder {
+  color: var(--text-dim);
+  opacity: 1;
+}
+
+.composer-transparent::selection {
+  background: rgba(209, 107, 72, 0.35);
+}
+
+.composer-hint {
+  margin: 0 0 6px;
+  font-size: 0.72rem;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.composer-hint-example {
+  background: var(--ember-soft);
+  border: 1px solid var(--ember);
+  border-radius: 4px;
+  padding: 0 4px;
+  color: var(--ember-hover);
+  font-style: italic;
+}
+
+/* IC speech inside the chat thread: a colored box around quoted words. */
+.session-ic-span {
+  background: var(--ember-soft);
+  border: 1px solid var(--ember);
+  border-radius: 6px;
+  padding: 0 5px;
+  color: var(--ember-hover);
+  font-style: italic;
+}
+/* <q> renders the quotation marks itself; no extra quotes needed. */
+
 .session-send-btn {
   min-width: 36px;
   min-height: 32px;

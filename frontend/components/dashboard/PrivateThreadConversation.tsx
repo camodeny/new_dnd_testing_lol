@@ -2,9 +2,11 @@
 
 import { useMemo, useState } from 'react'
 import DmTurnControls from '@/components/dashboard/DmTurnControls'
+import IcOocText from '@/components/dashboard/IcOocText'
 import MarkdownContent from '@/components/common/MarkdownContent'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
 import { gameplayThreads } from '@/lib/api'
+import { parseQuotedSegments } from '@/lib/icOoc'
 import { privateThreadLabel } from '@/lib/privateThreads'
 import type { CampaignMember, CampaignThread, User } from '@/types'
 
@@ -21,6 +23,7 @@ type ConversationEntry = {
   id: string
   role: 'player' | 'dm'
   content: string
+  segments?: Array<{ type: 'ic' | 'ooc'; text: string }>
   author: string
   timestamp: string | null
   order: number
@@ -42,10 +45,18 @@ export default function PrivateThreadConversation({
   const entries = useMemo<ConversationEntry[]>(() => {
     const playerEntries = realtime.messages.map((message) => {
       const userId = String(message.user_id ?? '')
+      const rawSegments = Array.isArray(message.segments) ? message.segments : []
       return {
         id: String(message.id ?? message.event_id),
         role: 'player' as const,
         content: String(message.raw_content ?? ''),
+        segments: rawSegments.filter(
+          (segment): segment is { type: 'ic' | 'ooc'; text: string } =>
+            !!segment
+            && (segment.type === 'ic' || segment.type === 'ooc')
+            && typeof segment.text === 'string'
+            && segment.text.length > 0,
+        ),
         author: userId === currentUser.id
           ? currentUser.username
           : members.find((member) => member.user_id === userId)?.username ?? 'Player',
@@ -77,7 +88,7 @@ export default function PrivateThreadConversation({
     setInput('')
     try {
       const operationId = crypto.randomUUID()
-      await gameplayThreads.submit(campaignId, thread.id, content, operationId)
+      await gameplayThreads.submit(campaignId, thread.id, content, operationId, parseQuotedSegments(content))
       await realtime.refresh()
     } catch (error) {
       setInput(content)
@@ -131,7 +142,7 @@ export default function PrivateThreadConversation({
                 <strong>{entry.author}</strong>
                 {entry.timestamp && <time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>}
               </div>
-              {entry.role === 'dm' ? <MarkdownContent content={entry.content} /> : <p>{entry.content}</p>}
+              {entry.role === 'dm' ? <MarkdownContent content={entry.content} /> : <IcOocText message={{ id: entry.id, session_id: '', role: 'player', content: entry.content, created_at: entry.timestamp ?? '', segments: entry.segments }} />}
             </div>
           </article>
         ))}

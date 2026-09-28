@@ -28,6 +28,14 @@ export function projectLiveTableMessages({
     const character = characters.find((candidate) => String(candidate.id) === String(event.character_id ?? ''))
     const isCurrentUser = currentUser && String(event.user_id ?? '') === String(currentUser.id)
     const segments = Array.isArray(event.segments) ? event.segments : []
+    const typedSegments = segments
+      .filter(
+        (segment): segment is { type: 'ic' | 'ooc'; text: string } =>
+          !!segment
+          && (segment.type === 'ic' || segment.type === 'ooc')
+          && typeof segment.text === 'string'
+          && segment.text.length > 0,
+      )
     return {
       id: String(event.id ?? event.event_id),
       session_id: sessionId,
@@ -35,7 +43,8 @@ export function projectLiveTableMessages({
       content: typeof event.raw_content === 'string' ? event.raw_content : '',
       created_at: timestamp(event.accepted_at ?? event.timestamp),
       sender_name: character?.name ?? (isCurrentUser ? currentUser.username : 'Player'),
-      is_ic: segments.length > 0 && segments.every((segment) => segment.type === 'ic'),
+      is_ic: typedSegments.length > 0 && typedSegments.every((segment) => segment.type === 'ic'),
+      segments: typedSegments,
     }
   })
 
