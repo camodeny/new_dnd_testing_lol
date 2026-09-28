@@ -71,6 +71,12 @@ Do not retell player declarations unless necessary; focus on the world's reply.
 Introduce new NPCs through new_entities and a narrated introduction, without
 using their temp_id as an EntityRef. They can speak as canonical NPCs on later
 turns once their durable identity is in context.
+REGISTRY FIRST: the packet carries a complete entity registry (id, name, kind,
+one-line summary for every known NPC/location). Before proposing a new entity,
+check the registry: if the figure is already there under any name or guise,
+reference its exact ID instead. Propose new_entities only for genuinely new
+faces, described with distinguishing detail so they cannot be confused with
+registry entries.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

@@ -185,6 +185,100 @@ def test_provider_failure_defers_and_supersession_is_auditable():
     assert duplicate.details["identity_supersession"]["provenance"] == {"repair_id": "r1"}
 
 
+class _NearTieDeferStub:
+    """Stub decision service returning a scripted DEFER distribution."""
+
+    def __init__(self, probabilities, confidence=0.36):
+        self.probabilities = dict(probabilities)
+        self.confidence = confidence
+        self.calls = 0
+
+    def decide(self, request):
+        from app.decisions.contracts import ChoiceResult, DecisionResponse
+
+        self.calls += 1
+        qid = request.questions[0].question_id
+        return DecisionResponse(
+            results={qid: ChoiceResult(
+                question_id=qid, selected_id=DEFER,
+                probabilities=dict(self.probabilities), confidence=self.confidence)},
+            provider="stub", model="stub-model", latency_ms=1, trace_id="t",
+        )
+
+
+def _frame_with_candidate(db, campaign):
+    make_entity(db, campaign, "Mara Venn")
+    frame = build_identity_frame(db, campaign, name="Mara", entity_type="npc")
+    assert any(c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER} for c in frame.candidates)
+    return frame
+
+
+def test_near_tie_defer_falls_back_to_runner_up_on_retry():
+    db, campaign = setup_db()
+    frame = _frame_with_candidate(db, campaign)
+    domain = [c.id for c in frame.candidates if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    probs = {domain[0]: 0.06, KEEP_DISTINCT: 0.01, DEFER: 0.49, NEW_ENTITY: 0.44}
+    stub = _NearTieDeferStub(probs)
+    # First decision still fails closed — the fallback only exists on retry.
+    first = decide_identity(db, campaign, frame, stub)
+    assert first.selected_id == DEFER
+    assert first.runner_up_applied is False
+    retry = decide_identity(db, campaign, frame, stub, prior_deferrals=1)
+    assert retry.selected_id == NEW_ENTITY
+    assert retry.runner_up_applied is True
+    assert stub.calls == 2
+
+
+def test_confident_defer_never_falls_back():
+    db, campaign = setup_db()
+    frame = _frame_with_candidate(db, campaign)
+    domain = [c.id for c in frame.candidates if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    probs = {domain[0]: 0.02, KEEP_DISTINCT: 0.02, DEFER: 0.90, NEW_ENTITY: 0.06}
+    stub = _NearTieDeferStub(probs, confidence=0.9)
+    result = decide_identity(db, campaign, frame, stub, prior_deferrals=3)
+    assert result.selected_id == DEFER
+    assert result.runner_up_applied is False
+
+
+def test_retry_with_memo_resolves_instead_of_looping():
+    from models.dm import DmTurnAttempt
+    from app.world.service import resolve_new_entity_identities_pre_narration
+
+    db, campaign = setup_db()
+    make_entity(db, campaign, "Mara Venn")
+    snapshot = {"new_entities": [{
+        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    parent = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign.id,
+        thread_id="main", audience="campaign", attempt_number=1,
+        status="abandoned", abandonment_reason="explicit_retry",
+        source_revision=7, input_set_revision=1,
+        identity_resolutions=[{
+            "temp_id": "tmp", "outcome": DEFER, "via": "deferred",
+            "jit_key": "jit", "proposal": {"kind": "npc", "public_name": "Mara"},
+            "candidate_labels": [],
+        }],
+    )
+    db.add(parent)
+    child = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign.id,
+        thread_id="main", audience="campaign", attempt_number=2,
+        parent_attempt_id=parent.id, status="prepared",
+        source_revision=7, input_set_revision=1,
+    )
+    db.add(child)
+    db.flush()
+    frame_probe = build_identity_frame(db, campaign, name="Mara", entity_type="npc")
+    domain = [c.id for c in frame_probe.candidates if c.id not in {NEW_ENTITY, KEEP_DISTINCT, DEFER}]
+    probs = {domain[0]: 0.06, KEEP_DISTINCT: 0.01, DEFER: 0.49, NEW_ENTITY: 0.44}
+    outcomes = resolve_new_entity_identities_pre_narration(
+        db, campaign, turn, child, snapshot,
+        identity_decision_service=_NearTieDeferStub(probs))
+    assert outcomes[0]["outcome"] == NEW_ENTITY
+    assert outcomes[0]["runner_up_fallback"] is True
+
+
 def test_keep_distinct_can_create_same_name_and_retry_is_idempotent():
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara", location_ref="north")

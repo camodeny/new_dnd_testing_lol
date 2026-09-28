@@ -739,17 +739,23 @@ def _resolve_identity_proposal(
     identity_decision_service: Any | None = None,
     identity_session_factory: Any | None = None,
     identity_telemetry_outbox: list | None = None,
-) -> tuple[Any | None, str, WorldEntity | None, Any | None]:
+    prior_deferrals: int = 0,
+) -> tuple[Any | None, str, WorldEntity | None, Any | None, bool]:
     """Run deterministic + bounded identity resolution for one proposal.
 
     No durable entity write happens here. Returns ``(frame, selected_id,
-    reused_entity, decision_service)`` where ``reused_entity`` is set for
-    deterministic stable UUID/alias hits (reuse with zero model calls) and
-    ``frame``/``selected_id`` otherwise. Raises
+    reused_entity, decision_service, runner_up_applied)`` where
+    ``reused_entity`` is set for deterministic stable UUID/alias hits
+    (reuse with zero model calls) and ``frame``/``selected_id`` otherwise.
+    Raises
     :class:`~app.world.identity.IdentityDeferredError` fail-closed
     (no insert) on ``DEFER`` or ``ValueError`` on plain ``NEW_ENTITY``
     against an exact canonical collision. The returned service is the
     (lazily constructed) service to reuse for subsequent proposals.
+
+    ``prior_deferrals`` counts earlier DEFER memos for the same proposal
+    in the retry chain; when positive, a repeated near-tie DEFER falls
+    back to the model's own runner-up (flagged) instead of looping.
     """
     from app.world.identity import (
         KEEP_DISTINCT,
@@ -765,7 +771,7 @@ def _resolve_identity_proposal(
         # canonical entity. Reuse it with zero model calls — aliases
         # can never reach KEEP_DISTINCT creation, so the frame has
         # nothing legal left to decide.
-        return None, str(collision.id), collision, identity_decision_service
+        return None, str(collision.id), collision, identity_decision_service, False
     location_value = _location_value(location_ref)
     frame = build_identity_frame(
         db, campaign, name=validate_entity_name(public_name), entity_type=kind,
@@ -808,13 +814,16 @@ def _resolve_identity_proposal(
             db, campaign, frame, identity_decision_service,
             session_factory=identity_session_factory,
             record_outbox=identity_telemetry_outbox,
+            prior_deferrals=prior_deferrals,
         )
         selected_id = decision.selected_id
+        runner_up_applied = decision.runner_up_applied
     else:
         # Exhaustive deterministic search found no plausible identity.
         # NEW_ENTITY is therefore an explicit code-owned bounded outcome,
         # still revalidated against the frame immediately before insert.
         selected_id = NEW_ENTITY
+        runner_up_applied = False
     if selected_id == DEFER:
         candidate_labels = [
             str(candidate.label)
@@ -837,7 +846,7 @@ def _resolve_identity_proposal(
         raise ValueError(
             f"new entity {temp_id!r} collides with canonical identity {collision.id}"
         )
-    return frame, selected_id, None, identity_decision_service
+    return frame, selected_id, None, identity_decision_service, runner_up_applied
 
 
 def _stored_identity_outcomes(attempt: Any) -> dict:
@@ -911,6 +920,45 @@ def _apply_stored_identity_outcome(
     return current
 
 
+def _count_prior_deferrals(db: Session, attempt: Any, *, temp_id: str,
+                           public_name: Any, max_levels: int = 5) -> int:
+    """Count DEFER memos for the same proposal up the abandoned-retry chain.
+
+    Never raises: unreadable ancestry means zero, never a blocked turn.
+    """
+    try:
+        from models.dm import DmTurnAttempt as _Attempt
+    except Exception:
+        return 0
+    count = 0
+    current = attempt
+    try:
+        for _ in range(max_levels):
+            parent_id = getattr(current, "parent_attempt_id", None)
+            if not parent_id:
+                break
+            parent = db.get(_Attempt, parent_id)
+            if parent is None:
+                break
+            for item in getattr(parent, "identity_resolutions", None) or []:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("outcome") != DEFER or item.get("via") != "deferred":
+                    continue
+                if str(item.get("temp_id") or "") != str(temp_id or ""):
+                    continue
+                proposal = item.get("proposal") if isinstance(item.get("proposal"), dict) else {}
+                if str(proposal.get("public_name") or "") != str(public_name or ""):
+                    continue
+                count += 1
+            if getattr(parent, "status", None) != "abandoned":
+                break
+            current = parent
+    except Exception:
+        return count
+    return count
+
+
 def resolve_new_entity_identities_pre_narration(
     db: Session,
     campaign: Campaign,
@@ -960,13 +1008,16 @@ def resolve_new_entity_identities_pre_narration(
             })
             continue
         try:
-            frame, selected_id, reused, service = _resolve_identity_proposal(
+            prior_deferrals = _count_prior_deferrals(
+                db, attempt, temp_id=temp_id, public_name=proposal["public_name"])
+            frame, selected_id, reused, service, runner_up_applied = _resolve_identity_proposal(
                 db, campaign, temp_id=temp_id, kind=proposal["kind"],
                 public_name=proposal["public_name"], location_ref=proposal["location_ref"],
                 turn_id=turn_id, attempt_id=attempt_id,
                 identity_decision_service=service,
                 identity_session_factory=identity_session_factory,
                 identity_telemetry_outbox=None,
+                prior_deferrals=prior_deferrals,
             )
         except IdentityDeferredError as exc:
             # Fail closed (no insert) but persist a deferral memo on the
@@ -1000,7 +1051,7 @@ def resolve_new_entity_identities_pre_narration(
                 "via": "exact_stable", "jit_key": jit_key,
             })
         else:
-            outcomes.append({
+            outcome_record = {
                 "temp_id": temp_id, "outcome": selected_id,
                 "via": "bounded_decision" if frame is not None and any(
                     c.id not in {"NEW_ENTITY", "KEEP_DISTINCT", "DEFER"}
@@ -1008,7 +1059,10 @@ def resolve_new_entity_identities_pre_narration(
                 ) else "deterministic_no_candidate",
                 "jit_key": jit_key,
                 "frame": serialize_identity_frame(frame) if frame is not None else None,
-            })
+            }
+            if runner_up_applied:
+                outcome_record["runner_up_fallback"] = True
+            outcomes.append(outcome_record)
     attempt.identity_resolutions = outcomes
     db.flush()
     try:
@@ -1084,7 +1138,7 @@ def promote_new_entities_from_contract(
             ))
             continue
         # Fallback for direct commit callers without a pre-narration step.
-        frame, selected_id, reused, service = _resolve_identity_proposal(
+        frame, selected_id, reused, service, _runner_up = _resolve_identity_proposal(
             db, campaign, temp_id=temp_id, kind=proposal["kind"],
             public_name=proposal["public_name"], location_ref=proposal["location_ref"],
             turn_id=turn_id, attempt_id=attempt_id,

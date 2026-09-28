@@ -1294,6 +1294,59 @@ def assemble_attempt_context(
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
 
+    # Complete entity registry (experiment): every live NPC/location-style
+    # entity with id + name + one-line summary, so the adjudicator can
+    # reference exact canonical IDs instead of proposing near-duplicate
+    # new_entities that later DEFER in identity resolution. dm_only +
+    # adjudication_only: never narrated, never player-visible. Low
+    # priority so budget trimming drops it before authoritative lanes;
+    # capped so large campaigns stay bounded.
+    lane_started = time.monotonic()
+    try:
+        from models.world import WorldEntity as _RegistryEntity
+
+        _registry_rows = list(db.execute(
+            select(_RegistryEntity)
+            .where(
+                _RegistryEntity.campaign_id == campaign.id,
+                _RegistryEntity.superseded_by_id.is_(None),
+            )
+            .order_by(_RegistryEntity.created_at.asc())
+            .limit(200)
+        ).scalars().all())
+        _registry = [
+            {
+                "id": str(row.id),
+                "name": row.name,
+                "kind": row.entity_type,
+                "summary": (str(row.summary or "")[:200] or None),
+            }
+            for row in _registry_rows
+        ]
+        records[LaneName.RELEVANT_CANON].append(
+            ContextRecord(
+                record_id=f"entity-registry:{campaign.id}",
+                required=False,
+                priority=10,
+                value={"entities": _registry},
+                sources=[
+                    _source(
+                        "world_entity",
+                        campaign.id,
+                        campaign.revision,
+                        campaign.revision,
+                        lane="relevant_canon_relations",
+                    )
+                ],
+                authorization=scope,
+                visibility="dm_only",  # type: ignore[arg-type]
+                use="adjudication_only",
+            )
+        )
+    except Exception as exc:
+        logger.warning("entity registry record failed: %s", exc)
+    timings[LaneName.RELEVANT_CANON] = (time.monotonic() - lane_started) * 1000
+
     # Per-subject fictional-knowledge lane (issue #251): DM-internal
     # perspective snapshots built from #211 WorldKnowledge, distinct from
     # objective truth and human disclosure. Covers acting PCs plus

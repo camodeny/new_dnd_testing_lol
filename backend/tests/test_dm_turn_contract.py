@@ -437,3 +437,60 @@ def test_public_projection_strips_internal_roll_fields():
     assert "character_id" not in json.dumps(proj)
     assert proj["roll_request"]["reason_public"] == "Inspect seal"
     assert proj["roll_request"]["label"] == "Investigation check"
+
+
+def test_lax_scalar_coercion_for_model_input():
+    # Benign model mistypings coerce instead of burning a regeneration:
+    # stringified ints/bools land as their declared types.
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "await_roll", "reason": "roll",
+        "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim(kind="roll_instruction", origin="dm_adjudication")]}],
+        "roll_request": {"request_id": "roll_1", "roll_kind": "check", "ability_or_skill": "Perception", "label": "Look", "advantage_state": "normal", "reason_public": "Spot", "dc_private": "14"},
+    })
+    assert c.roll_request.dc_private == 14
+
+
+def test_lax_coercion_still_rejects_garbage():
+    # Un-coercible values, wrong modes, and unknown fields still fail closed.
+    with pytest.raises(ContractValidationError):
+        normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "await_roll", "reason": "roll",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim(kind="roll_instruction", origin="dm_adjudication")]}],
+            "roll_request": {"request_id": "roll_1", "roll_kind": "check", "ability_or_skill": "Perception", "label": "Look", "advantage_state": "normal", "reason_public": "Spot", "dc_private": "fourteen"},
+        })
+    with pytest.raises(ContractValidationError):
+        normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": 123, "reason": "x", "beats": [],
+        })
+
+
+def test_structural_error_shape_extracts_loc_type():
+    from app.dm.contract import ContractValidationError
+    from app.dm.validators import _structural_error_shape
+
+    exc = ContractValidationError(
+        "contract_validation_failed", "bad",
+        details={"errors": [{"loc": ("roll_request", "dc_private"), "type": "int_parsing", "msg": "x"}]},
+    )
+    assert _structural_error_shape(exc) == "roll_request.dc_private:int_parsing"
+    assert _structural_error_shape(ContractValidationError("x", "y")) == "unavailable"
+
+
+def test_structural_rejection_carries_real_code():
+    from app.dm.validators import run_with_bounded_regeneration
+
+    good = {
+        "contract_version": CONTRACT_VERSION, "mode": "silent", "reason": "ok", "beats": [],
+    }
+    bad = dict(good, bogus_key="nope")
+    calls = []
+
+    def _adjudicate(packet=None, feedback=None):
+        calls.append(feedback)
+        return dict(bad) if len(calls) == 1 else dict(good)
+
+    contract, report = run_with_bounded_regeneration(_adjudicate, packet=None)
+    assert contract.mode == "silent"
+    assert report.passed
+    assert len(calls) == 2
+    assert calls[1] is not None and "contract/unknown_field" in calls[1]

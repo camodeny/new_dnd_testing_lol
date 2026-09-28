@@ -228,6 +228,21 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                         if t and eid:
                             full = str(eid).strip().lower()
                             out[full] = str(t).strip().lower()
+                    # Complete entity registry record: nested id/name/kind
+                    # list the adjudicator references by exact canonical ID.
+                    # Without this, registry IDs the DM correctly reuses
+                    # would fail as unknown_canonical_id.
+                    nested = v.get("entities")
+                    if isinstance(nested, list):
+                        for item in nested:
+                            if not isinstance(item, dict):
+                                continue
+                            nid = item.get("id")
+                            nkind = item.get("kind")
+                            if nid:
+                                out[str(nid).strip().lower()] = (
+                                    str(nkind).strip().lower() if nkind else None
+                                )
                     if rec.record_id.startswith("entity:"):
                         parts = rec.record_id.split(":")
                         if len(parts) >= 3:
@@ -1407,13 +1422,15 @@ def run_with_bounded_regeneration(
         except ContractValidationError as exc:
             # Structurally invalid output never reaches validators — convert to
             # a synthetic rejection so it retries with explicit feedback
-            # instead of failing on the first shot.
+            # instead of failing on the first shot. Keep the real code
+            # (unknown_field, invalid_mode, ...) so rejection telemetry
+            # attributes structural waste precisely.
             last_report = ValidationReport(
                 passed=False,
                 violations=[ValidationViolation(
                     validator="contract",
                     category="structure",
-                    code="invalid_contract",
+                    code=exc.code,
                     message=str(exc)[:500],
                 )],
                 results=[],
@@ -1423,7 +1440,8 @@ def run_with_bounded_regeneration(
             )
             structured_log(
                 logger, logging.WARNING, "validator_regeneration",
-                attempt=attempt, violations=["contract/invalid_contract"],
+                attempt=attempt, violations=[f"contract/{exc.code}"],
+                detail=_structural_error_shape(exc),
                 correlation_id=last_report.correlation_id,
             )
             if attempt >= max_regenerations:
@@ -1441,7 +1459,7 @@ def run_with_bounded_regeneration(
         last_report = report
         structured_log(
             logger, logging.WARNING, "validator_regeneration",
-            attempt=attempt, violations=[v.code for v in report.violations], correlation_id=report.correlation_id,
+            attempt=attempt, violations=[f"{v.validator}/{v.code}" for v in report.violations], correlation_id=report.correlation_id,
         )
         if attempt >= max_regenerations:
             break
@@ -1451,6 +1469,27 @@ def run_with_bounded_regeneration(
         f"Validation failed after {max_regenerations + 1} attempts; last violations: {[v.code for v in last_report.violations]}",
         last_report,
     )
+
+
+def _structural_error_shape(exc: ContractValidationError) -> str:
+    """Compact pydantic error shape for rejection taxonomy (observability only).
+
+    Returns up to two ``loc:type`` pairs from the preserved pydantic error
+    list (e.g. ``roll_request.dc_private:int_parsing``), so rejection logs
+    identify which field breaks without dumping model output. Never raises:
+    unknown detail shapes yield ``"unavailable"``.
+    """
+    try:
+        errors = (exc.details or {}).get("errors") or []
+        parts = []
+        for item in errors[:2]:
+            if not isinstance(item, dict):
+                continue
+            loc = ".".join(str(p) for p in (item.get("loc") or ()))
+            parts.append(f"{loc}:{item.get('type', '?')}")
+        return "; ".join(parts) if parts else "unavailable"
+    except Exception:
+        return "unavailable"
 
 
 def format_rejection_for_retry(report: ValidationReport) -> str:
