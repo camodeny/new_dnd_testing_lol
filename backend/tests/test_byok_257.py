@@ -15,12 +15,13 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-import models  # noqa: E402 — register tables on Base.metadata
+import models  # noqa: E402,F401 — register tables on Base.metadata
 from database import Base  # noqa: E402
 from models.byok import CampaignByokPolicy, ProviderCredential  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.reliability import AIRun, OperationTrace  # noqa: E402
+from models.threads import CampaignThread  # noqa: E402
 
 from app.byok import crypto as byok_crypto  # noqa: E402
 from app.byok import routing as byok_routing  # noqa: E402
@@ -365,7 +366,7 @@ def test_generative_byok_execution_marks_run_and_ledger(monkeypatch):
 
     from app.providers import policy as role_policy
 
-    primary = role_policy.get_role_policy("forward_dm")
+    role_policy.get_role_policy("forward_dm")
     seen = {}
 
     def fake_execute(adapter, request):
@@ -455,9 +456,6 @@ def test_generative_byok_auth_failure_recovers_to_platform(monkeypatch):
 
     from app.dm import adjudication as adj
 
-    active = byok_service.active_campaign_credential(db, camp) or types.SimpleNamespace(
-        row=row, secret=byok_service.decrypt_for_execution(row)
-    )
     byok = ByokExecution(
         credential_id=row.id, campaign_id=camp,
         secret=byok_service.decrypt_for_execution(row), provider=row.provider,
@@ -856,3 +854,127 @@ def test_pinned_adapter_and_byok_conflict_raises(monkeypatch):
         )
     with pytest.raises(ByokError, match="pinned"):
         adj.build_provider_narrator(adapter=_Adapter(), model="m", byok=byok)
+
+
+# ── 12. production route decision uses authorized BYOK ──────────────────────
+
+def _route_submission(db, camp, thread_id, owner):
+    from app.dm.turns import coordinate_turn
+    from app.runtime.submissions import accept_submission
+
+    accept_submission(
+        db, campaign_id=camp, user_id=owner, raw_content="...",
+        segments=[{"type": "ic", "text": "..."}],
+        thread_id=str(thread_id),
+    )
+    db.commit()
+    coord = coordinate_turn(db, camp, str(thread_id), commit=False)
+    db.commit()
+    assert coord is not None
+    return coord
+
+
+def test_route_attempt_uses_authorized_decision_byok(monkeypatch):
+    """Production routing serves the route decision from the authorized key.
+
+    Regression for PR #452 review: route_attempt must resolve the
+    campaign-authorized BYOK credential for forward_dm_route instead of
+    silently using the platform adapter.
+    """
+    _key(monkeypatch)
+    factory = _factory()
+    db = factory()
+    owner, member = _users(db, 2)
+    camp = _campaign(db, owner)
+    _add_member(db, camp, member)
+    thread_id = uuid.uuid4()
+    db.add(CampaignThread(
+        id=thread_id, campaign_id=camp, thread_type="campaign",
+        title="Table", created_by=owner,
+    ))
+    db.commit()
+    row = _credential(db, member, provider="jev", secret="ts-test-credential-0123456789")
+    db.commit()
+    byok_service.set_campaign_policy(
+        db, campaign_id=camp, credential_id=row.id, authorized_by=owner
+    )
+    db.commit()
+    turn, attempt = _route_submission(db, camp, thread_id, owner)
+
+    from app.byok.adapters import ByokAdapterProxy
+    from app.decisions.adapters.fake import FakeDecisionAdapter
+    from app.dm import decision_routing as routing
+
+    fake = FakeDecisionAdapter(
+        answers={routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID}
+    )
+    monkeypatch.setattr(
+        "app.byok.adapters.wrap_decision_adapter",
+        lambda provider, secret: ByokAdapterProxy(fake, secret),
+    )
+    captured = {}
+    monkeypatch.setattr(
+        "app.byok.accounting.mark_byok_run_fail_soft",
+        lambda *a, **k: captured.update(k),
+    )
+    outcome = routing.route_attempt(db, attempt=attempt, turn=turn)
+    assert outcome.directive == "direct_execute"
+    assert outcome.contract is not None and outcome.contract.mode == "silent"
+    # The credential-bound adapter served the call, not the platform key.
+    assert len(fake.calls) == 1
+    assert outcome.trace.get("credential_id") == str(row.id)
+    assert routing.path_info_fields(outcome)["decision_credential_id"] == str(row.id)
+    # Decision-class accounting fired with credential IDs only.
+    assert captured.get("credential_id") == row.id
+    assert captured.get("execution_class") == "decision"
+    assert captured.get("role") == routing.FORWARD_DM_ROUTE_CLASS
+
+
+def test_route_attempt_falls_back_without_authorized_byok(monkeypatch):
+    """No usable credential: routing preserves the funded/provider path."""
+    _key(monkeypatch)
+    factory = _factory()
+    db = factory()
+    owner, member = _users(db, 2)
+    camp = _campaign(db, owner)
+    _add_member(db, camp, member)
+    thread_id = uuid.uuid4()
+    db.add(CampaignThread(
+        id=thread_id, campaign_id=camp, thread_type="campaign",
+        title="Table", created_by=owner,
+    ))
+    db.commit()
+    turn, attempt = _route_submission(db, camp, thread_id, owner)
+
+    from app.dm import decision_routing as routing
+
+    def _must_not_wrap(provider, secret):
+        raise AssertionError("BYOK must not resolve without an authorized policy")
+
+    monkeypatch.setattr(
+        "app.byok.adapters.wrap_decision_adapter", _must_not_wrap
+    )
+
+    from app.decisions.contracts import ChoiceResult, DecisionResponse
+    from app.decisions.runtime import DecisionService
+
+    def _platform(self, request, **kwargs):
+        assert "byok" not in kwargs
+        question = request.questions[0]
+        ids = [c.id for c in question.candidates]
+        probs = {i: (1.0 if i == routing.ROUTE_SILENT_ID else 0.0) for i in ids}
+        return DecisionResponse(
+            results={question.question_id: ChoiceResult(
+                question_id=question.question_id,
+                selected_id=routing.ROUTE_SILENT_ID,
+                probabilities=probs, confidence=1.0,
+            )},
+            provider="platform-jev", model="jev-latest",
+            latency_ms=1, trace_id="t",
+        )
+
+    monkeypatch.setattr(DecisionService, "decide", _platform)
+    outcome = routing.route_attempt(db, attempt=attempt, turn=turn)
+    assert outcome.directive == "direct_execute"
+    assert outcome.contract is not None and outcome.contract.mode == "silent"
+    assert "credential_id" not in outcome.trace

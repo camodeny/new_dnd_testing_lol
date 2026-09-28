@@ -23,6 +23,7 @@ import hashlib
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -33,22 +34,21 @@ from app.byok.errors import (
     INVALID_CREDENTIAL,
     MALFORMED,
     NOT_FOUND,
-    UNSUPPORTED,
     UPSTREAM_UNREACHABLE,
     ByokError,
 )
 from app.byok.routing import (
-    SUPPORTED_CREDENTIAL_PROVIDERS,
     assert_supported_provider,
-    normalize_provider,
 )
 from models.byok import (
-    CREDENTIAL_STATUSES,
     CREDENTIAL_STATUS_ACTIVE,
     CREDENTIAL_STATUS_INVALID,
     CampaignByokPolicy,
     ProviderCredential,
 )
+
+if TYPE_CHECKING:
+    from app.byok.accounting import ByokExecution
 
 # Re-exported for transport consumers (router projections).
 __all__ = [

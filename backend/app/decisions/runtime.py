@@ -233,7 +233,7 @@ class DecisionService:
         byok_campaign_id = None
         if byok is not None:
             from app.byok.adapters import wrap_decision_adapter
-            from app.byok.routing import MODE_PRIMER, resolve_decision_route
+            from app.byok.routing import resolve_decision_route
 
             if not decision_role:
                 from app.byok.errors import ByokError

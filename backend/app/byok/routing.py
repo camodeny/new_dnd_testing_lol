@@ -24,7 +24,7 @@ branch on provider names; it consumes :func:`resolve_generative_route` /
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from app.byok.errors import ByokError, UNSUPPORTED
 
