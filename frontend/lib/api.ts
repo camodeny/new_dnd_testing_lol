@@ -300,6 +300,40 @@ export const capacity = {
     apiFetch<import('@/lib/capacity').CapacityStatePayload>(`/campaigns/${campaignId}/capacity-state`),
 }
 
+// ── Campaign funding (Stripe add-funds) ───────────────────────────────────
+// Participant-safe projections only: operation status + aggregate capacity.
+// Card data is entered on Stripe-hosted pages and never touches this app.
+export const funding = {
+  startCheckout: (
+    campaignId: string | number,
+    amountCents: number,
+    urls: { successUrl: string; cancelUrl: string },
+    idempotencyKey: string,
+  ) =>
+    apiFetch<{
+      funding_operation: import('@/lib/funding').FundingOperation
+      checkout_url: string
+    }>(`/campaigns/${campaignId}/funding/checkout`, {
+      method: 'POST',
+      body: JSON.stringify({
+        amount_cents: amountCents,
+        success_url: urls.successUrl,
+        cancel_url: urls.cancelUrl,
+        operation_id: idempotencyKey,
+      }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+  getOperation: (campaignId: string | number, operationId: string) =>
+    apiFetch<{
+      funding_operation: import('@/lib/funding').FundingOperation
+      capacity: unknown
+    }>(`/campaigns/${campaignId}/funding/operations/${encodeURIComponent(operationId)}`),
+  listOperations: (campaignId: string | number) =>
+    apiFetch<{ funding_operations: import('@/lib/funding').FundingOperation[] }>(
+      `/campaigns/${campaignId}/funding/operations`,
+    ),
+}
+
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 export const sessions = {

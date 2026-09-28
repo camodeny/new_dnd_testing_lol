@@ -111,6 +111,7 @@ describe('exported API surface', () => {
       'campaigns',
       'capacity',
       'characters',
+      'funding',
       'gameplayThreads',
       'sessions',
     ])
@@ -165,6 +166,13 @@ describe('exported API surface', () => {
     ])
     expect(Object.keys(api.sessions)).toEqual(['start'])
     expect(Object.keys(api.capacity)).toEqual(['getState'])
+    // Issue #256: member-safe funding projections only (Stripe-hosted
+    // checkout; card data never touches this app).
+    expect(Object.keys(api.funding).sort()).toEqual([
+      'getOperation',
+      'listOperations',
+      'startCheckout',
+    ])
   })
 
   it('fetches the participant-safe capacity projection without secrets', async () => {
