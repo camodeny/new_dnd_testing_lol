@@ -65,6 +65,7 @@ export interface Message {
   created_at: string
   sender_name?: string
   is_ic?: boolean
+  segments?: Array<{ type: 'ic' | 'ooc'; text: string }>
 }
 
 export interface CampaignMember {
