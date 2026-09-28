@@ -168,6 +168,7 @@ def test_path_info_fields_distinguish_execution_paths():
     assert fields["decision_path"] == routing.DECISION_ONLY
     assert fields["decision_directive"] == "direct_execute"
     assert fields["decision_selected"] == routing.ROUTE_SILENT_ID
+    assert fields["decision_skipped"] is False
 
 
 def test_ooc_signal_recorded_for_future_table_chat_route():
@@ -247,6 +248,7 @@ def test_direct_silent_bypasses_generative_adjudication(db):
         decision_service=service,
     )
     assert result.mode == "silent"
+    assert len(service.adapter.calls) == 1
     assert s.get(DmTurn, turn.id).status == "succeeded"
     assert s.get(DmTurnAttempt, attempt.id).status == "succeeded"
 
@@ -279,6 +281,7 @@ def test_generative_path_runs_when_router_escalates(db):
         decision_service=service,
     )
     assert calls == [1]
+    assert len(service.adapter.calls) == 1
     assert result.mode == "silent"
     assert s.get(DmTurn, turn.id).status == "succeeded"
 

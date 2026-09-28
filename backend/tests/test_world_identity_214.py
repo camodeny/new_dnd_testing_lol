@@ -510,8 +510,9 @@ def test_stored_outcome_stale_revision_fails_closed_at_commit():
     assert [row.name for row in db.query(_WorldEntity2).all()] == ["Mara Venn"]
 
 
-def test_pre_narration_exact_alias_reuses_owner_with_zero_model_calls():
+def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls():
     from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import IdentityReuseRequiresReadjudication
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
     add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
@@ -520,18 +521,35 @@ def test_pre_narration_exact_alias_reuses_owner_with_zero_model_calls():
     attempt = _attempt_fake(snapshot)
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(answers={}))
-    outcomes = resolve_new_entity_identities_pre_narration(
-        db, campaign, turn, attempt, snapshot, identity_decision_service=service)
-    assert outcomes[0] == {
-        "temp_id": "tmp-alias", "outcome": str(mara_venn.id),
-        "via": "exact_stable", "jit_key": outcomes[0]["jit_key"],
-    }
+    with pytest.raises(IdentityReuseRequiresReadjudication) as exc_info:
+        resolve_new_entity_identities_pre_narration(
+            db, campaign, turn, attempt, snapshot, identity_decision_service=service)
+    assert exc_info.value.canonical_id == str(mara_venn.id)
     assert service.adapter.calls == []
-    promoted = promote_new_entities_from_contract(
-        db, campaign, turn, attempt, identity_decision_service=service)
-    assert promoted[0].id == mara_venn.id
-    assert service.adapter.calls == []
+    assert attempt.identity_resolutions is None
     assert [row.id for row in db.query(type(mara_venn)).all()] == [mara_venn.id]
+
+
+def test_pre_narration_bounded_reuse_requires_readjudication():
+    from app.world.identity import IdentityReuseRequiresReadjudication
+    from app.world.service import resolve_new_entity_identities_pre_narration
+
+    db, campaign = setup_db()
+    mara_venn = make_entity(db, campaign, "Mara Venn")
+    snapshot = {"new_entities": [{
+        "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+    }]}
+    attempt = _attempt_fake(snapshot)
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": str(mara_venn.id)}
+    ))
+    with pytest.raises(IdentityReuseRequiresReadjudication) as exc_info:
+        resolve_new_entity_identities_pre_narration(
+            db, campaign, turn, attempt, snapshot, identity_decision_service=service)
+    assert exc_info.value.canonical_id == str(mara_venn.id)
+    assert len(service.adapter.calls) == 1
+    assert attempt.identity_resolutions is None
 
 
 # ── Pre-narration vs first-visible-chunk ordering (failed-visible audit) ──────

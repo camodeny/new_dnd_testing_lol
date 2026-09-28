@@ -213,7 +213,10 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                             out[norm_full] = "character"
                     else:
                         out[norm_full] = "character"
-        elif lane.name in (LaneName.RELEVANT_CANON, LaneName.CURRENT_SCENE, LaneName.COMBAT_HOOKS):
+        elif lane.name in (
+            LaneName.RELEVANT_CANON, LaneName.CURRENT_SCENE,
+            LaneName.COMBAT_HOOKS, LaneName.REPAIR_DIRECTIVES,
+        ):
             for rec in lane.records:
                 v = rec.value
                 if isinstance(v, dict):
@@ -222,6 +225,15 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                     # treat campaign IDs or names as entity authority.
                     if lane.name == LaneName.CURRENT_SCENE and v.get("location_entity_id"):
                         out[str(v["location_entity_id"]).strip().lower()] = "location"
+                    # A code-owned identity repair can name a canonical
+                    # entity even when the optional registry was budgeted
+                    # out. Its required record is identity authority for the
+                    # re-adjudicated contract.
+                    canonical = v.get("canonical_entity")
+                    if lane.name == LaneName.REPAIR_DIRECTIVES and isinstance(canonical, dict):
+                        cid, kind = canonical.get("id"), canonical.get("kind")
+                        if cid and kind:
+                            out[str(cid).strip().lower()] = str(kind).strip().lower()
                     for k in ("entity_type", "type"):
                         t = v.get(k)
                         eid = v.get("entity_id") or v.get("id")

@@ -144,6 +144,63 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, suppleme
     )
 
 
+def _with_identity_repair(packet, conflict):
+    """Add required canonical identity feedback before one re-adjudication."""
+    from app.dm.context import (
+        DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS, AuthorizationScope,
+        ContextBudget, ContextRecord, LaneName, SourceRef,
+        assemble_context_packet,
+    )
+
+    record = ContextRecord(
+        record_id=f"identity-repair:{conflict.temp_id}:{conflict.canonical_id}",
+        value={
+            "proposed_temp_id": conflict.temp_id,
+            "proposed_name": conflict.proposed_name,
+            "canonical_entity": {
+                "id": conflict.canonical_id,
+                "name": conflict.canonical_name,
+                "kind": conflict.canonical_kind,
+                "summary": conflict.canonical_summary,
+            },
+            "directive": (
+                "Identity resolution found an existing canonical entity for the "
+                "proposed new NPC. Re-adjudicate the same player intent. If this "
+                "is that person, remove the new_entities proposal, use the exact "
+                "canonical EntityRef, and rewrite any new-person introduction. "
+                "If a genuinely distinct person is needed, give the proposal a "
+                "distinct name and distinguishing details."
+            ),
+        },
+        sources=[SourceRef(
+            source_type="world_entity",
+            source_id=conflict.canonical_id,
+            source_version=conflict.canonical_revision,
+        )],
+        authorization=AuthorizationScope(
+            campaign_id=packet.audience.campaign_id,
+            thread_ids=[packet.audience.thread_id],
+        ),
+        visibility="dm_only",
+        use="adjudication_only",
+        required=True,
+        priority=100,
+    )
+    records = {lane.name: list(lane.records) for lane in packet.lanes}
+    records[LaneName.REPAIR_DIRECTIVES].append(record)
+    return assemble_context_packet(
+        audience=packet.audience,
+        records=records,
+        lane_status={lane.name: lane.authority_status for lane in packet.lanes},
+        source_errors={lane.name: lane.source_errors for lane in packet.lanes},
+        budget=ContextBudget(
+            max_bytes=max(DEFAULT_MAX_BYTES, packet.observability.serialized_bytes + 4096),
+            max_tokens=max(DEFAULT_MAX_TOKENS, packet.observability.estimated_tokens + 1024),
+        ),
+        retrieval_dependencies=[*packet.observability.retrieval_dependencies, "identity_repair"],
+    )
+
+
 def _classify_failure(exc: BaseException) -> str:
     """Map execution failures to attempt error_class (retriable default)."""
     from app.providers import policy as role_policy
@@ -626,6 +683,7 @@ def _execute_owned_attempt(
         NarrationStreamError,
         execute_validated_turn,
     )
+    from app.world.identity import IdentityReuseRequiresReadjudication
     from app.observability.tracing import structured_log
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -938,7 +996,10 @@ def _execute_owned_attempt(
                 turn_id=str(turn.id), attempt_id=str(attempt.id),
                 decision_path=_route_trace.get("decision_path"),
                 directive=_outcome.directive,
-                selected=str(_outcome.selected_id), trace_id=tid,
+                selected=str(_outcome.selected_id),
+                decision_skipped=_outcome.decision_skipped,
+                decision_latency_ms=_route_trace.get("latency_ms"),
+                trace_id=tid,
             )
         except Exception as exc:
             logger.warning("dm_execute decision routing failed: %s", exc)
@@ -984,6 +1045,31 @@ def _execute_owned_attempt(
                     logger.warning("dm_execute primer attach failed: %s", exc)
             return _base_adjudicate(primed_packet, feedback=feedback)
 
+    def _adjudicate_and_validate(start_packet):
+        """Run the normal evidence and validation path for an initial or repaired packet."""
+        validation_packet = start_packet
+
+        from app.dm.contract import ContractValidationError as _ContractValidationError
+
+        def evidence_adjudicate(enriched_packet):
+            nonlocal validation_packet
+            validation_packet = enriched_packet
+            try:
+                return adjudicate(enriched_packet)
+            except _ContractValidationError:
+                repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
+                return repaired
+
+        final_contract, _bundle = run_bounded_evidence_loop(
+            initial_packet=start_packet, adjudicate=evidence_adjudicate, db=db,
+            tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
+        )
+        report = default_pipeline.validate(final_contract, validation_packet)
+        if report.passed:
+            return final_contract, validation_packet
+        repaired_contract, _ = run_with_bounded_regeneration(adjudicate, validation_packet)
+        return repaired_contract, validation_packet
+
     try:
         if _snapshot_contract is not None:
             contract = _snapshot_contract
@@ -1006,36 +1092,7 @@ def _execute_owned_attempt(
         else:
             contract = None
         if contract is None:
-            # Evidence/tool loop first (no-op when the model never asks for
-            # evidence), then strict validation with bounded regeneration.
-            # Preserve the exact packet the last evidence adjudication saw, including
-            # its visibility filtering and per-round budget decisions.
-            validation_packet = packet
-
-            from app.dm.contract import ContractValidationError as _ContractValidationError
-
-            def evidence_adjudicate(enriched_packet):
-                nonlocal validation_packet
-                validation_packet = enriched_packet
-                try:
-                    return adjudicate(enriched_packet)
-                except _ContractValidationError:
-                    # Repair structurally invalid output within the round so
-                    # need_evidence mediation stays intact and exhaustion still
-                    # funnels through the normal _fail_visible path below.
-                    repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
-                    return repaired
-
-            final_contract, _bundle = run_bounded_evidence_loop(
-                initial_packet=packet, adjudicate=evidence_adjudicate, db=db,
-                tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
-            )
-            packet = validation_packet
-            report = default_pipeline.validate(final_contract, packet)
-            if report.passed:
-                contract = final_contract
-            else:
-                contract, report = run_with_bounded_regeneration(adjudicate, packet)
+            contract, packet = _adjudicate_and_validate(packet)
     except Exception as exc:
         db.rollback()
         _fail_visible(exc)
@@ -1162,18 +1219,48 @@ def _execute_owned_attempt(
         _judge_factory = None
 
     try:
-        result = execute_validated_turn(
-            db,
-            turn_id=turn.id,
-            attempt_id=attempt.id,
-            contract=contract,
-            narrator=narrator,
-            provider=pname or "dm-provider",
-            publish_realtime=True,
-            trace_id=tid,
-            judge_service=_judge_service,
-            judge_session_factory=_judge_factory,
-        )
+        for identity_repair_index in range(2):
+            try:
+                result = execute_validated_turn(
+                    db,
+                    turn_id=turn.id,
+                    attempt_id=attempt.id,
+                    contract=contract,
+                    narrator=narrator,
+                    provider=pname or "dm-provider",
+                    publish_realtime=True,
+                    trace_id=tid,
+                    judge_service=_judge_service,
+                    judge_session_factory=_judge_factory,
+                )
+                break
+            except IdentityReuseRequiresReadjudication as conflict:
+                # Identity resolution runs after attempt-local staging but
+                # before chunk zero. Roll back its uncommitted reads and
+                # re-adjudicate once against the resolved canonical identity.
+                # The next staging pass replaces the old snapshot/effects.
+                db.rollback()
+                from models.dm import DmTurnAttempt as _IdentityAttempt
+
+                current = db.get(_IdentityAttempt, attempt.id)
+                if current is not None:
+                    # Staging committed the original contract. It must not
+                    # become a narration-only retry candidate if correction
+                    # fails before the replacement contract is staged.
+                    current.contract_snapshot = None
+                    current.staged_effects = []
+                    current.identity_resolutions = None
+                    db.add(current)
+                    db.commit()
+                if identity_repair_index >= 1 or _snapshot_contract is not None:
+                    raise
+                packet = _with_identity_repair(packet, conflict)
+                structured_log(
+                    logger, logging.INFO, "dm_execute_identity_readjudication",
+                    turn_id=str(turn.id), attempt_id=str(attempt.id),
+                    canonical_id=conflict.canonical_id, trace_id=tid,
+                )
+                contract, packet = _adjudicate_and_validate(packet)
     except NarrationStreamError as exc:
         # Post-visibility remediation already applied inside
         # execute_validated_turn. The valid structured packet survives in

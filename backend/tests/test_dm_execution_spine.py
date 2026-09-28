@@ -142,6 +142,100 @@ def test_submission_autonomously_executes_to_persisted_dm_reply(db):
         assert s2.get(DmTurn, turn.id).status == "succeeded"
 
 
+def test_existing_npc_proposal_is_readjudicated_before_narration(db):
+    from app.dm.context import LaneName
+    from app.world.identity import add_alias
+    from app.world.service import create_entity_inline
+    from models.world import WorldEntity
+
+    s, camp_id, thread_id, _ = db
+    campaign = s.get(Campaign, camp_id)
+    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    add_alias(s, npc, "Mara")
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(packet)
+        if len(calls) == 1:
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION,
+                "mode": "respond",
+                "reason": "mistaken new NPC proposal",
+                "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                    "text": "A new traveler named Mara arrives at the door.",
+                    "claim_kind": "observation", "origin": "dm_adjudication",
+                }]}],
+                "new_entities": [{
+                    "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+                }],
+            })
+        repairs = next(
+            lane.records for lane in packet.lanes
+            if lane.name == LaneName.REPAIR_DIRECTIVES
+        )
+        assert len(repairs) == 1
+        assert repairs[0].value["canonical_entity"]["id"] == str(npc.id)
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": "existing NPC answers",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "Mara Venn answers from beside the door.",
+                "claim_kind": "observation", "origin": "dm_adjudication",
+                "topic_refs": [{"type": "npc", "id": str(npc.id)}],
+            }]}],
+        })
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=adjudicate, narrator="deterministic",
+    )
+    assert len(calls) == 2
+    assert result.attempt.status == "succeeded"
+    assert "Mara Venn answers" in result.narration.visible_text
+    assert "new traveler" not in result.narration.visible_text
+    assert (s.get(DmTurnAttempt, attempt.id).contract_snapshot or {})["new_entities"] == []
+    assert [row.id for row in s.query(WorldEntity).all()] == [npc.id]
+
+
+def test_repeated_existing_npc_proposal_never_streams(db):
+    from app.world.identity import IdentityReuseRequiresReadjudication, add_alias
+    from app.world.service import create_entity_inline
+
+    s, camp_id, thread_id, _ = db
+    campaign = s.get(Campaign, camp_id)
+    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    add_alias(s, npc, "Mara")
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(packet)
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": "repeated mistaken proposal",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "A new traveler named Mara arrives at the door.",
+                "claim_kind": "observation", "origin": "dm_adjudication",
+            }]}],
+            "new_entities": [{
+                "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+            }],
+        })
+
+    with pytest.raises(IdentityReuseRequiresReadjudication):
+        execute_dm_attempt(
+            s, attempt.id, adjudicate=adjudicate, narrator="deterministic",
+        )
+    assert len(calls) == 2
+    assert s.get(DmTurnAttempt, attempt.id).stream_id is None
+    assert s.get(DmTurnAttempt, attempt.id).contract_snapshot is None
+    assert s.get(DmTurn, turn.id).status != "succeeded"
+
+
 def test_terminal_model_execution_leaves_visible_failure_not_stuck_thinking(db):
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)

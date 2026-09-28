@@ -1176,6 +1176,7 @@ def path_info_fields(outcome: RoutingOutcome) -> dict[str, Any]:
     fields: dict[str, Any] = {
         "decision_path": outcome.trace.get("decision_path"),
         "decision_directive": outcome.directive,
+        "decision_skipped": outcome.decision_skipped,
     }
     if outcome.selected_id is not None:
         fields["decision_selected"] = outcome.selected_id

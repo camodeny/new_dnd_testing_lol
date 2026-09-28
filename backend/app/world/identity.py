@@ -47,6 +47,20 @@ class IdentityDeferredError(ValueError):
         self.proposal = dict(proposal or {})
         self.candidate_labels = list(candidate_labels or [])
 
+
+class IdentityReuseRequiresReadjudication(ValueError):
+    """A proposed new entity resolved to an existing canonical entity before narration."""
+
+    def __init__(self, *, temp_id: str, proposed_name: str, entity: WorldEntity):
+        super().__init__(f"new entity {temp_id!r} resolved to existing identity")
+        self.temp_id = temp_id
+        self.proposed_name = proposed_name
+        self.canonical_id = str(entity.id)
+        self.canonical_name = entity.name
+        self.canonical_kind = entity.entity_type
+        self.canonical_summary = str(entity.summary or "")[:200]
+        self.canonical_revision = str(entity.revision or 1)
+
 register_policy(DecisionClassPolicy(
     decision_class=IDENTITY_DECISION_CLASS,
     min_probability_direct=.85, min_confidence_direct=.8,
