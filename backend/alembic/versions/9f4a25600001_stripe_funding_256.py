@@ -1,7 +1,7 @@
 """stripe add-funds funding operations + webhook audit — issue #256 (additive).
 
 Revision ID: 9f4a25600001
-Revises: rename_source_checksum
+Revises: s221rep01
 
 Additive only: campaign_funding_operations + stripe_webhook_events tables.
 Payment records stay separate from fictional game state; no card/payment
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "9f4a25600001"
-down_revision: Union[str, Sequence[str], None] = "rename_source_checksum"
+down_revision: Union[str, Sequence[str], None] = "s221rep01"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
