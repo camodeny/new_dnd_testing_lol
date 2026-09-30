@@ -698,7 +698,7 @@ def _execute_owned_attempt(
     )
     from app.dm.evidence import run_bounded_evidence_loop
     from app.dm.tools import handle_ask_character_sheet
-    from app.dm.validators import default_pipeline, run_with_bounded_regeneration
+    from app.dm.validators import default_pipeline
     from app.dm.narration import (
         NarrationStreamError,
         execute_validated_turn,
@@ -1076,13 +1076,42 @@ def _execute_owned_attempt(
 
         from app.dm.contract import ContractValidationError as _ContractValidationError
 
+        def _repair_missing_perspectives(report, pkt):
+            """Deterministic perspective repair (issue #455): resolve-then-retry.
+
+            Best-effort and read-only: unresolvable subjects yield None and
+            the regen loop falls back to deterministic scope-narrowing.
+            """
+            try:
+                from app.dm.context import repair_packet_missing_perspectives as _repair_lanes
+                from app.dm.validators import missing_perspective_subjects as _subjects
+                from models.campaigns import Campaign as _Campaign
+
+                if pkt is None:
+                    return None
+                campaign = db.get(_Campaign, campaign_id)
+                if campaign is None:
+                    return None
+                subjects = _subjects(report)
+                if not subjects:
+                    return None
+                return _repair_lanes(pkt, db, campaign, subjects)
+            except Exception as exc:
+                logger.warning("dm_execute perspective repair failed: %s", exc)
+                return None
+
+        def _regen(adjudicate_fn, pkt):
+            from app.dm.validators import run_with_bounded_regeneration as _regen_loop
+
+            return _regen_loop(adjudicate_fn, pkt, packet_repair=_repair_missing_perspectives)
+
         def evidence_adjudicate(enriched_packet):
             nonlocal validation_packet
             validation_packet = enriched_packet
             try:
                 return adjudicate(enriched_packet)
             except _ContractValidationError:
-                repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
+                repaired, _ = _regen(adjudicate, enriched_packet)
                 return repaired
 
         final_contract, _bundle = run_bounded_evidence_loop(
@@ -1092,7 +1121,7 @@ def _execute_owned_attempt(
         report = default_pipeline.validate(final_contract, validation_packet)
         if report.passed:
             return final_contract, validation_packet
-        repaired_contract, _ = run_with_bounded_regeneration(adjudicate, validation_packet)
+        repaired_contract, _ = _regen(adjudicate, validation_packet)
         return repaired_contract, validation_packet
 
     try:

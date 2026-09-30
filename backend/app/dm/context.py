@@ -1546,3 +1546,159 @@ def assemble_attempt_context(
     # Include DB collection in total duration without contaminating deterministic payload.
     packet.observability.assembly_ms = (time.monotonic() - started) * 1000
     return packet
+
+
+def repair_packet_missing_perspectives(
+    packet: ForwardDmContextPacket,
+    db: Session,
+    campaign: Campaign,
+    subject_ids: list[str],
+) -> ForwardDmContextPacket | None:
+    """Append knowledge-perspective records for deterministically known subjects.
+
+    Issue #455 deeper fix: the ``knowledge_visibility`` lane is built from
+    scene present-actors, so a recently introduced (or otherwise omitted) NPC
+    has no perspective and their dialogue fails closed every regeneration.
+    Each requested subject is resolved through deterministic identity only —
+    stable UUID, exact alias, or unique exact name
+    (``app.world.identity.exact_identity``); ``tmp_*`` references stay owned
+    by identity deferral (#454) and unresolvable subjects are skipped. An
+    availability directive is added so the retrying model knows the
+    perspective now exists. Returns None when nothing resolved (callers fall
+    back to deterministic scope-narrowing). Never raises: repair is
+    best-effort.
+    """
+    try:
+        from app.world.epistemics import build_knowledge_visibility_values
+        from app.world.identity import exact_identity
+
+        ordered = [str(s or "").strip() for s in (subject_ids or [])]
+        ordered = [s for s in dict.fromkeys(ordered) if s][:8]
+        if not ordered or packet is None:
+            return None
+        have: set[str] = set()
+        knowledge_records: list[ContextRecord] = []
+        for lane in packet.lanes or []:
+            if lane.name == LaneName.KNOWLEDGE_VISIBILITY:
+                knowledge_records = list(lane.records)
+                for rec in knowledge_records:
+                    value = rec.value or {}
+                    for key in (value.get("character_id"), value.get("subject_entity_id")):
+                        token = str(key or "").strip()
+                        if token:
+                            have.add(token)
+                    for alias_id in value.get("alias_ids") or []:
+                        token = str(alias_id or "").strip()
+                        if token:
+                            have.add(token)
+        resolved: list[tuple[str, Any]] = []
+        for sid in ordered:
+            if sid in have or sid.startswith("tmp_"):
+                continue
+            entity = exact_identity(db, campaign.id, sid)
+            if entity is None or entity.campaign_id != campaign.id:
+                continue
+            canonical = str(entity.id)
+            if canonical in have and sid == canonical:
+                continue
+            resolved.append((sid, entity))
+        if not resolved:
+            return None
+        values = build_knowledge_visibility_values(
+            db, campaign, [],
+            npc_entity_ids=[entity.id for _, entity in resolved],
+        )
+        by_entity = {str(v.get("subject_entity_id")): v for v in (values or []) if isinstance(v, dict)}
+        template_auth = (
+            knowledge_records[0].authorization if knowledge_records
+            else _scope(campaign.id, thread_ids=[packet.audience.thread_id])
+        )
+        revision = campaign.revision
+        for rec in knowledge_records:
+            for source in rec.sources or []:
+                if source.campaign_revision is not None:
+                    revision = source.campaign_revision
+                    break
+            if revision != campaign.revision:
+                break
+        new_records: list[ContextRecord] = []
+        canonical_by_actor: dict[str, str] = {}
+        for sid, entity in resolved:
+            value = by_entity.get(str(entity.id))
+            if not isinstance(value, dict) or not value.get("subject_resolved"):
+                continue
+            value = dict(value)
+            if sid != str(entity.id):
+                value["alias_ids"] = [sid]
+            canonical_by_actor[sid] = str(entity.id)
+            new_records.append(
+                ContextRecord(
+                    record_id=f"knowledge-repair:{entity.id}",
+                    required=False,
+                    priority=90,
+                    value=value,
+                    sources=[
+                        *_template_sources(knowledge_records),
+                        _source(
+                            "world_entity",
+                            entity.id,
+                            entity.revision,
+                            revision,
+                            lane="knowledge_visibility",
+                        ),
+                    ],
+                    authorization=template_auth,
+                    visibility="dm_only",  # type: ignore[arg-type]
+                    use="adjudication_only",
+                )
+            )
+        if not new_records:
+            return None
+        mapping = ", ".join(f"{actor} -> {canonical_by_actor[actor]}" for actor in canonical_by_actor)
+        directive = ContextRecord(
+            record_id=f"repair:perspective-{uuid.uuid4().hex[:8]}",
+            value={
+                "directive": (
+                    "Missing knowledge perspectives resolved and attached to the "
+                    f"knowledge_visibility lane: {mapping}. These NPCs may now speak "
+                    "within their listed knowledge; keep every claim inside it."
+                ),
+            },
+            sources=[
+                _source(
+                    "knowledge_repair",
+                    mapping,
+                    "1",
+                    revision,
+                )
+            ],
+            authorization=template_auth,
+            visibility="dm_only",  # type: ignore[arg-type]
+            use="adjudication_only",
+            required=False,
+            priority=100,
+        )
+        records: dict = {lane.name: list(lane.records) for lane in packet.lanes}
+        records[LaneName.KNOWLEDGE_VISIBILITY] = list(records.get(LaneName.KNOWLEDGE_VISIBILITY, [])) + new_records
+        records[LaneName.REPAIR_DIRECTIVES] = list(records.get(LaneName.REPAIR_DIRECTIVES, [])) + [directive]
+        lane_status = {lane.name: lane.authority_status for lane in packet.lanes}
+        source_errors = {lane.name: lane.source_errors for lane in packet.lanes}
+        lane_status[LaneName.REPAIR_DIRECTIVES] = "authoritative"
+        return assemble_context_packet(
+            audience=packet.audience,
+            records=records,
+            lane_status=lane_status,
+            source_errors=source_errors,
+            retrieval_dependencies=list(packet.observability.retrieval_dependencies) + ["knowledge_perspective_repair"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("knowledge perspective repair unavailable: %s", exc)
+        return None
+
+
+def _template_sources(knowledge_records: list[ContextRecord]) -> list[SourceRef]:
+    """Reuse the attempt-attribution sources of a sibling knowledge record."""
+    for rec in knowledge_records or []:
+        if rec.sources:
+            return list(rec.sources)
+    return []

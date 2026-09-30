@@ -816,6 +816,15 @@ class KnowledgeValidator:
                 out[character_id] = perspective
             if subject_id:
                 out[subject_id] = perspective
+            # Deterministic identity aliases supplied by perspective repair
+            # (issue #455): alternate reference strings the model used for
+            # this subject. Canonical keys win on collision.
+            aliases = value.get("alias_ids") or []
+            if isinstance(aliases, list):
+                for alias_id in aliases:
+                    key = str(alias_id or "").strip()
+                    if key:
+                        out.setdefault(key, perspective)
         return out
 
     # Claim kinds that can carry fictional knowledge for an NPC subject.
@@ -1399,6 +1408,7 @@ def run_with_bounded_regeneration(
     max_regenerations: int = 3,
     pipeline: ValidatorPipeline | None = None,
     normalize_fn: Callable[[Any], DmTurnContractV1] | None = None,
+    packet_repair: Callable[[ValidationReport, ForwardDmContextPacket | None], ForwardDmContextPacket | None] | None = None,
 ) -> tuple[DmTurnContractV1, ValidationReport]:
     """Bounded retry: adjudicate → validate → on rejection, adjudicate again with feedback.
 
@@ -1408,6 +1418,19 @@ def run_with_bounded_regeneration(
     ``packet`` is augmented with a ``repair_directives`` record so packet-only
     adjudicators still see the rejection. Failures after the bound surface a
     truncated structured error.
+
+    ``packet_repair`` is an optional deterministic hook for missing knowledge
+    perspectives (issue #455): called once with the failing report and current
+    packet, it may return a packet with the absent lane entries resolved (or
+    None). A repaired packet costs exactly one model retry inside the normal
+    budget — never an extra call.
+
+    Deterministic fast-path (issue #455): when every violation is a missing
+    knowledge perspective, rewording cannot help — the lane entry is absent
+    from the frozen packet — so no further model call is spent. The offending
+    claims are stripped deterministically (scope-narrowing); when nothing
+    salvageable remains the turn degrades to a silent contract. Either path
+    costs zero additional model calls.
     """
     from app.dm.contract import normalize_contract as _normalize
 
@@ -1415,13 +1438,17 @@ def run_with_bounded_regeneration(
     pipe = pipeline or default_pipeline
     last_report: ValidationReport | None = None
     current_packet = packet
+    repair_attempted = False
 
     for attempt in range(max_regenerations + 1):
         feedback: str | None = format_rejection_for_retry(last_report) if last_report else None
         try:
-            # Augment packet with repair feedback for packet-aware adjudicators
+            # Augment packet with repair feedback for packet-aware adjudicators.
+            # Augmentation applies to the CURRENT packet (never the original):
+            # repair records accumulate across retries and a repaired
+            # perspective lane survives re-augmentation.
             if attempt > 0 and feedback is not None:
-                current_packet = _augment_packet_with_feedback(packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
+                current_packet = _augment_packet_with_feedback(current_packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
                 raw = _call_adjudicate(adjudicate, current_packet, feedback)
             else:
                 raw = _call_adjudicate(adjudicate, current_packet, feedback)
@@ -1473,6 +1500,55 @@ def run_with_bounded_regeneration(
             logger, logging.WARNING, "validator_regeneration",
             attempt=attempt, violations=[f"{v.validator}/{v.code}" for v in report.violations], correlation_id=report.correlation_id,
         )
+        locations = _missing_perspective_locations(report)
+        if locations is not None:
+            if packet_repair is not None and not repair_attempted and current_packet is not None:
+                # Resolve-then-retry (issue #455): one model retry against a
+                # deterministically repaired packet, inside the normal budget.
+                repair_attempted = True
+                try:
+                    repaired_packet = packet_repair(report, current_packet)
+                except Exception as exc:
+                    structured_log(
+                        logger, logging.WARNING, "validator_perspective_repair_failed",
+                        attempt=attempt, error=str(exc)[:200],
+                        correlation_id=report.correlation_id,
+                    )
+                    repaired_packet = None
+                if repaired_packet is not None and repaired_packet is not current_packet:
+                    current_packet = repaired_packet
+                    structured_log(
+                        logger, logging.INFO, "validator_perspective_repaired",
+                        attempt=attempt, subjects=missing_perspective_subjects(report),
+                        correlation_id=report.correlation_id,
+                    )
+                    if attempt < max_regenerations:
+                        continue
+            # Repair unavailable or exhausted: narrow deterministically with
+            # zero additional model calls (scope-narrowing, else silent).
+            narrowed = _narrow_contract_for_missing_perspective(contract, locations)
+            candidates = [c for c in (narrowed, _silent_contract_for_missing_perspective(contract)) if c is not None]
+            for candidate in candidates:
+                repair_report = pipe.validate(
+                    candidate, current_packet,
+                    known_entity_ids=known_entity_ids, canon_facts=canon_facts,
+                    private_fact_texts=private_fact_texts,
+                    regeneration_index=attempt + 1,
+                )
+                if repair_report.passed:
+                    structured_log(
+                        logger, logging.WARNING, "validator_deterministic_repair",
+                        attempt=attempt, mode=candidate.mode,
+                        removed_claims=sorted(locations),
+                        correlation_id=repair_report.correlation_id,
+                    )
+                    return candidate, repair_report
+                last_report = repair_report
+            raise ValidatorRejectionError(
+                f"Validation failed after {attempt + 1} attempt(s); deterministic repair exhausted; "
+                f"last violations: {[v.code for v in last_report.violations]}",
+                last_report,
+            )
         if attempt >= max_regenerations:
             break
 
@@ -1504,11 +1580,109 @@ def _structural_error_shape(exc: ContractValidationError) -> str:
         return "unavailable"
 
 
+# Violation code for NPC claims with no resolvable knowledge perspective
+# (KnowledgeValidator, fail-closed on ambiguous state). Rewording the
+# utterance can never clear it — the lane entry is absent from the frozen
+# packet — so it gets a deterministic fast-path in bounded regeneration
+# (issue #455) instead of burning model retries.
+_MISSING_PERSPECTIVE_CODE = "npc_utterance_ambiguous_knowledge"
+
+
 def format_rejection_for_retry(report: ValidationReport) -> str:
     """Human/model-facing structured feedback for bounded regeneration."""
     lines = [f"Validation failed (correlation {report.correlation_id}):"]
     for v in report.violations:
         loc = f" beat {v.claim_index[0]} claim {v.claim_index[1]}" if v.claim_index else ""
         lines.append(f"- [{v.validator}/{v.code}]{loc}: {v.message}")
+    if any(v.code == _MISSING_PERSPECTIVE_CODE for v in report.violations):
+        lines.append(
+            "NPCs listed with no resolvable knowledge perspective must not carry "
+            "knowledge-bearing claims: omit their dialogue or leave them silent, "
+            "unless the context now provides their perspective."
+        )
     lines.append("Fix the contract and retry without inventing facts. Remove unauthorized PC actions, unknown entity refs, private leaks, and unsupported promotions to fact.")
     return "\n".join(lines)
+
+
+def missing_perspective_subjects(report: ValidationReport) -> list[str]:
+    """Actor IDs behind missing-perspective violations, in first-seen order."""
+    subjects: list[str] = []
+    for v in report.violations or []:
+        if v.code != _MISSING_PERSPECTIVE_CODE:
+            continue
+        actor = ((v.details or {}).get("actor"))
+        sid = str(actor or "").strip()
+        if sid and sid not in subjects:
+            subjects.append(sid)
+    return subjects
+
+
+def _missing_perspective_locations(report: ValidationReport) -> set[tuple[int, int]] | None:
+    """Claim locations failing only on a missing knowledge perspective.
+
+    Returns the ``(beat, claim)`` set when EVERY violation is
+    ``npc_utterance_ambiguous_knowledge`` with a location — i.e. rewording
+    cannot help because the knowledge lane entry is absent from the frozen
+    packet (issue #455). Returns None for mixed, unlocatable, or empty
+    reports, where normal regeneration still applies.
+    """
+    if not report.violations:
+        return None
+    locations: set[tuple[int, int]] = set()
+    for v in report.violations:
+        if v.code != _MISSING_PERSPECTIVE_CODE or v.claim_index is None:
+            return None
+        locations.add((int(v.claim_index[0]), int(v.claim_index[1])))
+    return locations
+
+
+def _narrow_contract_for_missing_perspective(
+    contract: DmTurnContractV1, locations: set[tuple[int, int]]
+) -> DmTurnContractV1 | None:
+    """Drop perspective-missing claims (and beats left empty), or None."""
+    try:
+        data = contract.model_dump(mode="json")
+    except Exception:
+        return None
+    narrowed_beats = []
+    for bi, beat in enumerate(data.get("beats") or []):
+        claims = beat.get("claims") or []
+        kept = [c for ci, c in enumerate(claims) if (bi, ci) not in locations]
+        if not kept:
+            continue
+        if len(kept) != len(claims):
+            beat = dict(beat)
+            beat["claims"] = kept
+        narrowed_beats.append(beat)
+    data["beats"] = narrowed_beats
+    try:
+        from app.dm.contract import normalize_contract as _normalize
+
+        return _normalize(data)
+    except Exception:
+        return None
+
+
+def _silent_contract_for_missing_perspective(contract: DmTurnContractV1) -> DmTurnContractV1 | None:
+    """Degrade to a no-op silent contract, or None when not constructible."""
+    try:
+        data = contract.model_dump(mode="json")
+    except Exception:
+        return None
+    reason = str(data.get("reason") or "").strip() or "NPC dialogue withheld: no resolvable knowledge perspective"
+    data["mode"] = "silent"
+    data["reason"] = reason[:400]
+    data["beats"] = []
+    data["staged_effects"] = []
+    data["new_entities"] = []
+    data["evidence_requests"] = []
+    data["roll_request"] = None
+    data["table_chat_intent"] = None
+    data["safe_prelude"] = None
+    data["clarify_question"] = None
+    try:
+        from app.dm.contract import normalize_contract as _normalize
+
+        return _normalize(data)
+    except Exception:
+        return None
