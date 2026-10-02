@@ -259,6 +259,43 @@ def test_repair_name_for_already_laned_npc_only_adds_id_directive():
     assert any(f"Hooded Traveler -> {npc.id}" in rec.value["directive"] for rec in directives.records)
 
 
+def test_repair_sources_do_not_borrow_sibling_subject():
+    # Issue #455 review: the repaired record keeps only the sibling's
+    # attempt attribution, never the sibling's character/world_entity refs.
+    from app.dm.context import ContextAudience, LaneName, assemble_context_packet, repair_packet_missing_perspectives
+    Fac, camp, npc, _ = _setup_repair_scene()
+    db = Fac()
+    attempt_id = uuid.uuid4()
+    pc_id = uuid.uuid4()
+    other_subject = uuid.uuid4()
+    sibling = ContextRecord(
+        record_id=f"knowledge:{pc_id}", required=False, priority=90,
+        value={"character_id": str(pc_id), "subject_entity_id": str(other_subject),
+               "subject_resolved": True, "perspective": "character", "entries": [],
+               "total": 0, "truncated": False},
+        sources=[
+            _source("character", pc_id, 0, 0, lane="knowledge_visibility"),
+            _source("world_entity", other_subject, 0, 0, lane="knowledge_visibility"),
+            _source("dm_turn_attempt", attempt_id, 0, 0, lane="knowledge_visibility"),
+        ],
+        authorization=_scope(camp.id), visibility="dm_only", use="adjudication_only",
+    )
+    aud = ContextAudience(campaign_id=str(camp.id), thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[str(uuid.uuid4())])
+    records = {lane: [] for lane in LaneName}
+    records[LaneName.KNOWLEDGE_VISIBILITY] = [sibling]
+    status = {lane: "not_applicable" for lane in LaneName}
+    status[LaneName.KNOWLEDGE_VISIBILITY] = "authoritative"
+    pkt = assemble_context_packet(audience=aud, records=records, lane_status=status)
+    repaired = repair_packet_missing_perspectives(pkt, db, camp, [str(npc.id)])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    rec = next(r for r in lane.records if r.record_id == f"knowledge-repair:{npc.id}")
+    assert sorted((src.source_type, src.source_id) for src in rec.sources) == sorted([
+        ("dm_turn_attempt", str(attempt_id)),
+        ("world_entity", str(npc.id)),
+    ])
+
+
 def test_repair_returns_none_when_nothing_resolves():
     from app.dm.context import repair_packet_missing_perspectives
     Fac, camp, _, _ = _setup_repair_scene()

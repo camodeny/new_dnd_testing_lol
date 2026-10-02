@@ -486,6 +486,51 @@ def test_missing_perspective_all_offending_degrades_to_silent():
     assert contract.beats == []
 
 
+_GUARD_LEARNS_IDS = (str(uuid.uuid4()), str(uuid.uuid4()))
+
+
+def _guard_learns_effect():
+    return [{"id": "eff-guard-1", "effect_type": "transfer_knowledge", "arguments": {"subject_kind": "npc", "subject_entity_id": _GUARD_LEARNS_IDS[0], "target_kind": "entity", "target_entity_id": _GUARD_LEARNS_IDS[1]}}]
+
+
+def test_missing_perspective_never_silences_turn_with_effects():
+    # Issue #455 review: silencing would drop the staged effect, so the model
+    # gets a normal retry instead and the effect survives.
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_newcomer_dialogue_beat()], staged_effects=_guard_learns_effect())
+    good = _base([_quiet_narration_beat()], staged_effects=_guard_learns_effect())
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad if len(calls) == 1 else good
+
+    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 2
+    assert "npc_utterance_ambiguous_knowledge" in calls[1]
+    assert contract.mode == "respond"
+    assert [e.id for e in contract.staged_effects] == ["eff-guard-1"]
+
+
+def test_missing_perspective_with_effects_fails_visibly_when_budget_exhausted():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_newcomer_dialogue_beat()], staged_effects=_guard_learns_effect())
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad
+
+    with pytest.raises(ValidatorRejectionError):
+        run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=1)
+    assert len(calls) == 2
+
+
 def test_mixed_violations_still_retry_model_then_narrow():
     # Ambiguous perspective + an unrelated one-time failure: the model still
     # gets its retry for the fixable violation, then the perspective
