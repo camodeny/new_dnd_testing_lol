@@ -1419,9 +1419,11 @@ def run_with_bounded_regeneration(
     Deterministic fast-path (issue #455): when every violation is a missing
     knowledge perspective, rewording cannot help — the lane entry is absent
     from the frozen packet — so no further model call is spent. The offending
-    claims are stripped deterministically (scope-narrowing); when nothing
-    salvageable remains the turn degrades to a silent contract. Either path
-    costs zero additional model calls.
+    claims are stripped deterministically (scope-narrowing). When nothing
+    salvageable remains, a dialogue-only turn degrades to a silent contract;
+    a turn carrying effects, a roll request, new entities, or evidence
+    requests is never silenced — it spends a normal model retry, and fails
+    visibly once the budget is exhausted.
     """
     from app.dm.contract import normalize_contract as _normalize
 
@@ -1516,10 +1518,15 @@ def run_with_bounded_regeneration(
                     if attempt < max_regenerations:
                         continue
             # Repair unavailable or exhausted: narrow deterministically with
-            # zero additional model calls (scope-narrowing, else silent).
+            # zero additional model calls. Silence is only a fallback when it
+            # drops nothing but the dialogue; a contract carrying effects, a
+            # roll request, new entities, or evidence requests spends a model
+            # retry instead, and fails visibly once the budget is gone.
             narrowed = _narrow_contract_for_missing_perspective(contract, locations)
-            candidates = [c for c in (narrowed, _silent_contract_for_missing_perspective(contract)) if c is not None]
-            for candidate in candidates:
+            candidates = [narrowed]
+            if not _carries_turn_consequences(contract):
+                candidates.append(_silent_contract_for_missing_perspective(contract))
+            for candidate in [c for c in candidates if c is not None]:
                 repair_report = pipe.validate(
                     candidate, current_packet,
                     known_entity_ids=known_entity_ids, canon_facts=canon_facts,
@@ -1535,6 +1542,9 @@ def run_with_bounded_regeneration(
                     )
                     return candidate, repair_report
                 last_report = repair_report
+            if _carries_turn_consequences(contract) and attempt < max_regenerations:
+                last_report = report
+                continue
             raise ValidatorRejectionError(
                 f"Validation failed after {attempt + 1} attempt(s); deterministic repair exhausted; "
                 f"last violations: {[v.code for v in last_report.violations]}",
@@ -1652,6 +1662,16 @@ def _narrow_contract_for_missing_perspective(
         return _normalize(data)
     except Exception:
         return None
+
+
+def _carries_turn_consequences(contract: DmTurnContractV1) -> bool:
+    """True when silencing the contract would discard more than dialogue."""
+    return bool(
+        contract.staged_effects
+        or contract.roll_request is not None
+        or contract.new_entities
+        or contract.evidence_requests
+    )
 
 
 def _silent_contract_for_missing_perspective(contract: DmTurnContractV1) -> DmTurnContractV1 | None:

@@ -1696,8 +1696,14 @@ def repair_packet_missing_perspectives(
 
 
 def _template_sources(knowledge_records: list[ContextRecord]) -> list[SourceRef]:
-    """Reuse the attempt-attribution sources of a sibling knowledge record."""
+    """Reuse the attempt-attribution source of a sibling knowledge record.
+
+    Only the ``dm_turn_attempt`` source carries over: a sibling's
+    ``character``/``world_entity`` sources describe that sibling's subject,
+    not the repaired NPC.
+    """
     for rec in knowledge_records or []:
-        if rec.sources:
-            return list(rec.sources)
+        for source in rec.sources or []:
+            if source.source_type == "dm_turn_attempt":
+                return [source]
     return []
