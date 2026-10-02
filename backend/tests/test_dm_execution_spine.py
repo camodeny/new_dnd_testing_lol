@@ -774,3 +774,54 @@ def test_structural_exhaustion_fails_visibly_not_running(db):
     assert fresh_attempt.status in ("failed", "failed_visible")
     assert fresh_attempt.last_error
     assert s.get(DmTurn, attempt.turn_id).status != "streaming"
+
+
+def test_perspective_repair_packet_carries_through_validation(db):
+    """Issue #455 review: a contract that passed against the perspective-repaired
+    packet must not be re-validated against the unrepaired one (which would
+    fail again and start a second full regeneration)."""
+    from app.world.epistemics import assert_knowledge_inline
+    from app.world.service import create_entity_authoritative
+
+    s, camp_id, thread_id, _ = db
+    camp = s.get(Campaign, camp_id)
+    npc, _ = create_entity_authoritative(
+        s, camp_id, 0, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-exec",
+    )
+    well, _ = create_entity_authoritative(
+        s, camp_id, 1, entity_type="location", name="Old Well", operation_id="op-well-exec",
+    )
+    assert_knowledge_inline(
+        s, camp, subject_kind="npc", subject_entity_id=npc.id,
+        target_kind="entity", target_entity_id=well.id,
+        knowledge_state="knows", acquisition_source="direct_observation",
+        operation_id="op-know-exec",
+    )
+    s.commit()
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(feedback)
+        if len(calls) == 1:
+            raise ContractValidationError("contract_validation_failed", "respond requires 1-8 beats")
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "npc speaks",
+            "beats": [{
+                "id": "b1", "type": "npc_dialogue",
+                "speaker_ref": {"type": "npc", "id": str(npc.id)},
+                "speaker_public_name": "Hooded traveler", "truth_status": "truthful",
+                "claims": [{
+                    "text": "The old well runs deep.", "claim_kind": "npc_utterance",
+                    "actor_ref": {"type": "npc", "id": str(npc.id)},
+                    "topic_refs": [{"type": "location", "id": str(well.id)}],
+                    "origin": "dm_adjudication",
+                }],
+            }],
+            "open_player_choice": "What do you do?",
+        })
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    # structural failure, unrepaired dialogue, retry against the repaired packet
+    assert len(calls) == 3

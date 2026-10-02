@@ -41,6 +41,5 @@ SELECT cron.schedule(
 -- FROM net._http_response ORDER BY created DESC LIMIT 20;
 -- SELECT jobid, status, return_message, start_time
 -- FROM cron.job_run_details ORDER BY start_time DESC LIMIT 20;
--- Point the schedule at a publicly reachable backend: the private Tailscale
--- URL is not reachable from hosted Supabase.
+-- Point the schedule at a publicly reachable backend.
 -- Rollback: SELECT cron.unschedule('dnd-post-turn');

@@ -429,6 +429,130 @@ def test_structural_normalization_error_retries_with_feedback():
     assert calls[1] is not None and "beats" in calls[1]
 
 
+def _knowledge_packet_newcomer_without_perspective():
+    # Issue #455: guard has a resolved perspective; the newly introduced
+    # newcomer has none, so their knowledge claims fail closed.
+    cid = str(uuid.uuid4()); tid = str(uuid.uuid4())
+    know = ContextRecord(record_id="knowledge:npc:guard", value={"character_id": "", "subject_entity_id": "npc:guard", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k1", "target_kind": "entity", "target_id": "char:elara", "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}, sources=[SourceRef(source_type="world_entity", source_id="npc:guard", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="dm_only", use="adjudication_only")
+    pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.KNOWLEDGE_VISIBILITY: [know]}, extra_status={LaneName.KNOWLEDGE_VISIBILITY: "authoritative"})
+    return pkt
+
+
+def _newcomer_dialogue_beat():
+    return {"id": "beat_2", "type": "npc_dialogue", "speaker_ref": {"type": "npc", "id": "npc:newcomer"}, "speaker_public_name": "Hooded traveler", "truth_status": "truthful", "claims": [{"text": "The old well is poisoned", "claim_kind": "npc_utterance", "actor_ref": {"type": "npc", "id": "npc:newcomer"}, "topic_refs": [{"type": "object", "id": "well:1"}], "origin": "dm_adjudication"}]}
+
+
+def _quiet_narration_beat():
+    return {"id": "beat_1", "type": "narration", "claims": [{"text": "The room falls quiet", "claim_kind": "observation", "origin": "dm_adjudication"}]}
+
+
+def test_missing_perspective_narrows_without_model_retry():
+    # Issue #455: pure npc_utterance_ambiguous_knowledge must narrow
+    # deterministically on attempt 1 — zero additional model calls.
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_quiet_narration_beat(), _newcomer_dialogue_beat()])
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad
+
+    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 1
+    assert contract.mode == "respond"
+    assert len(contract.beats) == 1
+    assert contract.beats[0].type == "narration"
+
+
+def test_missing_perspective_all_offending_degrades_to_silent():
+    # Nothing salvageable: degrade to a silent contract, still 1 model call.
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_newcomer_dialogue_beat()])
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad
+
+    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 1
+    assert contract.mode == "silent"
+    assert contract.beats == []
+
+
+def test_mixed_violations_still_retry_model_then_narrow():
+    # Ambiguous perspective + an unrelated one-time failure: the model still
+    # gets its retry for the fixable violation, then the perspective
+    # violation narrows deterministically (2 calls total, not 4).
+    from app.dm.validators import KnowledgeValidator, ValidationViolation, ValidatorResult
+    pkt = _knowledge_packet_newcomer_without_perspective()
+
+    class FlakyOnce:
+        name = "flaky_once"; category = "test"
+        def __init__(self):
+            self.calls = 0
+        def validate(self, contract, packet, **kw):
+            self.calls += 1
+            if self.calls == 1:
+                return ValidatorResult(validator=self.name, category=self.category, passed=False, violations=[ValidationViolation(validator=self.name, category=self.category, code="custom_once", message="one-time")], latency_ms=0.1)
+            return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=0.1)
+
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator(), FlakyOnce()])
+    bad = _base([_quiet_narration_beat(), _newcomer_dialogue_beat()])
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad
+
+    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 2
+    assert len(contract.beats) == 1
+    assert contract.beats[0].type == "narration"
+
+
+def test_perspective_repair_hook_retries_once_and_passes():
+    # Issue #455 resolve-then-retry: the hook supplies the missing lane
+    # entry, the model retries once against the repaired packet, and the
+    # NPC keeps their dialogue — 2 calls, zero narrowing.
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_newcomer_dialogue_beat()])
+    calls = []
+    repairs = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad
+
+    def repair(report, packet):
+        repairs.append(packet)
+        value = {"character_id": "", "subject_entity_id": "npc:newcomer", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k9", "target_kind": "entity", "target_id": "well:1", "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}
+        rec = ContextRecord(record_id="knowledge:npc:newcomer", value=value, sources=[SourceRef(source_type="world_entity", source_id="npc:newcomer", source_version="1")], authorization=AuthorizationScope(campaign_id=packet.audience.campaign_id), visibility="dm_only", use="adjudication_only")
+        if any(r.record_id == rec.record_id for lane in packet.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY for r in lane.records):
+            return None
+        new_packet = packet.model_copy(deep=True)
+        for lane in new_packet.lanes:
+            if lane.name == LaneName.KNOWLEDGE_VISIBILITY:
+                lane.records.append(rec)
+        return new_packet
+
+    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, packet_repair=repair, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 2
+    assert len(repairs) == 1
+    assert len(contract.beats) == 1
+    assert contract.beats[0].type == "npc_dialogue"
+
+
 def test_current_scene_location_is_typed_identity_authority():
     cid, location_id = str(uuid.uuid4()), str(uuid.uuid4())
     scene = ContextRecord(

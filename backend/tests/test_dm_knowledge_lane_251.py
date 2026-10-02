@@ -142,3 +142,127 @@ def test_lane_records_are_dm_only_adjudication_only():
     )
     assert record.visibility == "dm_only"
     assert record.use == "adjudication_only"
+
+
+def _packet_with_empty_knowledge_lane(campaign_id):
+    from app.dm.context import ContextAudience, LaneName, assemble_context_packet
+    cid = str(campaign_id); tid = str(uuid.uuid4())
+    aud = ContextAudience(campaign_id=cid, thread_id=tid, audience="campaign", user_ids=[str(uuid.uuid4())])
+    records = {lane: [] for lane in LaneName}
+    status = {lane: "not_applicable" for lane in LaneName}
+    status[LaneName.KNOWLEDGE_VISIBILITY] = "authoritative"
+    return assemble_context_packet(audience=aud, records=records, lane_status=status)
+
+
+def _setup_repair_scene():
+    """Campaign with a recently introduced NPC who knows one location."""
+    Fac, camp = _setup()
+    db = Fac()
+    npc, _ = create_entity_authoritative(
+        db, camp.id, 0, entity_type="npc", name="Hooded Traveler",
+        operation_id="op-hood-455",
+    )
+    well, _ = create_entity_authoritative(
+        db, camp.id, 1, entity_type="location", name="Old Well",
+        operation_id="op-well-455",
+    )
+    assert_knowledge_inline(
+        db, camp, subject_kind="npc", subject_entity_id=npc.id,
+        target_kind="entity", target_entity_id=well.id,
+        knowledge_state="knows", acquisition_source="direct_observation",
+        operation_id="op-know-455",
+    )
+    return Fac, camp, npc, well
+
+
+def _dialogue_contract(actor_id, target_id):
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+    return normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "repair", "beats": [{"id": "b1", "type": "npc_dialogue", "speaker_ref": {"type": "npc", "id": actor_id}, "speaker_public_name": "Hooded traveler", "truth_status": "truthful", "claims": [{"text": "The old well is poisoned", "claim_kind": "npc_utterance", "actor_ref": {"type": "npc", "id": actor_id}, "topic_refs": [{"type": "location", "id": target_id}], "origin": "dm_adjudication"}]}]})
+
+
+def test_repair_resolves_recently_introduced_npc_by_uuid():
+    # Issue #455 deeper fix: a known-but-unlanned NPC is resolved by stable
+    # UUID; tmp_* and unknown subjects are skipped, never guessed.
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    from app.dm.validators import KnowledgeValidator, ValidatorPipeline
+    Fac, camp, npc, well = _setup_repair_scene()
+    db = Fac()
+    pkt = _packet_with_empty_knowledge_lane(camp.id)
+    repaired = repair_packet_missing_perspectives(pkt, db, camp, [str(npc.id), "tmp_ghost", "no such entity"])
+    assert repaired is not None and repaired is not pkt
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    assert len(lane.records) == 1
+    value = lane.records[0].value
+    assert value["subject_entity_id"] == str(npc.id)
+    assert value["subject_resolved"] is True
+    assert "alias_ids" not in value
+    assert any(str(e.get("target_id")) == str(well.id) for e in value["entries"])
+    # dm_only + adjudication_only like every lane sibling
+    assert lane.records[0].visibility == "dm_only"
+    assert lane.records[0].use == "adjudication_only"
+    # Dialogue within the NPC's knowledge now passes; the unrepaired packet fails.
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    contract = _dialogue_contract(str(npc.id), str(well.id))
+    assert pipe.validate(contract, repaired).passed
+    assert any(v.code == "npc_utterance_ambiguous_knowledge" for v in pipe.validate(contract, pkt).violations)
+
+
+def test_repair_by_name_attaches_canonical_perspective_and_requires_id():
+    # The model referenced the NPC by exact name: the canonical perspective is
+    # attached under the entity ID only, the directive names that ID, and a
+    # name-keyed claim still fails closed (the secrecy judge only knows IDs).
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    from app.dm.validators import KnowledgeValidator, ValidatorPipeline
+    Fac, camp, npc, well = _setup_repair_scene()
+    db = Fac()
+    pkt = _packet_with_empty_knowledge_lane(camp.id)
+    repaired = repair_packet_missing_perspectives(pkt, db, camp, ["Hooded Traveler"])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    value = lane.records[0].value
+    assert value["subject_entity_id"] == str(npc.id)
+    assert value["subject_name"] == "Hooded Traveler"
+    assert "alias_ids" not in value
+    directives = next(lane for lane in repaired.lanes if lane.name == LaneName.REPAIR_DIRECTIVES)
+    assert any(f"Hooded Traveler -> {npc.id}" in rec.value["directive"] for rec in directives.records)
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    by_name = pipe.validate(_dialogue_contract("Hooded Traveler", str(well.id)), repaired)
+    assert any(v.code == "npc_utterance_ambiguous_knowledge" for v in by_name.violations)
+    assert pipe.validate(_dialogue_contract(str(npc.id), str(well.id)), repaired).passed
+
+
+def test_repair_dedupes_name_and_id_for_same_npc():
+    # Same NPC referenced by ID in one claim and by name in another: one
+    # record per entity, so lane validation never sees a duplicate record ID.
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    Fac, camp, npc, _ = _setup_repair_scene()
+    db = Fac()
+    pkt = _packet_with_empty_knowledge_lane(camp.id)
+    repaired = repair_packet_missing_perspectives(pkt, db, camp, [str(npc.id), "Hooded Traveler"])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    assert [rec.record_id for rec in lane.records] == [f"knowledge-repair:{npc.id}"]
+
+
+def test_repair_name_for_already_laned_npc_only_adds_id_directive():
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    Fac, camp, npc, _ = _setup_repair_scene()
+    db = Fac()
+    first = repair_packet_missing_perspectives(
+        _packet_with_empty_knowledge_lane(camp.id), db, camp, [str(npc.id)],
+    )
+    repaired = repair_packet_missing_perspectives(first, db, camp, ["Hooded Traveler"])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    assert len(lane.records) == 1
+    directives = next(lane for lane in repaired.lanes if lane.name == LaneName.REPAIR_DIRECTIVES)
+    assert any(f"Hooded Traveler -> {npc.id}" in rec.value["directive"] for rec in directives.records)
+
+
+def test_repair_returns_none_when_nothing_resolves():
+    from app.dm.context import repair_packet_missing_perspectives
+    Fac, camp, _, _ = _setup_repair_scene()
+    db = Fac()
+    pkt = _packet_with_empty_knowledge_lane(camp.id)
+    assert repair_packet_missing_perspectives(pkt, db, camp, ["tmp_ghost", "no such entity"]) is None
+    assert repair_packet_missing_perspectives(pkt, db, camp, []) is None
