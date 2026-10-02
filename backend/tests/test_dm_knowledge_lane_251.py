@@ -207,9 +207,10 @@ def test_repair_resolves_recently_introduced_npc_by_uuid():
     assert any(v.code == "npc_utterance_ambiguous_knowledge" for v in pipe.validate(contract, pkt).violations)
 
 
-def test_repair_maps_exact_name_to_alias_key():
-    # The model referenced the NPC by exact name: the canonical perspective
-    # is attached under an alias key instead of failing closed.
+def test_repair_by_name_attaches_canonical_perspective_and_requires_id():
+    # The model referenced the NPC by exact name: the canonical perspective is
+    # attached under the entity ID only, the directive names that ID, and a
+    # name-keyed claim still fails closed (the secrecy judge only knows IDs).
     from app.dm.context import LaneName, repair_packet_missing_perspectives
     from app.dm.validators import KnowledgeValidator, ValidatorPipeline
     Fac, camp, npc, well = _setup_repair_scene()
@@ -220,9 +221,42 @@ def test_repair_maps_exact_name_to_alias_key():
     lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
     value = lane.records[0].value
     assert value["subject_entity_id"] == str(npc.id)
-    assert value.get("alias_ids") == ["Hooded Traveler"]
+    assert value["subject_name"] == "Hooded Traveler"
+    assert "alias_ids" not in value
+    directives = next(lane for lane in repaired.lanes if lane.name == LaneName.REPAIR_DIRECTIVES)
+    assert any(f"Hooded Traveler -> {npc.id}" in rec.value["directive"] for rec in directives.records)
     pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
-    assert pipe.validate(_dialogue_contract("Hooded Traveler", str(well.id)), repaired).passed
+    by_name = pipe.validate(_dialogue_contract("Hooded Traveler", str(well.id)), repaired)
+    assert any(v.code == "npc_utterance_ambiguous_knowledge" for v in by_name.violations)
+    assert pipe.validate(_dialogue_contract(str(npc.id), str(well.id)), repaired).passed
+
+
+def test_repair_dedupes_name_and_id_for_same_npc():
+    # Same NPC referenced by ID in one claim and by name in another: one
+    # record per entity, so lane validation never sees a duplicate record ID.
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    Fac, camp, npc, _ = _setup_repair_scene()
+    db = Fac()
+    pkt = _packet_with_empty_knowledge_lane(camp.id)
+    repaired = repair_packet_missing_perspectives(pkt, db, camp, [str(npc.id), "Hooded Traveler"])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    assert [rec.record_id for rec in lane.records] == [f"knowledge-repair:{npc.id}"]
+
+
+def test_repair_name_for_already_laned_npc_only_adds_id_directive():
+    from app.dm.context import LaneName, repair_packet_missing_perspectives
+    Fac, camp, npc, _ = _setup_repair_scene()
+    db = Fac()
+    first = repair_packet_missing_perspectives(
+        _packet_with_empty_knowledge_lane(camp.id), db, camp, [str(npc.id)],
+    )
+    repaired = repair_packet_missing_perspectives(first, db, camp, ["Hooded Traveler"])
+    assert repaired is not None
+    lane = next(lane for lane in repaired.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY)
+    assert len(lane.records) == 1
+    directives = next(lane for lane in repaired.lanes if lane.name == LaneName.REPAIR_DIRECTIVES)
+    assert any(f"Hooded Traveler -> {npc.id}" in rec.value["directive"] for rec in directives.records)
 
 
 def test_repair_returns_none_when_nothing_resolves():

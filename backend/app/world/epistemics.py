@@ -1126,6 +1126,7 @@ def _subject_knowledge_value(
         return {
             "character_id": str(character_id) if character_id is not None else None,
             "subject_entity_id": None,
+            "subject_name": None,
             "subject_resolved": False,
             "perspective": perspective,
             "entries": [],
@@ -1151,6 +1152,7 @@ def _subject_knowledge_value(
     return {
         "character_id": str(character_id) if character_id is not None else None,
         "subject_entity_id": str(subject.id),
+        "subject_name": subject.name,
         "subject_resolved": True,
         "perspective": perspective,
         "entries": entries,

@@ -1562,11 +1562,12 @@ def repair_packet_missing_perspectives(
     Each requested subject is resolved through deterministic identity only —
     stable UUID, exact alias, or unique exact name
     (``app.world.identity.exact_identity``); ``tmp_*`` references stay owned
-    by identity deferral (#454) and unresolvable subjects are skipped. An
-    availability directive is added so the retrying model knows the
-    perspective now exists. Returns None when nothing resolved (callers fall
-    back to deterministic scope-narrowing). Never raises: repair is
-    best-effort.
+    by identity deferral (#454) and unresolvable subjects are skipped. One
+    record is added per resolved entity, keyed only by its canonical ID: a
+    subject referenced by name stays unresolvable to the validator, and the
+    directive tells the retrying model which exact ID to use instead.
+    Returns None when nothing resolved (callers fall back to deterministic
+    scope-narrowing). Never raises: repair is best-effort.
     """
     try:
         from app.world.epistemics import build_knowledge_visibility_values
@@ -1587,11 +1588,10 @@ def repair_packet_missing_perspectives(
                         token = str(key or "").strip()
                         if token:
                             have.add(token)
-                    for alias_id in value.get("alias_ids") or []:
-                        token = str(alias_id or "").strip()
-                        if token:
-                            have.add(token)
-        resolved: list[tuple[str, Any]] = []
+        # reference the model used -> canonical entity ID
+        canonical_by_actor: dict[str, str] = {}
+        # entities that still need a perspective record, one per canonical ID
+        missing: dict[str, Any] = {}
         for sid in ordered:
             if sid in have or sid.startswith("tmp_"):
                 continue
@@ -1599,15 +1599,15 @@ def repair_packet_missing_perspectives(
             if entity is None or entity.campaign_id != campaign.id:
                 continue
             canonical = str(entity.id)
-            if canonical in have and sid == canonical:
-                continue
-            resolved.append((sid, entity))
-        if not resolved:
+            canonical_by_actor[sid] = canonical
+            if canonical not in have:
+                missing.setdefault(canonical, entity)
+        if not canonical_by_actor:
             return None
         values = build_knowledge_visibility_values(
             db, campaign, [],
-            npc_entity_ids=[entity.id for _, entity in resolved],
-        )
+            npc_entity_ids=[entity.id for entity in missing.values()],
+        ) if missing else []
         by_entity = {str(v.get("subject_entity_id")): v for v in (values or []) if isinstance(v, dict)}
         template_auth = (
             knowledge_records[0].authorization if knowledge_records
@@ -1622,21 +1622,19 @@ def repair_packet_missing_perspectives(
             if revision != campaign.revision:
                 break
         new_records: list[ContextRecord] = []
-        canonical_by_actor: dict[str, str] = {}
-        for sid, entity in resolved:
-            value = by_entity.get(str(entity.id))
+        for canonical, entity in missing.items():
+            value = by_entity.get(canonical)
             if not isinstance(value, dict) or not value.get("subject_resolved"):
+                canonical_by_actor = {
+                    actor: cid for actor, cid in canonical_by_actor.items() if cid != canonical
+                }
                 continue
-            value = dict(value)
-            if sid != str(entity.id):
-                value["alias_ids"] = [sid]
-            canonical_by_actor[sid] = str(entity.id)
             new_records.append(
                 ContextRecord(
                     record_id=f"knowledge-repair:{entity.id}",
                     required=False,
                     priority=90,
-                    value=value,
+                    value=dict(value),
                     sources=[
                         *_template_sources(knowledge_records),
                         _source(
@@ -1652,16 +1650,17 @@ def repair_packet_missing_perspectives(
                     use="adjudication_only",
                 )
             )
-        if not new_records:
+        if not canonical_by_actor:
             return None
-        mapping = ", ".join(f"{actor} -> {canonical_by_actor[actor]}" for actor in canonical_by_actor)
+        mapping = ", ".join(f"{actor} -> {canonical}" for actor, canonical in canonical_by_actor.items())
         directive = ContextRecord(
             record_id=f"repair:perspective-{uuid.uuid4().hex[:8]}",
             value={
                 "directive": (
-                    "Missing knowledge perspectives resolved and attached to the "
-                    f"knowledge_visibility lane: {mapping}. These NPCs may now speak "
-                    "within their listed knowledge; keep every claim inside it."
+                    "Knowledge perspectives resolved in the knowledge_visibility "
+                    f"lane: {mapping}. Reference these NPCs by the exact ID on the "
+                    "right in actor_ref, speaker_ref, and other refs, never by name. "
+                    "They may speak only within their listed knowledge."
                 ),
             },
             sources=[

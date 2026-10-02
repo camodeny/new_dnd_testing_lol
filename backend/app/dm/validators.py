@@ -816,15 +816,6 @@ class KnowledgeValidator:
                 out[character_id] = perspective
             if subject_id:
                 out[subject_id] = perspective
-            # Deterministic identity aliases supplied by perspective repair
-            # (issue #455): alternate reference strings the model used for
-            # this subject. Canonical keys win on collision.
-            aliases = value.get("alias_ids") or []
-            if isinstance(aliases, list):
-                for alias_id in aliases:
-                    key = str(alias_id or "").strip()
-                    if key:
-                        out.setdefault(key, perspective)
         return out
 
     # Claim kinds that can carry fictional knowledge for an NPC subject.

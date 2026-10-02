@@ -119,7 +119,10 @@ def build_forward_dm_messages(packet) -> list[dict]:
         "need_evidence, table_chat, and silent need none. "
         "player_declaration claims REQUIRE actor_ref {\"type\": \"character\", "
         "\"id\": \"<speaking PC id from the packet>\"} with origin "
-        "player_transcript, or do not assert a PC action. On narration "
+        "player_transcript, or do not assert a PC action. NPC actor_ref, "
+        "speaker_ref, and target/topic refs use the exact entity id from the "
+        "packet (subject_entity_id / registry id), never a name or alias. "
+        "On narration "
         "beats, speaker_ref, speaker_public_name, truth_status, and "
         "dm_private_context must all be null (npc_dialogue beats only)."
     )

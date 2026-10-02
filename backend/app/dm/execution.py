@@ -1101,9 +1101,24 @@ def _execute_owned_attempt(
                 return None
 
         def _regen(adjudicate_fn, pkt):
+            """Bounded regeneration returning the contract and the packet it passed against.
+
+            A perspective repair swaps in a packet carrying the resolved lane
+            entries; later validation must use that packet, or the repaired
+            contract fails again on the unrepaired one.
+            """
             from app.dm.validators import run_with_bounded_regeneration as _regen_loop
 
-            return _regen_loop(adjudicate_fn, pkt, packet_repair=_repair_missing_perspectives)
+            repaired_packets = []
+
+            def _repair_hook(report, current):
+                repaired_pkt = _repair_missing_perspectives(report, current)
+                if repaired_pkt is not None:
+                    repaired_packets.append(repaired_pkt)
+                return repaired_pkt
+
+            contract, _ = _regen_loop(adjudicate_fn, pkt, packet_repair=_repair_hook)
+            return contract, (repaired_packets[-1] if repaired_packets else pkt)
 
         def evidence_adjudicate(enriched_packet):
             nonlocal validation_packet
@@ -1111,7 +1126,7 @@ def _execute_owned_attempt(
             try:
                 return adjudicate(enriched_packet)
             except _ContractValidationError:
-                repaired, _ = _regen(adjudicate, enriched_packet)
+                repaired, validation_packet = _regen(adjudicate, enriched_packet)
                 return repaired
 
         final_contract, _bundle = run_bounded_evidence_loop(
@@ -1121,8 +1136,7 @@ def _execute_owned_attempt(
         report = default_pipeline.validate(final_contract, validation_packet)
         if report.passed:
             return final_contract, validation_packet
-        repaired_contract, _ = _regen(adjudicate, validation_packet)
-        return repaired_contract, validation_packet
+        return _regen(adjudicate, validation_packet)
 
     try:
         if _snapshot_contract is not None:
