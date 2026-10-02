@@ -42,7 +42,6 @@ SELECT cron.schedule(
 -- FROM net._http_response ORDER BY created DESC LIMIT 20;
 -- SELECT jobid, status, return_message, start_time
 -- FROM cron.job_run_details ORDER BY start_time DESC LIMIT 20;
--- Point the schedule at a publicly reachable backend: the private Tailscale
--- URL is not reachable from hosted Supabase. (Vercel Hobby only allows daily
--- crons, so the Vercel schedule is not used for this sweep.)
+-- Point the schedule at a publicly reachable backend. (Vercel Hobby only allows
+-- daily crons, so the Vercel schedule is not used for this sweep.)
 -- Rollback: SELECT cron.unschedule('dnd-adventure-closing');

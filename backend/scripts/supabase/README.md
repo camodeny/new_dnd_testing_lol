@@ -28,8 +28,7 @@ alone does not prove that the HTTP request or DM turn succeeded. The SQL uses a
 five-minute HTTP timeout. Supabase scheduling does not increase the backend
 host's request-duration limit: long evidence/regeneration runs require a worker
 runtime that can finish them. Point the schedule at a publicly reachable worker
-backend if runs exceed the Vercel runtime limit. The private Tailscale URL is not
-reachable from hosted Supabase.
+backend if runs exceed the Vercel runtime limit.
 
 Each PostgreSQL executor holds one additional connection and a transaction
 advisory lock for its lifetime. Recovery tries the same lock before resetting an
