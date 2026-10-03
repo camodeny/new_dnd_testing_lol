@@ -4,7 +4,7 @@ Meta serves Muse Spark from ``https://api.meta.ai/v1`` with standard
 ``choices`` envelopes, so these tests pin the ``choices[0].message`` /
 ``choices[].delta`` shapes and the ``META_API_KEY`` credential, plus a
 Meta-routed response reaching ``normalize_contract()`` through
-``adjudicate_with_provider``.
+``adjudicate_with_failover``.
 """
 
 import json
@@ -153,7 +153,7 @@ class _StubPacket:
 
 def test_dm_contract_via_meta_choices_envelope(monkeypatch):
     import app.providers as providers_pkg
-    from app.dm.adjudication import adjudicate_with_provider
+    from app.dm.adjudication import adjudicate_with_failover
 
     monkeypatch.setenv("META_API_KEY", "dummy")
     contract_json = json.dumps({
@@ -181,5 +181,5 @@ def test_dm_contract_via_meta_choices_envelope(monkeypatch):
         return MetaAdapter().parse_response(envelope)
 
     monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
-    contract = adjudicate_with_provider(_StubPacket())
+    contract, _ = adjudicate_with_failover(_StubPacket())
     assert contract.mode == "silent"

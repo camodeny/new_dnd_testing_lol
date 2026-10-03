@@ -351,6 +351,84 @@ def complete_adventure_inline(
     return adventure
 
 
+def turn_completion_args(staged_effects: list | None) -> dict | None:
+    """Arguments of the turn's staged ``complete_adventure`` effect, if any."""
+    return next(
+        (
+            e.get("arguments") or {}
+            for e in staged_effects or []
+            if e.get("effect_type") == "complete_adventure"
+        ),
+        None,
+    )
+
+
+def turn_completion_payload(args: dict, turn_id: uuid.UUID) -> dict:
+    """Player-readable ``adventure.completed`` fields for a DM-turn commit.
+
+    The DM's completion reason stays on the owner-visible adventure row,
+    never in the public domain-event feed (issue #260 security).
+    """
+    return {
+        "adventure_completion": {
+            "outcome": args.get("outcome"),
+            "public_summary": args.get("public_summary"),
+            "adventure_id": args.get("adventure_id"),
+        },
+        "outcome": args.get("outcome"),
+        "public_summary": args.get("public_summary"),
+        "source_turn_id": str(turn_id),
+    }
+
+
+def completed_by_turn(db: Session, campaign_id: uuid.UUID, turn_id: uuid.UUID) -> Adventure | None:
+    """The adventure a DM turn's staged completion closed, if any."""
+    return db.execute(
+        select(Adventure).where(
+            Adventure.campaign_id == campaign_id,
+            Adventure.status == "completed",
+            Adventure.source_turn_id == turn_id,
+        )
+    ).scalars().first()
+
+
+def finalize_turn_completion(
+    db: Session, *, turn, event, revision: int, adventure_id: str | None,
+) -> None:
+    """Link a DM turn's ``adventure.completed`` event and finalize derived work.
+
+    Runs inside the turn commit once the authoritative completion event and
+    campaign revision exist, so the #263 end cursor binds exactly
+    (event.sequence == campaign revision by invariant). Strictly additive
+    bookkeeping: failures are logged and never break the turn commit.
+    """
+    try:
+        adventure = None
+        if adventure_id:
+            try:
+                adventure = db.get(Adventure, uuid.UUID(str(adventure_id)))
+            except ValueError:
+                adventure = None
+        if adventure is None:
+            adventure = completed_by_turn(db, turn.campaign_id, turn.id)
+        if adventure is None or adventure.source_event_id is not None:
+            return
+        adventure.source_event_id = event.id
+        db.flush()
+        try:
+            finalize_adventure_derived(
+                db, adventure, event_sequence=event.sequence, revision=revision,
+            )
+            db.flush()
+        except Exception as exc:
+            logger.warning(
+                "dm_turn failed to finalize adventure summary turn_id=%s error=%s",
+                turn.id, exc,
+            )
+    except Exception as exc:
+        logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, exc)
+
+
 def complete_adventure(
     db: Session,
     campaign_id: uuid.UUID,

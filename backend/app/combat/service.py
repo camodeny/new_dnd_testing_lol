@@ -1182,3 +1182,163 @@ def fulfill_human_initiative(
 
         publish_encounter_ready(db, encounter)
     return request, fulfillment, participant, encounter, event
+
+
+# ── DM-turn lifecycle staging (issues #230, #239) ───────────────────────────
+
+
+def _turn_lifecycle_event(db: Session, campaign_id: uuid.UUID, operation_id, event_type: str):
+    from models.campaigns import CampaignDomainEvent
+
+    return db.execute(
+        select(CampaignDomainEvent).where(
+            CampaignDomainEvent.campaign_id == campaign_id,
+            CampaignDomainEvent.operation_id == operation_id,
+            CampaignDomainEvent.event_type == event_type,
+        )
+    ).scalars().first()
+
+
+def stage_turn_encounter_events(
+    db: Session, *, turn: DmTurn, attempt: DmTurnAttempt, turn_event, campaign_after: Campaign,
+) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
+    """Stage encounter lifecycle events for encounters this attempt started/ended.
+
+    The turn commit IS the fictional mutation of a ``start_encounter`` /
+    ``end_encounter`` effect, so each affected encounter gets its own domain
+    event chained in the same outer transaction (one event per revision,
+    preserving the sequence == revision invariant). Fail-closed: a staging
+    failure propagates and aborts the turn commit — a durable start or end
+    without its lifecycle event must never commit. Returns the (started,
+    ended) encounter ids for post-commit realtime delivery.
+    """
+    from app.campaigns.events import commit_campaign_mutation
+
+    provenance = {
+        "source": "dm_effect",
+        "turn_event_id": str(turn_event.id),
+        "attempt_id": str(attempt.id),
+    }
+    started_ids: list[uuid.UUID] = []
+    started = db.execute(
+        select(Encounter).where(
+            Encounter.campaign_id == turn.campaign_id,
+            Encounter.source_attempt_id == attempt.id,
+            Encounter.created_event_id.is_(None),
+        )
+    ).scalars().all()
+    for encounter in started:
+        lifecycle = _turn_lifecycle_event(
+            db, turn.campaign_id, encounter.operation_id, ENCOUNTER_STARTED_EVENT)
+        if lifecycle is None:
+            _, lifecycle = commit_campaign_mutation(
+                db,
+                turn.campaign_id,
+                expected_revision=int(campaign_after.revision or 0),
+                event_type=ENCOUNTER_STARTED_EVENT,
+                payload={
+                    "encounter_id": str(encounter.id),
+                    "thread_id": encounter.thread_id,
+                    "participant_count": int(encounter.participant_count or 0),
+                    "start_source": encounter.start_source,
+                    "source_turn_id": str(turn.id),
+                    "source_attempt_id": str(attempt.id),
+                    "participants": [
+                        {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
+                        for p in list_participants(db, encounter.id)
+                    ],
+                },
+                operation_id=encounter.operation_id,
+                actor_id=turn_event.actor_id,
+                provenance=provenance,
+                commit=False,
+            )
+        encounter.created_event_id = lifecycle.id
+        started_ids.append(encounter.id)
+
+    # Only encounters this attempt's own end_encounter effects targeted: the
+    # API end path stages its event immediately, and a turn must never claim
+    # provenance for an end it did not cause.
+    end_targets: list[uuid.UUID] = []
+    for effect in attempt.staged_effects or []:
+        if effect.get("effect_type") != "end_encounter":
+            continue
+        try:
+            end_targets.append(uuid.UUID(str((effect.get("arguments") or {}).get("encounter_id"))))
+        except ValueError:
+            continue
+    ended_ids: list[uuid.UUID] = []
+    ended = db.execute(
+        select(Encounter).where(
+            Encounter.campaign_id == turn.campaign_id,
+            Encounter.id.in_(end_targets),
+            Encounter.status == "ended",
+            Encounter.ended_event_id.is_(None),
+        )
+    ).scalars().all() if end_targets else []
+    if ended:
+        from app.combat.ending import build_final_snapshot, list_end_followups
+
+    for encounter in ended:
+        lifecycle = _turn_lifecycle_event(
+            db, turn.campaign_id, encounter.end_operation_id, ENCOUNTER_ENDED_EVENT)
+        if lifecycle is None:
+            _, lifecycle = commit_campaign_mutation(
+                db,
+                turn.campaign_id,
+                expected_revision=int(campaign_after.revision or 0),
+                event_type=ENCOUNTER_ENDED_EVENT,
+                payload={
+                    "encounter_id": str(encounter.id),
+                    "thread_id": encounter.thread_id,
+                    "outcome": encounter.end_outcome,
+                    "reason": encounter.end_reason,
+                    "round": int(encounter.round or 1),
+                    "turn_sequence": int(encounter.turn_sequence or 0),
+                    "duration_ms": int(encounter.end_duration_ms or 0),
+                    "participant_outcomes": dict(encounter.end_participant_outcomes or {}),
+                    "followup_hooks": [h.hook_type for h in list_end_followups(db, encounter.id)],
+                    "final_state": build_final_snapshot(db, encounter),
+                    "ended_by": str(encounter.ended_by) if encounter.ended_by else None,
+                },
+                operation_id=encounter.end_operation_id,
+                # Issue #239 privacy: owner-only like the API path. The
+                # turn event's actor may be the player whose turn triggered
+                # the DM effect; the ended payload carries DM-private
+                # reason/fates, so the campaign owner (AI-DM path) must own
+                # the event or members would see it as own-actor.
+                actor_id=campaign_after.owner_id,
+                visibility="dm_only",
+                provenance=provenance,
+                commit=False,
+            )
+        encounter.ended_event_id = lifecycle.id
+        ended_ids.append(encounter.id)
+    if started_ids or ended_ids:
+        db.flush()
+    return started_ids, ended_ids
+
+
+def publish_turn_encounter_events(
+    db: Session, started_ids: list[uuid.UUID], ended_ids: list[uuid.UUID],
+) -> None:
+    """Post-commit realtime delivery for staged lifecycle events.
+
+    The staged lifecycle events are authoritative; this direct publish is
+    latency-only and best-effort — it never rolls back committed state.
+    """
+    from app.realtime.service import publish_encounter_ended, publish_encounter_started
+
+    for ids, publish, label in (
+        (started_ids, publish_encounter_started, "start"),
+        (ended_ids, publish_encounter_ended, "end"),
+    ):
+        if not ids:
+            continue
+        try:
+            for encounter_id in ids:
+                row = db.get(Encounter, encounter_id)
+                if row is not None:
+                    publish(db, row)
+        except Exception as exc:
+            logger.warning("encounter %s post-commit publish skipped error=%s", label, exc)

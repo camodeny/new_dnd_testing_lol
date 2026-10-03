@@ -1,6 +1,6 @@
 """DM turn/attempt + structured contract — issues #200, #201, #203, #205, #207, #354."""
 from app.dm.adjudication import (  # noqa: F401
-    adjudicate_with_provider,
+    adjudicate_with_failover,
     build_forward_dm_messages,
     build_provider_narrator,
     resolve_dm_provider,
@@ -60,7 +60,6 @@ from app.dm.evidence import (  # noqa: F401
     EvidenceValidationError,
     MAX_EVIDENCE_ROUNDS,
     MAX_REQUESTS_PER_ROUND,
-    augment_packet_with_evidence,
     evidence_results_to_records,
     execute_evidence_round,
     run_bounded_evidence_loop,

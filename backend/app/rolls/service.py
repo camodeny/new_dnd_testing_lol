@@ -187,18 +187,13 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
     parent_attempt.invalidation_reason = "player_roll_input_available"
     parent_attempt.invalidated_at = _now()
     campaign = db.get(Campaign, turn.campaign_id)
-    next_attempt = DmTurnAttempt(
-        turn_id=turn.id, attempt_number=parent_attempt.attempt_number + 1, status="prepared",
-        campaign_id=turn.campaign_id, thread_id=turn.thread_id, audience=turn.audience,
+    from app.dm.turns import create_attempt
+
+    next_attempt = create_attempt(
+        db, turn, parent=parent_attempt, roll_evidence=evidence,
         source_revision=int(campaign.revision if campaign else parent_attempt.source_revision),
-        input_set_revision=turn.input_set_revision, submission_ids=list(turn.submission_ids or []),
-        parent_attempt_id=parent_attempt.id, roll_evidence=evidence,
-        assembly_window_start=turn.assembly_window_start, assembly_window_end=turn.assembly_window_end,
     )
-    db.add(next_attempt)
-    db.flush()
     turn.status = "pending"
-    turn.current_attempt_id = next_attempt.id
     turn.streaming_attempt_id = None
     logger.info("player_roll turn_resumed campaign_id=%s turn_id=%s old_attempt_id=%s new_attempt_id=%s evidence_count=%s",
                 turn.campaign_id, turn.id, parent_attempt.id, next_attempt.id, len(evidence))

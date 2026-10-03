@@ -203,6 +203,54 @@ def list_turns(db: Session, campaign_id: uuid.UUID, thread_id: str | None = None
     return list(db.execute(q).scalars().all())
 
 
+def create_attempt(
+    db: Session,
+    turn: DmTurn,
+    *,
+    source_revision: int,
+    parent: DmTurnAttempt | None = None,
+    submission_ids: list | None = None,
+    input_set_revision: int | None = None,
+    assembly_window: tuple[datetime | None, datetime | None] | None = None,
+    roll_evidence: list | None = None,
+    contract_snapshot: dict | None = None,
+    retry_count: int = 0,
+) -> DmTurnAttempt:
+    """Insert the turn's next prepared attempt and make it current (flush-only).
+
+    The single constructor for attempt rows: first attempts (``parent`` is
+    None) and every successor (pre-stream supersession, explicit retry,
+    roll resumption, backpressure rebase). Unspecified inputs default to
+    the turn's current input set. Each attempt is a fresh idempotency scope
+    (``commit_operation_id`` is its own id) with no staged effects.
+    """
+    window_start, window_end = assembly_window or (turn.assembly_window_start, turn.assembly_window_end)
+    attempt = DmTurnAttempt(
+        id=uuid.uuid4(),
+        turn_id=turn.id,
+        attempt_number=(int(parent.attempt_number or 0) + 1) if parent is not None else 1,
+        parent_attempt_id=parent.id if parent is not None else None,
+        status=ATTEMPT_PREPARED,
+        campaign_id=turn.campaign_id,
+        thread_id=turn.thread_id,
+        audience=turn.audience,
+        source_revision=int(source_revision),
+        input_set_revision=turn.input_set_revision if input_set_revision is None else input_set_revision,
+        submission_ids=list(turn.submission_ids if submission_ids is None else submission_ids),
+        assembly_window_start=window_start,
+        assembly_window_end=window_end,
+        roll_evidence=list(roll_evidence or []),
+        staged_effects=[],
+        contract_snapshot=contract_snapshot,
+        retry_count=retry_count,
+    )
+    attempt.commit_operation_id = str(attempt.id)
+    db.add(attempt)
+    db.flush()
+    turn.current_attempt_id = attempt.id
+    return attempt
+
+
 def _has_blocking_turn(db: Session, campaign_id: uuid.UUID, thread_id: str, exclude_turn_id: uuid.UUID | None = None) -> DmTurn | None:
     """Whether any streaming/failed_visible turn blocks advancing."""
     tid = str(thread_id)
@@ -357,23 +405,7 @@ def coordinate_turn(
 
         # If we did not hit the IntegrityError path, create attempt
         if active is None and _insert_succeeded:
-            attempt = DmTurnAttempt(
-                id=uuid.uuid4(),
-                turn_id=turn.id,
-                attempt_number=1,
-                status=ATTEMPT_PREPARED,
-                campaign_id=campaign_id,
-                thread_id=tid,
-                audience=audience,
-                source_revision=source_revision,
-                input_set_revision=1,
-                submission_ids=list(sub_ids),
-                assembly_window_start=window_start,
-                assembly_window_end=window_end,
-            )
-            db.add(attempt)
-            db.flush()
-            turn.current_attempt_id = attempt.id
+            attempt = create_attempt(db, turn, source_revision=source_revision)
             waiting_ms = int((time.monotonic() - start_wait) * 1000)
             turn.time_waiting_ms = waiting_ms
             db.flush()
@@ -472,25 +504,13 @@ def coordinate_turn(
         window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
         if window_end and window_end.tzinfo is None:
             window_end = window_end.replace(tzinfo=timezone.utc)
-        new_attempt = DmTurnAttempt(
-            id=uuid.uuid4(),
-            turn_id=active.id,
-            attempt_number=1,
-            status=ATTEMPT_PREPARED,
-            campaign_id=campaign_id,
-            thread_id=tid,
-            audience=audience,
-            source_revision=source_revision,
-            input_set_revision=new_rev,
-            submission_ids=list(new_ids_ordered),
-            assembly_window_start=window_start,
-            assembly_window_end=window_end,
+        new_attempt = create_attempt(
+            db, active, source_revision=source_revision,
+            submission_ids=new_ids_ordered, input_set_revision=new_rev,
+            assembly_window=(window_start, window_end),
         )
-        db.add(new_attempt)
-        db.flush()
         active.submission_ids = list(new_ids_ordered)
         active.input_set_revision = new_rev
-        active.current_attempt_id = new_attempt.id
         active.assembly_window_end = window_end
         active.source_revision = source_revision
         db.flush()
@@ -553,27 +573,14 @@ def coordinate_turn(
         window_start = window_start.replace(tzinfo=timezone.utc)
 
     new_rev = active.input_set_revision + 1
-    new_attempt = DmTurnAttempt(
-        id=uuid.uuid4(),
-        turn_id=active.id,
-        attempt_number=cur_attempt.attempt_number + 1,
-        status=ATTEMPT_PREPARED,
-        campaign_id=campaign_id,
-        thread_id=tid,
-        audience=audience,
-        source_revision=source_revision,
-        input_set_revision=new_rev,
-        submission_ids=list(new_ids_ordered),
-        parent_attempt_id=old_attempt_id,
-        assembly_window_start=window_start,
-        assembly_window_end=window_end,
+    new_attempt = create_attempt(
+        db, active, source_revision=source_revision, parent=cur_attempt,
+        submission_ids=new_ids_ordered, input_set_revision=new_rev,
+        assembly_window=(window_start, window_end),
     )
-    db.add(new_attempt)
-    db.flush()
 
     active.submission_ids = list(new_ids_ordered)
     active.input_set_revision = new_rev
-    active.current_attempt_id = new_attempt.id
     active.assembly_window_end = window_end
     db.flush()
     waiting_ms = int((time.monotonic() - start_wait) * 1000)
@@ -939,6 +946,186 @@ def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid
 # ── Commit / stale-revision guard ───────────────────────────────────────────
 
 
+def _lock_turn_and_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn | None, DmTurnAttempt | None]:
+    try:
+        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    except Exception:
+        turn = db.get(DmTurn, turn_id)
+        attempt = db.get(DmTurnAttempt, attempt_id)
+    return turn, attempt
+
+
+def _fail_commit_visible(db: Session, turn: DmTurn, attempt: DmTurnAttempt, *, error: str, error_class: str, commit: bool) -> None:
+    attempt.last_error = error
+    attempt.error_class = error_class
+    attempt.completed_at = _now()
+    attempt.status = ATTEMPT_FAILED_VISIBLE
+    turn.status = TURN_FAILED_VISIBLE
+    try:
+        db.flush()
+        if commit:
+            db.commit()
+    except Exception:
+        db.rollback()
+
+
+def _duplicate_commit_event(db: Session, turn: DmTurn, attempt: DmTurnAttempt, operation_id: str):
+    """Existing committed event for this attempt (idempotent replay), if any."""
+    from models.campaigns import CampaignDomainEvent
+
+    if attempt.status == ATTEMPT_SUCCEEDED and attempt.result:
+        try:
+            rid = attempt.result.get("event_id") or attempt.result.get("id")
+            if rid:
+                existing = db.get(CampaignDomainEvent, uuid.UUID(str(rid)))
+                if existing is not None:
+                    return existing
+        except Exception:
+            pass
+    return db.execute(
+        select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == operation_id)
+    ).scalars().first()
+
+
+def _replay_duplicate_commit(db: Session, turn: DmTurn, attempt: DmTurnAttempt, operation_id: str, *, silent: bool, commit: bool):
+    """Return the original commit for a replayed attempt, else None.
+
+    Covers both an already-succeeded attempt and a crash after the event
+    committed but before the turn/attempt rows were marked.
+    """
+    existing = _duplicate_commit_event(db, turn, attempt, operation_id)
+    if attempt.status == ATTEMPT_SUCCEEDED and turn.status == TURN_SUCCEEDED:
+        if existing is not None:
+            logger.info(
+                "dm_turn duplicate_commit_hit campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
+                turn.campaign_id, turn.id, attempt.id, operation_id, existing.id,
+            )
+            return turn, attempt, existing
+        # Already succeeded but no event found — return the stored result.
+        if attempt.result:
+            logger.info("dm_turn duplicate_commit_hit_no_event turn_id=%s attempt_id=%s", turn.id, attempt.id)
+            return turn, attempt, attempt.result
+    if existing is None or attempt.status == ATTEMPT_SUCCEEDED:
+        return None
+    logger.info(
+        "dm_turn duplicate_commit_hit_pre_mark campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
+        turn.campaign_id, turn.id, attempt.id, operation_id, existing.id,
+    )
+    now = _now()
+    if attempt.status in (PRE_STREAM_ATTEMPT_STATUSES if silent else {ATTEMPT_STREAMING}):
+        attempt.status = ATTEMPT_SUCCEEDED
+        attempt.completed_at = now
+        attempt.result = existing.to_dict() if hasattr(existing, "to_dict") else {"event_id": str(existing.id)}
+    if turn.status == (TURN_PENDING if silent else TURN_STREAMING):
+        turn.status = TURN_SUCCEEDED
+        turn.resolved_at = now
+        turn.committed_at = now
+    try:
+        db.flush()
+        if commit:
+            db.commit()
+        db.refresh(turn)
+        db.refresh(attempt)
+    except Exception:
+        db.rollback()
+    return turn, attempt, existing
+
+
+def _require_commit_boundary(db: Session, turn: DmTurn, attempt: DmTurnAttempt, *, silent: bool) -> None:
+    """Streaming turns commit only from their streaming attempt; silent turns never streamed."""
+    committable = PRE_STREAM_ATTEMPT_STATUSES if silent else {ATTEMPT_STREAMING}
+    if attempt.status not in committable or turn.status != (TURN_PENDING if silent else TURN_STREAMING):
+        boundary = "pre-stream (silent)" if silent else "streaming (stream-start boundary)"
+        raise ValueError(f"Attempt {attempt.id} status {attempt.status} / turn {turn.id} status {turn.status} cannot commit; must be {boundary}")
+    if not silent and str(turn.streaming_attempt_id) != str(attempt.id):
+        raise ValueError(f"Attempt {attempt.id} is not the streaming attempt for turn {turn.id}")
+    # Ensure turn is not blocked by another visible partial turn
+    blocking = _has_blocking_turn(db, turn.campaign_id, turn.thread_id, exclude_turn_id=turn.id)
+    if blocking is not None:
+        logger.warning(
+            "dm_turn commit_blocked_by_visible_turn campaign_id=%s thread_id=%s turn_id=%s blocking_turn_id=%s blocking_status=%s",
+            turn.campaign_id, turn.thread_id, turn.id, blocking.id, blocking.status,
+        )
+        raise TurnConflictError(turn.campaign_id, turn.thread_id, blocking.id)
+
+
+def _resolve_turn_submissions(db: Session, turn: DmTurn, submission_ids: list, now: datetime) -> None:
+    if not submission_ids:
+        return
+    try:
+        sub_uuids = [uuid.UUID(str(s)) for s in submission_ids]
+        rows = db.execute(
+            select(PlayerSubmission).where(PlayerSubmission.id.in_(sub_uuids))
+        ).scalars().all()
+        for row in rows:
+            row.resolution_status = "resolved"
+            row.resolved_at = now
+    except Exception as e:
+        logger.warning("dm_turn failed to resolve submissions turn_id=%s error=%s", turn.id, e)
+
+
+def _complete_stream(db: Session, turn: DmTurn, attempt: DmTurnAttempt, now: datetime) -> None:
+    if not attempt.stream_id:
+        return
+    try:
+        from models.dm import DMStream
+        stream = db.get(DMStream, attempt.stream_id)
+        if stream and stream.status == "streaming":
+            stream.status = "completed"
+            stream.completed_at = now
+            stream.completion_reason = "turn_committed"
+    except Exception as e:
+        logger.warning("dm_turn failed to complete stream turn_id=%s stream_id=%s error=%s", turn.id, attempt.stream_id, e)
+
+
+def _advance_opening_intro(db: Session, turn: DmTurn) -> None:
+    """Issue #246 — advance the opening-introduction cursor (best-effort).
+
+    Failures (including revision races) only defer the cursor, which
+    self-heals on the next commit. Never breaks a turn.
+    """
+    try:
+        from app.campaigns.opening_intro import maybe_advance_opening_intro
+
+        maybe_advance_opening_intro(db, turn.campaign_id)
+    except Exception as exc:
+        logger.warning(
+            "dm_turn opening intro advance skipped campaign_id=%s turn_id=%s error=%s",
+            turn.campaign_id, turn.id, exc,
+        )
+
+
+def _run_post_commit_hooks(db: Session, turn: DmTurn, attempt: DmTurnAttempt, event, *, encounters, identity_telemetry: list) -> None:
+    """Best-effort derived work after the turn commit; never breaks the turn."""
+    # Encounter start/end realtime delivery (issues #230, #239).
+    from app.combat.service import publish_turn_encounter_events
+
+    publish_turn_encounter_events(db, *encounters)
+    # #213 semantic-index hook: staged assert_fact / upsert_relation effects
+    # (and JIT-promoted entities) are written inside the turn transaction —
+    # without this, committed turn records would never become searchable.
+    try:
+        from app.world.semantic_index import note_turn_committed
+
+        note_turn_committed(db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
+    except Exception as e:
+        logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
+    # Identity-telemetry flush (issue #214): records collected during locked
+    # JIT promotion persist only now that the campaign lock is released and
+    # the entities are durable.
+    if identity_telemetry:
+        try:
+            from app.decisions import record_fail_soft
+
+            from database import SessionLocal
+
+            for record in identity_telemetry:
+                record_fail_soft(SessionLocal, record)
+        except Exception as e:
+            logger.warning("dm_turn identity telemetry flush skipped turn_id=%s error=%s", turn.id, e)
+
+
 def commit_turn(
     db: Session,
     turn_id: uuid.UUID,
@@ -948,25 +1135,33 @@ def commit_turn(
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
     commit: bool = True,
+    silent: bool = False,
 ) -> tuple[DmTurn, DmTurnAttempt, Any]:
     """Commit a DM turn's authoritative effects with optimistic revision validation.
 
-    Only the committed streaming current attempt can be committed (CAS).
-    Stale source-revision attempts are rejected without mutating campaign truth.
+    The single resolved-turn path: revision bump + domain event, staged-effect
+    promotion, resolved/committed timestamps, submission resolution, and
+    post-commit hooks. Only the turn's current attempt can commit (CAS):
+    normally the streaming attempt after narration; with ``silent=True`` the
+    pre-stream attempt of a zero-visible-output contract, which must also
+    pass the playability gate (issue #265) because no first-visible boundary
+    checked it. Stale source-revision attempts are rejected without
+    mutating campaign truth.
 
     With ``commit=False`` the commit is flush-only so a caller (e.g. partial-
     stream recovery inside an idempotent command) can atomically commit it
-    together with preceding recovery writes in a single transaction.
+    together with preceding recovery writes in a single transaction; the
+    post-commit hooks are then skipped.
     """
+    from app.adventures.service import (
+        completed_by_turn,
+        finalize_turn_completion,
+        turn_completion_args,
+        turn_completion_payload,
+    )
     from app.campaigns.events import RevisionConflictError, commit_campaign_mutation
 
-    # Lock for CAS
-    try:
-        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-    except Exception:
-        turn = db.get(DmTurn, turn_id)
-        attempt = db.get(DmTurnAttempt, attempt_id)
+    turn, attempt = _lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
@@ -976,7 +1171,7 @@ def commit_turn(
     if has_pending_rolls(db, turn.id):
         raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot commit an outcome")
 
-    # Obsolete attempt check — must be current streaming attempt
+    # Obsolete attempt check — must be the current attempt
     if str(turn.current_attempt_id) != str(attempt_id):
         logger.info(
             "dm_turn commit_discarded_superseded campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s current_attempt_id=%s status=%s invalidation_reason=%s",
@@ -999,79 +1194,10 @@ def commit_turn(
 
     # ── Idempotency: duplicate commit short-circuit (issue #206) ─────────────
     duplicate_op = operation_id or str(attempt.id)
-    # If attempt already succeeded, return existing result without duplicate mutation (idempotent retry)
-    if attempt.status == ATTEMPT_SUCCEEDED and turn.status == TURN_SUCCEEDED:
-        from models.campaigns import CampaignDomainEvent
-
-        existing = None
-        if attempt.result:
-            try:
-                rid = (attempt.result or {}).get("event_id") or (attempt.result or {}).get("id")
-                if rid:
-                    existing = db.get(CampaignDomainEvent, uuid.UUID(str(rid)))
-            except Exception:
-                existing = None
-        if existing is None:
-            existing = db.execute(
-                select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == duplicate_op)
-            ).scalars().first()
-        if existing is not None:
-            logger.info(
-                "dm_turn duplicate_commit_hit campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
-                turn.campaign_id, turn.id, attempt.id, duplicate_op, existing.id,
-            )
-            return turn, attempt, existing
-        # Fallback: already succeeded but no event found — treat as duplicate (should not happen)
-        if attempt.result:
-            logger.info("dm_turn duplicate_commit_hit_no_event turn_id=%s attempt_id=%s", turn.id, attempt.id)
-            # Return with stored result as pseudo-event
-            return turn, attempt, attempt.result
-
-    # Also check for duplicate before any mutation even if attempt not yet marked succeeded (crash-after-commit replay)
-    if duplicate_op:
-        from models.campaigns import CampaignDomainEvent
-
-        dup_event = db.execute(
-            select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == duplicate_op)
-        ).scalars().first()
-        if dup_event is not None and attempt.status != ATTEMPT_SUCCEEDED:
-            logger.info(
-                "dm_turn duplicate_commit_hit_pre_mark campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
-                turn.campaign_id, turn.id, attempt.id, duplicate_op, dup_event.id,
-            )
-            now_dup = _now()
-            if attempt.status == ATTEMPT_STREAMING:
-                attempt.status = ATTEMPT_SUCCEEDED
-                attempt.completed_at = now_dup
-                attempt.result = dup_event.to_dict() if hasattr(dup_event, "to_dict") else {"event_id": str(dup_event.id)}
-            if turn.status == TURN_STREAMING:
-                turn.status = TURN_SUCCEEDED
-                turn.resolved_at = now_dup
-                turn.committed_at = now_dup
-            try:
-                db.flush()
-                if commit:
-                    db.commit()
-                db.refresh(turn)
-                db.refresh(attempt)
-            except Exception:
-                db.rollback()
-            return turn, attempt, dup_event
-
-    # Only streaming attempt can commit authoritative effects — commitment boundary (after idempotency check)
-    if attempt.status != ATTEMPT_STREAMING or turn.status != TURN_STREAMING:
-        raise ValueError(f"Attempt {attempt_id} status {attempt.status} / turn {turn_id} status {turn.status} cannot commit; must be streaming (stream-start boundary)")
-    if str(turn.streaming_attempt_id) != str(attempt_id):
-        raise ValueError(f"Attempt {attempt_id} is not the streaming attempt for turn {turn_id}")
-
-    # Ensure turn is not blocked by another visible partial turn
-    blocking = _has_blocking_turn(db, turn.campaign_id, turn.thread_id, exclude_turn_id=turn.id)
-    if blocking is not None:
-        logger.warning(
-            "dm_turn commit_blocked_by_visible_turn campaign_id=%s thread_id=%s turn_id=%s blocking_turn_id=%s blocking_status=%s",
-            turn.campaign_id, turn.thread_id, turn.id, blocking.id, blocking.status,
-        )
-        raise TurnConflictError(turn.campaign_id, turn.thread_id, blocking.id)
+    replay = _replay_duplicate_commit(db, turn, attempt, duplicate_op, silent=silent, commit=commit)
+    if replay is not None:
+        return replay
+    _require_commit_boundary(db, turn, attempt, silent=silent)
 
     # Optimistic revision validation
     expected = expected_revision if expected_revision is not None else attempt.source_revision
@@ -1084,17 +1210,11 @@ def commit_turn(
             "dm_turn stale_source_revision_conflict campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s expected=%s actual=%s source_revision=%s",
             turn.campaign_id, turn.thread_id, turn.id, attempt.id, expected, actual, attempt.source_revision,
         )
-        attempt.last_error = f"Stale source_revision: expected {expected}, actual {actual}"
-        attempt.error_class = "stale_revision_visible"
-        attempt.completed_at = _now()
-        attempt.status = ATTEMPT_FAILED_VISIBLE
-        turn.status = TURN_FAILED_VISIBLE
-        try:
-            db.flush()
-            if commit:
-                db.commit()
-        except Exception:
-            db.rollback()
+        _fail_commit_visible(
+            db, turn, attempt,
+            error=f"Stale source_revision: expected {expected}, actual {actual}",
+            error_class="stale_revision_visible", commit=commit,
+        )
         raise StaleRevisionError(turn.campaign_id, int(expected), actual, attempt.id)
 
     execute_start = time.monotonic()
@@ -1107,25 +1227,24 @@ def commit_turn(
     attempt_audience = str(
         getattr(attempt, "audience", None) or getattr(turn, "audience", None) or "campaign"
     )
-    is_private_turn = attempt_audience == "private"
-    turn_visibility = "private" if is_private_turn else "public"
+    turn_visibility = "private" if attempt_audience == "private" else "public"
     turn_provenance: dict[str, Any] = {
         "source": "dm_turn",
         "thread_id": str(turn.thread_id),
         "audience": attempt_audience,
         "attempt_id": str(attempt.id),
     }
-    # Build enriched payload that includes staged effects metadata for audit
-    base_payload = payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []}
-    base_payload = dict(base_payload)
+    base_payload = dict(payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []})
     base_payload.setdefault("thread_id", str(turn.thread_id))
     base_payload.setdefault("audience", attempt_audience)
+    if silent:
+        base_payload["mode"] = "silent"
+        turn_provenance["mode"] = "silent"
     # Include staged effect ids/types in payload for observability
     staged_list = attempt.staged_effects or []
     adventure_completion_args: dict | None = None
     event_type = DM_TURN_RESOLVED
     if staged_list:
-        base_payload = dict(base_payload)
         base_payload["staged_effect_ids"] = [e.get("id") for e in staged_list]
         base_payload["staged_effect_types"] = [e.get("effect_type") for e in staged_list]
         if attempt.stream_id:
@@ -1133,23 +1252,10 @@ def commit_turn(
         # A staged adventure completion promotes the turn commit to the
         # adventure.completed domain event (issue #260): the turn IS the
         # authoritative provenance for the DM's completion decision.
-        adventure_completion_args = next(
-            (e.get("arguments") or {} for e in staged_list if e.get("effect_type") == "complete_adventure"),
-            None,
-        )
+        adventure_completion_args = turn_completion_args(staged_list)
         if adventure_completion_args is not None:
             event_type = "adventure.completed"
-            # Player-readable lifecycle data only — the DM's completion
-            # reason stays on the owner-visible adventure row, never in the
-            # public domain-event feed (issue #260 security).
-            base_payload["adventure_completion"] = {
-                "outcome": adventure_completion_args.get("outcome"),
-                "public_summary": adventure_completion_args.get("public_summary"),
-                "adventure_id": adventure_completion_args.get("adventure_id"),
-            }
-            base_payload["outcome"] = adventure_completion_args.get("outcome")
-            base_payload["public_summary"] = adventure_completion_args.get("public_summary")
-            base_payload["source_turn_id"] = str(turn.id)
+            base_payload.update(turn_completion_payload(adventure_completion_args, turn.id))
 
     # Resolved adventure identity closed by this turn (issue #260): populated
     # inside the mutation, consumed by the post-mutate payload builder so the
@@ -1163,51 +1269,43 @@ def commit_turn(
     # is FOR UPDATE-locked would stall on the parent FK lock.
     identity_telemetry_outbox: list = []
 
-    def _mutate_with_effects(campaign):
+    def _mutate_with_effects(locked_campaign):
+        if silent:
+            # Issue #265 — a silent completion still advances the table;
+            # serialize the dormancy decision with the campaign row lock the
+            # revision guard already holds.
+            from app.campaigns.service import require_playable_campaign
+
+            require_playable_campaign(locked_campaign)
         # Apply staged effects via registry (fail-closed)
         if staged_list:
             from app.dm.effects import apply_staged_effects
 
-            apply_staged_effects(db, campaign, staged_list, turn, attempt)
+            apply_staged_effects(db, locked_campaign, staged_list, turn, attempt)
         if adventure_completion_args is not None:
             try:
-                from models.campaigns import Adventure as _Adventure
-
-                _closed = (
-                    db.execute(
-                        select(_Adventure).where(
-                            _Adventure.campaign_id == turn.campaign_id,
-                            _Adventure.status == "completed",
-                            _Adventure.source_turn_id == turn.id,
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-                if _closed is not None:
-                    resolved_adventure["adventure_id"] = str(_closed.id)
-                    resolved_adventure["title"] = _closed.title or ""
+                closed = completed_by_turn(db, turn.campaign_id, turn.id)
+                if closed is not None:
+                    resolved_adventure["adventure_id"] = str(closed.id)
+                    resolved_adventure["title"] = closed.title or ""
             except Exception as e:
                 logger.warning("dm_turn failed to resolve completed adventure turn_id=%s error=%s", turn.id, e)
         # JIT-promote committed new-entity proposals to durable canonical
         # identity exactly once (issue #209). Runs in the same revision
         # transaction: failed commit leaves no half-created authority.
         # Idempotency key per (attempt, temp_id) makes retries safe.
-        try:
-            from app.world.identity import promote_new_entities_from_contract
+        from app.world.identity import promote_new_entities_from_contract
 
-            promoted = promote_new_entities_from_contract(
-                db, campaign, turn, attempt,
-                identity_telemetry_outbox=identity_telemetry_outbox)
-            if promoted:
-                base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
-                base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
-        except ImportError:
-            pass
+        promoted = promote_new_entities_from_contract(
+            db, locked_campaign, turn, attempt,
+            identity_telemetry_outbox=identity_telemetry_outbox)
+        if promoted:
+            base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
+            base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
 
     def _adventure_event_payload() -> dict:
         """Post-mutate payload: same lifecycle fields, resolved adventure id."""
-        if adventure_completion_args is not None and resolved_adventure.get("adventure_id"):
+        if resolved_adventure.get("adventure_id"):
             merged = dict(base_payload)
             merged["adventure_completion"] = {
                 **merged.get("adventure_completion", {}),
@@ -1222,20 +1320,21 @@ def commit_turn(
         attempt.commit_operation_id = duplicate_op
         db.flush()
 
+    is_completion = event_type == "adventure.completed"
     try:
         campaign_after, event = commit_campaign_mutation(
             db,
             turn.campaign_id,
             expected_revision=int(expected),
             event_type=event_type,
-            payload=None if event_type == "adventure.completed" else base_payload,
+            payload=None if is_completion else base_payload,
             operation_id=duplicate_op,
             actor_id=actor_id,
             visibility=turn_visibility,
             provenance=turn_provenance,
             mutate=_mutate_with_effects,
             commit=False,
-            payload_builder=_adventure_event_payload if event_type == "adventure.completed" else None,
+            payload_builder=_adventure_event_payload if is_completion else None,
         )
     except RevisionConflictError as exc:
         logger.warning(
@@ -1243,213 +1342,26 @@ def commit_turn(
             turn.campaign_id, turn.thread_id, turn.id, attempt.id, exc.expected_revision, exc.actual_revision,
         )
         db.rollback()
-        # Re-lock after rollback
-        try:
-            turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-            attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-        except Exception:
-            turn = db.get(DmTurn, turn_id)
-            attempt = db.get(DmTurnAttempt, attempt_id)
+        turn, attempt = _lock_turn_and_attempt(db, turn_id, attempt_id)
         if attempt and turn:
-            attempt.last_error = str(exc)
-            attempt.error_class = "revision_conflict"
-            attempt.completed_at = _now()
-            attempt.status = ATTEMPT_FAILED_VISIBLE
-            turn.status = TURN_FAILED_VISIBLE
-            try:
-                db.flush()
-                if commit:
-                    db.commit()
-            except Exception:
-                db.rollback()
+            _fail_commit_visible(
+                db, turn, attempt, error=str(exc), error_class="revision_conflict", commit=commit,
+            )
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
 
     now = _now()
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
-    # Link the authoritative event back onto the completed adventure for
-    # turn/event provenance (issue #260). Strictly additive bookkeeping —
-    # never breaks the commit.
-    if event_type == "adventure.completed":
-        try:
-            from models.campaigns import Adventure as _Adventure
-
-            _completed_adv = None
-            _explicit_aid = (base_payload.get("adventure_completion") or {}).get("adventure_id")
-            if _explicit_aid:
-                try:
-                    _completed_adv = db.get(_Adventure, uuid.UUID(str(_explicit_aid)))
-                except ValueError:
-                    _completed_adv = None
-            if _completed_adv is None:
-                _completed_adv = (
-                    db.execute(
-                        select(_Adventure).where(
-                            _Adventure.campaign_id == turn.campaign_id,
-                            _Adventure.status == "completed",
-                            _Adventure.source_turn_id == turn.id,
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
-            if _completed_adv is not None and _completed_adv.source_event_id is None:
-                _completed_adv.source_event_id = event.id
-                db.flush()
-                # Shared #263 finalization, post-commit: the authoritative
-                # completion event and campaign revision exist only now, so
-                # the end cursor binds exactly (event.sequence ==
-                # campaign revision by invariant). Best-effort: derived-work
-                # failures are recorded, never break the turn commit.
-                try:
-                    from app.adventures.service import (
-                        finalize_adventure_derived as _finalize,
-                    )
-
-                    _finalize(
-                        db, _completed_adv,
-                        event_sequence=event.sequence,
-                        revision=campaign_after.revision,
-                    )
-                    db.flush()
-                except Exception as e:
-                    logger.warning(
-                        "dm_turn failed to finalize adventure summary turn_id=%s error=%s",
-                        turn.id, e,
-                    )
-        except Exception as e:
-            logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
-    # Stage encounter.started lifecycle semantics for encounters created by
-    # this attempt's start_encounter effect (issue #230). The turn commit IS
-    # the start's fictional mutation, so each linked encounter gets its own
-    # domain event chained in the same outer
-    # transaction (one event per revision, preserving the
-    # sequence == revision invariant). Fail-closed: any staging failure
-    # propagates and aborts the turn commit — a durable encounter without
-    # its lifecycle event must never commit. Direct realtime delivery
-    # happens post-commit below.
-    linked_encounter_ids: list[uuid.UUID] = []
-    from models.campaigns import CampaignDomainEvent as _DomainEvent
-    from models.combat import Encounter as _Encounter
-
-    _started = db.execute(
-        select(_Encounter).where(
-            _Encounter.campaign_id == turn.campaign_id,
-            _Encounter.source_attempt_id == attempt.id,
-            _Encounter.created_event_id.is_(None),
+    if is_completion:
+        finalize_turn_completion(
+            db, turn=turn, event=event, revision=campaign_after.revision,
+            adventure_id=(base_payload.get("adventure_completion") or {}).get("adventure_id"),
         )
-    ).scalars().all()
-    if _started:
-        from app.campaigns.events import commit_campaign_mutation as _commit_mutation
-        from app.combat.service import (
-            ENCOUNTER_STARTED_EVENT as _ENCOUNTER_STARTED,
-            list_participants as _list_parts,
-        )
+    from app.combat.service import stage_turn_encounter_events
 
-        for _enc in _started:
-            _lifecycle = db.execute(
-                select(_DomainEvent).where(
-                    _DomainEvent.campaign_id == turn.campaign_id,
-                    _DomainEvent.operation_id == _enc.operation_id,
-                    _DomainEvent.event_type == _ENCOUNTER_STARTED,
-                )
-            ).scalars().first()
-            if _lifecycle is None:
-                _, _lifecycle = _commit_mutation(
-                    db,
-                    turn.campaign_id,
-                    expected_revision=int(campaign_after.revision or 0),
-                    event_type=_ENCOUNTER_STARTED,
-                    payload={
-                        "encounter_id": str(_enc.id),
-                        "thread_id": _enc.thread_id,
-                        "participant_count": int(_enc.participant_count or 0),
-                        "start_source": _enc.start_source,
-                        "source_turn_id": str(turn.id),
-                        "source_attempt_id": str(attempt.id),
-                        "participants": [
-                            {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
-                            for p in _list_parts(db, _enc.id)
-                        ],
-                    },
-                    operation_id=_enc.operation_id,
-                    actor_id=event.actor_id,
-                    provenance={
-                        "source": "dm_effect",
-                        "turn_event_id": str(event.id),
-                        "attempt_id": str(attempt.id),
-                    },
-                    commit=False,
-                )
-            _enc.created_event_id = _lifecycle.id
-            linked_encounter_ids.append(_enc.id)
-        db.flush()
-    # Stage encounter.ended lifecycle semantics for encounters closed by this
-    # attempt's end_encounter effect (issue #239). Mirrors the start staging
-    # above: the turn commit IS the end's fictional mutation, so each
-    # inline-ended encounter without a staged event gets its own domain event
-    # in the same outer transaction. Fail-closed like
-    # the start path — an unstaged durable end must never commit. The API end
-    # path stages its own event immediately (ended_event_id set), so the
-    # IS NULL scope only catches inline ends from this commit.
-    linked_ended_ids: list[uuid.UUID] = []
-    _ended = db.execute(
-        select(_Encounter).where(
-            _Encounter.campaign_id == turn.campaign_id,
-            _Encounter.status == "ended",
-            _Encounter.ended_event_id.is_(None),
-        )
-    ).scalars().all()
-    if _ended:
-        from app.campaigns.events import commit_campaign_mutation as _commit_end_mutation
-        from app.combat.ending import build_final_snapshot as _final_snapshot
-        from app.combat.ending import list_end_followups as _end_hooks
-        from app.combat.service import ENCOUNTER_ENDED_EVENT as _ENCOUNTER_ENDED
+    encounters = stage_turn_encounter_events(
+        db, turn=turn, attempt=attempt, turn_event=event, campaign_after=campaign_after,
+    )
 
-        for _enc in _ended:
-            _end_lifecycle = db.execute(
-                select(_DomainEvent).where(
-                    _DomainEvent.campaign_id == turn.campaign_id,
-                    _DomainEvent.operation_id == _enc.end_operation_id,
-                    _DomainEvent.event_type == _ENCOUNTER_ENDED,
-                )
-            ).scalars().first()
-            if _end_lifecycle is None:
-                _, _end_lifecycle = _commit_end_mutation(
-                    db,
-                    turn.campaign_id,
-                    expected_revision=int(campaign_after.revision or 0),
-                    event_type=_ENCOUNTER_ENDED,
-                    payload={
-                        "encounter_id": str(_enc.id),
-                        "thread_id": _enc.thread_id,
-                        "outcome": _enc.end_outcome,
-                        "reason": _enc.end_reason,
-                        "round": int(_enc.round or 1),
-                        "turn_sequence": int(_enc.turn_sequence or 0),
-                        "duration_ms": int(_enc.end_duration_ms or 0),
-                        "participant_outcomes": dict(_enc.end_participant_outcomes or {}),
-                        "followup_hooks": [h.hook_type for h in _end_hooks(db, _enc.id)],
-                        "final_state": _final_snapshot(db, _enc),
-                        "ended_by": str(_enc.ended_by) if _enc.ended_by else None,
-                    },
-                    operation_id=_enc.end_operation_id,
-                    # Issue #239 privacy: owner-only like the API path.
-                    # event.actor_id may be the player whose turn triggered
-                    # the DM effect; the ended payload carries DM-private
-                    # reason/fates, so the campaign owner (AI-DM path) must
-                    # own the event or members would see it as own-actor.
-                    actor_id=campaign_after.owner_id,
-                    visibility="dm_only",
-                    provenance={
-                        "source": "dm_effect",
-                        "turn_event_id": str(event.id),
-                        "attempt_id": str(attempt.id),
-                    },
-                    commit=False,
-                )
-            _enc.ended_event_id = _end_lifecycle.id
-            linked_ended_ids.append(_enc.id)
-        db.flush()
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
@@ -1458,114 +1370,27 @@ def commit_turn(
     attempt.status = ATTEMPT_SUCCEEDED
     attempt.completed_at = now
     attempt.result = event.to_dict() if hasattr(event, "to_dict") else {"event_id": str(event.id)}
+    if silent:
+        attempt.result = {**attempt.result, "mode": "silent"}
     attempt.processing_duration_ms = commit_duration_ms
     attempt.last_error = None
     attempt.error_class = None
-
-    if attempt.submission_ids:
-        try:
-            sub_uuids = [uuid.UUID(s) for s in (attempt.submission_ids or [])]
-            rows = db.execute(
-                select(PlayerSubmission).where(PlayerSubmission.id.in_(sub_uuids))
-            ).scalars().all()
-            for row in rows:
-                row.resolution_status = "resolved"
-                row.resolved_at = now
-        except Exception as e:
-            logger.warning("dm_turn failed to resolve submissions turn_id=%s error=%s", turn.id, e)
-
-    # Mark stream completed if linked
-    if attempt.stream_id:
-        try:
-            from models.dm import DMStream
-            stream = db.get(DMStream, attempt.stream_id)
-            if stream and stream.status == "streaming":
-                stream.status = "completed"
-                stream.completed_at = now
-                stream.completion_reason = "turn_committed"
-        except Exception as e:
-            logger.warning("dm_turn failed to complete stream turn_id=%s stream_id=%s error=%s", turn.id, attempt.stream_id, e)
+    _resolve_turn_submissions(db, turn, attempt.submission_ids or [], now)
+    _complete_stream(db, turn, attempt, now)
 
     db.flush()
     if commit:
         db.commit()
-    if commit:
-        # Issue #246 — advance the opening-introduction cursor. Best-effort
-        # derived state: failures (including revision races) only defer the
-        # cursor, which self-heals on the next commit. Never breaks a turn.
-        try:
-            from app.campaigns.opening_intro import maybe_advance_opening_intro
-
-            maybe_advance_opening_intro(db, turn.campaign_id)
-        except Exception as exc:
-            logger.warning(
-                "dm_turn opening intro advance skipped campaign_id=%s turn_id=%s error=%s",
-                turn.campaign_id, turn.id, exc,
-            )
+        _advance_opening_intro(db, turn)
     db.refresh(turn)
     db.refresh(attempt)
     db.refresh(campaign_after)
     db.refresh(event)
-
-    # Post-commit encounter-start realtime hook (issue #230). The lifecycle
-    # event staged above is authoritative; this direct publish is
-    # latency-only and best-effort — it never rolls back committed state.
-    if commit and linked_encounter_ids:
-        try:
-            from app.realtime.service import publish_encounter_started as _publish_started
-            from models.combat import Encounter as _EncounterPub
-
-            for _eid in linked_encounter_ids:
-                _row = db.get(_EncounterPub, _eid)
-                if _row is not None:
-                    _publish_started(db, _row)
-        except Exception as e:
-            logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
-
-    # Post-commit encounter-ended realtime hook (issue #239). Same contract
-    # as the start hook above: the lifecycle event is authoritative, this is
-    # latency-only and never rolls back committed state.
-    if commit and linked_ended_ids:
-        try:
-            from app.realtime.service import publish_encounter_ended as _publish_ended
-
-            for _eid in linked_ended_ids:
-                _row = db.get(_EncounterPub, _eid)
-                if _row is not None:
-                    _publish_ended(db, _row)
-        except Exception as e:
-            logger.warning("dm_turn encounter-end post-commit publish skipped turn_id=%s error=%s", turn.id, e)
-
-    # Post-commit #213 semantic-index hook for turn-path writes. Staged
-    # assert_fact / upsert_relation effects (and JIT-promoted entities) are
-    # written inside the turn transaction — without this, committed turn
-    # records would never become searchable. Best-effort derived work only: never breaks
-    # the committed turn. Skipped when the caller owns the transaction
-    # (commit=False), mirroring the encounter hook above.
     if commit:
-        try:
-            from app.world.semantic_index import note_turn_committed
-
-            note_turn_committed(
-                db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
-        except Exception as e:
-            logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
-
-    # Post-commit identity-telemetry flush (issue #214). Records collected
-    # during locked JIT promotion persist only now that the campaign lock
-    # is released and the entities are durable. Fail-soft: never breaks
-    # the committed turn. Skipped when the caller owns the transaction
-    # (commit=False), mirroring the hooks above.
-    if commit and identity_telemetry_outbox:
-        try:
-            from app.decisions import record_fail_soft as _record_fail_soft
-
-            from database import SessionLocal as _SessionLocal
-
-            for _record in identity_telemetry_outbox:
-                _record_fail_soft(_SessionLocal, _record)
-        except Exception as e:
-            logger.warning("dm_turn identity telemetry flush skipped turn_id=%s error=%s", turn.id, e)
+        _run_post_commit_hooks(
+            db, turn, attempt, event,
+            encounters=encounters, identity_telemetry=identity_telemetry_outbox,
+        )
 
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "

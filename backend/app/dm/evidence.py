@@ -39,11 +39,11 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.dm.context import (
     AuthorizationScope,
     ContextAudience,
+    ContextBudget,
     ContextRecord,
     ForwardDmContextPacket,
     LaneName,
     SourceRef,
-    assemble_context_packet,
 )
 from app.dm.contract import DmTurnContractV1, EvidenceRequest, normalize_contract
 from app.observability.tracing import structured_log
@@ -339,55 +339,6 @@ def evidence_results_to_records(
             )
         )
     return records
-
-
-def augment_packet_with_evidence(
-    packet: ForwardDmContextPacket,
-    new_records: list[ContextRecord],
-) -> ForwardDmContextPacket:
-    """Return a new packet with evidence_results appended (distinct lane)."""
-    # Re-assemble from existing lanes plus new evidence records.
-    # Preserve all existing records and lane status; just extend evidence lane.
-    existing: dict[LaneName, list[ContextRecord]] = {
-        lane.name: list(lane.records) for lane in packet.lanes
-    }
-    # Extend or initialize evidence lane
-    ev_lane_records = existing.get(LaneName.EVIDENCE_RESULTS, [])
-    ev_lane_records = list(ev_lane_records) + list(new_records)
-
-    # Build records mapping for re-assembly
-    records_map: dict[LaneName, list[ContextRecord]] = {}
-    for lane in packet.lanes:
-        if lane.name == LaneName.EVIDENCE_RESULTS:
-            records_map[lane.name] = ev_lane_records
-        else:
-            records_map[lane.name] = list(lane.records)
-
-    lane_status = {lane.name: lane.authority_status for lane in packet.lanes}
-    source_errors = {lane.name: lane.source_errors for lane in packet.lanes}
-
-    # Retrieval dependencies extended with evidence
-    deps = list(packet.observability.retrieval_dependencies) + ["evidence_results"]
-
-    # Budget reuse — evidence records are optional, so total-budget pressure can omit old ones
-    from app.dm.context import ContextBudget
-
-    budget = ContextBudget(
-        max_bytes=packet.observability.serialized_bytes + 32_000,
-        max_tokens=packet.observability.estimated_tokens + 8000,
-    )
-
-    # Reuse assembly helper but keep evidence lane authoritative
-    new_packet = assemble_context_packet(
-        audience=packet.audience,
-        records=records_map,
-        lane_status=lane_status,
-        source_errors=source_errors,
-        budget=budget,
-        retrieval_dependencies=deps,
-    )
-    # Restore original assembly_ms baseline plus evidence latency
-    return new_packet
 
 
 # ── Execution of one round ───────────────────────────────────────────────────
@@ -704,7 +655,16 @@ def run_bounded_evidence_loop(
         except Exception as exc:
             raise EvidenceValidationError(f"failed to mediate evidence to context lane: {exc}") from exc
 
-        packet = augment_packet_with_evidence(packet, records)
+        # Evidence records are optional, so total-budget pressure can omit
+        # older ones; the budget grows with the packet it extends.
+        packet = packet.with_records(
+            {LaneName.EVIDENCE_RESULTS: records},
+            dependency="evidence_results",
+            budget=ContextBudget(
+                max_bytes=packet.observability.serialized_bytes + 32_000,
+                max_tokens=packet.observability.estimated_tokens + 8000,
+            ),
+        )
 
         # Re-adjudicate with enriched context
         current = _normalize(adjudicate(packet))

@@ -1,47 +1,44 @@
-"""Autonomous DM-turn execution spine — issues #354, #208.
+"""DM turn execution — how accepted player input becomes a committed turn.
 
-Handoff from coordinated ``prepared`` attempts to real model-backed execution
-through the production pipeline:
+1. ``runtime.router`` accepts a submission; ``dm.turns.coordinate_turn``
+   groups unresolved input into a turn with one prepared attempt.
+2. ``dm.recovery.execute_committed_attempt`` (post-response) or
+   :func:`run_dm_execute_sweep` (``/api/cron/dm-execute``) calls
+   :func:`execute_dm_attempt`, which takes ``dm.ownership`` of the attempt.
+3. :func:`_claim` — idempotent skip, backpressure gate (``post_turn.backpressure``),
+   then ``turns.mark_attempt_running``.
+4. Context — ``dm.context.assemble_attempt_context`` builds the packet.
+5. Adjudicate + validate — ``dm.adjudication.adjudicate_with_failover`` (role
+   failover, ``providers.runner`` accounting) inside
+   ``dm.evidence.run_bounded_evidence_loop``, checked by ``dm.validators``
+   with bounded regeneration. A narration-only retry reuses a snapshot.
+6. Mode dispatch — ``await_roll`` -> ``rolls.service.request_rolls``;
+   ``silent`` -> ``turns.commit_turn(silent=True)``.
+7. Narrate + commit — ``dm.narration.execute_validated_turn`` stages effects,
+   streams durable narration (``dm.streams``), then ``turns.commit_turn``
+   applies ``dm.effects`` via ``campaigns.events.commit_campaign_mutation``.
+   Derived world work runs later in ``post_turn`` (``/api/cron/post-turn``).
 
-  claim (``mark_attempt_running``) → ``assemble_attempt_context`` →
-  provider adjudication (``app.dm.adjudication`` with role-aware failover
-  via ``app.providers.policy``) → evidence/tool loop →
-  validation with bounded regeneration → ``execute_validated_turn``
-  (stage → durable stream narration → atomic commit) → realtime projection.
-
-#208 hardening on the same spine (no parallel stack): same-model
-alternate-provider failover, explicitly-approved different-model fallback
-only, unified retryable/terminal classification, narration-only survival
-via contract_snapshot, partial-stream resume/continuation, generic
-player-visible retry on exhaustion, and non-billable recovery AI runs.
-There is no degraded emergency DM mode: exhausted recovery stops with a
-generic retryable failure rather than narrating an incomplete result.
-
-Failures never fabricate a turn: any terminal error marks the attempt failed
-(visible, so the live table shows a failure instead of stuck "thinking") and
-staged effects are never committed without a valid DM result.
-
-Entry points:
-- :func:`execute_dm_attempt` — execute one attempt (idempotent).
-- :func:`run_dm_execute_sweep` — claim + execute oldest prepared attempts;
-  used by the ``/api/cron/dm-execute`` reconciliation trigger. A DB sweep
-  (not queue-only) keeps serverless runtimes autonomous without a
-  push-consumer trigger.
-- ``app.dm.recovery.execute_committed_attempt`` — best-effort post-response
-  execution of the attempt coordinated by a new submission, campaign start,
-  retry, or roll fulfillment, so prepared work does not wait for the sweep
-  (disable with ``DM_EXECUTE_DISPATCH=0``).
+Failures never fabricate a turn: :func:`_record_failure` requeues a
+pre-visibility transient or leaves a visible failure with a generic retry
+marker; archive mid-run defers via :func:`_defer_archived`.
 """
 from __future__ import annotations
 
 import logging
 import os
 import uuid
+from dataclasses import dataclass, field
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.observability.tracing import structured_log
+
 logger = logging.getLogger(__name__)
+
+_IDEMPOTENT_SKIP_STATUSES = ("succeeded", "streaming", "failed_visible", "superseded", "discarded", "abandoned")
 
 
 def _is_config_error(exc: BaseException) -> bool:
@@ -53,6 +50,204 @@ def retry_backoff_seconds(retry_count: int) -> int:
     """Bounded exponential backoff for retriable DM attempts (seconds)."""
     count = max(1, int(retry_count or 1))
     return min(30 * (2 ** (count - 1)), 600)
+
+
+@dataclass
+class _Run:
+    """One claimed attempt moving through the spine."""
+
+    db: Session
+    attempt: Any
+    turn: Any
+    attempt_id: uuid.UUID
+    turn_id: uuid.UUID
+    campaign_id: uuid.UUID
+    trace_id: str
+    timeout_seconds: float
+    is_recovery: bool
+    provider: str | None = None
+    model: str | None = None
+    path_info: dict = field(default_factory=dict)
+
+
+@dataclass
+class NonNarratedResult:
+    """Outcome of an ``await_roll`` or ``silent`` contract (no narration stream)."""
+
+    turn: Any
+    attempt: Any
+    mode: str
+    roll_requests: list = field(default_factory=list)
+    narration: Any = None
+    event: Any = None
+
+
+def _execute_owned_attempt(
+    db: Session,
+    attempt_id: uuid.UUID,
+    *,
+    adjudicate=None,
+    narrator=None,
+    provider_name: str | None = None,
+    timeout_seconds: float = 90,
+    trace_id: str | None = None,
+):
+    """Claim and execute one prepared DM attempt end-to-end (idempotent).
+
+    ``adjudicate``/``narrator`` are injectable seams for tests; production
+    defaults resolve the configured provider via ``app.dm.adjudication``.
+    Returns the narration ``ValidatedTurnResult`` or a
+    :class:`NonNarratedResult`; ``None`` when skipped or deferred.
+    """
+    from app.campaigns.service import CampaignArchivedError
+    from app.dm.narration import NarrationStreamError
+
+    run = _claim(db, attempt_id, trace_id=trace_id or str(uuid.uuid4()), timeout_seconds=timeout_seconds)
+    if run is None:
+        return None
+    try:
+        packet = _assemble_production_context(db, run.attempt_id)
+    except Exception as exc:
+        # Missing authority fails identically on every retry: never requeue.
+        _record_failure(run, exc, retryable=False)
+        raise
+    try:
+        adjudicate = _build_adjudicator(run, adjudicate, provider_name)
+    except Exception as exc:
+        _record_failure(run, exc)
+        raise
+    snapshot = _narration_retry_contract(run)
+    try:
+        if snapshot is not None:
+            contract = snapshot
+        else:
+            adjudicate = _with_deferral_advisory(run, adjudicate)
+            contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
+    except Exception as exc:
+        _record_failure(run, exc)
+        raise
+    # Issue #265 — dormancy re-check at the first durable visibility
+    # boundary: archive may have committed during adjudication.
+    if _campaign_archived(db, run.campaign_id):
+        return _defer_archived(run, "archived_at_visibility_boundary")
+    try:
+        if contract.mode == "await_roll":
+            return _complete_await_roll(db, run, contract)
+        if contract.mode == "silent":
+            return _complete_silent(db, run, contract)
+        return _narrate_and_commit(
+            run, contract, packet,
+            narrator=_build_narrator(run, narrator),
+            adjudicate=adjudicate,
+            can_readjudicate=snapshot is None,
+        )
+    except NarrationStreamError as exc:
+        _offer_narration_retry(run, exc)
+        raise
+    except CampaignArchivedError:
+        # The commit or chunk-0 boundary refused the archived table and
+        # rolled back with it, so nothing visible persisted.
+        return _defer_archived(run, contract.mode if contract.mode in ("await_roll", "silent") else "first_visible_boundary")
+    except Exception as exc:
+        _record_failure(run, exc)
+        raise
+
+
+def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
+    """Only the owner may claim, execute, or fail this attempt."""
+    from app.dm.ownership import execution_ownership
+    from models.dm import DmTurnAttempt
+
+    # Issue #265 — dormancy freezes fictional time: a prepared attempt on an
+    # archived campaign is deferred, not executed. It stays prepared so the
+    # post-restore sweep resumes the exact same table; returning None keeps
+    # the sweep's skipped accounting without failing the job.
+    attempt = db.get(DmTurnAttempt, attempt_id)
+    if attempt is not None and _campaign_archived(db, attempt.campaign_id):
+        logger.info(
+            "dm_execute deferred attempt_id=%s campaign_id=%s reason=archived",
+            attempt_id, attempt.campaign_id,
+        )
+        return None
+
+    with execution_ownership(db, attempt_id) as acquired:
+        if not acquired:
+            return None
+        return _execute_owned_attempt(db, attempt_id, **kwargs)
+
+
+# ── Spine steps ─────────────────────────────────────────────────────────────
+
+
+def _claim(db: Session, attempt_id: uuid.UUID, *, trace_id: str, timeout_seconds: float) -> _Run | None:
+    """Gate and claim the attempt; ``None`` when there is nothing to run.
+
+    Already terminal/streaming work is never re-executed. Issue #222 — while
+    post-turn trails beyond the safe forward-DM context budget, new AI
+    progression pauses BEFORE context becomes unreliable: the attempt stays
+    prepared (backpressure is not failure) with a future retry-eligibility
+    time, and resumes rebased onto current authority after catch-up. A
+    caller observing running work never adopts another worker's claim.
+    """
+    from app.dm.turns import mark_attempt_running
+    from app.post_turn.backpressure import pause_if_backpressured
+    from models.dm import DmTurn, DmTurnAttempt
+
+    attempt = db.get(DmTurnAttempt, attempt_id)
+    if attempt is None:
+        raise ValueError(f"DM attempt {attempt_id} not found")
+    if attempt.status in _IDEMPOTENT_SKIP_STATUSES:
+        logger.info("dm_execute skip attempt_id=%s status=%s", attempt.id, attempt.status)
+        return None
+    if pause_if_backpressured(
+        db, attempt.campaign_id, attempt_id=attempt.id, turn_id=attempt.turn_id,
+    ) is not None:
+        _defer_backpressured_attempt(db, attempt)
+        return None
+    attempt = _refresh_backpressured_stale_attempt(db, attempt)
+    try:
+        attempt = mark_attempt_running(db, attempt.id)
+    except ValueError:
+        db.rollback()
+        return None
+    return _Run(
+        db=db,
+        attempt=attempt,
+        turn=db.get(DmTurn, attempt.turn_id),
+        attempt_id=attempt.id,
+        turn_id=attempt.turn_id,
+        campaign_id=attempt.campaign_id,
+        trace_id=trace_id,
+        timeout_seconds=timeout_seconds,
+        is_recovery=_is_recovery_attempt(db, attempt),
+    )
+
+
+def _is_recovery_attempt(db: Session, attempt) -> bool:
+    """Whether provider calls for this attempt are recovery/non-billable.
+
+    Only attempts whose parent was abandoned via explicit Retry count:
+    ordinary pre-stream supersession also creates parented attempts, but
+    those are first-try executions (primary/billable). Automatic
+    same-attempt retries (a requeued transient, ``retry_count > 0``) are
+    recovery work too.
+    """
+    from models.dm import DmTurnAttempt
+
+    if int(getattr(attempt, "retry_count", 0) or 0) > 0:
+        return True
+    parent_id = getattr(attempt, "parent_attempt_id", None)
+    if parent_id is None:
+        return False
+    try:
+        parent = db.get(DmTurnAttempt, parent_id)
+    except Exception:
+        return False
+    return (
+        parent is not None
+        and parent.status == "abandoned"
+        and (parent.abandonment_reason or "") == "explicit_retry"
+    )
 
 
 def _assemble_production_context(db: Session, attempt_id: uuid.UUID):
@@ -92,15 +287,243 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID):
         )
 
 
-def _with_identity_repair(packet, conflict):
-    """Add required canonical identity feedback before one re-adjudication."""
-    from app.dm.context import (
-        DEFAULT_MAX_BYTES, DEFAULT_MAX_TOKENS, AuthorizationScope,
-        ContextBudget, ContextRecord, LaneName, SourceRef,
-        assemble_context_packet,
+def _build_adjudicator(run: _Run, adjudicate, provider_name: str | None):
+    """Production adjudicator through the role-aware failover path (#208)."""
+    run.provider = provider_name
+    if adjudicate is None:
+        from app.providers import policy as role_policy
+
+        path = role_policy.execution_path("forward_dm")
+        run.provider = provider_name or path[0][0]
+        run.model = path[0][1]
+        adjudicate = _failover_adjudicator(run)
+    structured_log(
+        logger, logging.INFO, "dm_execute_start",
+        submission_ids=[str(s) for s in run.attempt.submission_ids or []],
+        turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+        provider=run.provider, model=run.model, trace_id=run.trace_id,
+    )
+    return adjudicate
+
+
+def _failover_adjudicator(run: _Run):
+    """``adjudicate(packet, feedback)`` over ``adjudicate_with_failover``, recording the path taken."""
+
+    def adjudicate_via_failover(packet, feedback=None):
+        from app.dm.adjudication import adjudicate_with_failover
+
+        _ = feedback  # feedback reaches the model via the regeneration packet
+        contract, info = adjudicate_with_failover(
+            packet, db=run.db, role="forward_dm",
+            timeout_seconds=run.timeout_seconds, trace_id=run.trace_id,
+            # Explicit-Retry attempts carry retry lineage: even the first
+            # provider call is recovery/non-billable so failed work is never
+            # double-charged.
+            is_retry=run.is_recovery,
+            campaign_id=run.campaign_id,
+        )
+        run.path_info.update(info)
+        return contract
+
+    return adjudicate_via_failover
+
+
+def _narration_retry_contract(run: _Run):
+    """Narration-only retry (#208): reuse the parent's preserved valid contract.
+
+    A fresh explicit-Retry attempt carrying ``contract_snapshot`` skips
+    adjudication and goes straight to narration+commit; staged effects are
+    re-staged from the snapshot (never copied as committed truth).
+    """
+    from app.dm.contract import normalize_contract
+
+    attempt = run.attempt
+    if getattr(attempt, "contract_snapshot", None) is None or getattr(attempt, "parent_attempt_id", None) is None:
+        return None
+    try:
+        contract = normalize_contract(dict(attempt.contract_snapshot))
+    except Exception:
+        return None
+    structured_log(
+        logger, logging.INFO, "dm_execute_narration_retry",
+        turn_id=str(run.turn_id), attempt_id=str(run.attempt_id), trace_id=run.trace_id,
+    )
+    return contract
+
+
+def _with_deferral_advisory(run: _Run, adjudicate):
+    """Attach the identity-deferral advisory to every adjudication packet.
+
+    When an abandoned explicit-retry parent deferred a new-entity identity,
+    deterministic adjudication would otherwise replay the identical frame
+    into the same DEFER. Advisory only — the generative DM stays
+    authoritative. Fail-soft: no advisory on error.
+    """
+    from app.dm.context import attach_retry_deferral_advisory, build_retry_deferral_advisory
+
+    note = build_retry_deferral_advisory(run.db, run.attempt)
+    if note is None:
+        return adjudicate
+    structured_log(
+        logger, logging.INFO, "dm_execute_deferral_advisory",
+        turn_id=str(run.turn_id), attempt_id=str(run.attempt_id), trace_id=run.trace_id,
     )
 
-    record = ContextRecord(
+    def advised(packet, feedback=None):
+        return adjudicate(attach_retry_deferral_advisory(packet, note), feedback=feedback)
+
+    return advised
+
+
+def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
+    """Evidence loop + validation with bounded regeneration.
+
+    Returns ``(contract, packet)`` where packet is the one the contract
+    validated against: a perspective repair (issue #455) swaps in a packet
+    carrying the resolved lane entries, and later validation must use it.
+    """
+    from app.dm.contract import ContractValidationError
+    from app.dm.evidence import run_bounded_evidence_loop
+    from app.dm.validators import default_pipeline, run_with_bounded_regeneration
+
+    def repair_missing_perspectives(report, pkt):
+        """Deterministic resolve-then-retry; None falls back to scope-narrowing."""
+        try:
+            from app.dm.context import repair_packet_missing_perspectives
+            from app.dm.validators import missing_perspective_subjects
+            from models.campaigns import Campaign
+
+            if pkt is None:
+                return None
+            campaign = run.db.get(Campaign, run.campaign_id)
+            subjects = missing_perspective_subjects(report)
+            if campaign is None or not subjects:
+                return None
+            return repair_packet_missing_perspectives(pkt, run.db, campaign, subjects)
+        except Exception as exc:
+            logger.warning("dm_execute perspective repair failed: %s", exc)
+            return None
+
+    def regenerate(pkt):
+        repaired_packets = []
+
+        def repair_hook(report, current):
+            repaired = repair_missing_perspectives(report, current)
+            if repaired is not None:
+                repaired_packets.append(repaired)
+            return repaired
+
+        contract, _ = run_with_bounded_regeneration(adjudicate, pkt, packet_repair=repair_hook)
+        return contract, (repaired_packets[-1] if repaired_packets else pkt)
+
+    validation_packet = start_packet
+
+    def evidence_adjudicate(enriched_packet):
+        nonlocal validation_packet
+        validation_packet = enriched_packet
+        try:
+            return adjudicate(enriched_packet)
+        except ContractValidationError:
+            repaired, validation_packet = regenerate(enriched_packet)
+            return repaired
+
+    final_contract, _bundle = run_bounded_evidence_loop(
+        initial_packet=start_packet, adjudicate=evidence_adjudicate, db=run.db,
+    )
+    if default_pipeline.validate(final_contract, validation_packet).passed:
+        return final_contract, validation_packet
+    return regenerate(validation_packet)
+
+
+def _build_narrator(run: _Run, narrator):
+    """Production streaming narrator, or the deterministic template on opt-in."""
+    if narrator is None:
+        from app.dm.adjudication import build_provider_narrator
+
+        return build_provider_narrator(
+            timeout_seconds=run.timeout_seconds,
+            db=run.db, trace_id=run.trace_id, is_retry=run.is_recovery,
+            campaign_id=run.campaign_id,
+        )
+    if narrator == "deterministic":
+        # Explicit opt-in to the deterministic template narrator (no model
+        # call): same production stream/commit path, used by tests.
+        return None
+    return narrator
+
+
+def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, can_readjudicate: bool):
+    """Stage, stream, and commit; re-adjudicate once on an identity conflict.
+
+    Identity resolution runs after attempt-local staging but before chunk
+    zero. On a conflict, roll back its uncommitted reads and re-adjudicate
+    once against the resolved canonical identity; the next staging pass
+    replaces the old snapshot/effects.
+    """
+    from app.dm.context import LaneName
+    from app.dm.narration import execute_validated_turn
+    from app.world.identity import IdentityReuseRequiresReadjudication
+    from models.dm import DmTurnAttempt
+
+    db = run.db
+    repaired = False
+    while True:
+        try:
+            result = execute_validated_turn(
+                db,
+                turn_id=run.turn_id,
+                attempt_id=run.attempt_id,
+                contract=contract,
+                narrator=narrator,
+                provider=run.provider or "dm-provider",
+                publish_realtime=True,
+                trace_id=run.trace_id,
+            )
+            structured_log(
+                logger, logging.INFO, "dm_execute_complete",
+                turn_id=str(result.turn.id), attempt_id=str(result.attempt.id),
+                stream_id=str(result.narration.stream_id),
+                audience=str(getattr(result.turn, "audience", "campaign")),
+                provider=run.path_info.get("provider") or run.provider,
+                model=run.path_info.get("model") or run.model,
+                failover_reasons=run.path_info.get("failover_reasons") or [],
+                ttft_added_ms=run.path_info.get("ttft_added_ms") or 0.0,
+                trace_id=run.trace_id,
+            )
+            return result
+        except IdentityReuseRequiresReadjudication as conflict:
+            db.rollback()
+            current = db.get(DmTurnAttempt, run.attempt_id)
+            if current is not None:
+                # Staging committed the original contract. It must not
+                # become a narration-only retry candidate if correction
+                # fails before the replacement contract is staged.
+                current.contract_snapshot = None
+                current.staged_effects = []
+                current.identity_resolutions = None
+                db.add(current)
+                db.commit()
+            if repaired or not can_readjudicate:
+                raise
+            repaired = True
+            packet = packet.with_records(
+                {LaneName.REPAIR_DIRECTIVES: [_identity_repair_record(packet, conflict)]},
+                dependency="identity_repair",
+                budget=packet.headroom_budget(4096, 1024),
+            )
+            structured_log(
+                logger, logging.INFO, "dm_execute_identity_readjudication",
+                turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+                canonical_id=conflict.canonical_id, trace_id=run.trace_id,
+            )
+            contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
+
+
+def _identity_repair_record(packet, conflict):
+    """Required canonical identity feedback for one re-adjudication."""
+    from app.dm.context import AuthorizationScope, ContextRecord, SourceRef
+
+    return ContextRecord(
         record_id=f"identity-repair:{conflict.temp_id}:{conflict.canonical_id}",
         value={
             "proposed_temp_id": conflict.temp_id,
@@ -134,95 +557,9 @@ def _with_identity_repair(packet, conflict):
         required=True,
         priority=100,
     )
-    records = {lane.name: list(lane.records) for lane in packet.lanes}
-    records[LaneName.REPAIR_DIRECTIVES].append(record)
-    return assemble_context_packet(
-        audience=packet.audience,
-        records=records,
-        lane_status={lane.name: lane.authority_status for lane in packet.lanes},
-        source_errors={lane.name: lane.source_errors for lane in packet.lanes},
-        budget=ContextBudget(
-            max_bytes=max(DEFAULT_MAX_BYTES, packet.observability.serialized_bytes + 4096),
-            max_tokens=max(DEFAULT_MAX_TOKENS, packet.observability.estimated_tokens + 1024),
-        ),
-        retrieval_dependencies=[*packet.observability.retrieval_dependencies, "identity_repair"],
-    )
 
 
-def _classify_failure(exc: BaseException) -> str:
-    """Map execution failures to attempt error_class (retriable default)."""
-    from app.providers import policy as role_policy
-
-    if isinstance(exc, RuntimeError) and "Unapproved model substitution" in str(exc):
-        return "terminal"
-    try:
-        cls, _reason = role_policy.classify_execution_failure(exc)
-        return cls
-    except Exception:
-        pass
-    from app.worker.executor import TERMINAL, classify_error
-
-    if _is_config_error(exc):
-        return "retriable"
-    try:
-        return classify_error(exc)
-    except Exception:
-        return TERMINAL
-
-
-def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
-    """Attach a generic player-visible retry marker without infra details.
-
-    Internal diagnostics stay in ``last_error``/logs; ``result.public_error``
-    is the only player-facing surface and never includes provider, model,
-    status code, or exception text.
-    """
-    from app.providers import policy as role_policy
-
-    from models.dm import DmTurnAttempt
-
-    try:
-        attempt = db.get(DmTurnAttempt, attempt_id)
-        if attempt is None:
-            return
-        base = dict(attempt.result or {})
-        base["public_error"] = role_policy.GENERIC_RETRYABLE_MESSAGE
-        base["retryable"] = True
-        attempt.result = base
-        db.add(attempt)
-        db.flush()
-    except Exception:
-        pass
-
-
-def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
-    """Only the owner may claim, execute, or fail this attempt."""
-    from app.dm.ownership import execution_ownership
-    from models.dm import DmTurnAttempt
-
-    # Issue #265 — dormancy freezes fictional time: a prepared attempt on an
-    # archived campaign is deferred, not executed. It stays prepared so the
-    # post-restore sweep resumes the exact same table; returning None keeps
-    # the sweep's skipped accounting without failing the job.
-    try:
-        attempt = db.get(DmTurnAttempt, attempt_id)
-        if attempt is not None:
-            from models.campaigns import Campaign
-
-            campaign = db.get(Campaign, attempt.campaign_id)
-            if campaign is not None and str(campaign.status or "").lower() == "archived":
-                logger.info(
-                    "dm_execute deferred attempt_id=%s campaign_id=%s reason=archived",
-                    attempt_id, attempt.campaign_id,
-                )
-                return None
-    except Exception as exc:
-        logger.warning("dm_execute archive check failed attempt_id=%s error=%s", attempt_id, exc)
-
-    with execution_ownership(db, attempt_id) as acquired:
-        if not acquired:
-            return None
-        return _execute_owned_attempt(db, attempt_id, **kwargs)
+# ── Non-narrated modes ──────────────────────────────────────────────────────
 
 
 def _await_roll_prompt_text(contract) -> str:
@@ -277,10 +614,11 @@ def _resolve_roll_participants(db: Session, turn, contract):
     raise ValueError("await_roll requires a player-owned character to request the roll")
 
 
-def _complete_await_roll(db: Session, *, turn, attempt, contract, trace_id: str):
+def _complete_await_roll(db: Session, run: _Run, contract) -> NonNarratedResult:
     """Persist a player-owned roll request and leave the same turn open."""
     from app.rolls.service import request_rolls
 
+    turn, attempt = run.turn, run.attempt
     requested_user_id, character_id = _resolve_roll_participants(db, turn, contract)
     rr = contract.roll_request
     payload = {
@@ -301,153 +639,236 @@ def _complete_await_roll(db: Session, *, turn, attempt, contract, trace_id: str)
     prompt = _await_roll_prompt_text(contract)
     if prompt:
         try:
-            base = dict(attempt.result or {})
-            base["prompt"] = prompt[:1000]
-            attempt.result = base
+            attempt.result = {**(attempt.result or {}), "prompt": prompt[:1000]}
             db.add(attempt)
         except Exception:
             pass
     db.commit()
     db.refresh(turn)
     db.refresh(attempt)
-    from app.observability.tracing import structured_log
-
     structured_log(
         logger, logging.INFO, "dm_execute_await_roll",
         turn_id=str(turn.id), attempt_id=str(attempt.id),
-        roll_request_ids=[str(r.id) for r in rows], trace_id=trace_id,
+        roll_request_ids=[str(r.id) for r in rows], trace_id=run.trace_id,
     )
-
-    from dataclasses import dataclass
-
-    @dataclass
-    class AwaitRollResult:
-        turn: object
-        attempt: object
-        roll_requests: list
-        narration: object = None
-        event: object = None
-        mode: str = "await_roll"
-
-    return AwaitRollResult(turn=turn, attempt=attempt, roll_requests=rows)
+    return NonNarratedResult(turn=turn, attempt=attempt, mode="await_roll", roll_requests=rows)
 
 
-def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, trace_id: str):
+def _complete_silent(db: Session, run: _Run, contract) -> NonNarratedResult:
     """Complete a valid silent contract with no visible narration.
 
-    Zero-visible-output still performs the normal resolved-turn bookkeeping
-    (revision bump + completion event, resolved/committed timestamps,
-    submission resolution) so consumed input is never re-adjudicated.
+    Zero-visible-output still resolves through the shared ``commit_turn``
+    path (revision bump + completion event, timestamps, submission
+    resolution) so consumed input is never re-adjudicated.
     """
-    import time
-    from datetime import datetime, timezone
+    from app.dm.turns import commit_turn, stage_validated_attempt
 
-    from sqlalchemy import select
-
-    from app.campaigns.events import commit_campaign_mutation
-    from app.dm.turns import DM_TURN_RESOLVED, stage_validated_attempt
-    from models.threads import PlayerSubmission
-
-    staged = stage_validated_attempt(db, attempt.id, contract)
-    _ = staged
-    expected = int(attempt.source_revision)
-    submission_ids = list(attempt.submission_ids or [])
-    duplicate_op = str(attempt.id)
-    # Issue #248 — same restricted-visibility commit as the narration path:
-    # a private silent turn must not broadcast a public domain event.
-    silent_audience = str(getattr(attempt, "audience", None) or getattr(turn, "audience", None) or "campaign")
-    silent_visibility = "private" if silent_audience == "private" else "public"
-    base_payload: dict = {
-        "turn_id": str(turn.id),
-        "attempt_id": str(attempt.id),
-        "submission_ids": submission_ids,
-        "mode": "silent",
-        "thread_id": str(turn.thread_id),
-        "audience": silent_audience,
-    }
-    if not attempt.commit_operation_id:
-        attempt.commit_operation_id = duplicate_op
-        db.flush()
-    execute_start = time.monotonic()
-    from app.campaigns.service import require_playable_campaign
-
-    def _silent_playable_guard(locked) -> None:
-        # Issue #265 — silent completion still advances the table; serialize
-        # the dormancy decision with the same campaign row lock the
-        # revision guard already holds.
-        require_playable_campaign(locked)
-
-    campaign_after, event = commit_campaign_mutation(
-        db,
-        turn.campaign_id,
-        expected,
-        event_type=DM_TURN_RESOLVED,
-        payload=base_payload,
-        operation_id=duplicate_op,
-        mutate=_silent_playable_guard,
-        commit=False,
-        visibility=silent_visibility,
-        provenance={
-            "source": "dm_turn",
-            "thread_id": str(turn.thread_id),
-            "audience": silent_audience,
-            "attempt_id": str(attempt.id),
-            "mode": "silent",
-        },
-    )
-    now = datetime.now(timezone.utc)
-    commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
-    turn.status = "succeeded"
-    turn.resolved_at = now
-    turn.committed_at = now
-    turn.commit_duration_ms = commit_duration_ms
-    turn.time_executing_ms = commit_duration_ms
-    attempt.status = "succeeded"
-    attempt.completed_at = now
-    try:
-        attempt.result = event.to_dict() if hasattr(event, "to_dict") else {"event_id": str(event.id)}
-        attempt.result = {**(attempt.result or {}), "mode": "silent"}
-    except Exception:
-        attempt.result = {"mode": "silent"}
-    attempt.processing_duration_ms = commit_duration_ms
-    attempt.last_error = None
-    attempt.error_class = None
-    if submission_ids:
-        try:
-            sub_uuids = [uuid.UUID(str(s)) for s in submission_ids]
-            rows = db.execute(
-                select(PlayerSubmission).where(PlayerSubmission.id.in_(sub_uuids))
-            ).scalars().all()
-            for row in rows:
-                row.resolution_status = "resolved"
-                row.resolved_at = now
-        except Exception as exc:
-            logger.warning("dm_execute_silent failed to resolve submissions turn_id=%s error=%s", turn.id, exc)
-    db.flush()
-    db.commit()
-    db.refresh(turn)
-    db.refresh(attempt)
-    db.refresh(campaign_after)
-    db.refresh(event)
-    from app.observability.tracing import structured_log
-
+    stage_validated_attempt(db, run.attempt_id, contract)
+    turn, attempt, event = commit_turn(db, run.turn_id, run.attempt_id, silent=True)
     structured_log(
         logger, logging.INFO, "dm_execute_silent",
         turn_id=str(turn.id), attempt_id=str(attempt.id),
-        provider=provider, trace_id=trace_id,
+        provider=run.provider or "dm-provider", trace_id=run.trace_id,
+    )
+    return NonNarratedResult(turn=turn, attempt=attempt, mode="silent", event=event)
+
+
+# ── Failure, deferral, and backpressure handling ────────────────────────────
+
+
+def _classify_failure(exc: BaseException) -> str:
+    """Map execution failures to attempt error_class (retriable default)."""
+    from app.providers import policy as role_policy
+
+    if isinstance(exc, RuntimeError) and "Unapproved model substitution" in str(exc):
+        return "terminal"
+    try:
+        cls, _reason = role_policy.classify_execution_failure(exc)
+        return cls
+    except Exception:
+        pass
+    from app.worker.executor import TERMINAL, classify_error
+
+    if _is_config_error(exc):
+        return "retriable"
+    try:
+        return classify_error(exc)
+    except Exception:
+        return TERMINAL
+
+
+def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
+    """Attach a generic player-visible retry marker without infra details.
+
+    Internal diagnostics stay in ``last_error``/logs; ``result.public_error``
+    is the only player-facing surface and never includes provider, model,
+    status code, or exception text.
+    """
+    from app.providers import policy as role_policy
+
+    from models.dm import DmTurnAttempt
+
+    try:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None:
+            return
+        attempt.result = {
+            **(attempt.result or {}),
+            "public_error": role_policy.GENERIC_RETRYABLE_MESSAGE,
+            "retryable": True,
+        }
+        db.add(attempt)
+        db.flush()
+    except Exception:
+        pass
+
+
+def _record_failure(run: _Run, exc: BaseException, *, retryable: bool = True) -> None:
+    """The one pre-commit failure path for every spine step.
+
+    Only acts while the attempt is still this worker's pre-stream claim
+    (post-visibility remediation happens inside narration, and superseded
+    work is never resurrected). A retriable failure before anything became
+    visible requeues the claim BEHIND ready work (prepared, error kept,
+    future ``next_retry_at``) so the next sweep retries it without starving
+    newer attempts. Anything else — and every non-``retryable`` failure such
+    as missing context authority, which fails identically on each retry —
+    leaves a visible failure so the table never looks stuck "thinking".
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING, mark_attempt_failed
+    from app.worker.executor import RETRIABLE
+    from models.dm import DmTurn, DmTurnAttempt
+
+    db = run.db
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    error_class = _classify_failure(exc)
+    error = f"{type(exc).__name__}: {exc}"[:2000]
+    try:
+        current = db.get(DmTurnAttempt, run.attempt_id)
+        if current is None or current.status not in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+            return
+        turn = db.get(DmTurn, run.turn_id)
+        crossed = turn is not None and turn.status in ("streaming", "failed_visible")
+        if retryable and error_class == RETRIABLE and not crossed:
+            retries = int(getattr(current, "retry_count", 0) or 0) + 1
+            current.last_error = error
+            current.error_class = error_class
+            current.status = ATTEMPT_PREPARED
+            current.started_at = None
+            current.completed_at = None
+            current.retry_count = retries
+            current.next_retry_at = datetime.now(timezone.utc) + timedelta(
+                seconds=retry_backoff_seconds(retries)
+            )
+            db.add(current)
+            db.commit()
+            structured_log(
+                logger, logging.WARNING, "dm_execute_retryable",
+                attempt_id=str(run.attempt_id), turn_id=str(run.turn_id),
+                error_class=error_class, error=str(exc)[:500], trace_id=run.trace_id,
+            )
+            return
+        mark_attempt_failed(db, run.attempt_id, error=error, error_class=error_class, visible=True)
+        if retryable:
+            try:
+                _attach_public_retry_marker(db, run.attempt_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+    except Exception as mark_exc:
+        logger.warning(
+            "dm_execute failure-marking failed attempt_id=%s error=%s",
+            run.attempt_id, mark_exc,
+        )
+    structured_log(
+        logger, logging.WARNING, "dm_execute_failed",
+        attempt_id=str(run.attempt_id), turn_id=str(run.turn_id),
+        error_class=error_class, error=str(exc)[:500], trace_id=run.trace_id,
     )
 
-    from dataclasses import dataclass
 
-    @dataclass
-    class SilentResult:
-        turn: object
-        attempt: object
-        narration: object = None
-        event: object = None
-        mode: str = "silent"
+def _offer_narration_retry(run: _Run, exc) -> None:
+    """Post-visibility stream failure: offer narration-only retry.
 
-    return SilentResult(turn=turn, attempt=attempt, event=event)
+    Remediation already happened inside ``execute_validated_turn``; the
+    valid structured packet survives in ``contract_snapshot`` so narration
+    can retry independently without re-adjudication.
+    """
+    from models.dm import DmTurnAttempt
+
+    db = run.db
+    try:
+        current = db.get(DmTurnAttempt, run.attempt_id)
+        if current is not None:
+            current.result = {
+                **(current.result or {}),
+                "narration_retry_available": True,
+                "partial_stream_id": str(exc.stream_id) if exc.stream_id else None,
+            }
+            db.add(current)
+            _attach_public_retry_marker(db, run.attempt_id)
+            db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    structured_log(
+        logger, logging.WARNING, "dm_execute_stream_failed",
+        turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+        stream_id=str(exc.stream_id), trace_id=run.trace_id,
+    )
+
+
+def _campaign_archived(db: Session, campaign_id: uuid.UUID) -> bool:
+    from models.campaigns import Campaign
+
+    try:
+        campaign = db.get(Campaign, campaign_id)
+        return campaign is not None and str(campaign.status or "").lower() == "archived"
+    except Exception as exc:
+        logger.warning("dm_execute archive check failed campaign_id=%s error=%s", campaign_id, exc)
+        return False
+
+
+def _defer_archived(run: _Run, reason: str) -> None:
+    """Dormancy deferral — issue #265.
+
+    Archive committed after this worker's last playability check. Reset the
+    claim to prepared (no failure marker — dormancy is not failure) so the
+    post-restore sweep resumes the exact same attempt.
+    """
+    from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING
+    from models.dm import DmTurnAttempt
+
+    db = run.db
+    try:
+        db.rollback()
+    except Exception:
+        pass
+    try:
+        current = db.get(DmTurnAttempt, run.attempt_id)
+        if current is not None and current.status == ATTEMPT_RUNNING:
+            current.status = ATTEMPT_PREPARED
+            current.started_at = None
+            current.last_error = f"CampaignArchived: {reason}"
+            db.add(current)
+            db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+    logger.info(
+        "dm_execute deferred attempt_id=%s campaign_id=%s reason=%s",
+        run.attempt_id, run.campaign_id, reason,
+    )
+    return None
 
 
 def _defer_backpressured_attempt(db: Session, attempt) -> None:
@@ -461,16 +882,15 @@ def _defer_backpressured_attempt(db: Session, attempt) -> None:
     is untouched (this is not a failure); the sweep retries the attempt once
     the eligibility time passes and catch-up has cleared the backlog.
     """
-    from datetime import datetime, timezone
-    from datetime import timedelta as _td
+    from datetime import datetime, timedelta, timezone
+
+    from models.dm import DmTurnAttempt
 
     try:
-        from models.dm import DmTurnAttempt as _Attempt
-
-        fresh = db.get(_Attempt, attempt.id)
+        fresh = db.get(DmTurnAttempt, attempt.id)
         if fresh is None or fresh.status != "prepared":
             return
-        fresh.next_retry_at = datetime.now(timezone.utc) + _td(
+        fresh.next_retry_at = datetime.now(timezone.utc) + timedelta(
             seconds=retry_backoff_seconds(int(getattr(fresh, "retry_count", 0) or 0) + 1)
         )
         db.add(fresh)
@@ -512,6 +932,7 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
     the replacement attempt either way.
     Returns the attempt to execute (possibly a fresh row).
     """
+    from app.dm.turns import _now, create_attempt
     from models.campaigns import Campaign
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -537,42 +958,19 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
             or list(turn.submission_ids or []) != list(attempt.submission_ids or [])
         ):
             return attempt
-        from app.dm.turns import _now
-
-        now = _now()
         old = db.get(DmTurnAttempt, attempt.id)
         if old is None or old.status != "prepared":
             return attempt
         old.status = "superseded"
         old.invalidation_reason = "backpressure_revision_refresh"
-        old.invalidated_at = now
-        new_attempt = DmTurnAttempt(
-            id=uuid.uuid4(),
-            turn_id=turn.id,
-            attempt_number=int(old.attempt_number or 0) + 1,
-            status="prepared",
-            campaign_id=old.campaign_id,
-            thread_id=old.thread_id,
-            audience=old.audience,
-            source_revision=int(campaign.revision or 0),
-            input_set_revision=old.input_set_revision,
-            submission_ids=list(old.submission_ids or []),
-            parent_attempt_id=old.id,
-            assembly_window_start=old.assembly_window_start,
-            assembly_window_end=old.assembly_window_end,
-            roll_evidence=list(old.roll_evidence or []),
-            staged_effects=[],
-            contract_snapshot=None,
-            commit_operation_id=None,
+        old.invalidated_at = _now()
+        new_attempt = create_attempt(
+            db, turn, source_revision=int(campaign.revision or 0), parent=old,
+            submission_ids=old.submission_ids, input_set_revision=old.input_set_revision,
+            assembly_window=(old.assembly_window_start, old.assembly_window_end),
+            roll_evidence=old.roll_evidence,
             retry_count=int(getattr(old, "retry_count", 0) or 0),
-            next_retry_at=None,
-            last_error=getattr(old, "last_error", None),
-            error_class=getattr(old, "error_class", None),
         )
-        new_attempt.commit_operation_id = str(new_attempt.id)
-        db.add(new_attempt)
-        db.flush()
-        turn.current_attempt_id = new_attempt.id
         turn.source_revision = int(campaign.revision or 0)
         db.add(turn)
         db.flush()
@@ -595,612 +993,6 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
             getattr(attempt, "id", None), exc,
         )
         return attempt
-
-
-def _execute_owned_attempt(
-    db: Session,
-    attempt_id: uuid.UUID,
-    *,
-    adjudicate=None,
-    narrator=None,
-    provider_name: str | None = None,
-    timeout_seconds: float = 90,
-    trace_id: str | None = None,
-):
-    """Claim and execute one prepared DM attempt end-to-end (idempotent).
-
-    ``adjudicate``/``narrator`` are injectable seams for tests; production
-    defaults resolve the configured provider via ``app.dm.adjudication``.
-    Returns the :class:`ValidatedTurnResult` on success.
-    """
-    from app.dm.turns import (
-        ATTEMPT_PREPARED,
-        ATTEMPT_RUNNING,
-        mark_attempt_failed,
-        mark_attempt_running,
-    )
-    from app.dm.evidence import run_bounded_evidence_loop
-    from app.dm.validators import default_pipeline
-    from app.dm.narration import (
-        NarrationStreamError,
-        execute_validated_turn,
-    )
-    from app.world.identity import IdentityReuseRequiresReadjudication
-    from app.observability.tracing import structured_log
-    from models.dm import DmTurn, DmTurnAttempt
-
-    tid = trace_id or str(uuid.uuid4())
-    attempt = db.get(DmTurnAttempt, attempt_id)
-    if attempt is None:
-        raise ValueError(f"DM attempt {attempt_id} not found")
-    turn = db.get(DmTurn, attempt.turn_id)
-
-    # Idempotent no-ops: already terminal/streaming work is never re-executed.
-    if attempt.status in ("succeeded", "streaming", "failed_visible", "superseded", "discarded", "abandoned"):
-        logger.info(
-            "dm_execute skip attempt_id=%s status=%s", attempt.id, attempt.status,
-        )
-        return None
-    submission_ids = list(attempt.submission_ids or [])
-    campaign_id = attempt.campaign_id
-    turn_id = attempt.turn_id
-
-    # Issue #222 — safe lag/backpressure: while post-turn trails beyond the
-    # safe forward-DM context budget, new AI progression pauses BEFORE
-    # context becomes unreliable. The attempt stays prepared (no failure
-    # marker — this is not failure) with a future retry-eligibility time so
-    # blocked attempts defer behind ready work, and a critical catch-up
-    # trigger fires. Player-input acceptance/coordination is untouched:
-    # accepted intent stays durable and resolves after catch-up (the resume
-    # path rebases the prepared attempt when catch-up advanced authority).
-    from app.post_turn.backpressure import pause_if_backpressured
-
-    _bp_status = pause_if_backpressured(
-        db, campaign_id, attempt_id=attempt.id, turn_id=turn_id,
-    )
-    if _bp_status is not None:
-        _defer_backpressured_attempt(db, attempt)
-        return None
-    attempt = _refresh_backpressured_stale_attempt(db, attempt)
-    attempt_id = attempt.id
-    turn = db.get(DmTurn, attempt.turn_id)
-    submission_ids = list(attempt.submission_ids or [])
-
-    # A caller observing running work must never adopt another worker's claim.
-    try:
-        attempt = mark_attempt_running(db, attempt.id)
-    except ValueError:
-        db.rollback()
-        return None
-
-    def _fail_closed(exc: BaseException) -> None:
-        """Authority/context failure: always visible, never retried blindly.
-
-        A missing-authority or source-reader error will fail identically on
-        every retry until the authority or code is fixed, so resetting to
-        prepared would only burn sweeps. Leave a visible marker instead.
-        """
-        error_class = _classify_failure(exc)
-        try:
-            mark_attempt_failed(
-                db, attempt.id,
-                error=f"{type(exc).__name__}: {exc}"[:2000],
-                error_class=error_class,
-                visible=True,
-            )
-        except Exception as mark_exc:
-            logger.warning(
-                "dm_execute failure-marking failed attempt_id=%s error=%s",
-                attempt_id, mark_exc,
-            )
-        structured_log(
-            logger, logging.WARNING, "dm_execute_failed",
-            attempt_id=str(attempt_id), turn_id=str(turn_id),
-            error_class=error_class, error=str(exc)[:500], trace_id=tid,
-        )
-
-    def _fail_visible(exc: BaseException) -> None:
-        from app.worker.executor import RETRIABLE
-
-        error_class = _classify_failure(exc)
-        try:
-            fresh_attempt = db.get(DmTurnAttempt, attempt.id)
-            fresh_turn = db.get(DmTurn, turn_id) if turn_id else None
-            crossed = (
-                (fresh_attempt is not None and fresh_attempt.status in ("streaming", "failed_visible"))
-                or (fresh_turn is not None and fresh_turn.status in ("streaming", "failed_visible"))
-            )
-            if error_class == RETRIABLE and not crossed:
-                # Pre-visibility transient: keep retryable work but requeue it
-                # BEHIND ready work. Reset the claim to prepared with a future
-                # eligibility time (error preserved) so the next cron sweep
-                # retries without manual repair — without
-                # letting one failing attempt starve newer prepared attempts.
-                if fresh_attempt is not None:
-                    from datetime import datetime, timezone
-                    from datetime import timedelta as _td
-
-                    now = datetime.now(timezone.utc)
-                    retries = int(getattr(fresh_attempt, "retry_count", 0) or 0) + 1
-                    fresh_attempt.last_error = f"{type(exc).__name__}: {exc}"[:2000]
-                    fresh_attempt.error_class = error_class
-                    fresh_attempt.status = ATTEMPT_PREPARED
-                    fresh_attempt.started_at = None
-                    fresh_attempt.completed_at = None
-                    fresh_attempt.retry_count = retries
-                    fresh_attempt.next_retry_at = now + _td(
-                        seconds=retry_backoff_seconds(retries)
-                    )
-                    db.add(fresh_attempt)
-                    db.commit()
-                structured_log(
-                    logger, logging.WARNING, "dm_execute_retryable",
-                    attempt_id=str(attempt_id), turn_id=str(turn_id),
-                    error_class=error_class, error=str(exc)[:500], trace_id=tid,
-                )
-                return
-            mark_attempt_failed(
-                db, attempt.id,
-                error=f"{type(exc).__name__}: {exc}"[:2000],
-                error_class=error_class,
-                visible=True,
-            )
-            try:
-                _attach_public_retry_marker(db, attempt.id)
-                db.commit()
-            except Exception:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-        except Exception as mark_exc:
-            logger.warning(
-                "dm_execute failure-marking failed attempt_id=%s error=%s",
-                attempt_id, mark_exc,
-            )
-        structured_log(
-            logger, logging.WARNING, "dm_execute_failed",
-            attempt_id=str(attempt_id), turn_id=str(turn_id),
-            error_class=error_class, error=str(exc)[:500], trace_id=tid,
-        )
-
-    def _defer_archived(reason: str):
-        """Dormancy deferral — issue #265.
-
-        Archive committed after this worker's last playability check. Reset
-        the claim to prepared (no failure marker — dormancy is not failure)
-        so the post-restore sweep resumes the exact same attempt.
-        """
-        from app.campaigns.service import CampaignArchivedError  # noqa: F401 (re-export guard)
-
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        try:
-            from models.dm import DmTurnAttempt as _AttDeferred
-
-            _cur = db.get(_AttDeferred, attempt.id)
-            if _cur is not None and _cur.status == ATTEMPT_RUNNING:
-                _cur.status = ATTEMPT_PREPARED
-                _cur.started_at = None
-                _cur.last_error = f"CampaignArchived: {reason}"
-                db.add(_cur)
-                db.commit()
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        logger.info(
-            "dm_execute deferred attempt_id=%s campaign_id=%s reason=%s",
-            attempt.id, campaign_id, reason,
-        )
-        return None
-
-    def _is_archived_error(exc: BaseException) -> bool:
-        from app.campaigns.service import CampaignArchivedError
-
-        return isinstance(exc, CampaignArchivedError)
-
-    try:
-        packet = _assemble_production_context(db, attempt.id)
-    except Exception as exc:
-        db.rollback()
-        _fail_closed(exc)
-        raise
-
-    # Resolve providers per call area (fail-clear gates live in
-    # adjudication/areas config). Narrator resolves its own pinned area
-    # inside build_provider_narrator. #208: adjudication runs through the
-    # role-aware failover path on the same spine (no parallel stack).
-    # Explicit-retry lineage for accounting: only attempts whose parent was
-    # abandoned via explicit Retry count as recovery/non-billable. Ordinary
-    # pre-stream supersession also creates parented attempts, but those are
-    # first-try executions (primary/billable).
-    _is_explicit_retry = False
-    _retry_parent_id = getattr(attempt, "parent_attempt_id", None)
-    if _retry_parent_id is not None:
-        try:
-            from models.dm import DmTurnAttempt as _ParentAtt
-
-            _parent = db.get(_ParentAtt, _retry_parent_id)
-            _is_explicit_retry = (
-                _parent is not None
-                and _parent.status == "abandoned"
-                and (_parent.abandonment_reason or "") == "explicit_retry"
-            )
-        except Exception:
-            _is_explicit_retry = False
-    # Automatic same-attempt retries (a pre-visibility transient requeued
-    # with retry_count > 0) are recovery work too.
-    _is_recovery_retry = _is_explicit_retry or int(
-        getattr(attempt, "retry_count", 0) or 0) > 0
-    adapter = None
-    model = None
-    pname = provider_name
-    path_info: dict = {}
-    if adjudicate is None:
-        try:
-            from app.providers import policy as _role_policy
-
-            _path = _role_policy.execution_path("forward_dm")
-            pname = pname or _path[0][0]
-            model = _path[0][1]
-
-            def adjudicate(packet, feedback=None):  # type: ignore[misc]
-                from app.dm.adjudication import adjudicate_with_failover as _failover
-
-                _ = feedback  # feedback reaches the model via regeneration packet
-                contract, info = _failover(
-                    packet, db=db, role="forward_dm",
-                    timeout_seconds=timeout_seconds, trace_id=tid,
-                    # Explicit-Retry attempts carry retry lineage: even the
-                    # first provider call is recovery/non-billable so failed
-                    # work is never double-charged.
-                    is_retry=_is_recovery_retry,
-                    campaign_id=campaign_id,
-                )
-                path_info.update(info)
-                return contract
-        except Exception as exc:
-            db.rollback()
-            _fail_visible(exc)
-            raise
-
-    structured_log(
-        logger, logging.INFO, "dm_execute_start",
-        submission_ids=[str(s) for s in submission_ids],
-        turn_id=str(turn_id), attempt_id=str(attempt.id),
-        provider=pname, model=model, trace_id=tid,
-    )
-
-    # Narration-only retry (#208): a fresh explicit-Retry attempt carrying a
-    # preserved valid contract_snapshot skips adjudication and goes straight
-    # to narration+commit. Staged effects are re-staged from the snapshot
-    # (never copied as committed truth).
-    _snapshot_contract = None
-    _reuse_snapshot = (
-        getattr(attempt, "contract_snapshot", None) is not None
-        and getattr(attempt, "parent_attempt_id", None) is not None
-    )
-    if _reuse_snapshot:
-        try:
-            from app.dm.contract import normalize_contract as _normalize_snapshot
-
-            _snapshot_contract = _normalize_snapshot(dict(attempt.contract_snapshot))
-            structured_log(
-                logger, logging.INFO, "dm_execute_narration_retry",
-                turn_id=str(turn_id), attempt_id=str(attempt.id),
-                trace_id=tid,
-            )
-        except Exception:
-            _snapshot_contract = None
-            _reuse_snapshot = False
-
-    # Identity-deferral retry feedback: when an abandoned explicit-retry
-    # parent deferred a new-entity identity (deterministic adjudication
-    # would otherwise replay the identical frame into the same DEFER),
-    # advise re-adjudication to disambiguate. Advisory only — the
-    # generative DM stays authoritative. Fail-soft: no advisory on error.
-    if _snapshot_contract is None:
-        from app.dm.context import (
-            attach_retry_deferral_advisory,
-            build_retry_deferral_advisory,
-        )
-
-        _deferral_note = build_retry_deferral_advisory(db, attempt)
-        if _deferral_note is not None:
-            structured_log(
-                logger, logging.INFO, "dm_execute_deferral_advisory",
-                turn_id=str(turn.id), attempt_id=str(attempt.id),
-                trace_id=tid,
-            )
-            _base_adjudicate = adjudicate
-
-            def adjudicate(packet, feedback=None):  # type: ignore[misc]
-                return _base_adjudicate(
-                    attach_retry_deferral_advisory(packet, _deferral_note),
-                    feedback=feedback,
-                )
-
-    def _adjudicate_and_validate(start_packet):
-        """Run the normal evidence and validation path for an initial or repaired packet."""
-        validation_packet = start_packet
-
-        from app.dm.contract import ContractValidationError as _ContractValidationError
-
-        def _repair_missing_perspectives(report, pkt):
-            """Deterministic perspective repair (issue #455): resolve-then-retry.
-
-            Best-effort and read-only: unresolvable subjects yield None and
-            the regen loop falls back to deterministic scope-narrowing.
-            """
-            try:
-                from app.dm.context import repair_packet_missing_perspectives as _repair_lanes
-                from app.dm.validators import missing_perspective_subjects as _subjects
-                from models.campaigns import Campaign as _Campaign
-
-                if pkt is None:
-                    return None
-                campaign = db.get(_Campaign, campaign_id)
-                if campaign is None:
-                    return None
-                subjects = _subjects(report)
-                if not subjects:
-                    return None
-                return _repair_lanes(pkt, db, campaign, subjects)
-            except Exception as exc:
-                logger.warning("dm_execute perspective repair failed: %s", exc)
-                return None
-
-        def _regen(adjudicate_fn, pkt):
-            """Bounded regeneration returning the contract and the packet it passed against.
-
-            A perspective repair swaps in a packet carrying the resolved lane
-            entries; later validation must use that packet, or the repaired
-            contract fails again on the unrepaired one.
-            """
-            from app.dm.validators import run_with_bounded_regeneration as _regen_loop
-
-            repaired_packets = []
-
-            def _repair_hook(report, current):
-                repaired_pkt = _repair_missing_perspectives(report, current)
-                if repaired_pkt is not None:
-                    repaired_packets.append(repaired_pkt)
-                return repaired_pkt
-
-            contract, _ = _regen_loop(adjudicate_fn, pkt, packet_repair=_repair_hook)
-            return contract, (repaired_packets[-1] if repaired_packets else pkt)
-
-        def evidence_adjudicate(enriched_packet):
-            nonlocal validation_packet
-            validation_packet = enriched_packet
-            try:
-                return adjudicate(enriched_packet)
-            except _ContractValidationError:
-                repaired, validation_packet = _regen(adjudicate, enriched_packet)
-                return repaired
-
-        final_contract, _bundle = run_bounded_evidence_loop(
-            initial_packet=start_packet, adjudicate=evidence_adjudicate, db=db,
-        )
-        report = default_pipeline.validate(final_contract, validation_packet)
-        if report.passed:
-            return final_contract, validation_packet
-        return _regen(adjudicate, validation_packet)
-
-    try:
-        if _snapshot_contract is not None:
-            contract = _snapshot_contract
-        else:
-            contract, packet = _adjudicate_and_validate(packet)
-    except Exception as exc:
-        db.rollback()
-        _fail_visible(exc)
-        raise
-
-    # Issue #265 — dormancy re-check at the first durable visibility
-    # boundary. Archive may have committed during adjudication/validation;
-    # persisting a stream, roll-await, or silent completion afterwards would
-    # advance an archived table. Defer instead: reset the claim to prepared
-    # (no failure marker — dormancy is not failure) so the post-restore sweep
-    # resumes the exact same attempt.
-    _archived_now = False
-    try:
-        from models.campaigns import Campaign as _Campaign
-
-        _fresh_campaign = db.get(_Campaign, campaign_id)
-        _archived_now = (
-            _fresh_campaign is not None
-            and str(_fresh_campaign.status or "").lower() == "archived"
-        )
-    except Exception as exc:
-        logger.warning("dm_execute archive re-check failed attempt_id=%s error=%s", attempt.id, exc)
-    if _archived_now:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        try:
-            from models.dm import DmTurnAttempt as _AttArchived
-
-            _current = db.get(_AttArchived, attempt.id)
-            if _current is not None and _current.status == ATTEMPT_RUNNING:
-                _current.status = ATTEMPT_PREPARED
-                _current.started_at = None
-                _current.last_error = "CampaignArchived: deferred until restore"
-                db.add(_current)
-                db.commit()
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        logger.info(
-            "dm_execute deferred attempt_id=%s campaign_id=%s reason=archived_at_visibility_boundary",
-            attempt.id, campaign_id,
-        )
-        return None
-
-    # Mode-aware lifecycle dispatch: non-final modes must not go through
-    # the final narration-and-commit path.
-    if contract.mode == "await_roll":
-        try:
-            return _complete_await_roll(
-                db, turn=turn, attempt=attempt, contract=contract, trace_id=tid,
-            )
-        except Exception as exc:
-            if _is_archived_error(exc):
-                return _defer_archived("await_roll")
-            db.rollback()
-            try:
-                from models.dm import DmTurnAttempt as _Att
-
-                current = db.get(_Att, attempt.id)
-                if current is not None and current.status in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
-                    _fail_visible(exc)
-            except Exception:
-                pass
-            raise
-    if contract.mode == "silent":
-        try:
-            return _complete_silent(
-                db, turn=turn, attempt=attempt, contract=contract,
-                provider=pname or "dm-provider", trace_id=tid,
-            )
-        except Exception as exc:
-            if _is_archived_error(exc):
-                return _defer_archived("silent")
-            db.rollback()
-            try:
-                from models.dm import DmTurnAttempt as _Att
-
-                current = db.get(_Att, attempt.id)
-                if current is not None and current.status in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
-                    _fail_visible(exc)
-            except Exception:
-                pass
-            raise
-
-    if narrator is None:
-        try:
-            from app.dm.adjudication import build_provider_narrator
-
-            narrator = build_provider_narrator(
-                timeout_seconds=timeout_seconds,
-                db=db, trace_id=tid, is_retry=_is_recovery_retry,
-                campaign_id=campaign_id,
-            )
-        except Exception as exc:
-            db.rollback()
-            _fail_visible(exc)
-            raise
-    elif narrator == "deterministic":
-        # Explicit opt-in to the deterministic template narrator (no model
-        # call): same production stream/commit path, used by tests.
-        narrator = None
-
-    try:
-        for identity_repair_index in range(2):
-            try:
-                result = execute_validated_turn(
-                    db,
-                    turn_id=turn.id,
-                    attempt_id=attempt.id,
-                    contract=contract,
-                    narrator=narrator,
-                    provider=pname or "dm-provider",
-                    publish_realtime=True,
-                    trace_id=tid,
-                )
-                break
-            except IdentityReuseRequiresReadjudication as conflict:
-                # Identity resolution runs after attempt-local staging but
-                # before chunk zero. Roll back its uncommitted reads and
-                # re-adjudicate once against the resolved canonical identity.
-                # The next staging pass replaces the old snapshot/effects.
-                db.rollback()
-                from models.dm import DmTurnAttempt as _IdentityAttempt
-
-                current = db.get(_IdentityAttempt, attempt.id)
-                if current is not None:
-                    # Staging committed the original contract. It must not
-                    # become a narration-only retry candidate if correction
-                    # fails before the replacement contract is staged.
-                    current.contract_snapshot = None
-                    current.staged_effects = []
-                    current.identity_resolutions = None
-                    db.add(current)
-                    db.commit()
-                if identity_repair_index >= 1 or _snapshot_contract is not None:
-                    raise
-                packet = _with_identity_repair(packet, conflict)
-                structured_log(
-                    logger, logging.INFO, "dm_execute_identity_readjudication",
-                    turn_id=str(turn.id), attempt_id=str(attempt.id),
-                    canonical_id=conflict.canonical_id, trace_id=tid,
-                )
-                contract, packet = _adjudicate_and_validate(packet)
-    except NarrationStreamError as exc:
-        # Post-visibility remediation already applied inside
-        # execute_validated_turn. The valid structured packet survives in
-        # attempt.contract_snapshot so narration can retry independently
-        # without re-adjudication.
-        try:
-            from models.dm import DmTurnAttempt as _Att2
-
-            current = db.get(_Att2, attempt.id)
-            if current is not None:
-                base = dict(current.result or {})
-                base["narration_retry_available"] = True
-                base["partial_stream_id"] = str(exc.stream_id) if exc.stream_id else None
-                current.result = base
-                db.add(current)
-                _attach_public_retry_marker(db, attempt.id)
-                db.commit()
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-        structured_log(
-            logger, logging.WARNING, "dm_execute_stream_failed",
-            turn_id=str(turn_id), attempt_id=str(attempt.id),
-            stream_id=str(exc.stream_id), trace_id=tid,
-        )
-        raise
-    except Exception as exc:
-        if _is_archived_error(exc):
-            # Chunk-0 boundary refused the archived table: the chunk row
-            # rolled back with it, so nothing visible persisted — defer.
-            return _defer_archived("first_visible_boundary")
-        db.rollback()
-        # Pre-visibility failure: nothing persisted, leave a visible marker
-        # so the turn never looks stuck-thinking.
-        try:
-            from models.dm import DmTurnAttempt as _Att
-
-            current = db.get(_Att, attempt.id)
-            if current is not None and current.status in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
-                _fail_visible(exc)
-        except Exception:
-            pass
-        raise
-
-    structured_log(
-        logger, logging.INFO, "dm_execute_complete",
-        turn_id=str(result.turn.id), attempt_id=str(result.attempt.id),
-        stream_id=str(result.narration.stream_id),
-        audience=str(getattr(result.turn, "audience", "campaign")),
-        provider=path_info.get("provider") or pname,
-        model=path_info.get("model") or model,
-        failover_reasons=path_info.get("failover_reasons") or [],
-        ttft_added_ms=path_info.get("ttft_added_ms") or 0.0,
-        trace_id=tid,
-    )
-    return result
 
 
 def find_prepared_attempts(db: Session, *, limit: int = 5):

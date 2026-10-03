@@ -11,6 +11,8 @@ import json
 import logging
 import uuid
 
+from app.providers import policy as role_policy
+
 logger = logging.getLogger(__name__)
 
 #: Reasoning effort for forward-DM adjudication. Muse Spark always reasons
@@ -91,9 +93,9 @@ intent; do not request the same roll again.
 def resolve_dm_provider():
     """Resolve (adapter, model, provider_name) for forward-DM execution.
 
-    Thin wrapper over ``app.providers.resolve_area("dm")`` kept for
-    backwards compatibility. Provider + model are pinned in code
-    (see ``app.providers.areas``); only the API key comes from env.
+    The forward-DM primary seam over ``app.providers.resolve_area("dm")``
+    (test fakes patch it). Provider + model are pinned in code (see
+    ``app.providers.areas``); only the API key comes from env.
     """
     from app.providers.areas import resolve_area
 
@@ -162,31 +164,15 @@ def parse_contract_json(text: str) -> dict:
     return raw
 
 
-def adjudicate_with_provider(
-    packet,
-    *,
-    adapter=None,
-    model: str | None = None,
-    timeout_seconds: float = 90,
-    trace_id: str | None = None,
-):
-    """Call the configured provider and normalize to DmTurnContractV1.
-
-    Raises the provider/validation error unchanged so the execution
-    orchestrator can mark a visible failure (never fabricate a turn).
-    """
+def _adjudicate_once(packet, *, adapter, model: str, timeout_seconds: float,
+                     trace_id: str, attempt: int = 1, classification: str = "primary"):
+    """One schema-constrained adjudication call; returns (contract, response)."""
     from app.dm.contract import contract_json_schema_strict, normalize_contract
     from app.providers import ProviderRequest, execute_chat
     from app.observability.tracing import structured_log
 
-    if adapter is None or model is None:
-        resolved_adapter, resolved_model, _ = resolve_dm_provider()
-        adapter = adapter or resolved_adapter
-        model = model or resolved_model
-    tid = trace_id or str(uuid.uuid4())
-    messages = build_forward_dm_messages(packet)
     request = ProviderRequest(
-        messages=messages,
+        messages=build_forward_dm_messages(packet),
         model=model,
         json_schema=contract_json_schema_strict(),
         json_schema_name="dm_turn_contract_v1",
@@ -198,16 +184,12 @@ def adjudicate_with_provider(
     )
     structured_log(
         logger, logging.INFO, "forward_dm_provider_start",
-        provider=adapter.name, model=model, trace_id=tid,
+        provider=adapter.name, model=model,
+        trace_id=trace_id, attempt=attempt, classification=classification,
     )
     response = execute_chat(adapter, request)
-    raw = parse_contract_json(response.content)
-    contract = normalize_contract(raw)
-    structured_log(
-        logger, logging.INFO, "forward_dm_provider_contract",
-        provider=adapter.name, model=model, mode=contract.mode, trace_id=tid,
-    )
-    return contract
+    contract = normalize_contract(parse_contract_json(response.content))
+    return contract, response
 
 
 def adjudicate_with_failover(
@@ -238,32 +220,19 @@ def adjudicate_with_failover(
     """
     import time
 
-    from app.providers import ProviderRequest, execute_chat
-    from app.providers import policy as role_policy
+    from app.providers.runner import (
+        AiRunLedger, classification_for, require_approved, resolve_candidate,
+    )
     from app.observability.tracing import structured_log
 
     tid = trace_id or str(uuid.uuid4())
     t_start = time.monotonic()
     role_policy.get_role_policy(role)
-    # Independent telemetry transaction: AI-run rows must survive gameplay
-    # rollback so failed attempts keep their recovery/billing attribution.
-    telemetry = None
-    if db is not None:
-        try:
-            from app.observability.service import telemetry_factory_for
-
-            telemetry = telemetry_factory_for(db)
-        except Exception:
-            telemetry = None
 
     if adapter is not None and model is not None:
         # Injected seam (tests): single pinned attempt, no failover chain.
-        if not role_policy.is_model_approved(role, adapter.name, model):
-            raise RuntimeError(
-                f"Unapproved model substitution blocked for role {role!r}: "
-                f"{adapter.name}/{model}"
-            )
-        contract = adjudicate_with_provider(
+        require_approved(role, adapter.name, model)
+        contract, _ = _adjudicate_once(
             packet, adapter=adapter, model=model,
             timeout_seconds=timeout_seconds, trace_id=tid,
         )
@@ -273,116 +242,65 @@ def adjudicate_with_failover(
             "ttft_added_ms": 0.0,
         }
 
+    ledger = AiRunLedger(
+        db, role=role, logical_operation="forward_dm_adjudicate",
+        trace_id=tid, campaign_id=campaign_id,
+    )
     path = role_policy.execution_path(role)
     failover_reasons: list[str] = []
     last_exc: BaseException | None = None
     for index, (provider_name, candidate_model) in enumerate(path):
-        if not role_policy.is_model_approved(role, provider_name, candidate_model):
-            # Defense in depth: execution_path should never yield these.
-            raise RuntimeError(
-                f"Unapproved model substitution blocked for role {role!r}: "
-                f"{provider_name}/{candidate_model}"
-            )
+        # Defense in depth: execution_path should never yield unapproved
+        # candidates; the gate raises before any config resolution.
+        require_approved(role, provider_name, candidate_model)
         try:
-            if index == 0:
+            cand_adapter, cand_model = resolve_candidate(
+                role, index, provider_name, candidate_model,
                 # Primary resolves through the canonical seam so existing
                 # config gates and test hooks on resolve_dm_provider hold.
-                cand_adapter, cand_model, _ = resolve_dm_provider()
-            else:
-                from app.providers.registry import provider_registry
-
-                cand_adapter = provider_registry.get(provider_name)
-                cand_adapter.require_config(candidate_model)
-                cand_model = candidate_model
+                resolve_primary=resolve_dm_provider,
+            )
         except Exception as exc:
             last_exc = exc
             reason = f"config_unavailable:{provider_name}"
             failover_reasons.append(reason)
             role_policy.record_failover_attempt(reason, provider_name, candidate_model)
             continue
-        classification = "recovery" if (index > 0 or is_retry) else "primary"
-        ai_run = None
-        if telemetry is not None:
-            try:
-                from app.observability.service import start_ai_run
-
-                ai_run = start_ai_run(
-                    telemetry, logical_operation="forward_dm_adjudicate",
-                    role=role, provider=cand_adapter.name, model=cand_model,
-                    attempt=index + 1, classification=classification,
-                    billable=(classification == "primary"),
-                    trace_id=tid,
-                )
-                if classification == "recovery":
-                    role_policy.record_recovery_run(billable=False)
-            except Exception:
-                ai_run = None
+        classification = classification_for(index, is_retry)
+        run = ledger.start(
+            adapter=cand_adapter, model=cand_model, path_index=index,
+            classification=classification,
+        )
+        if run.tracked and classification == "recovery":
+            role_policy.record_recovery_run(billable=False)
         try:
-            from app.dm.contract import contract_json_schema_strict, normalize_contract
-
-            messages = build_forward_dm_messages(packet)
-            request = ProviderRequest(
-                messages=messages, model=cand_model,
-                json_schema=contract_json_schema_strict(),
-                json_schema_name="dm_turn_contract_v1",
-                timeout_seconds=timeout_seconds, temperature=0,
-                reasoning_effort=FORWARD_DM_REASONING_EFFORT,
+            contract, response = _adjudicate_once(
+                packet, adapter=cand_adapter, model=cand_model,
+                timeout_seconds=timeout_seconds, trace_id=tid,
+                attempt=index + 1, classification=classification,
             )
-            structured_log(
-                logger, logging.INFO, "forward_dm_provider_start",
-                provider=cand_adapter.name, model=cand_model,
-                trace_id=tid, attempt=index + 1, classification=classification,
-            )
-            response = execute_chat(cand_adapter, request)
-            raw = parse_contract_json(response.content)
-            contract = normalize_contract(raw)
-            ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
-            if ai_run is not None and telemetry is not None:
-                try:
-                    from app.billing.config import cost_usd_for, tokens_from_usage
-                    from app.billing.ledger import charge_finished_run
-                    from app.observability.service import finish_ai_run
-
-                    usage = getattr(response, "usage", None)
-                    in_tokens, out_tokens = tokens_from_usage(usage)
-                    finish_ai_run(telemetry, ai_run.id, status="succeeded",
-                                  result_code="contract_ok",
-                                  input_tokens=in_tokens, output_tokens=out_tokens,
-                                  cost_usd=cost_usd_for(cand_adapter.name, cand_model, usage))
-                    if campaign_id is not None:
-                        charge_finished_run(telemetry, run_id=ai_run.id,
-                                            campaign_id=campaign_id)
-                except Exception:
-                    pass
-            structured_log(
-                logger, logging.INFO, "forward_dm_provider_contract",
-                provider=cand_adapter.name, model=cand_model,
-                mode=contract.mode, trace_id=tid,
-                failover_reasons=failover_reasons,
-            )
-            return contract, {
-                "provider": cand_adapter.name, "model": cand_model,
-                "attempt_index": index, "failover_reasons": list(failover_reasons),
-                "ttft_added_ms": ttft_added,
-            }
         except Exception as exc:
             last_exc = exc
-            if ai_run is not None and telemetry is not None:
-                try:
-                    from app.observability.service import finish_ai_run
-
-                    finish_ai_run(telemetry, ai_run.id, status="failed",
-                                  error_type=type(exc).__name__[:128])
-                except Exception:
-                    pass
+            run.failed(exc)
             cls, reason = role_policy.classify_execution_failure(exc)
             failover_reasons.append(reason)
-            role_policy.record_failover_attempt(
-                reason, cand_adapter.name, cand_model
-            )
+            role_policy.record_failover_attempt(reason, cand_adapter.name, cand_model)
             if cls == "terminal" or index >= len(path) - 1:
                 break
             continue
+        ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
+        run.succeeded(usage=getattr(response, "usage", None), result_code="contract_ok")
+        structured_log(
+            logger, logging.INFO, "forward_dm_provider_contract",
+            provider=cand_adapter.name, model=cand_model,
+            mode=contract.mode, trace_id=tid,
+            failover_reasons=failover_reasons,
+        )
+        return contract, {
+            "provider": cand_adapter.name, "model": cand_model,
+            "attempt_index": index, "failover_reasons": list(failover_reasons),
+            "ttft_added_ms": ttft_added,
+        }
     assert last_exc is not None
     role_policy.record_exhausted()
     raise last_exc
@@ -424,55 +342,50 @@ def build_provider_narrator(
     explicit-retry attempt).
     """
     from app.providers import ProviderRequest, stream_chat
-    from app.providers import policy as role_policy
+    from app.providers.runner import (
+        AiRunLedger, classification_for, require_approved, resolve_candidate,
+    )
     from app.observability.tracing import structured_log
 
     tid = trace_id or str(uuid.uuid4())
-    # Independent telemetry transaction (see adjudication path): narration
-    # runs survive gameplay rollback.
-    telemetry = None
-    if db is not None:
-        try:
-            from app.observability.service import telemetry_factory_for
-
-            telemetry = telemetry_factory_for(db)
-        except Exception:
-            telemetry = None
+    ledger = AiRunLedger(
+        db, role=role, logical_operation="narration_stream",
+        trace_id=tid, campaign_id=campaign_id,
+    )
     if adapter is not None and model is not None:
-        if not role_policy.is_model_approved(role, adapter.name, model):
-            raise RuntimeError(
-                f"Unapproved model substitution blocked for role {role!r}: "
-                f"{adapter.name}/{model}"
-            )
-        pinned = [(0, adapter, model)]
+        require_approved(role, adapter.name, model)
+        policy_path = None
     else:
         if (adapter is not None) != (model is not None):
             raise RuntimeError(
                 "Provide both adapter and model, or neither (policy path)"
             )
-        pinned = None
-    policy_path = None if pinned is not None else role_policy.execution_path(role)
+        policy_path = role_policy.execution_path(role)
 
-    def _resolve(path_index: int, provider_name: str, candidate_model: str):
-        """Resolve one candidate, preserving its policy-path index."""
-        if not role_policy.is_model_approved(role, provider_name, candidate_model):
-            raise RuntimeError(
-                f"Unapproved model substitution blocked for role {role!r}: "
-                f"{provider_name}/{candidate_model}"
+    def _resolved_candidates() -> list[tuple[int, object, str]]:
+        """(path_index, adapter, model) for every configurable candidate."""
+        if policy_path is None:
+            return [(0, adapter, model)]
+        resolved: list[tuple[int, object, str]] = []
+        first_error: BaseException | None = None
+        for path_index, (provider_name, candidate_model) in enumerate(policy_path):
+            try:
+                cand_adapter, cand_model = resolve_candidate(
+                    role, path_index, provider_name, candidate_model)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                role_policy.record_failover_attempt(
+                    f"config_unavailable:{provider_name}", str(provider_name),
+                    candidate_model,
+                )
+                continue
+            resolved.append((path_index, cand_adapter, cand_model))
+        if not resolved:
+            raise first_error if first_error is not None else RuntimeError(
+                f"No narration provider available for role {role!r}"
             )
-        if path_index == 0:
-            # Primary resolves through the canonical seam so existing
-            # config gates hold.
-            from app.providers.areas import resolve_area
-
-            area = role_policy.ROLE_AREA.get(role, role)
-            cand_adapter, cand_model, _ = resolve_area(area)
-            return cand_adapter, cand_model
-        from app.providers.registry import provider_registry
-
-        cand_adapter = provider_registry.get(provider_name)
-        cand_adapter.require_config(candidate_model)
-        return cand_adapter, candidate_model
+        return resolved
 
     def _narrate(narrator_request) -> object:
         prompt = getattr(narrator_request, "prompt", "")
@@ -485,56 +398,13 @@ def build_provider_narrator(
                 return False
 
         def _gen():
-            # (path_index, provider_ref, model, pre_resolved): provider_ref
-            # is an adapter when pinned, else a registry name.
-            if pinned is not None:
-                entries = [(0, adapter, model, True)]
-            else:
-                assert policy_path is not None
-                entries = [(i, p, m, False) for i, (p, m) in enumerate(policy_path)]
-            resolved: list[tuple[int, object, str]] = []
-            first_error: BaseException | None = None
-            for path_index, provider_ref, candidate_model, pre_resolved in entries:
-                try:
-                    if pre_resolved:
-                        cand_adapter, cand_model = provider_ref, candidate_model
-                    else:
-                        cand_adapter, cand_model = _resolve(
-                            path_index, provider_ref, candidate_model)
-                except Exception as exc:
-                    if first_error is None:
-                        first_error = exc
-                    role_policy.record_failover_attempt(
-                        f"config_unavailable:{provider_ref}", str(provider_ref),
-                        candidate_model,
-                    )
-                    continue
-                resolved.append((path_index, cand_adapter, cand_model))
-            if not resolved:
-                raise first_error if first_error is not None else RuntimeError(
-                    f"No narration provider available for role {role!r}"
-                )
-            failover_reasons: list[str] = []
+            resolved = _resolved_candidates()
             for position, (path_index, cand_adapter, cand_model) in enumerate(resolved):
-                # Lineage follows the POLICY-PATH index: a skipped primary
-                # never promotes an alternate to billable primary work.
-                classification = "recovery" if (path_index > 0 or is_retry) else "primary"
-                billable = (classification == "primary")
-                ai_run = None
-                if telemetry is not None:
-                    try:
-                        from app.observability.service import start_ai_run
-
-                        ai_run = start_ai_run(
-                            telemetry, logical_operation="narration_stream",
-                            role=role, provider=cand_adapter.name,
-                            model=cand_model, attempt=path_index + 1,
-                            classification=classification,
-                            billable=billable,
-                            trace_id=tid,
-                        )
-                    except Exception:
-                        ai_run = None
+                classification = classification_for(path_index, is_retry)
+                run = ledger.start(
+                    adapter=cand_adapter, model=cand_model, path_index=path_index,
+                    classification=classification,
+                )
                 pr = ProviderRequest(
                     messages=[
                         {"role": "system", "content": prompt},
@@ -559,35 +429,11 @@ def build_provider_narrator(
                             yield event.text
                         elif event.kind == "done" and getattr(event, "usage", None):
                             stream_usage = event.usage
-                    if ai_run is not None and telemetry is not None:
-                        try:
-                            from app.billing.config import cost_usd_for, tokens_from_usage
-                            from app.billing.ledger import charge_finished_run
-                            from app.observability.service import finish_ai_run
-
-                            in_tokens, out_tokens = tokens_from_usage(stream_usage)
-                            finish_ai_run(telemetry, ai_run.id, status="succeeded",
-                                          result_code="stream_ok",
-                                          input_tokens=in_tokens, output_tokens=out_tokens,
-                                          cost_usd=cost_usd_for(cand_adapter.name, cand_model,
-                                                                stream_usage))
-                            if campaign_id is not None:
-                                charge_finished_run(telemetry, run_id=ai_run.id,
-                                                    campaign_id=campaign_id)
-                        except Exception:
-                            pass
+                    run.succeeded(usage=stream_usage, result_code="stream_ok")
                     return
                 except Exception as exc:
-                    if ai_run is not None and telemetry is not None:
-                        try:
-                            from app.observability.service import finish_ai_run
-
-                            finish_ai_run(telemetry, ai_run.id, status="failed",
-                                          error_type=type(exc).__name__[:128])
-                        except Exception:
-                            pass
+                    run.failed(exc)
                     cls, reason = role_policy.classify_execution_failure(exc)
-                    failover_reasons.append(reason)
                     role_policy.record_failover_attempt(
                         reason, cand_adapter.name, cand_model
                     )

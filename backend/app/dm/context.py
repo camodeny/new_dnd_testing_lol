@@ -245,6 +245,43 @@ class ForwardDmContextPacket(StrictModel):
     def serialize_for_narration(self) -> str:
         return _canonical_json(self.narration_projection())
 
+    def with_records(
+        self,
+        additions: Mapping[LaneName, Iterable[ContextRecord]],
+        *,
+        dependency: str,
+        budget: ContextBudget | None = None,
+        authoritative_lanes: Iterable[LaneName] = (),
+    ) -> "ForwardDmContextPacket":
+        """Rebuild this packet with ``additions`` appended to their lanes.
+
+        The rebuild goes back through :func:`assemble_context_packet`, so
+        appended records get the same authorization and budget enforcement
+        as assembled ones. ``dependency`` is recorded in the retrieval
+        dependencies; ``authoritative_lanes`` force those lanes' status.
+        """
+        records = {lane.name: list(lane.records) for lane in self.lanes}
+        for name, extra in additions.items():
+            records[name] = [*records.get(name, []), *extra]
+        lane_status = {lane.name: lane.authority_status for lane in self.lanes}
+        for name in authoritative_lanes:
+            lane_status[name] = "authoritative"
+        return assemble_context_packet(
+            audience=self.audience,
+            records=records,
+            lane_status=lane_status,
+            source_errors={lane.name: lane.source_errors for lane in self.lanes},
+            budget=budget,
+            retrieval_dependencies=[*self.observability.retrieval_dependencies, dependency],
+        )
+
+    def headroom_budget(self, extra_bytes: int, extra_tokens: int) -> ContextBudget:
+        """Default budget, raised so this packet plus the headroom still fits."""
+        return ContextBudget(
+            max_bytes=max(DEFAULT_MAX_BYTES, self.observability.serialized_bytes + extra_bytes),
+            max_tokens=max(DEFAULT_MAX_TOKENS, self.observability.estimated_tokens + extra_tokens),
+        )
+
 
 class ContextAssemblyError(RuntimeError):
     code = "context_assembly_failed"
@@ -1580,18 +1617,13 @@ def repair_packet_missing_perspectives(
             required=False,
             priority=100,
         )
-        records: dict = {lane.name: list(lane.records) for lane in packet.lanes}
-        records[LaneName.KNOWLEDGE_VISIBILITY] = list(records.get(LaneName.KNOWLEDGE_VISIBILITY, [])) + new_records
-        records[LaneName.REPAIR_DIRECTIVES] = list(records.get(LaneName.REPAIR_DIRECTIVES, [])) + [directive]
-        lane_status = {lane.name: lane.authority_status for lane in packet.lanes}
-        source_errors = {lane.name: lane.source_errors for lane in packet.lanes}
-        lane_status[LaneName.REPAIR_DIRECTIVES] = "authoritative"
-        return assemble_context_packet(
-            audience=packet.audience,
-            records=records,
-            lane_status=lane_status,
-            source_errors=source_errors,
-            retrieval_dependencies=list(packet.observability.retrieval_dependencies) + ["knowledge_perspective_repair"],
+        return packet.with_records(
+            {
+                LaneName.KNOWLEDGE_VISIBILITY: new_records,
+                LaneName.REPAIR_DIRECTIVES: [directive],
+            },
+            dependency="knowledge_perspective_repair",
+            authoritative_lanes=[LaneName.REPAIR_DIRECTIVES],
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("knowledge perspective repair unavailable: %s", exc)
@@ -1702,11 +1734,8 @@ def attach_retry_deferral_advisory(
     audience: on a private turn it stays thread-scoped and private.
     """
     audience = packet.audience
-    lanes = list(packet.lanes)
-    lane_index = next(
-        i for i, lane in enumerate(lanes) if lane.name == LaneName.PLAYER_INPUTS
-    )
-    if any(r.record_id == IDENTITY_DEFERRAL_RECORD_ID for r in lanes[lane_index].records):
+    inputs = next(lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS)
+    if any(r.record_id == IDENTITY_DEFERRAL_RECORD_ID for r in inputs.records):
         return packet
     private = str(audience.audience or "campaign") == "private"
     record = ContextRecord(
@@ -1737,6 +1766,8 @@ def attach_retry_deferral_advisory(
         required=False,
         priority=5,
     )
-    primed = packet.model_copy(deep=True)
-    primed.lanes[lane_index].records.append(record)
-    return primed
+    return packet.with_records(
+        {LaneName.PLAYER_INPUTS: [record]},
+        dependency="identity_deferral",
+        budget=packet.headroom_budget(4096, 1024),
+    )

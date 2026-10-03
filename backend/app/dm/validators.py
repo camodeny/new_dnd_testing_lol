@@ -1151,34 +1151,22 @@ def _augment_packet_with_feedback(
     if packet is None:
         return None
     try:
-        from app.dm.context import AuthorizationScope, ContextRecord, LaneName as _LN, SourceRef as _SR, assemble_context_packet
+        from app.dm.context import AuthorizationScope, ContextRecord, LaneName, SourceRef
 
         rec = ContextRecord(
             record_id=f"repair:{correlation_id}",
             value={"directive": feedback, "correlation_id": correlation_id},
-            sources=[_SR(source_type="validator_rejection", source_id=correlation_id, source_version="1", provenance={"feedback": True})],
+            sources=[SourceRef(source_type="validator_rejection", source_id=correlation_id, source_version="1", provenance={"feedback": True})],
             authorization=AuthorizationScope(campaign_id=packet.audience.campaign_id, thread_ids=[packet.audience.thread_id]),
             visibility="dm_only",
             use="adjudication_only",
             required=False,
             priority=100,
         )
-        # Reassemble packet with additional repair record
-        from collections import defaultdict
-
-        records: dict = {lane.name: list(lane.records) for lane in packet.lanes}
-        # ensure repair lane exists
-        records[_LN.REPAIR_DIRECTIVES] = list(records.get(_LN.REPAIR_DIRECTIVES, [])) + [rec]
-        lane_status = {lane.name: lane.authority_status for lane in packet.lanes}
-        source_errors = {lane.name: lane.source_errors for lane in packet.lanes}
-        # keep repair lane authoritative
-        lane_status[_LN.REPAIR_DIRECTIVES] = "authoritative"
-        return assemble_context_packet(
-            audience=packet.audience,
-            records=records,
-            lane_status=lane_status,
-            source_errors=source_errors,
-            retrieval_dependencies=list(packet.observability.retrieval_dependencies) + ["validator_repair"],
+        return packet.with_records(
+            {LaneName.REPAIR_DIRECTIVES: [rec]},
+            dependency="validator_repair",
+            authoritative_lanes=[LaneName.REPAIR_DIRECTIVES],
         )
     except Exception:
         return packet
