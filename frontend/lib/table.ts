@@ -133,6 +133,13 @@ export interface TableEncounter {
   my_pending_initiative?: string[]
 }
 
+/** A shop the current scene references. Stock and buying arrive with #464. */
+export interface TableShop {
+  entity_id: string
+  name: string
+  summary?: string | null
+}
+
 /** Player-lane table projection (`snapshot.table`). Each section may carry
  *  `{ error }` independently when its server projection failed closed. */
 export interface TableProjection {
@@ -141,6 +148,7 @@ export interface TableProjection {
   scene: TableScene | ProjectionError | null
   journal: TableJournal | ProjectionError
   encounter: TableEncounter | ProjectionError | null
+  shops?: TableShop[]
 }
 
 export function isProjectionError(value: unknown): value is ProjectionError {
@@ -293,11 +301,18 @@ export function buildTimeline(
 
 // ── Side panel tabs ────────────────────────────────────────────────────────
 
-export type PanelTab = 'character' | 'journal' | 'party'
+/** Tabs about you are always present; contextual tabs (`shop:<id>`) exist
+ *  only while the scene has that place in it. */
+export type PanelTab = 'character' | 'journal' | 'party' | `shop:${string}`
 
-/** Tabs about you are always present; Party only matters with company. */
-export function panelTabs(multiplayer: boolean): PanelTab[] {
-  return multiplayer ? ['character', 'journal', 'party'] : ['character', 'journal']
+export function shopTab(shop: TableShop): PanelTab {
+  return `shop:${shop.entity_id}`
+}
+
+/** Party only matters with company; shops appear while they're here. */
+export function panelTabs(multiplayer: boolean, shops: TableShop[] = []): PanelTab[] {
+  const base: PanelTab[] = multiplayer ? ['character', 'journal', 'party'] : ['character', 'journal']
+  return [...base, ...shops.map(shopTab)]
 }
 
 export function orderedParticipants(encounter: TableEncounter): EncounterParticipant[] {

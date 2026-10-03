@@ -3589,3 +3589,36 @@ a.automation-list-item:focus-visible {
   .tv-side-chat { flex: 1 0 60svh; border-top: 1px solid var(--tv-line); border-left: 0; }
   .tv-place span { display: none; }
 }
+
+/* Placeholders for features that don't exist yet: visible, clearly
+   marked "soon", and never pretending to work. */
+.tv-mode-soon {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px 0 10px;
+  border: 1px dashed var(--tv-line); border-radius: 7px; background: none;
+  color: var(--tv-faint); font-size: 12.5px; cursor: default;
+}
+.tv-mode-soon span, .tv-soon-badge {
+  padding: 0 5px; border-radius: 4px; background: var(--tv-hover);
+  color: var(--tv-muted); font-size: 10.5px; font-weight: 500; line-height: 16px;
+}
+.tv-soon-note { margin: 0; font-size: 13px; }
+.tv-soon {
+  margin-top: 18px; padding: 14px 16px; border: 1px dashed var(--tv-line); border-radius: 12px;
+}
+.tv-soon b { display: block; font-size: 13.5px; font-weight: 600; }
+.tv-soon p { margin: 4px 0 12px; color: var(--tv-muted); font-size: 13px; }
+.tv-shop-glyph { background: #f3ece2; color: #8a6a3d; border-radius: 12px; }
+.tv-shop-glyph i { font-size: 18px; }
+.tv-who .tv-plain-case { text-transform: none; }
+.tv-tab-slot { display: contents; }
+.tv-tab-sep { width: 1px; height: 16px; margin: 0 6px; background: var(--tv-line); }
+.tv-tab.context { display: inline-flex; align-items: center; gap: 6px; animation: tv-tab-in 300ms ease-out; }
+.tv-tab.context .bi { font-size: 13px; }
+@keyframes tv-tab-in { from { opacity: 0; transform: translateX(-6px); } }
+@media (prefers-reduced-motion: reduce) { .tv-tab.context { animation: none; } }
+.tv-place-card { display: flex; align-items: center; gap: 14px; padding: 14px 16px; }
+.tv-place-card b { display: block; font-weight: 600; }
+.tv-place-card span:not(.tv-place-glyph) { color: var(--tv-muted); font-size: 13px; }
+.tv-place-card .tv-btn { margin-left: auto; }
+.tv-place-glyph { display: grid; flex: 0 0 auto; place-items: center; width: 38px; height: 38px; border-radius: 10px; background: var(--tv-hover); }
+.tv-place-glyph i { font-size: 17px; }

@@ -264,3 +264,22 @@ def test_npc_role_needs_explicit_member_visibility(ctx):
     [hal_view] = [p for p in _view(ctx, "alice")["journal"]["people"] if p["name"] == "Hal"]
     assert hal_view["role"] is None
     assert hal_view["summary"] == "Sells rope"
+
+
+def test_shops_here_are_scene_referenced_and_player_visible(ctx):
+    db = ctx["factory"]()
+    camp = db.get(Campaign, ctx["campaign_id"])
+    hals, _ = _world.create_entity(db, camp, entity_type="shop", name="Hal's Provisions", summary="Rope and lanterns")
+    fence, _ = _world.create_entity(db, camp, entity_type="shop", name="The Fence", visibility="dm_only")
+    elsewhere, _ = _world.create_entity(db, camp, entity_type="shop", name="Far Market")
+    _world.apply_scene_update(
+        db, camp, new_revision=1, location_name="Gallows Landing",
+        present_actors=[{"name": "Hal's Provisions", "entity_id": str(hals.id)},
+                        {"name": "The Fence", "entity_id": str(fence.id)}],
+    )
+    db.commit()
+    db.close()
+    for who in ("alice", "owner"):
+        assert _view(ctx, who)["shops"] == [
+            {"entity_id": str(hals.id), "name": "Hal's Provisions", "summary": "Rope and lanterns"},
+        ]

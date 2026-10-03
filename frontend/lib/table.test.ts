@@ -86,9 +86,10 @@ describe('timeline + panels', () => {
     expect(items[1]).toMatchObject({ kind: 'roll', mine: true, who: 'Bryn' })
   })
 
-  it('shows Party only with company', () => {
+  it('shows Party only with company and shops only while they are here', () => {
     expect(panelTabs(false)).toEqual(['character', 'journal'])
     expect(panelTabs(true)).toEqual(['character', 'journal', 'party'])
+    expect(panelTabs(false, [{ entity_id: 's1', name: 'Hal’s' }])).toEqual(['character', 'journal', 'shop:s1'])
   })
 
   it('treats only an active, healthy encounter as combat', () => {

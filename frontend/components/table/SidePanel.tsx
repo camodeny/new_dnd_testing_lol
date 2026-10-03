@@ -15,10 +15,11 @@ import {
   type TableCharacter,
   type TableJournal,
   type TablePartyMember,
+  type TableShop,
 } from '@/lib/table'
 import type { CampaignMember } from '@/types'
 
-const TAB_LABEL: Record<PanelTab, string> = { character: 'Character', journal: 'Journal', party: 'Party' }
+const TAB_LABEL: Record<'character' | 'journal' | 'party', string> = { character: 'Character', journal: 'Journal', party: 'Party' }
 
 function initials(name: string): string {
   return name.split(/\s+/).filter(Boolean).map((w) => w[0]).join('').slice(0, 2).toUpperCase()
@@ -117,16 +118,32 @@ function CharacterView({ character }: { character: TableCharacter | ProjectionEr
 
 // ── Journal ────────────────────────────────────────────────────────────────
 
+/** Placeholder until goals are tracked: there is no quest model yet. */
+function GoalsPlaceholder() {
+  return (
+    <section className="tv-section first">
+      <h4>What you’re trying to do</h4>
+      <p className="tv-muted tv-soon-note">Coming soon: your goals will collect here as the story sets them.</p>
+    </section>
+  )
+}
+
 function JournalView({ journal, fresh }: { journal: TableJournal | null; fresh: Set<string> }) {
   if (!journal) return <Unavailable />
   if (journal.people.length === 0 && journal.facts.length === 0) {
-    return <p className="tv-muted">Nothing here yet. People you meet and things you learn will collect here.</p>
+    return (
+      <>
+        <GoalsPlaceholder />
+        <p className="tv-muted tv-section">Nothing else here yet. People you meet and things you learn will collect here.</p>
+      </>
+    )
   }
   const New = ({ id }: { id: string }) => (fresh.has(id) ? <span className="tv-new">New</span> : null)
   return (
     <>
+      <GoalsPlaceholder />
       {journal.people.length > 0 && (
-        <section className="tv-section first">
+        <section className="tv-section">
           <h4>People you know of</h4>
           {journal.people.map((p) => (
             <div className="tv-entry" key={p.entity_id}>
@@ -176,6 +193,28 @@ function PartyView({ party, members }: { party: TablePartyMember[] | ProjectionE
   )
 }
 
+// ── Shop (placeholder) ─────────────────────────────────────────────────────
+
+/** The shop is real (the scene references it); browsing and buying are not
+ *  built yet (#464), so the story is the way to trade for now. */
+function ShopView({ shop, onSuggest }: { shop: TableShop; onSuggest: (text: string) => void }) {
+  return (
+    <>
+      <div className="tv-who">
+        <span className="tv-face large tv-shop-glyph" aria-hidden="true"><i className="bi bi-shop" /></span>
+        <div><h3>{shop.name}</h3>{shop.summary && <p className="tv-plain-case">{shop.summary}</p>}</div>
+      </div>
+      <div className="tv-soon">
+        <b>Browsing wares here is coming soon</b>
+        <p>For now, trade through the story. Tell the DM what you’d like to buy or sell.</p>
+        <button type="button" className="tv-btn ghost small" onClick={() => onSuggest('I ask what they have for sale.')}>
+          Ask what’s for sale
+        </button>
+      </div>
+    </>
+  )
+}
+
 // ── Panel ──────────────────────────────────────────────────────────────────
 
 function journalIds(journal: TableJournal | null): string[] {
@@ -207,11 +246,16 @@ interface SidePanelProps {
   party: TablePartyMember[] | ProjectionError | null
   journal: TableJournal | ProjectionError | null
   members: CampaignMember[]
+  shops: TableShop[]
+  /** Prefill the composer from a panel action. */
+  onSuggest: (text: string) => void
 }
 
 export default function SidePanel({
-  campaignId, userId, tabs, tab, onTab, onClose, character, party, journal, members,
+  campaignId, userId, tabs, tab, onTab, onClose, character, party, journal, members, shops, onSuggest,
 }: SidePanelProps) {
+  const shopFor = (t: PanelTab) => shops.find((shop) => `shop:${shop.entity_id}` === t) ?? null
+  const activeShop = shopFor(tab)
   const journalData = healthy(journal)
   const ids = useMemo(() => journalIds(journalData), [journalData])
   const key = userId ? seenKey(campaignId, userId) : null
@@ -252,15 +296,22 @@ export default function SidePanel({
   return (
     <aside className="tv-panel" aria-label="Side panel">
       <div className="tv-tabs" role="tablist">
-        {tabs.map((t) => (
-          <button
-            key={t} type="button" role="tab" aria-selected={tab === t}
-            className={`tv-tab${tab === t ? ' on' : ''}`} onClick={() => switchTab(t)}
-          >
-            {TAB_LABEL[t]}
-            {t === 'journal' && tab !== 'journal' && unseen.length > 0 && <span className="tv-dot" aria-label="New entries" />}
-          </button>
-        ))}
+        {tabs.map((t, index) => {
+          const shop = shopFor(t)
+          const startsContext = shop && !shopFor(tabs[index - 1] ?? 'character')
+          return (
+            <span key={t} className="tv-tab-slot">
+              {startsContext && <span className="tv-tab-sep" aria-hidden="true" />}
+              <button
+                type="button" role="tab" aria-selected={tab === t}
+                className={`tv-tab${tab === t ? ' on' : ''}${shop ? ' context' : ''}`} onClick={() => switchTab(t)}
+              >
+                {shop ? <><i className="bi bi-shop" aria-hidden="true" /> {shop.name}</> : TAB_LABEL[t as keyof typeof TAB_LABEL]}
+                {t === 'journal' && tab !== 'journal' && unseen.length > 0 && <span className="tv-dot" aria-label="New entries" />}
+              </button>
+            </span>
+          )
+        })}
         <button type="button" className="tv-icon-btn tv-tabs-close" onClick={onClose} aria-label="Close side panel">
           <i className="bi bi-x-lg" aria-hidden="true" />
         </button>
@@ -269,6 +320,7 @@ export default function SidePanel({
         {tab === 'character' && <CharacterView character={character} />}
         {tab === 'journal' && <JournalView journal={journalData} fresh={fresh} />}
         {tab === 'party' && <PartyView party={party} members={members} />}
+        {activeShop && <ShopView shop={activeShop} onSuggest={onSuggest} />}
       </div>
     </aside>
   )

@@ -246,6 +246,37 @@ def _scene(db: Session, campaign: Campaign) -> dict[str, Any] | None:
     return {"location_name": scene.location_name, "fictional_time": scene.fictional_time}
 
 
+def _shops_here(db: Session, campaign: Campaign, viewer: uuid.UUID) -> list[dict[str, Any]]:
+    """Shops the current scene references that this player may see.
+
+    The hook for the contextual Shop tab. Buying and selling are not built
+    yet (#464); this only says a shop is here, never stock or prices.
+    """
+    from app.visibility.policy import RESTRICTED_VISIBILITIES
+    from app.world.service import get_current_scene
+    from models.world import WorldEntity
+
+    scene = get_current_scene(db, campaign.id)
+    if scene is None or scene.visibility in RESTRICTED_VISIBILITIES:
+        return []
+    shops: list[dict[str, Any]] = []
+    for actor in scene.present_actors or []:
+        raw_id = actor.get("entity_id") if isinstance(actor, dict) else None
+        if not raw_id:
+            continue
+        try:
+            entity = db.get(WorldEntity, uuid.UUID(str(raw_id)))
+        except ValueError:
+            continue
+        if (
+            entity is None or entity.campaign_id != campaign.id or entity.entity_type != "shop"
+            or not _player_may_receive(db, campaign, "entity", entity.id, viewer)
+        ):
+            continue
+        shops.append({"entity_id": str(entity.id), "name": entity.name, "summary": entity.summary})
+    return shops
+
+
 def _visible_facts(
     db: Session, campaign: Campaign, viewer: uuid.UUID, *,
     entity_id: uuid.UUID | None = None, limit: int,
@@ -369,7 +400,7 @@ def build_table_for_viewer(
     viewer = viewer_id if isinstance(viewer_id, uuid.UUID) else uuid.UUID(str(viewer_id))
     if not is_campaign_participant(db, campaign, viewer):
         return {"character": None, "party": [], "scene": None,
-                "journal": {"people": [], "facts": []}, "encounter": None}
+                "journal": {"people": [], "facts": []}, "encounter": None, "shops": []}
 
     party = _section("party", campaign, lambda: _party_section(db, campaign, viewer),
                      {"character": PROJECTION_FAILED, "party": PROJECTION_FAILED})
@@ -381,4 +412,5 @@ def build_table_for_viewer(
                             PROJECTION_FAILED),
         "encounter": _section("encounter", campaign, lambda: _encounter(db, campaign, viewer),
                               PROJECTION_FAILED),
+        "shops": _section("shops", campaign, lambda: _shops_here(db, campaign, viewer), []),
     }

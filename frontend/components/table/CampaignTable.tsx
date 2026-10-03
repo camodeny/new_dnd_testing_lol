@@ -17,6 +17,7 @@ import {
   buildTimeline,
   healthy,
   panelTabs,
+  shopTab,
   type PanelTab,
   type TableCharacter,
   type TableProjection,
@@ -69,6 +70,8 @@ export default function CampaignTable({
   const [panelOpen, setPanelOpen] = useState(true)
   const [combatPanelOpen, setCombatPanelOpen] = useState(false)
   const [tab, setTab] = useState<PanelTab>('character')
+  // Shops whose arrival card was already acted on this visit.
+  const [browsedShops, setBrowsedShops] = useState<Set<string>>(new Set())
   const [switcherOpen, setSwitcherOpen] = useState(false)
   const [members, setMembers] = useState<CampaignMember[]>([])
   const [privateThreads, setPrivateThreads] = useState<CampaignThread[]>([])
@@ -88,7 +91,8 @@ export default function CampaignTable({
   const party = healthy(table?.party) ?? []
   const character = healthy(table?.character) as TableCharacter | null
   const scene = healthy(table?.scene)
-  const tabs = panelTabs(multiplayer)
+  const shops = inCombat ? [] : (table?.shops ?? [])
+  const tabs = panelTabs(multiplayer, shops)
   const myRoll = rollRequests.find((roll) => roll.status === 'pending' && roll.requested_user_id === userId) ?? null
   const timeline = buildTimeline(messages, rollRequests, party, userId)
 
@@ -231,6 +235,17 @@ export default function CampaignTable({
               {aiThinking && <p className="tv-thinking">{aiThinkingStatus || (activeDmText ? 'Writing…' : 'The DM is thinking…')}</p>}
             </div>
           )}
+          {shops.filter((shop) => !browsedShops.has(shop.entity_id)).map((shop) => (
+            <div className="tv-card tv-place-card" key={shop.entity_id}>
+              <span className="tv-place-glyph" aria-hidden="true"><i className="bi bi-shop" /></span>
+              <div><b>{shop.name}</b>{shop.summary && <span>{shop.summary}</span>}</div>
+              <button type="button" className="tv-btn ghost" onClick={() => {
+                setBrowsedShops((current) => new Set([...current, shop.entity_id]))
+                setTab(shopTab(shop))
+                setPanelOpen(true)
+              }}>Browse wares</button>
+            </div>
+          ))}
           {turnControls && <div className="tv-turn-controls">{turnControls}</div>}
           {myRoll && onRefresh && (
             <RollCard campaignId={campaign.id} roll={myRoll} modifier={character?.roll_modifiers?.[myRoll.id]} refresh={onRefresh} />
@@ -265,6 +280,7 @@ export default function CampaignTable({
       onTab={setTab} onClose={() => (inCombat ? setCombatPanelOpen(false) : setPanelOpen(false))}
       character={table ? table.character : null} party={table ? table.party : null}
       journal={table ? table.journal : null} members={members}
+      shops={shops} onSuggest={suggest}
     />
   )
 

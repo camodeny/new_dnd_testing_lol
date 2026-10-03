@@ -144,6 +144,11 @@ export default function Composer({
             </button>
           ))}
         </div>
+        {/* Placeholder: out-of-story questions for the DM have no message
+            type yet; the private DM chat covers them for now. */}
+        <button type="button" className="tv-mode-soon" disabled title="Coming soon: ask the DM a question outside the story">
+          Ask the DM <span>Soon</span>
+        </button>
         <button
           type="button"
           className="tv-send"

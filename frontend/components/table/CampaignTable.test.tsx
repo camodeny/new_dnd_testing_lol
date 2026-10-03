@@ -69,7 +69,7 @@ async function render(props: { campaign?: Campaign; table?: TableProjection | nu
   await act(async () => {})
 }
 
-const tab = (name: string) => [...container.querySelectorAll('[role="tab"]')].find((t) => t.textContent?.startsWith(name)) as HTMLButtonElement | undefined
+const tab = (name: string) => [...container.querySelectorAll('[role="tab"]')].find((t) => t.textContent?.trim().startsWith(name)) as HTMLButtonElement | undefined
 
 it('reads like a story with the place in the header and the character panel open', async () => {
   await render({})
@@ -146,4 +146,26 @@ it('lets the fight take over the screen, with the story alongside', async () => 
   const attack = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Attack with longsword')!
   await act(async () => attack.click())
   expect(container.querySelector('textarea')!.value).toBe('I attack with my longsword ')
+})
+
+it('announces a shop in the story and opens its contextual tab as a placeholder', async () => {
+  await render({ table: { ...table, shops: [{ entity_id: 's1', name: 'Hal’s Provisions', summary: 'Rope and lanterns' }] } })
+  expect(tab('Hal’s Provisions')?.classList.contains('context')).toBe(true)
+  const browse = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Browse wares')!
+  await act(async () => browse.click())
+  expect(container.querySelector('.tv-view')?.textContent).toContain('Browsing wares here is coming soon')
+  // The arrival card retires once acted on.
+  expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Browse wares')).toBe(false)
+  const ask = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Ask what’s for sale')!
+  await act(async () => ask.click())
+  expect(container.querySelector('textarea')!.value).toBe('I ask what they have for sale.')
+})
+
+it('marks unbuilt features as coming soon instead of faking them', async () => {
+  await render({})
+  const askDm = container.querySelector('.tv-mode-soon') as HTMLButtonElement
+  expect(askDm.disabled).toBe(true)
+  expect(askDm.textContent).toContain('Soon')
+  await act(async () => tab('Journal')!.click())
+  expect(container.querySelector('.tv-view')?.textContent).toContain('Coming soon: your goals')
 })
