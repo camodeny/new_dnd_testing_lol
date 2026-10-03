@@ -45,6 +45,7 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import select
@@ -52,6 +53,7 @@ from sqlalchemy.orm import Session
 
 from app.schema import coerce_uuid
 from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.service import lock_campaign_row
 from app.decisions import (
     ACTIVE,
     ESCALATE,
@@ -71,6 +73,7 @@ from app.decisions import (
     shared_trace,
     to_decision_request,
 )
+from app.idempotency import compose_operation_id
 from app.observability.tracing import structured_log
 from app.visibility.access import is_campaign_participant, is_world_authority
 from app.visibility.policy import RESTRICTED_VISIBILITIES, visible_to_viewer, world_event_visibility
@@ -148,6 +151,21 @@ class ClockStaleError(DecisionError):
         self.clock_id = clock_id
         self.frame_revision = frame_revision
         self.current_revision = current_revision
+
+
+#: Caller-owned veto on revision-bumping clock commits: returns a deferral
+#: reason, or ``None`` to allow. Called once unlocked before any model work
+#: and again under the campaign row lock immediately before the commit.
+ClockCommitGate = Callable[[Session, uuid.UUID], "str | None"]
+
+
+class ClockCommitDeferred(Exception):
+    """A clock commit must wait; nothing was applied and the range retries."""
+
+    def __init__(self, campaign_id: Any, reason: str) -> None:
+        super().__init__(f"clock commit deferred for campaign {campaign_id}: {reason}")
+        self.campaign_id = campaign_id
+        self.reason = reason
 
 
 # ── Validation (fail closed at creation) ───────────────────────────────────
@@ -722,6 +740,7 @@ def apply_clock_outcome(
     db: Session, campaign_id: Any, clock_id: Any, *, frame: DecisionFrame,
     selected_id: str, evidence_refs: list[dict[str, Any]],
     from_sequence: int, to_sequence: int, operation_id: str | None = None,
+    commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Apply one decided outcome after revision + evidence revalidation.
 
@@ -730,7 +749,9 @@ def apply_clock_outcome(
     outcomes, invalid evidence refs, or advancement/completion selected
     with no evidence satisfying the relevant criteria. NO_CHANGE advances
     only the idempotency watermark; advancement/completion commit a domain
-    event under campaign revision ordering.
+    event under campaign revision ordering. ``commit_gate`` is re-checked
+    under the campaign row lock right before that commit and raises
+    :class:`ClockCommitDeferred` (nothing applied) when it vetoes.
     """
     cid = coerce_uuid(campaign_id, field="campaign_id")
     clock = get_clock_strict(db, cid, coerce_uuid(clock_id, field="clock_id"))
@@ -837,6 +858,14 @@ def apply_clock_outcome(
         holder["revision"] = fresh.revision
         holder["status"] = fresh.status
 
+    if commit_gate is not None:
+        # Same lock commit_campaign_mutation takes below (re-entrant within
+        # this transaction), held through the commit so the gate's verdict
+        # cannot go stale before the revision bump lands.
+        lock_campaign_row(db, cid)
+        reason = commit_gate(db, cid)
+        if reason:
+            raise ClockCommitDeferred(cid, reason)
     event_type = CLOCK_COMPLETED_EVENT if (
         completing or int(clock.progress or 0) + int(amount or 0) >= int(clock.threshold)
     ) else CLOCK_ADVANCED_EVENT
@@ -879,7 +908,7 @@ def evaluate_clock_for_range(
     events: list[CampaignDomainEvent], *, from_sequence: int, to_sequence: int,
     decision_service: DecisionService | None = None,
     session_factory: Any = None, operation_id: str | None = None,
-    is_authority: bool = True,
+    is_authority: bool = True, commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Evaluate one clock against the unevaluated suffix of a source range.
 
@@ -916,7 +945,8 @@ def evaluate_clock_for_range(
         max_advance = max(1, int(criteria.get("max_advance", 1)))
         remaining = int(clock.threshold) - int(clock.progress or 0)
         if remaining <= 0:
-            return _complete_threshold(db, campaign, clock, refs, from_sequence, to_sequence, operation_id)
+            return _complete_threshold(db, campaign, clock, refs, from_sequence, to_sequence,
+                                       operation_id, commit_gate)
         available = int(clock.progress_carry or 0) + total
         ticks = min(available // required, max_advance, remaining)
         if ticks <= 0:
@@ -939,7 +969,7 @@ def evaluate_clock_for_range(
                 ),
                 selected_id=outcome_id, evidence_refs=refs,
                 from_sequence=from_sequence, to_sequence=to_sequence,
-                operation_id=operation_id,
+                operation_id=operation_id, commit_gate=commit_gate,
             )
         except ClockStaleError:
             # No rollback here: a stale clock wrote nothing of its own, and
@@ -1000,7 +1030,7 @@ def evaluate_clock_for_range(
             selected_id=decision.selected_id,
             evidence_refs=completion_refs if judged_complete else refs,
             from_sequence=from_sequence, to_sequence=to_sequence,
-            operation_id=operation_id,
+            operation_id=operation_id, commit_gate=commit_gate,
         )
     except ClockStaleError:
         # Same savepoint-owned isolation as the deterministic path above:
@@ -1020,7 +1050,7 @@ def evaluate_clock_for_range(
 def _complete_threshold(
     db: Session, campaign: Campaign, clock: CampaignClock,
     refs: list[dict[str, Any]], from_sequence: int, to_sequence: int,
-    operation_id: str | None,
+    operation_id: str | None, commit_gate: ClockCommitGate | None,
 ) -> dict[str, Any]:
     """Defensive completion when progress already covers the threshold."""
     frame = build_clock_frame(
@@ -1030,7 +1060,7 @@ def _complete_threshold(
     applied = apply_clock_outcome(
         db, campaign.id, clock.id, frame=frame, selected_id=COMPLETE,
         evidence_refs=refs, from_sequence=from_sequence,
-        to_sequence=to_sequence, operation_id=operation_id,
+        to_sequence=to_sequence, operation_id=operation_id, commit_gate=commit_gate,
     )
     applied["evidence_count"] = len(refs)
     applied["path"] = "deterministic"
@@ -1044,6 +1074,7 @@ def consolidate_clocks_for_range(
     db: Session, campaign_id: Any, from_sequence: int, to_sequence: int,
     events: list[CampaignDomainEvent], *, decision_service: DecisionService | None = None,
     session_factory: Any = None, operation_id: str | None = None,
+    commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Evaluate every evaluable clock against one committed source range.
 
@@ -1053,11 +1084,21 @@ def consolidate_clocks_for_range(
     processing error propagates so the post-turn run fails and the range
     is retried cumulatively. Emits no wall-clock reads: an empty evidence
     window is an explicit no-op.
+
+    ``commit_gate`` vetoes revision-bumping commits: checked once up front
+    (before any decision-model call) and again under the campaign row lock
+    per commit. A veto raises :class:`ClockCommitDeferred` so the caller
+    retries the whole range later; clocks already committed this pass keep
+    their watermarks and are not re-applied.
     """
     cid = coerce_uuid(campaign_id, field="campaign_id")
     campaign = db.get(Campaign, cid)
     if campaign is None:
         raise ValueError(f"Campaign {campaign_id} not found")
+    if commit_gate is not None:
+        reason = commit_gate(db, cid)
+        if reason:
+            raise ClockCommitDeferred(cid, reason)
     # All non-terminal clocks load so dormant/pending skips are explicit
     # per-clock results (a clock may remain dormant without advancing);
     # terminal clocks are never re-evaluated.
@@ -1067,10 +1108,7 @@ def consolidate_clocks_for_range(
     ).order_by(CampaignClock.created_at.asc())).scalars().all())
     results: list[dict[str, Any]] = []
     for clock in clocks:
-        op_id = (
-            f"{operation_id}:clock:{clock.id}:{from_sequence}-{to_sequence}"
-            if operation_id else f"clock:{clock.id}:{from_sequence}-{to_sequence}"
-        )
+        op_id = compose_operation_id(operation_id, "clock", clock.id, f"{from_sequence}-{to_sequence}")
         # One savepoint per clock: a stale skip rolls back only that clock's
         # pending work, never sibling clocks' flushed watermarks or (already
         # committed) advancements. The guards below handle writers that
@@ -1085,8 +1123,12 @@ def consolidate_clocks_for_range(
                 db, campaign, clock, events,
                 from_sequence=from_sequence, to_sequence=to_sequence,
                 decision_service=decision_service, session_factory=session_factory,
-                operation_id=op_id,
+                operation_id=op_id, commit_gate=commit_gate,
             )
+        except ClockCommitDeferred:
+            if savepoint.is_active:
+                savepoint.rollback()
+            raise
         except ClockStaleError:
             if savepoint.is_active:
                 savepoint.rollback()

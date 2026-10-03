@@ -61,6 +61,9 @@ The authoritative walkthrough is the module docstring of `dm/execution.py`. In s
 5. The same mutation stages a `PostTurnRun` via `post_turn.service.maybe_trigger_post_turn`.
    `/api/cron/post-turn` materializes world state, evaluates clocks, and verifies consistency.
    Only after that does it advance the checkpoint.
+   Clock commits bump the campaign revision, so a run defers (stays pending, no attempt spent)
+   while any turn is `pending`/`streaming` (`post_turn.service.dm_turn_commit_gate`). The gate is
+   re-checked under the campaign row lock that `coordinate_turn` holds when it pins `source_revision`.
 
 ## Async model
 

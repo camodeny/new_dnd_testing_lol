@@ -27,6 +27,7 @@ import logging
 
 from sqlalchemy import select as _select
 from sqlalchemy.orm import Session
+from app.idempotency import compose_operation_id
 from app.submissions.service import accept_submission
 from app.threads.service import get_or_create_campaign_thread
 
@@ -283,7 +284,7 @@ def run_campaign_start(
             "thread_id": thread_id_str,
             "intro_order": intro_order,
         },
-        operation_id=f"{operation_id}:started",
+        operation_id=compose_operation_id(operation_id, "started"),
         actor_id=actor_id,
         targets={"campaign_id": str(campaign.id)},
         visibility="public",

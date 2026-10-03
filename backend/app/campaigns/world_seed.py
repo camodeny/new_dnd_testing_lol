@@ -28,6 +28,7 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.dm.turns import DM_TURN_RESOLVED
+from app.idempotency import compose_operation_id
 from app.visibility.policy import canonical_visibility
 from app.world.clocks import (
     create_clock,
@@ -483,13 +484,13 @@ def run_world_seed(
             db, locked, entity_type="location", name=spec["location"]["name"],
             summary=spec["location"]["summary"], status="active", visibility="campaign",
             details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
-            operation_id=f"{operation_id}:location", idempotency_key=ck("location"),
+            operation_id=compose_operation_id(operation_id, "location"), idempotency_key=ck("location"),
         )
         faction, _ = create_entity(
             db, locked, entity_type="faction", name=spec["faction"]["name"],
             summary=spec["faction"]["summary"], status="active", visibility="campaign",
             details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
-            operation_id=f"{operation_id}:faction", idempotency_key=ck("faction"),
+            operation_id=compose_operation_id(operation_id, "faction"), idempotency_key=ck("faction"),
         )
         npc_rows = []
         for idx, npc in enumerate(spec["npcs"]):
@@ -497,19 +498,19 @@ def run_world_seed(
                 db, locked, entity_type="npc", name=npc["name"],
                 summary=npc["summary"], status="active", visibility="campaign",
                 details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
-                operation_id=f"{operation_id}:npc:{idx}", idempotency_key=ck(f"npc:{idx}"),
+                operation_id=compose_operation_id(operation_id, f"npc:{idx}"), idempotency_key=ck(f"npc:{idx}"),
             )
             npc_rows.append(row)
             create_relation(
                 db, locked, subject_entity_id=row.id, relation_type="member_of",
                 object_entity_id=faction.id, epistemic_state="confirmed", visibility="campaign",
-                provenance=prov, operation_id=f"{operation_id}:rel:{idx}",
+                provenance=prov, operation_id=compose_operation_id(operation_id, f"rel:{idx}"),
                 idempotency_key=ck(f"rel:{idx}"),
             )
             create_relation(
                 db, locked, subject_entity_id=row.id, relation_type="present_at",
                 object_entity_id=location.id, epistemic_state="confirmed", visibility="campaign",
-                provenance=prov, operation_id=f"{operation_id}:at:{idx}",
+                provenance=prov, operation_id=compose_operation_id(operation_id, f"at:{idx}"),
                 idempotency_key=ck(f"at:{idx}"),
             )
         char_rows = []
@@ -519,7 +520,7 @@ def run_world_seed(
                 summary=f"Player character adventuring from {spec['location']['name']}.",
                 status="active", visibility="campaign",
                 details={"seed": WORLD_SEED_TAG, "character_id": str(pc["character_id"])},
-                operation_id=f"{operation_id}:pc:{pc['character_id']}",
+                operation_id=compose_operation_id(operation_id, f"pc:{pc['character_id']}"),
                 idempotency_key=ck(f"pc:{pc['character_id']}"),
             )
             char_rows.append(row)
@@ -527,13 +528,13 @@ def run_world_seed(
         situation_fact, _ = create_fact(
             db, locked, content=spec["situation"], entity_refs=[location.id],
             epistemic_state="confirmed", visibility="campaign", provenance=prov,
-            operation_id=f"{operation_id}:situation", idempotency_key=ck("situation"),
+            operation_id=compose_operation_id(operation_id, "situation"), idempotency_key=ck("situation"),
         )
         secret_fact, _ = create_fact(
             db, locked,
             content=f"Hidden scheme behind {spec['pressure']['name']}: {spec['pressure']['description']}",
             entity_refs=[location.id], epistemic_state="confirmed", visibility="dm_only",
-            provenance=prov, operation_id=f"{operation_id}:secret",
+            provenance=prov, operation_id=compose_operation_id(operation_id, "secret"),
             idempotency_key=ck("secret"),
         )
         hook_fact_by_char: dict[str, str] = {}
@@ -559,7 +560,7 @@ def run_world_seed(
             hook_fact, _ = create_fact(
                 db, locked, content=hook_text,
                 epistemic_state="confirmed", visibility="dm_only", provenance=prov,
-                operation_id=f"{operation_id}:hook:{idx}", idempotency_key=ck(f"hook:{idx}"),
+                operation_id=compose_operation_id(operation_id, f"hook:{idx}"), idempotency_key=ck(f"hook:{idx}"),
             )
             hook_count += 1
             hook_fact_by_char[str(hook["character_id"])] = str(hook_fact.id)
@@ -577,7 +578,7 @@ def run_world_seed(
                 target_kind="fact", target_fact_id=situation_fact.id,
                 knowledge_state="knows", acquisition_source="world_seed",
                 visibility="campaign", provenance=prov,
-                operation_id=f"{operation_id}:know:{row.id}",
+                operation_id=compose_operation_id(operation_id, f"know:{row.id}"),
                 idempotency_key=ck(f"know:{row.id}"),
             )
         char_by_pc_id = {
@@ -596,7 +597,7 @@ def run_world_seed(
                 target_kind="fact", target_fact_id=hook_fact_id,
                 knowledge_state="knows", acquisition_source="private_lore",
                 visibility="dm_only", provenance=prov,
-                operation_id=f"{operation_id}:hookknow:{row.id}",
+                operation_id=compose_operation_id(operation_id, f"hookknow:{row.id}"),
                 idempotency_key=ck(f"hookknow:{row.id}"),
             )
 
@@ -617,7 +618,7 @@ def run_world_seed(
                 "event_types": [DM_TURN_RESOLVED],
             },
             visibility="campaign", provenance=prov,
-            operation_id=f"{operation_id}:clock", idempotency_key=ck("clock"),
+            operation_id=compose_operation_id(operation_id, "clock"), idempotency_key=ck("clock"),
         )
         scene = apply_scene_update(
             db, locked, new_revision=prior + 1, location_entity_id=location.id,
@@ -628,7 +629,7 @@ def run_world_seed(
                 "seed": WORLD_SEED_TAG,
                 "contract_version": WORLD_SEED_CONTRACT_VERSION,
             },
-            visibility="campaign", operation_id=f"{operation_id}:scene",
+            visibility="campaign", operation_id=compose_operation_id(operation_id, "scene"),
         )
         if from_status == "lobby":
             locked.status = "starting"
@@ -654,7 +655,7 @@ def run_world_seed(
             "candidates_tried": candidates_tried,
             "seed": WORLD_SEED_TAG,
         },
-        operation_id=f"{operation_id}:seeded",
+        operation_id=compose_operation_id(operation_id, "seeded"),
         actor_id=actor_id,
         targets={"campaign_id": str(campaign.id)},
         visibility="public",

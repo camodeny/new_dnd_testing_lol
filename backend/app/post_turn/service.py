@@ -26,19 +26,21 @@ import uuid
 from datetime import datetime, timezone
 from collections.abc import Callable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.dm.turns import has_in_flight_turn
 from app.observability.service import telemetry_factory_for
 from app.observability.tracing import current_trace_id
 from app.realtime.service import publish_projection_invalidated_for_grantee
 from app.worker.envelope import new_envelope
 from app.worker.executor import execute_worker_job
-from app.world.clocks import consolidate_clocks_for_range
+from app.world.clocks import ClockCommitDeferred, consolidate_clocks_for_range
 from app.world.semantic_index import note_authoritative_write
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.post_turn import PostTurnCheckpoint, PostTurnRun
+from models.reliability import WorkerExecution
 
 logger = logging.getLogger(__name__)
 
@@ -324,6 +326,20 @@ def maybe_trigger_post_turn(
 # ── Consolidation (worker side) ────────────────────────────────────────────
 
 
+DM_TURN_IN_FLIGHT = "dm_turn_in_flight"
+
+
+def dm_turn_commit_gate(db: Session, campaign_id: uuid.UUID) -> str | None:
+    """Veto post-turn revision bumps while a DM turn awaits its commit.
+
+    An in-flight turn pinned ``source_revision`` and commits against it, so
+    a clock commit landing first would fail that turn stale after its
+    narration already streamed. Deferral is ordinary backpressure: the
+    range retries on a later sweep once the table is between turns.
+    """
+    return DM_TURN_IN_FLIGHT if has_in_flight_turn(db, campaign_id) else None
+
+
 def _validate_range_contiguous(db: Session, campaign_id: uuid.UUID, from_seq: int, to_seq: int) -> list[CampaignDomainEvent]:
     """Load the range and fail loudly on gaps — never silently skip."""
     events = list(
@@ -501,6 +517,30 @@ def run_post_turn_range(
             logger.warning("post_turn locked archive check failed campaign=%s error=%s", campaign_id, exc)
             return False
 
+    def _defer(reason: str) -> dict:
+        """Hand the range back untouched: pending, attempt not consumed."""
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.info(
+            "post_turn deferred campaign=%s range=%s-%s reason=%s",
+            campaign_id, effective_from, to_sequence, reason,
+        )
+        fresh = db.get(PostTurnRun, run.id)
+        if fresh is not None and fresh.status not in ("succeeded", "skipped"):
+            fresh.status = "pending"
+            fresh.attempts = max(0, int(fresh.attempts or 0) - 1)
+            fresh.failure_reason = None
+            fresh.result = {"deferred": True, "reason": reason}
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+        return {"deferred": True, "reason": reason,
+                "from_sequence": from_sequence, "to_sequence": to_sequence,
+                "processed_through": processed}
+
     def _retire_skipped(reason: str) -> dict:
         logger.info(
             "post_turn skipped campaign=%s range=%s-%s reason=%s",
@@ -543,6 +583,11 @@ def run_post_turn_range(
             material_campaign = db.get(Campaign, campaign_id)
             if material_campaign is None:
                 raise RuntimeError(f"post-turn campaign {campaign_id} not found")
+            # The range is all-or-nothing and its clocks cannot commit while
+            # a DM turn is in flight: skip every model call until it lands.
+            in_flight = dm_turn_commit_gate(db, campaign_id)
+            if in_flight:
+                return _defer(in_flight)
             patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
             patch["materialization"] = materialize_range(
                 db, material_campaign, events, effective_from, to_sequence,
@@ -559,6 +604,7 @@ def run_post_turn_range(
                 decision_service=clock_decision_service,
                 session_factory=clock_telemetry_factory,
                 operation_id=operation_id,
+                commit_gate=dm_turn_commit_gate,
             )
             # Issue #220 — consistency verification is required consolidation:
             # deterministic + semantic contradictions against committed canon
@@ -661,6 +707,8 @@ def run_post_turn_range(
             _publish_grant_invalidations(db, campaign_id, patch)
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
+    except ClockCommitDeferred as exc:
+        return _defer(exc.reason)
     except Exception as exc:
         # Failure reason is durable even though the checkpoint is unchanged.
         _fail(exc)
@@ -979,16 +1027,32 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     )
     executed: list[str] = []
     failed: list[dict] = []
-    skipped: list[str] = []
+    deferred: list[str] = []
     for run in candidates:
+        if dm_turn_commit_gate(db, run.campaign_id):
+            # Cheap pre-claim check: no worker claim, no attempt spent.
+            logger.info("post_turn deferred campaign=%s run=%s reason=%s",
+                        run.campaign_id, run.id, DM_TURN_IN_FLIGHT)
+            deferred.append(str(run.id))
+            continue
         try:
             env = _envelope_for_run(run)
-            execute_worker_job(db, env, lambda e, _db=db: handle_post_turn_envelope(e, _db),
-                               max_attempts=max_attempts)
-            executed.append(str(run.id))
+            result, _duplicate = execute_worker_job(
+                db, env, lambda e, _db=db: handle_post_turn_envelope(e, _db),
+                max_attempts=max_attempts)
+            if isinstance(result, dict) and result.get("deferred"):
+                # A turn started mid-run and the locked gate vetoed the clock
+                # commit. Deferral is not an execution: drop the ledger row
+                # so the next sweep re-runs the job instead of replaying it.
+                db.execute(delete(WorkerExecution).where(WorkerExecution.id == run.id))
+                db.commit()
+                deferred.append(str(run.id))
+            else:
+                executed.append(str(run.id))
         except Exception as exc:  # noqa: BLE001 — sweep must survive bad runs
             db.rollback()
             logger.warning("post_turn sweep run_failed run=%s error=%s", run.id, exc)
             failed.append({"run_id": str(run.id), "error": str(exc)[:300]})
-    logger.info("post_turn sweep repaired=%s executed=%s failed=%s", len(repaired), len(executed), len(failed))
-    return {"repaired": repaired, "executed": executed, "failed": failed, "skipped": skipped}
+    logger.info("post_turn sweep repaired=%s executed=%s deferred=%s failed=%s",
+                len(repaired), len(executed), len(deferred), len(failed))
+    return {"repaired": repaired, "executed": executed, "failed": failed, "deferred": deferred}

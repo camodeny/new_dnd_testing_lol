@@ -89,6 +89,13 @@ BLOCKING_TURN_STATUSES = {TURN_AWAITING_ROLL, TURN_STREAMING, TURN_FAILED_VISIBL
 PRE_STREAM_ATTEMPT_STATUSES = {ATTEMPT_PREPARED, ATTEMPT_RUNNING}
 VISIBLE_ATTEMPT_STATUSES = {ATTEMPT_STREAMING, ATTEMPT_FAILED_VISIBLE}
 ABANDONED_STATUSES = {ATTEMPT_ABANDONED, TURN_ABANDONED}
+#: Turns whose current attempt pinned ``source_revision`` and will commit
+#: against it: any other revision bump before that commit fails the turn
+#: stale. ``awaiting_roll`` and ``failed_visible`` are excluded because they
+#: only leave through a fresh attempt that re-reads the revision under the
+#: campaign row lock (roll resume, explicit Retry); contract-reuse recovery
+#: of a failed_visible turn already refuses a moved revision.
+IN_FLIGHT_TURN_STATUSES = {TURN_PENDING, TURN_STREAMING}
 
 
 class TurnConflictError(Exception):
@@ -254,6 +261,22 @@ def create_attempt(
     db.flush()
     turn.current_attempt_id = attempt.id
     return attempt
+
+
+def has_in_flight_turn(db: Session, campaign_id: uuid.UUID) -> bool:
+    """Whether any thread of the campaign has a turn awaiting its commit.
+
+    Authoritative only while the caller holds the campaign row lock:
+    ``coordinate_turn`` creates pending turns and reads ``source_revision``
+    under that same lock, so a lock holder that sees no in-flight turn can
+    bump the revision without staling one.
+    """
+    return db.execute(
+        select(DmTurn.id).where(
+            DmTurn.campaign_id == campaign_id,
+            DmTurn.status.in_(list(IN_FLIGHT_TURN_STATUSES)),
+        ).limit(1)
+    ).first() is not None
 
 
 def _has_blocking_turn(db: Session, campaign_id: uuid.UUID, thread_id: str, exclude_turn_id: uuid.UUID | None = None) -> DmTurn | None:
