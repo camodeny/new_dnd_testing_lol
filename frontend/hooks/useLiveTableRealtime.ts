@@ -33,6 +33,12 @@ import {
   type RealtimeEvent,
   type SnapshotForRealtime,
 } from '@/lib/realtime'
+import { isProjectionError, type TableProjection } from '@/lib/table'
+
+/** A whole-table projection failure renders as "no table data", never stale. */
+function snapshotTable(snap: SnapshotForRealtime): TableProjection | null {
+  return snap.table && !isProjectionError(snap.table) ? snap.table : null
+}
 
 interface UseLiveTableRealtimeOptions {
   campaignId: string | null
@@ -47,6 +53,7 @@ interface LiveTableState {
   rollRequests: NonNullable<SnapshotForRealtime['roll_requests']>
   dmMessages: DmMessageForRealtime[]
   surfaces: NonNullable<SnapshotForRealtime['surfaces']> | null
+  table: TableProjection | null
   dmChunks: Map<string, RealtimeEvent[]> // incremental chunks newer than snapshot
   dmStatus: RealtimeEvent | null
   revision: number | null
@@ -92,6 +99,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         dmMessages: initialSnapshot.dm_messages ?? [],
         rollRequests: initialSnapshot.roll_requests ?? [],
         surfaces: initialSnapshot.surfaces ?? null,
+        table: snapshotTable(initialSnapshot),
         dmChunks: new Map(),
         dmStatus: null,
         revision: initialSnapshot.revision ?? null,
@@ -111,6 +119,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       dmMessages: [],
       rollRequests: [],
       surfaces: null,
+      table: null,
       dmChunks: new Map(),
       dmStatus: null,
       revision: initialSnapshot?.revision ?? null,
@@ -178,6 +187,9 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         // every adopted snapshot (reconnect + invalidation reloads), never
         // merged — a revoked view must not linger beside a new grant.
         surfaces: snap.surfaces ?? null,
+        // Replaced wholesale like surfaces: the adopted snapshot is the only
+        // authority for what the table shows.
+        table: snapshotTable(snap),
         // Clear incremental chunks — snapshot's visible_text is authoritative.
         // New chunks strictly newer than snapshot will repopulate this map.
         dmChunks: new Map(),
@@ -412,6 +424,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       dmMessages: [],
       rollRequests: [],
       surfaces: null,
+      table: null,
       dmChunks: new Map(),
       dmStatus: null,
       revision: null,
@@ -630,6 +643,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     dmMessages: state.dmMessages,
     rollRequests: state.rollRequests,
     surfaces: state.surfaces,
+    table: state.table,
     dmChunks: state.dmChunks,
     dmStatus: state.dmStatus,
     revision: state.revision,

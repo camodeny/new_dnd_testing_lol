@@ -20,8 +20,8 @@ import { mergeOptimisticMessages } from '@/lib/optimisticMessages'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import CampaignLobby from '@/components/dashboard/CampaignLobby'
-import StoryAtlas from '@/components/dashboard/StoryAtlas'
-import type { Campaign, Character, Message, Session, EncounterMap } from '@/types'
+import CampaignTable from '@/components/table/CampaignTable'
+import type { Campaign, Character, Message, Session } from '@/types'
 
 type CampaignMode = 'lobby' | 'planning' | 'world-building' | 'session'
 
@@ -56,7 +56,6 @@ export default function CampaignViewPage() {
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
-  const [encounterMap, setEncounterMap] = useState<EncounterMap | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [mode, setMode] = useState<CampaignMode | null>(null)
@@ -155,8 +154,6 @@ export default function CampaignViewPage() {
 
       if (activeSession) {
         setSession(activeSession)
-        // No authoritative encounter-map backend (stub removed); map state
-        // stays client-owned via StoryAtlas onEncounterMapChange.
         setMode('session')
       } else if (camp.status === 'active') {
         // Live table survived a refresh: re-enter the session with a
@@ -256,6 +253,7 @@ export default function CampaignViewPage() {
       content,
       created_at: new Date().toISOString(),
       sender_name: currentCharacter?.name ?? user?.username ?? 'Player',
+      is_own: true,
       segments: parseQuotedSegments(content),
     }
     optimistic.is_ic = (optimistic.segments ?? []).every((segment) => segment.type === 'ic')
@@ -278,12 +276,12 @@ export default function CampaignViewPage() {
       })
       await liveTable.refresh()
     } catch (err) {
-      // Send failed: withdraw the optimistic entry (StoryAtlas restores the
+      // Send failed: withdraw the optimistic entry (the table restores the
       // draft) so a failed send is never displayed as accepted work.
       setPendingMessages((current) => current.filter((entry) => entry.id !== pendingId))
       if (isCapacityPausedError(err)) {
         // Lost a capacity race after the meter's last poll: keep the draft
-        // (StoryAtlas restores it) and resync from the authoritative
+        // (the table restores it) and resync from the authoritative
         // projection instead of showing raw accounting detail.
         void capacity.refresh()
         setError('AI narration just paused for the campaign — your draft is kept. It will send when capacity returns.')
@@ -478,15 +476,14 @@ export default function CampaignViewPage() {
           </div>
         </div>
       ) : (
-        <StoryAtlas
+        <CampaignTable
           campaign={campaign}
-          characters={characters}
           session={session}
           messages={messages}
           hasOlderMessages={liveTable.hasOlderMessages}
           currentUser={user}
-          currentCharacter={currentCharacter}
-          encounterMap={encounterMap}
+          table={liveTable.table}
+          rollRequests={liveTable.rollRequests}
           aiThinking={aiThinking}
           aiThinkingStatus={aiThinkingStatus}
           activeDmText={streamingDmText}
@@ -514,9 +511,8 @@ export default function CampaignViewPage() {
           onCapacityEvent={handleCapacityEvent}
           onSendMessage={handleSendMessage}
           onLoadOlderMessages={handleLoadOlderMessages}
-          onRetryLiveTable={liveTable.refresh}
+          onRefresh={liveTable.refresh}
           onStartSession={handleStartSession}
-          onEncounterMapChange={setEncounterMap}
           onExitToCampaigns={() => router.push('/')}
         />
       )}

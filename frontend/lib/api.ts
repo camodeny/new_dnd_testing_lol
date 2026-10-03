@@ -335,6 +335,5 @@ export const funding = {
 }
 
 // ── Encounter maps ────────────────────────────────────────────────────────
-// Removed: the encounter-maps/current stub had no authoritative backend
-// (PR #348 re-review). StoryAtlas owns map state client-side via
-// onEncounterMapChange until a real map authority lands.
+// No client API: the player's view of the active encounter and its map
+// arrives in the live-table snapshot's `table.encounter` projection.
