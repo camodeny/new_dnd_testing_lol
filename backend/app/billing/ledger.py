@@ -52,7 +52,6 @@ from models.usage import (
     FUNDED_CREDIT_TYPES,
     ENTRY_TYPE_ADMIN_ADJUSTMENT,
     ENTRY_TYPE_AI_SPEND,
-    ENTRY_TYPE_BYOK_MARKER,
     CampaignUsageEntry,
 )
 
@@ -75,8 +74,8 @@ class LedgerConflictError(AccountingError):
 
 # Entry types that must carry a strictly positive amount.
 _POSITIVE_TYPES = FUNDED_CREDIT_TYPES
-# ai_spend must be strictly negative; byok_marker exactly zero; admin any nonzero? allow zero? require nonzero to keep audit clean.
-_AMOUNT_RULES = "positive-funding / negative-spend / zero-byok / nonzero-admin"
+# AI spend is strictly negative; admin adjustments must be nonzero.
+_AMOUNT_RULES = "positive-funding / negative-spend / nonzero-admin"
 
 
 def usd_to_cents(cost_usd: float | Decimal | None) -> int:
@@ -101,9 +100,6 @@ def _validate_amount(entry_type: str, amount_cents: int) -> None:
     elif entry_type == ENTRY_TYPE_AI_SPEND:
         if amount_cents >= 0:
             raise AccountingError(f"ai_spend requires amount_cents < 0, got {amount_cents}")
-    elif entry_type == ENTRY_TYPE_BYOK_MARKER:
-        if amount_cents != 0:
-            raise AccountingError(f"byok_marker requires amount_cents == 0, got {amount_cents}")
     elif entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT:
         if amount_cents == 0:
             raise AccountingError("admin_adjustment requires nonzero amount_cents")
@@ -399,7 +395,6 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
     - ``remaining_cents``: funded − consumed.
     - ``percent_used``: consumed/funded·100 clamped to [0, 100]; 0.0 when
       nothing is funded and nothing spent, 100.0 when spent with no funding.
-    - ``byok_run_markers``: count of zero-amount BYOK markers (no capacity effect).
     - ``recovery_cost_usd``: separately tracked non-billable cost (free).
     - ``contributors``: per-user funded totals (aggregates only).
     """
@@ -408,7 +403,6 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
     funded = 0
     consumed = 0
     spend_count = 0
-    byok_markers = 0
     contributors: dict[str, int] = {}
     for e in entries:
         if e.entry_type in FUNDED_CREDIT_TYPES:
@@ -421,8 +415,6 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
         elif e.entry_type == ENTRY_TYPE_AI_SPEND:
             consumed += abs(e.amount_cents)
             spend_count += 1
-        elif e.entry_type == ENTRY_TYPE_BYOK_MARKER:
-            byok_markers += 1
 
     remaining = funded - consumed
     if funded <= 0:
@@ -439,7 +431,6 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
         "percent_used": percent,
         "entry_count": len(entries),
         "spend_entry_count": spend_count,
-        "byok_run_markers": byok_markers,
         "recovery_cost_usd": recovery_cost_usd(db, campaign_id),
         "contributors": contributors,
     }

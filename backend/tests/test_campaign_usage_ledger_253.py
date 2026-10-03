@@ -232,9 +232,9 @@ def test_admin_adjustment_signed_correction():
     db.close()
 
 
-# ── 7. percentage calc: grace, added funds, BYOK marker ────────────────────
+# ── 7. percentage calc: grace and added funds ────────────────────
 
-def test_percentage_from_ledger_with_grace_and_byok():
+def test_percentage_from_ledger_with_grace_and_added_funds():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
@@ -244,8 +244,6 @@ def test_percentage_from_ledger_with_grace_and_byok():
                  idempotency_key="funds-1")
     record_entry(db, campaign_id=camp, entry_type="grace", amount_cents=200,
                  idempotency_key="grace-1")
-    record_entry(db, campaign_id=camp, entry_type="byok_marker", amount_cents=0,
-                 idempotency_key="byok-1", note="user key run, non-platform")
     db.commit()
     run = _run(db, cost_usd=2.50, campaign_id=camp)
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
@@ -253,7 +251,6 @@ def test_percentage_from_ledger_with_grace_and_byok():
     summary = get_capacity_summary(db, camp)
     assert summary["funded_cents"] == 1000
     assert summary["consumed_cents"] == 250
-    assert summary["byok_run_markers"] == 1  # marker has no capacity effect
     assert summary["percent_used"] == 25.0
     # Empty ledger edge: nothing funded, nothing spent → 0%.
     camp2, _ = _seed(db)
@@ -321,8 +318,8 @@ def test_billing_state_not_in_dm_or_rules_inputs():
         record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=-5,
                      idempotency_key="bad-sign")
     with pytest.raises(AccountingError):
-        record_entry(db, campaign_id=camp, entry_type="byok_marker", amount_cents=10,
-                     idempotency_key="bad-byok")
+        record_entry(db, campaign_id=camp, entry_type="unsupported", amount_cents=10,
+                     idempotency_key="unknown-type")
     db.rollback()
     db.close()
 

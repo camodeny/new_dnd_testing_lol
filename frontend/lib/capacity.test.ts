@@ -34,9 +34,8 @@ describe('deriveCapacityView', () => {
     expect(deriveCapacityView({ ai_paused: true }).state).toBe('paused')
   })
 
-  it('keeps funded/BYOK-style payloads percentage-only', () => {
-    // A funded campaign with spend and a BYOK-flavored zero-amount marker
-    // surface both project to the same simple view shape.
+  it('keeps funded payloads percentage-only', () => {
+    // Funding and spend project to a simple view without raw accounting.
     expect(deriveCapacityView({ percent_used: 12, funded_cents: 500, contributor_count: 2 }))
       .toEqual({ state: 'normal', percent: 12 })
   })

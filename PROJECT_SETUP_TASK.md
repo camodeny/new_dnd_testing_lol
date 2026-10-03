@@ -367,7 +367,7 @@ Keep them Backlog until promoted.
 
 Only use for work that the current issue/Project state explicitly marks as intentionally parked. Do not arbitrarily demote normal backlog tickets to P3.
 
-Important: before #257/#258 become Ready, review their sequencing together. Their responsibilities around the role/model/provider approval registry and BYOK routing are tightly coupled; do not invent or force a circular native dependency.
+Provider/model approval applies to platform-managed credentials only; user-managed provider keys have been removed.
 
 ---
 

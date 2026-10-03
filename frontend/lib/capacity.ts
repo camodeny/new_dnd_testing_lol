@@ -7,7 +7,7 @@
  * a percentage plus one of `normal | low | grace | paused | unavailable`.
  *
  * Deliberately excluded from the view: raw costs, token counts, provider
- * details, contributor identities, payment details, and BYOK credentials.
+ * details, contributor identities, payment details.
  * Capacity is campaign-level/shared; copy must never blame a participant.
  */
 
@@ -79,5 +79,5 @@ export function isCapacityPausedError(error: unknown): boolean {
 export type CapacityUiEvent =
   | { type: 'projection_load_error'; message: string }
   | { type: 'paused_view' }
-  | { type: 'resume_choice'; path: 'add_funds' | 'byok' }
+  | { type: 'resume_choice'; path: 'add_funds' }
   | { type: 'paused_submit_attempt' }
