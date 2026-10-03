@@ -28,7 +28,7 @@ import os
 import pytest
 
 # The only env inputs to semantic model resolution
-# (backend/app/world/semantic.py::resolve_embedding_model).
+# (backend/app/world/semantic_index.py::resolve_embedding_model).
 _PROVIDER_ENV_VARS = (
     "GEMINI_API_KEY",
     "GOOGLE_API_KEY",

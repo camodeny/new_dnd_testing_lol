@@ -16,7 +16,7 @@ Rules:
   in forward-DM context assembly (see ``app.dm.context``) so narration
   never claims an unaware state.
 - When the backlog exceeds the safe budget, new AI progression pauses
-  (``BackpressureBlocked``) BEFORE context becomes unreliable, a
+  (:func:`pause_if_backpressured`) BEFORE context becomes unreliable, a
   critical catch-up trigger fires, and accepted player input stays
   durable (coordination/acceptance is untouched — only execution pauses).
 - Estimation failure blocks conservatively: never silently omit history.
@@ -56,20 +56,6 @@ DEFAULT_SAFE_CONTEXT_TOKENS = 12_000
 # added on top of each event's measured payload size so the estimate
 # always meets or exceeds the real assembled record cost.
 RECORD_ENVELOPE_MARGIN_BYTES = 512
-
-
-class BackpressureBlocked(Exception):
-    """New AI progression must pause until post-turn catches up."""
-
-    code = "post_turn_backpressure"
-
-    def __init__(self, status: dict[str, Any]):
-        self.status = status
-        super().__init__(
-            "Post-turn is behind beyond the safe context budget; "
-            f"AI progression paused (outstanding={status.get('outstanding')}, "
-            f"estimated_bytes={status.get('estimated_bytes')})."
-        )
 
 
 def get_safe_context_budget_bytes() -> int:
@@ -192,14 +178,6 @@ def evaluate_backpressure(db: Session, campaign_id: uuid.UUID) -> dict[str, Any]
         "age_seconds": span.get("age_seconds", 0.0),
         "suggested_trigger": "critical" if blocked else None,
     }
-
-
-def require_forward_progress(db: Session, campaign_id: uuid.UUID) -> dict[str, Any]:
-    """Raise :class:`BackpressureBlocked` when new AI progression must pause."""
-    status = evaluate_backpressure(db, campaign_id)
-    if status["blocked"]:
-        raise BackpressureBlocked(status)
-    return status
 
 
 def request_catchup(

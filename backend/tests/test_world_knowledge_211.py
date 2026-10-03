@@ -17,16 +17,16 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
-from app.world.epistemics import (  # noqa: E402
+from app.visibility.access import may_user_receive  # noqa: E402
+from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     grant_visibility,
-    may_user_receive,
     project_facts_for_user,
     project_relations_for_user,
     what_does_subject_know,
     who_knows_target,
 )
-from app.world.knowledge import create_fact, create_relation  # noqa: E402
+from app.world.facts import create_fact, create_relation  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402

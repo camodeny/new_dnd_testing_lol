@@ -33,13 +33,10 @@ from app.adventures.service import (
     project_recap,
 )
 from app.campaigns.events import RevisionConflictError
-from app.campaigns.service import (
-    CampaignArchivedError,
-    is_campaign_member,
-    parse_campaign_id,
-)
+from app.campaigns.service import CampaignArchivedError, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+from app.visibility.access import is_campaign_participant
 from database import get_db
 from models.campaigns import Adventure, AdventureEpilogue, AdventureSummary, Campaign
 
@@ -55,7 +52,7 @@ def _campaign_or_404(db: Session, cid: uuid_lib.UUID) -> Campaign:
 
 
 def _require_member(db: Session, camp: Campaign, profile) -> None:
-    if camp.owner_id != profile.id and not is_campaign_member(db, camp.id, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
 
 

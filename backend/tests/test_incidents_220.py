@@ -33,13 +33,12 @@ from app.post_turn.incidents import (  # noqa: E402
     UNCERTAIN,
     ProposedWrite,
     SemanticPair,
-    get_consistency_stats,
     is_range_complete,
     resolve_incident,
     verify_post_turn_consistency,
 )
 from app.post_turn.service import get_checkpoint, run_post_turn_range  # noqa: E402
-from app.world.knowledge import create_fact  # noqa: E402
+from app.world.facts import create_fact  # noqa: E402
 from app.world.service import apply_scene_update, create_entity  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.post_turn import PostTurnConsistencyIncident  # noqa: E402
@@ -405,10 +404,6 @@ def test_required_unresolved_incidents_block_post_turn_complete():
     resolve_incident(db, pending[0].id)
     db.expire_all()
     assert is_range_complete(db, c.id, e1.sequence, e2.sequence) is True
-    stats = get_consistency_stats(db, c.id)
-    assert stats["by_type"]["source_conflict"] == 1
-    assert stats["by_detection_path"]["deterministic"] == 1
-    assert stats["avg_time_to_resolution_seconds"] is not None
 
 
 def test_clean_range_completes_with_no_incidents():

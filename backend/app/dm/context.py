@@ -1367,7 +1367,7 @@ def assemble_attempt_context(
             if len(scene_npc_ids) >= 32:
                 break
     try:
-        from app.world.epistemics import build_knowledge_visibility_values
+        from app.world.knowledge import build_knowledge_visibility_values
 
         knowledge_values = build_knowledge_visibility_values(
             db, campaign, sorted(character_ids, key=str),
@@ -1538,7 +1538,7 @@ def repair_packet_missing_perspectives(
     scope-narrowing). Never raises: repair is best-effort.
     """
     try:
-        from app.world.epistemics import build_knowledge_visibility_values
+        from app.world.knowledge import build_knowledge_visibility_values
         from app.world.identity import exact_identity
 
         ordered = [str(s or "").strip() for s in (subject_ids or [])]

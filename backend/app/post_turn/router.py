@@ -30,7 +30,7 @@ def post_turn_cron_get(request: Request, db: Session = Depends(get_db)):
 
     require_cron_secret(request.headers.get("authorization"))
     from app.post_turn.service import run_post_turn_sweep
-    from app.world.semantic import run_semantic_index_sweep
+    from app.world.semantic_index import run_semantic_index_sweep
 
     result = run_post_turn_sweep(db)
     logger.info(

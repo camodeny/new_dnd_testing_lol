@@ -302,13 +302,13 @@ def validate_seed_spec(spec: dict, *, required_pc_ids: list[str]) -> None:
     from app.world.service import (
         validate_entity_name, validate_entity_status, validate_entity_type,
     )
-    from app.world.knowledge import (
+    from app.world.facts import (
         validate_epistemic_state, validate_fact_content, validate_relation_type,
     )
     from app.world.clocks import (
         validate_advancement_criteria, validate_completion_criteria, validate_stages,
     )
-    from app.world.epistemics import normalize_record_visibility
+    from app.visibility.policy import canonical_visibility
 
     if not isinstance(spec, dict) or spec.get("contract_version") != WORLD_SEED_CONTRACT_VERSION:
         raise WorldSeedError("World seed spec contract version mismatch")
@@ -333,8 +333,8 @@ def validate_seed_spec(spec: dict, *, required_pc_ids: list[str]) -> None:
     if missing:
         raise WorldSeedError("World seed does not cover every selected party character")
     # Visibility vocabulary fails closed.
-    normalize_record_visibility("campaign")
-    normalize_record_visibility("dm_only")
+    canonical_visibility("campaign")
+    canonical_visibility("dm_only")
     validate_relation_type("member_of")
     validate_relation_type("present_at")
     validate_epistemic_state("confirmed")
@@ -385,8 +385,8 @@ def run_world_seed(
         CampaignArchivedError, compute_start_eligibility, require_playable_campaign,
     )
     from app.world.clocks import create_clock
-    from app.world.epistemics import assert_knowledge
-    from app.world.knowledge import create_fact, create_relation
+    from app.world.knowledge import assert_knowledge
+    from app.world.facts import create_fact, create_relation
     from app.world.service import apply_scene_update, create_entity
     from models.campaigns import Campaign, CampaignMember
     from models.world import CampaignCurrentScene

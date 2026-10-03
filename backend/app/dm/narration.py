@@ -1750,7 +1750,7 @@ def execute_validated_turn(
     if getattr(contract, "new_entities", None):
         from models.campaigns import Campaign as _Campaign
 
-        from app.world.service import resolve_new_entity_identities_pre_narration
+        from app.world.identity import resolve_new_entity_identities_pre_narration
 
         _campaign = db.get(_Campaign, turn.campaign_id)
         if _campaign is None:
@@ -1787,7 +1787,7 @@ def execute_validated_turn(
         try:
             from models.campaigns import Campaign as _Campaign
 
-            from app.world.epistemics import collect_subject_restricted_fact_texts
+            from app.world.knowledge import collect_subject_restricted_fact_texts
 
             _speakers = derive_knowledge_speaker_scope(contract)
             if _speakers:

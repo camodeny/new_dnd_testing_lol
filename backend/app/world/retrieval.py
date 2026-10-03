@@ -37,13 +37,31 @@ from sqlalchemy import or_ as sqlalchemy_or, select
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
+from app.visibility.policy import most_restrictive, visibility_or_dm_only
+from app.world._common import clamp_limit, coerce_optional_uuid, coerce_uuid
+from app.world.evidence_packets import (
+    EvidencePacket,
+    audience_viewers,
+    authorize_world_record,
+    entity_packet,
+    event_packet,
+    event_visible_player_facing,
+    fact_packet,
+    knowledge_packet,
+    packet_source_ids,
+    relation_packet,
+    resolve_campaign,
+    resolve_viewers,
+    submission_gate,
+    tool_result,
+    turn_gate,
+    turn_packet,
+)
 from models.campaigns import Campaign, CampaignDomainEvent
-from models.dm import DmTurn, DmTurnAttempt
+from models.dm import DmTurn
 from models.threads import PlayerSubmission
 
 logger = logging.getLogger(__name__)
-
-RETRIEVAL_SOURCE = "world_retrieval_212"
 
 # ── Bounds (observable; every outcome reports the applied values) ────────────
 
@@ -59,62 +77,7 @@ STATUS_OK = "ok"
 STATUS_NOT_FOUND = "not_found"
 STATUS_DEFER = "defer"
 STATUS_NO_MATCH = "no_match"
-# ── Typed evidence packet ────────────────────────────────────────────────────
-
-@dataclass
-class EvidencePacket:
-    """One normalized authoritative evidence item.
-
-    ``source_type``/``source_id``/``source_version`` form the stable source
-    identity used by validators and audit tooling. ``retrieval_rank`` is the
-    deterministic retrieval order.
-    ``revealable`` is meaningful in player-facing mode (True = authorized
-    for the viewer); in DM-internal mode it is None (deferred to later
-    projection) while ``visibility`` is always preserved.
-    """
-
-    source_type: str
-    source_id: str
-    source_version: str
-    content: dict[str, Any]
-    epistemic_state: str | None
-    visibility: str
-    campaign_id: str
-    revision_or_sequence: int | None
-    provenance: dict[str, Any]
-    retrieval_rank: int = 0
-    retrieval_score: float = 0.0
-    revealable: bool | None = None
-    denial_reason: str | None = None
-    created_at: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "source_type": self.source_type,
-            "source_id": self.source_id,
-            "source_version": self.source_version,
-            "content": self.content,
-            "epistemic_state": self.epistemic_state,
-            "visibility": self.visibility,
-            "campaign_id": self.campaign_id,
-            "revision_or_sequence": self.revision_or_sequence,
-            "provenance": self.provenance,
-            "retrieval_rank": self.retrieval_rank,
-            "retrieval_score": self.retrieval_score,
-            "revealable": self.revealable,
-            "denial_reason": self.denial_reason,
-            "created_at": self.created_at,
-        }
-
-    def to_source_ref(self) -> dict[str, Any]:
-        return {
-            "source_type": self.source_type,
-            "source_id": self.source_id,
-            "source_version": self.source_version,
-            "campaign_revision": self.revision_or_sequence,
-            "provenance": dict(self.provenance),
-        }
-
+# ── Typed outcome ────────────────────────────────────────────────────────────
 
 @dataclass
 class RetrievalOutcome:
@@ -152,112 +115,12 @@ class RetrievalOutcome:
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-def _clamp_limit(limit: Any) -> int:
-    try:
-        value = int(limit if limit is not None else RETRIEVAL_DEFAULT_LIMIT)
-    except (TypeError, ValueError):
-        value = RETRIEVAL_DEFAULT_LIMIT
-    return max(1, min(value, RETRIEVAL_MAX_LIMIT))
-
-
 def _clamp_depth(depth: Any) -> int:
     try:
         value = int(depth if depth is not None else RETRIEVAL_DEFAULT_DEPTH)
     except (TypeError, ValueError):
         value = RETRIEVAL_DEFAULT_DEPTH
     return max(0, min(value, RETRIEVAL_MAX_DEPTH))
-
-
-def _coerce_uuid(value: Any, *, field_name: str) -> uuid.UUID:
-    try:
-        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise ValueError(f"Invalid {field_name} {value!r}") from exc
-
-
-def _coerce_optional_uuid(value: Any) -> uuid.UUID | None:
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
-    return _coerce_uuid(value, field_name="id")
-
-
-def _packet_source_ids(packets: list[EvidencePacket]) -> list[str]:
-    return sorted({f"{p.source_type}:{p.source_id}@{p.source_version}" for p in packets})
-
-
-def _provenance(
-    record: Any, *, extra: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """Code-owned provenance built only from persisted record fields."""
-    prov: dict[str, Any] = {"retrieved_by": RETRIEVAL_SOURCE}
-    for attr in ("source_turn_id", "source_attempt_id", "source_event_id",
-                 "actor_id", "operation_id", "idempotency_key"):
-        value = getattr(record, attr, None)
-        if value is not None:
-            prov[attr] = str(value)
-    stored = getattr(record, "provenance", None)
-    if isinstance(stored, dict):
-        for key, value in stored.items():
-            prov.setdefault(f"record_{key}", value)
-    if extra:
-        for key, value in extra.items():
-            prov.setdefault(key, value)
-    return prov
-
-
-def _version_of(record: Any, *, fallback: str = "1") -> str:
-    version = getattr(record, "version", None)
-    if version is not None:
-        return f"v{int(version)}"
-    updated = getattr(record, "updated_at", None)
-    if updated is not None:
-        try:
-            return updated.isoformat()
-        except Exception:
-            pass
-    return fallback
-
-
-def _created_iso(record: Any) -> str | None:
-    created = getattr(record, "created_at", None)
-    try:
-        return created.isoformat() if created else None
-    except Exception:
-        return None
-
-
-def _resolve_campaign(db: Session, campaign_id: Any) -> Campaign:
-    cid = _coerce_uuid(campaign_id, field_name="campaign_id")
-    campaign = db.get(Campaign, cid)
-    if campaign is None:
-        raise ValueError(f"Campaign {cid} not found")
-    return campaign
-
-
-def _resolve_viewers(viewer_user_id: Any) -> list[uuid.UUID]:
-    """Normalize one viewer id or a list of them (fail-closed on garbage)."""
-    if viewer_user_id is None:
-        return []
-    raw = viewer_user_id if isinstance(viewer_user_id, (list, tuple)) else [viewer_user_id]
-    viewers: list[uuid.UUID] = []
-    for value in raw:
-        try:
-            viewers.append(_coerce_uuid(value, field_name="viewer_user_id"))
-        except ValueError:
-            continue
-    seen: set[str] = set()
-    unique: list[uuid.UUID] = []
-    for viewer in viewers:
-        if str(viewer) not in seen:
-            seen.add(str(viewer))
-            unique.append(viewer)
-    return unique
-
-
-def _membership(db: Session, campaign: Campaign, viewer: uuid.UUID) -> bool:
-    from app.campaigns.service import is_campaign_member
-
-    return campaign.owner_id == viewer or is_campaign_member(db, campaign.id, viewer)
 
 
 def _log_query(
@@ -297,203 +160,6 @@ def _not_found(query_type: str, campaign: Campaign, *, depth: int, limit: int,
     return outcome
 
 
-# ── Packet builders (one per record kind; visibility always preserved) ───────
-
-def _entity_packet(entity: Any, campaign_id: uuid.UUID, rank: int,
-                   *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="world_entity",
-        source_id=str(entity.id),
-        source_version=_version_of(entity),
-        content=entity.to_dict(),
-        epistemic_state=None,
-        visibility=str(getattr(entity, "visibility", "campaign")),
-        campaign_id=str(campaign_id),
-        revision_or_sequence=None,
-        provenance=_provenance(entity),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(entity),
-    )
-
-
-def _relation_packet(relation: Any, campaign_id: uuid.UUID, rank: int,
-                     *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="world_relation",
-        source_id=str(relation.id),
-        source_version=_version_of(relation),
-        content=relation.to_dict(),
-        epistemic_state=str(getattr(relation, "epistemic_state", "claimed")),
-        visibility=str(getattr(relation, "visibility", "dm_only")),
-        campaign_id=str(campaign_id),
-        revision_or_sequence=None,
-        provenance=_provenance(relation),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(relation),
-    )
-
-
-def _fact_packet(fact: Any, campaign_id: uuid.UUID, rank: int,
-                 *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="world_fact",
-        source_id=str(fact.id),
-        source_version=_version_of(fact),
-        content=fact.to_dict(),
-        epistemic_state=str(getattr(fact, "epistemic_state", "claimed")),
-        visibility=str(getattr(fact, "visibility", "dm_only")),
-        campaign_id=str(campaign_id),
-        revision_or_sequence=None,
-        provenance=_provenance(fact),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(fact),
-    )
-
-
-def _event_packet(event: CampaignDomainEvent, rank: int,
-                  *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="domain_event",
-        source_id=str(event.id),
-        source_version=f"seq{int(event.sequence)}",
-        content=event.to_dict(),
-        epistemic_state=None,
-        visibility=str(getattr(event, "visibility", "public")),
-        campaign_id=str(event.campaign_id),
-        revision_or_sequence=int(event.sequence),
-        provenance=_provenance(event, extra={"event_type": event.event_type}),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(event),
-    )
-
-
-def _turn_packet(turn: DmTurn, rank: int, *,
-                 revealable: bool | None,
-                 submissions: list[dict[str, Any]] | None = None,
-                 records: dict[str, list[str]] | None = None) -> EvidencePacket:
-    audience = str(getattr(turn, "audience", "campaign") or "campaign")
-    visibility = audience if audience in {"public", "campaign", "private", "dm_only"} else "campaign"
-    content = turn.to_dict()
-    if submissions is not None:
-        content = {**content, "submissions": submissions}
-    if records is not None:
-        content = {**content, "established_records": records}
-    return EvidencePacket(
-        source_type="source_turn",
-        source_id=str(turn.id),
-        source_version=_version_of(turn),
-        content=content,
-        epistemic_state=None,
-        visibility=visibility,
-        campaign_id=str(turn.campaign_id),
-        revision_or_sequence=int(getattr(turn, "source_revision", 0) or 0),
-        provenance=_provenance(turn, extra={"thread_id": str(getattr(turn, "thread_id", ""))}),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(turn),
-    )
-
-
-def _scene_packet(scene: Any, rank: int, *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="scene",
-        source_id=str(scene.campaign_id),
-        source_version=f"r{int(getattr(scene, 'revision', 0) or 0)}",
-        content=scene.to_dict(),
-        epistemic_state=None,
-        visibility=str(getattr(scene, "visibility", "campaign")),
-        campaign_id=str(scene.campaign_id),
-        revision_or_sequence=int(getattr(scene, "revision", 0) or 0),
-        provenance=_provenance(scene),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(scene),
-    )
-
-
-def _knowledge_packet(entry: dict[str, Any], rank: int,
-                      *, revealable: bool | None) -> EvidencePacket:
-    return EvidencePacket(
-        source_type="knowledge",
-        source_id=str(entry.get("knowledge_id", f"knowledge:{rank}")),
-        source_version="1",
-        content=dict(entry),
-        epistemic_state=str(entry.get("knowledge_state", "believes")),
-        visibility=str(entry.get("visibility", "dm_only") or "dm_only"),
-        campaign_id=str(entry.get("campaign_id", "")),
-        revision_or_sequence=None,
-        provenance={"retrieved_by": RETRIEVAL_SOURCE,
-                    "subject_entity_id": str(entry.get("subject_entity_id", "")),
-                    "target_kind": str(entry.get("target_kind", "")),
-                    "target_id": str(entry.get("target_id", ""))},
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=None,
-    )
-
-
-# ── Authorization gates ──────────────────────────────────────────────────────
-
-def _authorize_world_record(
-    db: Session, campaign: Campaign, kind: str, record_id: uuid.UUID,
-    viewers: list[uuid.UUID], *, dm_internal: bool,
-) -> tuple[bool, str | None]:
-    """Return (allowed, denial_reason) for one world record.
-
-    DM-internal mode never denies here — visibility metadata travels on the
-    packet for later projection. Player-facing mode requires membership plus
-    an explicit ``may_user_receive`` allow for EVERY listed viewer
-    (intersection: the most restrictive viewer wins, fail closed).
-    """
-    from app.world.epistemics import may_user_receive
-
-    if dm_internal:
-        return True, None
-    if not viewers:
-        return False, "viewer_required"
-    for viewer in viewers:
-        if not _membership(db, campaign, viewer):
-            return False, "not_campaign_member"
-        verdict = may_user_receive(db, campaign, kind, record_id, viewer)
-        if not verdict.get("allowed"):
-            return False, str(verdict.get("reason", "denied"))
-    return True, None
-
-
-def _event_visible_player_facing(db: Session, campaign: Campaign,
-                                  event: CampaignDomainEvent,
-                                  viewers: list[uuid.UUID]) -> tuple[bool, str | None]:
-    """Member feed rule mirroring ``list_campaign_events``: public events,
-    plus a viewer's own actor events. Anything else stays hidden.
-
-    Every player-facing viewer must first pass campaign membership — an
-    arbitrary user UUID plus a known campaign ID must not read that
-    campaign's public timeline.
-    """
-    if not viewers:
-        return False, "viewer_required"
-    for viewer in viewers:
-        if not _membership(db, campaign, viewer):
-            return False, "not_campaign_member"
-    if str(getattr(event, "visibility", "public")) == "public":
-        return True, None
-    actor = getattr(event, "actor_id", None)
-    if actor is not None and any(str(actor) == str(viewer) for viewer in viewers):
-        return True, None
-    return False, "event_not_visible"
-
-
 # ── Entity + graph traversal ─────────────────────────────────────────────────
 
 def retrieve_entity(
@@ -508,15 +174,15 @@ def retrieve_entity(
     from app.world.service import get_entity_strict
 
     started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     try:
-        eid = _coerce_uuid(entity_id, field_name="entity_id")
+        eid = coerce_uuid(entity_id, field="entity_id")
         entity = get_entity_strict(db, campaign.id, eid)
     except ValueError as exc:
         return _not_found("lookup_world_entity", campaign, depth=0,
                           limit=1, detail=str(exc))
-    allowed, reason = _authorize_world_record(
+    allowed, reason = authorize_world_record(
         db, campaign, "entity", entity.id, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
     outcome.total = 1
@@ -528,11 +194,11 @@ def retrieve_entity(
         _log_query("lookup_world_entity", campaign, depth=0, limit=1,
                    outcome=outcome, dm_internal=dm_internal)
         return outcome
-    outcome.packets = [_entity_packet(
+    outcome.packets = [entity_packet(
         entity, campaign.id, 0,
         revealable=None if dm_internal else True)]
     outcome.visible = 1
-    outcome.source_ids = _packet_source_ids(outcome.packets)
+    outcome.source_ids = packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("lookup_world_entity", campaign, depth=0, limit=1,
                outcome=outcome, dm_internal=dm_internal)
@@ -563,18 +229,18 @@ def traverse_relations(
 
     started = time.monotonic()
     depth_applied = _clamp_depth(depth)
-    limit_applied = _clamp_limit(limit)
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    limit_applied = clamp_limit(limit, default=RETRIEVAL_DEFAULT_LIMIT, maximum=RETRIEVAL_MAX_LIMIT)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     try:
-        root_id = _coerce_uuid(root_entity_id, field_name="entity_id")
+        root_id = coerce_uuid(root_entity_id, field="entity_id")
         root = get_entity_strict(db, campaign.id, root_id)
     except ValueError as exc:
         return _not_found("traverse_world_relations", campaign, depth=depth_applied,
                           limit=limit_applied, detail=str(exc))
 
     outcome = RetrievalOutcome(depth_applied=depth_applied, limit_applied=limit_applied)
-    allowed, reason = _authorize_world_record(
+    allowed, reason = authorize_world_record(
         db, campaign, "entity", root.id, viewers, dm_internal=dm_internal)
     if not allowed:
         outcome.total = 1
@@ -593,11 +259,11 @@ def traverse_relations(
     relation_ids: set[str] = set()
     truncated = False
 
-    root_packet = _entity_packet(root, campaign.id, 0,
+    root_packet = entity_packet(root, campaign.id, 0,
                                  revealable=None if dm_internal else True)
     packets[0] = root_packet
 
-    from app.world.knowledge import list_relations
+    from app.world.facts import list_relations
     from models.world import WorldEntity
 
     for _level in range(depth_applied):
@@ -612,14 +278,14 @@ def traverse_relations(
                 if str(relation.id) in relation_ids:
                     continue
                 total_seen += 1
-                allowed_rel, reason_rel = _authorize_world_record(
+                allowed_rel, reason_rel = authorize_world_record(
                     db, campaign, "relation", relation.id, viewers,
                     dm_internal=dm_internal)
                 if not allowed_rel:
                     denied_reasons[reason_rel or "denied"] = denied_reasons.get(reason_rel or "denied", 0) + 1
                     continue
                 relation_ids.add(str(relation.id))
-                packets.append(_relation_packet(
+                packets.append(relation_packet(
                     relation, campaign.id, len(packets),
                     revealable=None if dm_internal else True))
                 for neighbor_id in (relation.subject_entity_id, relation.object_entity_id):
@@ -629,14 +295,14 @@ def traverse_relations(
                     if neighbor is None or neighbor.campaign_id != campaign.id:
                         continue
                     total_seen += 1
-                    allowed_ent, reason_ent = _authorize_world_record(
+                    allowed_ent, reason_ent = authorize_world_record(
                         db, campaign, "entity", neighbor.id, viewers,
                         dm_internal=dm_internal)
                     if not allowed_ent:
                         denied_reasons[reason_ent or "denied"] = denied_reasons.get(reason_ent or "denied", 0) + 1
                         continue
                     visited_entities.add(str(neighbor.id))
-                    packets.append(_entity_packet(
+                    packets.append(entity_packet(
                         neighbor, campaign.id, len(packets),
                         revealable=None if dm_internal else True))
                     next_frontier.append(neighbor)
@@ -667,7 +333,7 @@ def traverse_relations(
     outcome.denied = total_seen - len(packets)
     outcome.denied_reasons = denied_reasons
     outcome.truncated = truncated
-    outcome.source_ids = _packet_source_ids(packets)
+    outcome.source_ids = packet_source_ids(packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("traverse_world_relations", campaign, depth=depth_applied,
                limit=limit_applied, outcome=outcome, dm_internal=dm_internal)
@@ -685,18 +351,18 @@ def lookup_fact(
     dm_internal: bool = False,
 ) -> RetrievalOutcome:
     """Retrieve one canonical fact by stable ID with provenance metadata."""
-    from app.world.knowledge import get_fact_strict
+    from app.world.facts import get_fact_strict
 
     started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     try:
-        fid = _coerce_uuid(fact_id, field_name="fact_id")
+        fid = coerce_uuid(fact_id, field="fact_id")
         fact = get_fact_strict(db, campaign.id, fid)
     except ValueError as exc:
         return _not_found("lookup_world_fact", campaign, depth=0,
                           limit=1, detail=str(exc))
-    allowed, reason = _authorize_world_record(
+    allowed, reason = authorize_world_record(
         db, campaign, "fact", fact.id, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
     outcome.total = 1
@@ -707,10 +373,10 @@ def lookup_fact(
         _log_query("lookup_world_fact", campaign, depth=0, limit=1,
                    outcome=outcome, dm_internal=dm_internal)
         return outcome
-    outcome.packets = [_fact_packet(
+    outcome.packets = [fact_packet(
         fact, campaign.id, 0, revealable=None if dm_internal else True)]
     outcome.visible = 1
-    outcome.source_ids = _packet_source_ids(outcome.packets)
+    outcome.source_ids = packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("lookup_world_fact", campaign, depth=0, limit=1,
                outcome=outcome, dm_internal=dm_internal)
@@ -732,8 +398,8 @@ def fact_source_evidence(
     downstream execution can decide whether an answer is actually supported.
     """
     started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     fact_outcome = lookup_fact(db, campaign.id, fact_id, viewers,
                                dm_internal=dm_internal)
     if fact_outcome.status == STATUS_NOT_FOUND or not fact_outcome.packets:
@@ -747,17 +413,17 @@ def fact_source_evidence(
     turn_ref = content.get("source_turn_id")
     if event_ref:
         total += 1
-        event = db.get(CampaignDomainEvent, _coerce_optional_uuid(event_ref))
+        event = db.get(CampaignDomainEvent, coerce_optional_uuid(event_ref))
         if event is None or event.campaign_id != campaign.id:
             denied += 1
             denied_reasons["source_event_not_found"] = denied_reasons.get("source_event_not_found", 0) + 1
         else:
-            gate = (True, None) if dm_internal else _event_visible_player_facing(db, campaign, event, viewers)
+            gate = (True, None) if dm_internal else event_visible_player_facing(db, campaign, event, viewers)
             if not gate[0]:
                 denied += 1
                 denied_reasons[gate[1] or "denied"] = denied_reasons.get(gate[1] or "denied", 0) + 1
             else:
-                packets.append(_event_packet(event, len(packets),
+                packets.append(event_packet(event, len(packets),
                                              revealable=None if dm_internal else True))
     if turn_ref:
         total += 1
@@ -782,7 +448,7 @@ def fact_source_evidence(
         status=STATUS_OK, packets=packets, total=total, visible=len(packets),
         denied=denied, denied_reasons=denied_reasons,
         depth_applied=1, limit_applied=len(packets),
-        source_ids=_packet_source_ids(packets),
+        source_ids=packet_source_ids(packets),
         latency_ms=(time.monotonic() - started) * 1000,
     )
     _log_query("lookup_world_fact", campaign, depth=1, limit=len(packets),
@@ -811,9 +477,9 @@ def query_timeline(
     DM-internal retrieval preserves every event's visibility metadata.
     """
     started = time.monotonic()
-    limit_applied = _clamp_limit(limit)
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    limit_applied = clamp_limit(limit, default=RETRIEVAL_DEFAULT_LIMIT, maximum=RETRIEVAL_MAX_LIMIT)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     wanted: list[str] | None = None
     if event_types is not None:
         raw = [event_types] if isinstance(event_types, str) else list(event_types)
@@ -853,12 +519,12 @@ def query_timeline(
     outcome.total = len(rows)
     packets: list[EvidencePacket] = []
     for event in rows:
-        gate = (True, None) if dm_internal else _event_visible_player_facing(db, campaign, event, viewers)
+        gate = (True, None) if dm_internal else event_visible_player_facing(db, campaign, event, viewers)
         if not gate[0]:
             outcome.denied += 1
             outcome.denied_reasons[gate[1] or "denied"] = outcome.denied_reasons.get(gate[1] or "denied", 0) + 1
             continue
-        packets.append(_event_packet(event, len(packets),
+        packets.append(event_packet(event, len(packets),
                                      revealable=None if dm_internal else True))
     if len(packets) > limit_applied:
         packets = packets[:limit_applied]
@@ -868,7 +534,7 @@ def query_timeline(
         packet.retrieval_score = float(1000 - rank)
     outcome.packets = packets
     outcome.visible = len(packets)
-    outcome.source_ids = _packet_source_ids(packets)
+    outcome.source_ids = packet_source_ids(packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("query_world_timeline", campaign, depth=0, limit=limit_applied,
                outcome=outcome, dm_internal=dm_internal)
@@ -876,90 +542,6 @@ def query_timeline(
 
 
 # ── Source turns + submissions ───────────────────────────────────────────────
-
-def _thread_readable_for_viewer(
-    db: Session, campaign: Campaign, raw_thread_id: Any, viewer: uuid.UUID,
-) -> bool:
-    """Thread-ACL check for source-turn/submission evidence (read-only).
-
-    Uses the centralized ``can_read_thread`` primitive: shared campaign
-    threads require campaign membership; private threads require explicit
-    thread membership (owner status alone never grants private access).
-    Private content must live on a resolvable thread row — an unresolvable
-    thread reference denies fail-closed. (This helper is only invoked for
-    private-audience records; shared-audience legacy ``"main"`` turns
-    without a durable thread row never reach it.)
-    """
-    from app.runtime.threads import can_read_thread, parse_thread_id
-    from models.threads import CampaignThread
-    from sqlalchemy import select as _select
-
-    raw = "" if raw_thread_id is None else str(raw_thread_id)
-    if not raw or raw == "main":
-        thread = db.execute(
-            _select(CampaignThread).where(
-                CampaignThread.campaign_id == campaign.id,
-                CampaignThread.thread_type == "campaign",
-            )
-        ).scalars().first()
-        if thread is None:
-            return False
-        try:
-            return bool(can_read_thread(db, campaign.id, thread.id, viewer))
-        except Exception:
-            return False
-    try:
-        tid = parse_thread_id(raw)
-    except Exception:
-        return False
-    try:
-        return bool(can_read_thread(db, campaign.id, tid, viewer))
-    except Exception:
-        return False
-
-
-def _turn_gate(
-    db: Session, campaign: Campaign, turn: DmTurn,
-    viewers: list[uuid.UUID], *, dm_internal: bool,
-) -> tuple[bool, str | None]:
-    if dm_internal:
-        return True, None
-    if not viewers:
-        return False, "viewer_required"
-    for viewer in viewers:
-        if not _membership(db, campaign, viewer):
-            return False, "not_campaign_member"
-    audience = str(getattr(turn, "audience", "campaign") or "campaign")
-    if audience == "private":
-        for viewer in viewers:
-            if not _thread_readable_for_viewer(
-                db, campaign, getattr(turn, "thread_id", None), viewer
-            ):
-                return False, "turn_not_visible"
-        return True, None
-    return True, None
-
-
-def _submission_gate(
-    db: Session, campaign: Campaign, submission: PlayerSubmission,
-    viewers: list[uuid.UUID], *, dm_internal: bool,
-) -> tuple[bool, str | None]:
-    if dm_internal:
-        return True, None
-    if not viewers:
-        return False, "viewer_required"
-    for viewer in viewers:
-        if not _membership(db, campaign, viewer):
-            return False, "not_campaign_member"
-    audience = str(getattr(submission, "audience", "campaign") or "campaign")
-    if audience == "private":
-        for viewer in viewers:
-            if not _thread_readable_for_viewer(
-                db, campaign, getattr(submission, "thread_id", None), viewer
-            ):
-                return False, "submission_not_visible"
-    return True, None
-
 
 def lookup_source_turn(
     db: Session,
@@ -973,20 +555,20 @@ def lookup_source_turn(
 ) -> RetrievalOutcome:
     """Retrieve the source turn that established world state, with its player
     submissions and the relation/fact rows that cite it as provenance."""
-    from app.world.knowledge import list_records_for_source_turn
+    from app.world.facts import list_records_for_source_turn
 
     started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     try:
-        tid = _coerce_uuid(turn_id, field_name="turn_id")
+        tid = coerce_uuid(turn_id, field="turn_id")
         turn = db.get(DmTurn, tid)
         if turn is None or turn.campaign_id != campaign.id:
             raise ValueError(f"Source turn {tid} not found in campaign {campaign.id}")
     except ValueError as exc:
         return _not_found("lookup_source_turn", campaign, depth=0,
                           limit=1, detail=str(exc))
-    allowed, reason = _turn_gate(db, campaign, turn, viewers, dm_internal=dm_internal)
+    allowed, reason = turn_gate(db, campaign, turn, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=1, limit_applied=1)
     outcome.total = 1
     if not allowed:
@@ -1001,13 +583,13 @@ def lookup_source_turn(
     if include_submissions:
         for raw_sid in list(getattr(turn, "submission_ids", None) or []):
             try:
-                sid = _coerce_uuid(raw_sid, field_name="submission_id")
+                sid = coerce_uuid(raw_sid, field="submission_id")
             except ValueError:
                 continue
             submission = db.get(PlayerSubmission, sid)
             if submission is None or submission.campaign_id != campaign.id:
                 continue
-            gate_ok, _ = _submission_gate(db, campaign, submission, viewers,
+            gate_ok, _ = submission_gate(db, campaign, submission, viewers,
                                           dm_internal=dm_internal)
             if not gate_ok:
                 outcome.denied += 1
@@ -1020,7 +602,7 @@ def lookup_source_turn(
     if include_established_records:
         grouped = list_records_for_source_turn(db, campaign.id, turn.id)
         for relation in grouped.get("relations", []):
-            gate_ok, _ = _authorize_world_record(
+            gate_ok, _ = authorize_world_record(
                 db, campaign, "relation", relation.id, viewers, dm_internal=dm_internal)
             if not gate_ok:
                 outcome.denied += 1
@@ -1030,7 +612,7 @@ def lookup_source_turn(
             records["relation_ids"].append(str(relation.id))
             outcome.total += 1
         for fact in grouped.get("facts", []):
-            gate_ok, _ = _authorize_world_record(
+            gate_ok, _ = authorize_world_record(
                 db, campaign, "fact", fact.id, viewers, dm_internal=dm_internal)
             if not gate_ok:
                 outcome.denied += 1
@@ -1039,18 +621,16 @@ def lookup_source_turn(
                 continue
             records["fact_ids"].append(str(fact.id))
             outcome.total += 1
-    outcome.packets = [_turn_packet(
+    outcome.packets = [turn_packet(
         turn, 0, revealable=None if dm_internal else True,
         submissions=submission_dicts, records=records)]
     outcome.visible = 1
-    outcome.source_ids = _packet_source_ids(outcome.packets)
+    outcome.source_ids = packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("lookup_source_turn", campaign, depth=1, limit=1,
                outcome=outcome, dm_internal=dm_internal)
     return outcome
 
-
-# ── Current scene ────────────────────────────────────────────────────────────
 
 # ── Character / NPC knowledge ────────────────────────────────────────────────
 
@@ -1063,40 +643,6 @@ def _knowledge_target_id_of_row(row: Any) -> tuple[str, str]:
     if kind == "entity" and getattr(row, "target_entity_id", None):
         return kind, str(row.target_entity_id)
     return kind, ""
-
-
-def _canonical_knowledge_visibility(value: Any) -> str:
-    """Canonical packet visibility: public/campaign/dm_only/private.
-
-    Unknown spellings fail closed to ``dm_only`` (adjudication-only, never
-    narration-eligible) rather than guessing broader disclosure.
-    """
-    s = str(value or "dm_only").strip()
-    aliases = {"party": "campaign", "party_known": "campaign", "dm_private": "dm_only"}
-    s = aliases.get(s, s)
-    if s in {"public", "campaign", "dm_only", "private"}:
-        return s
-    return "dm_only"
-
-
-_VISIBILITY_RESTRICTIVENESS = {"public": 0, "campaign": 1, "dm_only": 2, "private": 3}
-
-
-def _most_restrictive_visibility(first: Any, second: Any) -> str:
-    """Most restrictive of two visibility labels (fail closed on unknown).
-
-    ``dm_only`` dominates ``private``: ``dm_only`` evidence is always
-    adjudication-only, while ``private`` evidence can be narration-eligible
-    for a private audience — so a packet embedding a ``dm_only`` target must
-    stay ``dm_only`` even when the knowledge row itself is ``private``.
-    """
-    a = _canonical_knowledge_visibility(first)
-    b = _canonical_knowledge_visibility(second)
-    if a == "dm_only" or b == "dm_only":
-        return "dm_only"
-    if _VISIBILITY_RESTRICTIVENESS.get(b, 2) > _VISIBILITY_RESTRICTIVENESS.get(a, 2):
-        return b
-    return a
 
 
 def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> dict[str, Any]:
@@ -1127,7 +673,7 @@ def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> 
         target = None
         target_visibility = None
     row_visibility = getattr(row, "visibility", "dm_only")
-    visibility = _most_restrictive_visibility(row_visibility, target_visibility or row_visibility)
+    visibility = most_restrictive(row_visibility, target_visibility or row_visibility)
     return {
         "knowledge_id": str(row.id),
         "subject_kind": getattr(row, "subject_kind", None),
@@ -1137,7 +683,7 @@ def _knowledge_entry_from_row(db: Session, row: Any, campaign_id: uuid.UUID) -> 
         "knowledge_state": getattr(row, "knowledge_state", "believes"),
         "acquisition_source": getattr(row, "acquisition_source", None),
         "visibility": visibility,
-        "target_visibility": _canonical_knowledge_visibility(target_visibility or row_visibility),
+        "target_visibility": visibility_or_dm_only(target_visibility or row_visibility),
         "target": target,
         "campaign_id": str(campaign_id),
     }
@@ -1157,14 +703,14 @@ def _enrich_entries_with_row_visibility(
 
     for entry in entries:
         try:
-            row = db.get(WorldKnowledge, _coerce_optional_uuid(entry.get("knowledge_id")))
+            row = db.get(WorldKnowledge, coerce_optional_uuid(entry.get("knowledge_id")))
         except Exception:
             row = None
         if row is not None and getattr(row, "campaign_id", None) == campaign_id:
             row_vis = getattr(row, "visibility", "dm_only")
             target = entry.get("target") if isinstance(entry.get("target"), dict) else None
             target_vis = (target or {}).get("visibility", row_vis)
-            entry["visibility"] = _most_restrictive_visibility(row_vis, target_vis)
+            entry["visibility"] = most_restrictive(row_vis, target_vis)
 
 
 def query_character_knowledge(
@@ -1185,21 +731,21 @@ def query_character_knowledge(
     filtering while remaining campaign-scoped, returning every knowledge
     row for the subject with its real visibility metadata preserved.
     """
-    from app.world.epistemics import validate_knowledge_state, what_does_subject_know
+    from app.world.knowledge import validate_knowledge_state, what_does_subject_know
 
     started = time.monotonic()
-    limit_applied = _clamp_limit(limit)
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
+    limit_applied = clamp_limit(limit, default=RETRIEVAL_DEFAULT_LIMIT, maximum=RETRIEVAL_MAX_LIMIT)
+    campaign = resolve_campaign(db, campaign_id)
+    viewers = resolve_viewers(viewer_user_id)
     if knowledge_state is not None:
         validate_knowledge_state(knowledge_state)
     try:
-        subject_id = _coerce_uuid(subject_entity_id, field_name="subject_entity_id")
+        subject_id = coerce_uuid(subject_entity_id, field="subject_entity_id")
     except ValueError as exc:
         return _not_found("query_character_knowledge", campaign, depth=0,
                           limit=limit_applied, detail=str(exc))
     if dm_internal:
-        from app.world.epistemics import list_knowledge_for_subject
+        from app.world.knowledge import list_knowledge_for_subject
         from models.world import WorldEntity
 
         subject = db.get(WorldEntity, subject_id)
@@ -1215,14 +761,14 @@ def query_character_knowledge(
         rows = rows[:limit_applied]
         entries = [_knowledge_entry_from_row(db, row, campaign.id) for row in rows]
         packets = [
-            _knowledge_packet(entry, rank, revealable=None)
+            knowledge_packet(entry, rank, revealable=None)
             for rank, entry in enumerate(entries)
         ]
         outcome = RetrievalOutcome(
             status=STATUS_OK, packets=packets, total=total_rows,
             visible=len(packets), denied=0, denied_reasons={},
             depth_applied=0, limit_applied=limit_applied, truncated=truncated,
-            source_ids=_packet_source_ids(packets),
+            source_ids=packet_source_ids(packets),
             latency_ms=(time.monotonic() - started) * 1000,
         )
         _log_query("query_character_knowledge", campaign, depth=0,
@@ -1254,7 +800,7 @@ def query_character_knowledge(
     entries = entries[:limit_applied]
     _enrich_entries_with_row_visibility(db, campaign.id, entries)
     packets = [
-        _knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
+        knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
                           revealable=True)
         for rank, entry in enumerate(entries)
     ]
@@ -1263,7 +809,7 @@ def query_character_knowledge(
         visible=len(packets), denied=int(projection.get("denied", 0)),
         denied_reasons=dict(projection.get("denied_reasons", {})),
         depth_applied=0, limit_applied=limit_applied, truncated=truncated,
-        source_ids=_packet_source_ids(packets),
+        source_ids=packet_source_ids(packets),
         latency_ms=(time.monotonic() - started) * 1000,
     )
     _log_query("query_character_knowledge", campaign, depth=0,
@@ -1276,7 +822,7 @@ def _query_character_knowledge_multi(
     viewers: list[uuid.UUID], started: float, limit_applied: int,
     *, knowledge_state: str | None,
 ) -> RetrievalOutcome:
-    from app.world.epistemics import what_does_subject_know
+    from app.world.knowledge import what_does_subject_know
 
     per_viewer = [
         what_does_subject_know(
@@ -1301,7 +847,7 @@ def _query_character_knowledge_multi(
     denied_total = max((int(p.get("total", 0)) - len(entries) for p in per_viewer), default=0)
     _enrich_entries_with_row_visibility(db, campaign.id, entries)
     packets = [
-        _knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
+        knowledge_packet({**entry, "campaign_id": str(campaign.id)}, rank,
                           revealable=True)
         for rank, entry in enumerate(entries)
     ]
@@ -1310,7 +856,7 @@ def _query_character_knowledge_multi(
         visible=len(packets), denied=max(0, denied_total),
         denied_reasons={"target_not_visible": max(0, denied_total)} if denied_total else {},
         depth_applied=0, limit_applied=limit_applied, truncated=truncated,
-        source_ids=_packet_source_ids(packets),
+        source_ids=packet_source_ids(packets),
         latency_ms=(time.monotonic() - started) * 1000,
     )
     _log_query("query_character_knowledge", campaign, depth=0,
@@ -1320,70 +866,7 @@ def _query_character_knowledge_multi(
 
 # ── #203 evidence-tool handlers ──────────────────────────────────────────────
 
-def _audience_viewers(audience: Any) -> list[str]:
-    try:
-        return list(getattr(audience, "user_ids", None) or [])
-    except Exception:
-        return []
-
-
-def _bundle_result(
-    request_id: str, tool: str, audience: Any, outcome: RetrievalOutcome,
-    *, dm_internal: bool,
-) -> dict[str, Any]:
-    packets = outcome.packets
-    sources = [p.to_source_ref() for p in packets]
-    if outcome.status == STATUS_NOT_FOUND and not packets:
-        status = "missing"
-    elif outcome.status in {STATUS_DEFER, STATUS_NO_MATCH}:
-        status = "unknown"
-    else:
-        status = "ok" if packets else "unknown"
-    if dm_internal:
-        visibility = "dm_only" if any(
-            p.visibility in {"private", "dm_only"} for p in packets) else "campaign"
-    else:
-        rank = {"public": 0, "campaign": 1, "dm_only": 2, "private": 3}
-        visibility = "campaign"
-        for packet in packets:
-            if rank.get(packet.visibility, 1) > rank.get(visibility, 1):
-                visibility = packet.visibility
-    try:
-        thread_id = str(getattr(audience, "thread_id", ""))
-    except Exception:
-        thread_id = ""
-    try:
-        campaign_id = str(getattr(audience, "campaign_id", ""))
-    except Exception:
-        campaign_id = ""
-    authorization: dict[str, Any] = {"campaign_id": campaign_id, "thread_ids": []}
-    if thread_id:
-        authorization["thread_ids"] = [thread_id]
-    if visibility == "private":
-        authorization["user_ids"] = _audience_viewers(audience)
-    payload = {
-        "retrieval_status": outcome.status,
-        "packets": [p.to_dict() for p in packets],
-        "total": outcome.total,
-        "visible": outcome.visible,
-        "denied": outcome.denied,
-        "denied_reasons": dict(outcome.denied_reasons),
-        "depth_applied": outcome.depth_applied,
-        "limit_applied": outcome.limit_applied,
-        "truncated": outcome.truncated,
-        "latency_ms": outcome.latency_ms,
-    }
-    return {
-        "status": status,
-        "sources": sources,
-        "visibility": visibility,
-        "authorization": authorization,
-        "payload": payload,
-        "result_count": len(packets),
-    }
-
-
-def _require_db(db: Any, request_id: str, tool: str) -> Session | dict[str, Any]:
+def _require_db(db: Any) -> Session | dict[str, Any]:
     if db is None:
         return {
             "status": "unknown",
@@ -1397,8 +880,32 @@ def _require_db(db: Any, request_id: str, tool: str) -> Session | dict[str, Any]
     return db
 
 
+def _bundle_result(audience: Any, outcome: RetrievalOutcome, *, dm_internal: bool) -> dict[str, Any]:
+    packets = outcome.packets
+    if outcome.status == STATUS_NOT_FOUND and not packets:
+        status = "missing"
+    elif outcome.status in {STATUS_DEFER, STATUS_NO_MATCH}:
+        status = "unknown"
+    else:
+        status = "ok" if packets else "unknown"
+    payload = {
+        "retrieval_status": outcome.status,
+        "packets": [p.to_dict() for p in packets],
+        "total": outcome.total,
+        "visible": outcome.visible,
+        "denied": outcome.denied,
+        "denied_reasons": dict(outcome.denied_reasons),
+        "depth_applied": outcome.depth_applied,
+        "limit_applied": outcome.limit_applied,
+        "truncated": outcome.truncated,
+        "latency_ms": outcome.latency_ms,
+    }
+    return tool_result(audience, status=status, packets=packets, payload=payload,
+                       dm_internal=dm_internal)
+
+
 def handle_lookup_world_entity(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
@@ -1407,12 +914,12 @@ def handle_lookup_world_entity(req: Any, audience: Any, db: Any = None) -> dict[
         raise ValueError("lookup_world_entity requires query (entity id)")
     outcome = retrieve_entity(
         session, getattr(audience, "campaign_id", None), query,
-        _audience_viewers(audience), dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+        audience_viewers(audience), dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 def handle_traverse_world_relations(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
@@ -1421,13 +928,13 @@ def handle_traverse_world_relations(req: Any, audience: Any, db: Any = None) -> 
         raise ValueError("traverse_world_relations requires query (entity id)")
     outcome = traverse_relations(
         session, getattr(audience, "campaign_id", None), query,
-        _audience_viewers(audience), limit=getattr(req, "limit", None),
+        audience_viewers(audience), limit=getattr(req, "limit", None),
         dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 def handle_lookup_world_fact(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
@@ -1436,25 +943,25 @@ def handle_lookup_world_fact(req: Any, audience: Any, db: Any = None) -> dict[st
         raise ValueError("lookup_world_fact requires query (fact id)")
     outcome = fact_source_evidence(
         session, getattr(audience, "campaign_id", None), query,
-        _audience_viewers(audience), dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+        audience_viewers(audience), dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 def handle_query_world_timeline(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
     query = (getattr(req, "query", None) or "").strip() or None
     outcome = query_timeline(
         session, getattr(audience, "campaign_id", None),
-        _audience_viewers(audience), event_types=query,
+        audience_viewers(audience), event_types=query,
         limit=getattr(req, "limit", None), dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 def handle_lookup_source_turn(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
@@ -1463,12 +970,12 @@ def handle_lookup_source_turn(req: Any, audience: Any, db: Any = None) -> dict[s
         raise ValueError("lookup_source_turn requires query (turn id)")
     outcome = lookup_source_turn(
         session, getattr(audience, "campaign_id", None), query,
-        _audience_viewers(audience), dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+        audience_viewers(audience), dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 def handle_query_character_knowledge(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    session = _require_db(db, req.id, req.tool)
+    session = _require_db(db)
     if isinstance(session, dict):
         return session
     dm_internal = getattr(audience, "audience", "campaign") != "private"
@@ -1479,9 +986,9 @@ def handle_query_character_knowledge(req: Any, audience: Any, db: Any = None) ->
         raise ValueError("query_character_knowledge requires query (subject entity id)")
     outcome = query_character_knowledge(
         session, getattr(audience, "campaign_id", None), subject,
-        _audience_viewers(audience), limit=getattr(req, "limit", None),
+        audience_viewers(audience), limit=getattr(req, "limit", None),
         dm_internal=dm_internal)
-    return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
+    return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
 
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {

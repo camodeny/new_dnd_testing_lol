@@ -341,7 +341,7 @@ def test_create_entity_inline_idempotency_race_returns_winner():
     from unittest import mock
 
     import app.world.service as world_service
-    from app.world.service import _find_by_idempotency
+    from app.world.service import find_entity_by_idempotency
 
     Fac, cid, _owner = _setup()
     db = Fac()
@@ -356,7 +356,7 @@ def test_create_entity_inline_idempotency_race_returns_winner():
     # Simulate the race window: the precheck SELECT misses (concurrent winner
     # not yet visible), then the upsert absorbs the unique conflict and the
     # post-insert lookup finds the winner.
-    real_find = _find_by_idempotency
+    real_find = find_entity_by_idempotency
     calls = {"n": 0}
 
     def flaky_find(db_, cid_, key_):
@@ -365,7 +365,7 @@ def test_create_entity_inline_idempotency_race_returns_winner():
             return None
         return real_find(db_, cid_, key_)
 
-    with mock.patch.object(world_service, "_find_by_idempotency", side_effect=flaky_find):
+    with mock.patch.object(world_service, "find_entity_by_idempotency", side_effect=flaky_find):
         campaign2 = db.get(Campaign, cid)
         loser, created2 = create_entity(
             db, campaign2, entity_type="npc", name="Loser",
@@ -484,7 +484,7 @@ def test_staged_patch_explicit_null_location_clears_reference():
 
 
 def test_restricted_scene_hidden_from_ordinary_member():
-    from app.world.service import scene_visible_to_viewer
+    from app.visibility.policy import visible_to_viewer
 
     Fac, cid, _owner = _setup()
     db = Fac()
@@ -493,8 +493,8 @@ def test_restricted_scene_hidden_from_ordinary_member():
         operation_id="op-s",
     )
     scene = get_current_scene(db, cid)
-    assert scene_visible_to_viewer(scene, True) is True
-    assert scene_visible_to_viewer(scene, False) is False
+    assert visible_to_viewer(scene.visibility, True) is True
+    assert visible_to_viewer(scene.visibility, False) is False
 
 
 def test_dm_only_scene_excluded_from_player_narration_projection():

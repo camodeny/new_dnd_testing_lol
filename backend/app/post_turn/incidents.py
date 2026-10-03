@@ -620,12 +620,11 @@ def detect_canon_self_conflicts(
 # ── Bounded semantic judgments (ambiguous residue only) ────────────────────
 
 def _pair_visibility(pair: SemanticPair) -> str:
-    from app.world.service import normalize_visibility
+    from app.visibility.policy import disclosure_rank, normalize_visibility
 
-    ranks = {"dm_only": 0, "private": 1, "campaign": 2, "public": 3}
     sides = [pair.canon_claim.get("visibility"), pair.new_claim.get("visibility")]
     try:
-        return min(sides, key=lambda v: ranks[normalize_visibility(v)])
+        return min(sides, key=lambda v: disclosure_rank(normalize_visibility(v)))
     except (ValueError, KeyError, TypeError):
         return "dm_only"
 
@@ -1037,65 +1036,3 @@ def resolve_incident(db: Session, incident_id: uuid.UUID, *,
         incident_type=row.incident_type, resolution=resolution,
     )
     return row
-
-
-def get_consistency_stats(db: Session, campaign_id: uuid.UUID) -> dict[str, Any]:
-    """Observability: categories, paths, records, ranges, decisions, latency."""
-    rows = db.execute(select(PostTurnConsistencyIncident).where(
-        PostTurnConsistencyIncident.campaign_id == campaign_id,
-    )).scalars().all()
-    by_type: dict[str, int] = {}
-    by_category: dict[str, int] = {}
-    by_path: dict[str, int] = {}
-    by_status: dict[str, int] = {}
-    by_severity: dict[str, int] = {}
-    distribution: dict[str, int] = {}
-    models: dict[str, int] = {}
-    latencies: list[int] = []
-    repeated = 0
-    verifier_failures = 0
-    resolution_seconds: list[float] = []
-    for row in rows:
-        by_type[row.incident_type] = by_type.get(row.incident_type, 0) + 1
-        by_category[row.category or "unknown"] = by_category.get(row.category or "unknown", 0) + 1
-        by_path[row.detection_path] = by_path.get(row.detection_path, 0) + 1
-        by_status[row.status] = by_status.get(row.status, 0) + 1
-        by_severity[row.severity or "unknown"] = by_severity.get(row.severity or "unknown", 0) + 1
-        for key, value in (row.decision_distribution or {}).items():
-            distribution[key] = distribution.get(key, 0) + int(value or 0)
-        if row.decision_model:
-            models[row.decision_model] = models.get(row.decision_model, 0) + 1
-        if row.detection_latency_ms is not None:
-            latencies.append(int(row.detection_latency_ms))
-        repeated += max(0, int(row.repeat_count or 1) - 1)
-        if row.incident_type == VERIFIER_FAILURE:
-            verifier_failures += 1
-        if row.status == RESOLVED_STATUS and row.resolved_at and row.created_at:
-            try:
-                resolution_seconds.append(
-                    max(0.0, (row.resolved_at - row.created_at).total_seconds()))
-            except TypeError:
-                pass
-    affected = sum(len(r.affected_records or []) for r in rows)
-    return {
-        "campaign_id": str(campaign_id),
-        "incidents": len(rows),
-        "unresolved": sum(by_status.get(s, 0) for s in UNRESOLVED_STATUSES),
-        "by_type": by_type,
-        "by_category": by_category,
-        "by_detection_path": by_path,
-        "by_status": by_status,
-        "by_severity": by_severity,
-        "affected_records": affected,
-        "decision_class": INCIDENT_DECISION_CLASS,
-        "decision_distribution": distribution,
-        "decision_models": models,
-        "decision_policy": dict(INCIDENT_POLICY),
-        "repeated_incidents": repeated,
-        "verifier_failures": verifier_failures,
-        "avg_detection_latency_ms": (
-            sum(latencies) / len(latencies) if latencies else None),
-        "avg_time_to_resolution_seconds": (
-            sum(resolution_seconds) / len(resolution_seconds)
-            if resolution_seconds else None),
-    }

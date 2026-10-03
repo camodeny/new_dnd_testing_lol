@@ -14,7 +14,7 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/world` | World state written inside turn/post-turn commits: entities, current scene, facts/relations, knowledge, clocks, NPC state, retrieval + semantic index |
 | `app/runtime` | Turn/session orchestration stubs (live-table sessions) |
 | `app/rules` | Rules / combat pure domain (no I/O, no FastAPI) — placeholder for Epic 2 |
-| `app/visibility` | Fog / visibility calculations — placeholder |
+| `app/visibility` | Disclosure vocabulary/normalization/ordering (`policy`) and campaign participation, DM-authority, and per-record receive checks (`access`) |
 | `app/billing` | Billing / entitlement checks — placeholder |
 | `app/realtime` | Realtime projections / websocket fan-out — placeholder |
 | `app/providers` | LLM provider adapters — re-exports `llm_providers` without workflow branching |

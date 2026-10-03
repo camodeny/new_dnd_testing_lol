@@ -1,1082 +1,831 @@
-"""Durable relations + epistemic facts — issue #210.
+"""Per-knower epistemic knowledge + arbitrary-subset visibility — issue #211.
 
-Two versioned record kinds with explicit truth/epistemic state, visibility,
-provenance, and lifecycle:
+Three concepts stay separate:
 
-- WorldRelation: subject —relation_type→ object (entity or literal label).
-- WorldFact: free-form proposition with referenced canonical entities.
+- Objective truth: WorldFact / WorldRelation rows (epistemic_state, #210).
+- Fictional knowledge: WorldKnowledge rows — what a character/NPC/party
+  fictionally holds (knows/believes/suspects/claims/does_not_know). Writing
+  here never mutates truth tables.
+- Human disclosure: ``visibility`` (public/campaign/party/dm_only/private)
+  plus WorldVisibilityGrant rows for arbitrary authorized subsets. The AI is
+  the only DM; campaign-owner status grants ``dm_only`` access (DM authority)
+  but never ``private`` access — private disclosure requires an explicit
+  active grant naming the human user.
 
-Contract shared by both:
+Reusable server-side queries (all SQL-expressible, RLS-compatible); the
+per-record receive check itself is :func:`app.visibility.access.may_user_receive`:
 
-- Only ``status == "active"`` rows are current truth (indexed; no replay).
-- Changes create a new version row; the prior active row flips to
-  ``superseded`` in the same transaction — history is preserved, never
-  destructively overwritten.
-- A bare claim (player/NPC utterance) stores as ``claimed``/``suspected``/
-  etc. and never becomes ``confirmed`` truth unless superseded explicitly.
-- Duplicate retries keyed by idempotency_key return the existing row with
-  no new version.
-- Failed updates raise before mutating the prior row's lifecycle, so the
-  prior active truth survives intact (the outer revision transaction rolls
-  back on any error).
-- Unknown/conflicting entity or source-event references fail closed
-  (ValueError) for later adjudication/repair.
-- Visibility is mandatory and fail-closed (default ``dm_only``); restricted
-  records are filtered for ordinary viewers, mirroring #209.
+- ``what_does_subject_know(db, campaign, subject_entity_id, viewer_user_id, ...)``
+- ``who_knows_target(db, campaign, target_kind, target_id, viewer_user_id, ...)``
+
+Fail-closed everywhere: missing/ambiguous visibility, unknown records,
+non-membership, and revoked/missing grants all deny with a reason code.
+Access is never inferred from a related shared record — the subject entity,
+the knowledge row, and its truth target are authorized independently.
+
+Observability: acquisition_source on every knowledge row; grants emit
+structured logs; denials return reason codes; projections
+return filter counts without leaking hidden content (denied rows contribute
+only counts, never ids/content).
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import uuid
 from typing import Any
 
-from sqlalchemy import delete, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
-from app.world.service import (
-    RESTRICTED_VISIBILITIES,
-    UNSET,
-    normalize_visibility,
+from app.visibility.access import (
+    is_campaign_participant,
+    load_grant_target,
+    may_user_receive,
+    validate_grant_target_kind,
 )
-from models.campaigns import Campaign, CampaignDomainEvent
-from models.dm import DmTurn, DmTurnAttempt
+from app.visibility.policy import canonical_visibility
+from app.world._common import coerce_optional_uuid, coerce_uuid, normalize_idempotency_key
+from models.campaigns import Campaign
+from models.profiles import Profile
 from models.world import (
-    EPISTEMIC_STATES,
-    RECORD_STATUSES,
+    KNOWLEDGE_STATES,
+    KNOWLEDGE_TARGET_KINDS,
+    KNOWER_KINDS,
     WorldEntity,
     WorldFact,
-    WorldFactEntityRef,
+    WorldKnowledge,
     WorldRelation,
+    WorldVisibilityGrant,
 )
 
 logger = logging.getLogger(__name__)
 
-__all__ = [
-    "EPISTEMIC_STATES",
-    "RECORD_STATUSES",
-    "validate_relation_type",
-    "validate_epistemic_state",
-    "validate_record_status",
-    "validate_new_version_status",
-    "validate_object_label",
-    "validate_fact_content",
-    "get_relation_strict",
-    "get_fact_strict",
-    "list_relations",
-    "list_facts",
-    "list_records_for_source_turn",
-    "create_relation",
-    "supersede_relation",
-    "create_fact",
-    "supersede_fact",
-]
-
-_RELATION_TYPE_RE = re.compile(r"^[a-z0-9_]{2,64}$")
-_MAX_FACT_ENTITY_REFS = 24
-
-
 # ── Validation ──────────────────────────────────────────────────────────────
 
-def validate_relation_type(value: Any) -> str:
-    t = str(value or "").strip().lower()
-    if not _RELATION_TYPE_RE.fullmatch(t or ""):
-        raise ValueError("relation_type must be 2-64 chars of [a-z0-9_]")
-    return t
-
-
-def validate_epistemic_state(value: Any) -> str:
-    s = str(value or "claimed").strip().lower() or "claimed"
-    if s not in EPISTEMIC_STATES:
-        raise ValueError(f"epistemic_state must be one of {sorted(EPISTEMIC_STATES)}")
+def validate_knowledge_state(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s in {"does-not-know", "does not know", "doesnt_know"}:
+        s = "does_not_know"
+    if s not in KNOWLEDGE_STATES:
+        raise ValueError(f"knowledge_state must be one of {sorted(KNOWLEDGE_STATES)}")
     return s
 
 
-def validate_record_status(value: Any) -> str:
-    s = str(value or "active").strip().lower() or "active"
-    if s not in RECORD_STATUSES:
-        raise ValueError(f"status must be one of {sorted(RECORD_STATUSES)}")
+def validate_knower_kind(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s not in KNOWER_KINDS:
+        raise ValueError(f"subject_kind must be one of {sorted(KNOWER_KINDS)}")
     return s
 
 
-def validate_fact_content(value: Any) -> str:
-    text = str(value or "").strip()
-    if not text:
-        raise ValueError("fact content is required")
-    if len(text) > 2000:
-        raise ValueError("fact content must be 2000 characters or fewer")
-    return text
+def validate_knowledge_target_kind(value: Any) -> str:
+    s = str(value or "").strip().lower()
+    if s not in KNOWLEDGE_TARGET_KINDS:
+        raise ValueError(f"target_kind must be one of {sorted(KNOWLEDGE_TARGET_KINDS)}")
+    return s
 
 
-def validate_object_label(value: Any) -> str | None:
-    """Durable relation labels are rejected when overlong, never truncated.
-
-    Returns None for absent/blank input (callers decide whether a missing
-    label is acceptable); raises for values exceeding the 256-char column.
-    """
+def validate_acquisition_source(value: Any) -> str | None:
     if value is None:
         return None
-    label = str(value).strip()
-    if not label:
+    s = str(value).strip().lower()
+    if not s:
         return None
-    if len(label) > 256:
-        raise ValueError("object_label must be 256 characters or fewer")
-    return label
-
-
-def validate_new_version_status(value: Any) -> str:
-    """Lifecycle gate for newly-created versions.
-
-    ``superseded`` is reserved for prior rows that actually have a successor
-    (assigned internally); a new version may only be ``active`` current truth
-    or ``retracted`` terminal state. Otherwise the chain ends in a row that
-    claims a successor it does not have and can never be superseded later.
-    """
-    s = validate_record_status(value)
-    if s == "superseded":
-        raise ValueError('new version status must be "active" or "retracted", not "superseded"')
+    if len(s) > 64:
+        raise ValueError("acquisition_source must be 64 characters or fewer")
     return s
 
 
-def _coerce_uuid(value: Any, *, field: str) -> uuid.UUID:
-    try:
-        return value if isinstance(value, uuid.UUID) else uuid.UUID(str(value))
-    except (ValueError, AttributeError, TypeError) as exc:
-        raise ValueError(f"Invalid {field} {value!r}") from exc
-
-
-def _coerce_optional_uuid(value: Any, *, field: str) -> uuid.UUID | None:
-    if value is None or (isinstance(value, str) and not value.strip()):
-        return None
-    return _coerce_uuid(value, field=field)
-
-
-def _normalize_idempotency_key(value: Any) -> str | None:
-    key = str(value or "").strip() or None
-    if key and len(key) > 128:
-        raise ValueError("idempotency_key must be 128 characters or fewer")
-    return key
-
-
-def _normalize_grants(value: Any) -> dict:
+def _normalize_mapping(value: Any, *, field: str) -> dict:
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise ValueError("grants must be an object")
+        raise ValueError(f"{field} must be an object")
     return dict(value)
 
 
-def _normalize_provenance(value: Any) -> dict:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError("provenance must be an object")
-    return dict(value)
+# ── Target resolution (fail closed; never infer across records) ─────────────
 
-
-# ── Reference resolution (fail closed) ──────────────────────────────────────
-
-def _resolve_world_entity(db: Session, campaign_id: uuid.UUID, entity_id: Any, *, role: str) -> WorldEntity:
-    eid = _coerce_uuid(entity_id, field=f"{role}_entity_id")
+def _resolve_subject(db: Session, campaign_id: uuid.UUID, subject_entity_id: Any) -> WorldEntity:
+    eid = coerce_uuid(subject_entity_id, field="subject_entity_id")
     entity = db.get(WorldEntity, eid)
     if entity is None or entity.campaign_id != campaign_id:
         structured_log(
-            logger, logging.WARNING, "world_provenance_resolution_failed",
-            campaign_id=str(campaign_id), role=role, entity_id=str(eid),
+            logger, logging.WARNING, "world_knowledge_subject_unresolved",
+            campaign_id=str(campaign_id), subject_entity_id=str(eid),
             reason="entity_not_in_campaign",
         )
-        raise ValueError(f"{role} entity {eid} not found in campaign {campaign_id}")
+        raise ValueError(f"subject entity {eid} not found in campaign {campaign_id}")
     return entity
 
 
-def _resolve_fact_entity_refs(
-    db: Session, campaign_id: uuid.UUID, entity_refs: Any
-) -> list[uuid.UUID]:
-    if entity_refs is None:
-        return []
-    if not isinstance(entity_refs, (list, tuple)):
-        raise ValueError("entity_refs must be a list")
-    if len(entity_refs) > _MAX_FACT_ENTITY_REFS:
-        raise ValueError(f"entity_refs must have at most {_MAX_FACT_ENTITY_REFS} entries")
-    resolved: list[uuid.UUID] = []
-    for raw in entity_refs:
-        entity = _resolve_world_entity(db, campaign_id, raw, role="fact_reference")
-        if entity.id not in resolved:
-            resolved.append(entity.id)
-    return resolved
+def _resolve_target(
+    db: Session, campaign_id: uuid.UUID, target_kind: str, *,
+    target_fact_id: Any = None, target_relation_id: Any = None,
+    target_entity_id: Any = None, target_id: Any = None,
+) -> tuple[str, uuid.UUID]:
+    """Resolve exactly one truth target in-campaign. Raises fail-closed."""
+    kind = validate_knowledge_target_kind(target_kind)
+    # Polymorphic shorthand: target_id + kind.
+    fact_ref = target_fact_id if target_fact_id is not None else (target_id if kind == "fact" else None)
+    rel_ref = target_relation_id if target_relation_id is not None else (target_id if kind == "relation" else None)
+    ent_ref = target_entity_id if target_entity_id is not None else (target_id if kind == "entity" else None)
+    provided = [v for v in (fact_ref, rel_ref, ent_ref) if v is not None]
+    if len(provided) != 1:
+        raise ValueError("exactly one target reference is required")
+    if kind == "fact":
+        fid = coerce_uuid(fact_ref, field="target_fact_id")
+        row = db.get(WorldFact, fid)
+        if row is None or row.campaign_id != campaign_id:
+            raise ValueError(f"target fact {fid} not found in campaign {campaign_id}")
+        return kind, fid
+    if kind == "relation":
+        rid = coerce_uuid(rel_ref, field="target_relation_id")
+        row = db.get(WorldRelation, rid)
+        if row is None or row.campaign_id != campaign_id:
+            raise ValueError(f"target relation {rid} not found in campaign {campaign_id}")
+        return kind, rid
+    eid = coerce_uuid(ent_ref, field="target_entity_id")
+    row = db.get(WorldEntity, eid)
+    if row is None or row.campaign_id != campaign_id:
+        raise ValueError(f"target entity {eid} not found in campaign {campaign_id}")
+    return kind, eid
 
 
-def _resolve_source_event(
-    db: Session, campaign_id: uuid.UUID, source_event_id: Any
-) -> uuid.UUID | None:
-    eid = _coerce_optional_uuid(source_event_id, field="source_event_id")
-    if eid is None:
-        return None
-    event = db.get(CampaignDomainEvent, eid)
-    if event is None or event.campaign_id != campaign_id:
-        structured_log(
-            logger, logging.WARNING, "world_provenance_resolution_failed",
-            campaign_id=str(campaign_id), source_event_id=str(eid),
-            reason="event_not_in_campaign",
-        )
-        raise ValueError(f"source_event {eid} not found in campaign {campaign_id}")
-    return eid
+# ── Knowledge writers (never touch truth tables) ────────────────────────────
 
+def _find_knowledge_by_idempotency(
+    db: Session, campaign_id: uuid.UUID, key: str | None
+) -> WorldKnowledge | None:
+    """Single-key idempotency precheck on the live row (same pattern as #210).
 
-def _resolve_source_turn_refs(
-    db: Session,
-    campaign_id: uuid.UUID,
-    source_turn_id: Any,
-    source_attempt_id: Any,
-) -> tuple[uuid.UUID | None, uuid.UUID | None]:
-    """Resolve turn/attempt provenance against the campaign (fail closed).
-
-    A durable record must never claim a source turn/attempt that does not
-    exist, belongs to another campaign, or (when both are supplied) do not
-    belong together.
+    Fresh-key re-assertion of the same (subject, target) is a legitimate
+    update (new revision + event); same-key retry returns the row without
+    re-mutating. Historical-key tracking lives in the central
+    command-idempotency boundary when callers need it — not in a
+    world-specific ledger.
     """
-    turn_id = _coerce_optional_uuid(source_turn_id, field="source_turn_id")
-    attempt_id = _coerce_optional_uuid(source_attempt_id, field="source_attempt_id")
-    if turn_id is not None:
-        turn = db.get(DmTurn, turn_id)
-        if turn is None or turn.campaign_id != campaign_id:
-            structured_log(
-                logger, logging.WARNING, "world_provenance_resolution_failed",
-                campaign_id=str(campaign_id), source_turn_id=str(turn_id),
-                reason="turn_not_in_campaign",
-            )
-            raise ValueError(f"source_turn {turn_id} not found in campaign {campaign_id}")
-    if attempt_id is not None:
-        attempt = db.get(DmTurnAttempt, attempt_id)
-        if attempt is None or attempt.campaign_id != campaign_id:
-            structured_log(
-                logger, logging.WARNING, "world_provenance_resolution_failed",
-                campaign_id=str(campaign_id), source_attempt_id=str(attempt_id),
-                reason="attempt_not_in_campaign",
-            )
-            raise ValueError(f"source_attempt {attempt_id} not found in campaign {campaign_id}")
-        if turn_id is not None and str(attempt.turn_id) != str(turn_id):
-            structured_log(
-                logger, logging.WARNING, "world_provenance_resolution_failed",
-                campaign_id=str(campaign_id), source_turn_id=str(turn_id),
-                source_attempt_id=str(attempt_id), reason="attempt_turn_mismatch",
-            )
-            raise ValueError(
-                f"source_attempt {attempt_id} does not belong to source_turn {turn_id}"
-            )
-    return turn_id, attempt_id
-
-
-# ── Viewer-aware reads ──────────────────────────────────────────────────────
-
-# ── Typed reads (active truth by default; no history replay) ────────────────
-
-def get_relation_strict(db: Session, campaign_id: uuid.UUID, relation_id: uuid.UUID) -> WorldRelation:
-    relation = db.get(WorldRelation, _coerce_uuid(relation_id, field="relation_id"))
-    if relation is None or relation.campaign_id != campaign_id:
-        raise ValueError(f"World relation {relation_id} not found in campaign {campaign_id}")
-    return relation
-
-
-def get_fact_strict(db: Session, campaign_id: uuid.UUID, fact_id: uuid.UUID) -> WorldFact:
-    fact = db.get(WorldFact, _coerce_uuid(fact_id, field="fact_id"))
-    if fact is None or fact.campaign_id != campaign_id:
-        raise ValueError(f"World fact {fact_id} not found in campaign {campaign_id}")
-    return fact
-
-
-def list_relations(
-    db: Session,
-    campaign_id: uuid.UUID,
-    *,
-    subject_entity_id: Any | None = None,
-    object_entity_id: Any | None = None,
-    entity_id: Any | None = None,
-    relation_type: str | None = None,
-    epistemic_state: str | None = None,
-    status: str | None = None,
-    include_history: bool = False,
-    limit: int = 100,
-    exclude_restricted: bool = False,
-) -> list[WorldRelation]:
-    q = select(WorldRelation).where(WorldRelation.campaign_id == campaign_id)
-    if exclude_restricted:
-        # Viewer predicate belongs BEFORE ordering/limiting: filtering
-        # restricted rows after LIMIT would let hidden rows consume the
-        # result window and mask later visible rows for ordinary members.
-        q = q.where(WorldRelation.visibility.notin_(list(RESTRICTED_VISIBILITIES)))
-    if status is not None:
-        q = q.where(WorldRelation.status == validate_record_status(status))
-    elif not include_history:
-        q = q.where(WorldRelation.status == "active")
-    if subject_entity_id is not None:
-        q = q.where(WorldRelation.subject_entity_id == _coerce_uuid(subject_entity_id, field="subject_entity_id"))
-    if object_entity_id is not None:
-        q = q.where(WorldRelation.object_entity_id == _coerce_uuid(object_entity_id, field="object_entity_id"))
-    if entity_id is not None:
-        eid = _coerce_uuid(entity_id, field="entity_id")
-        q = q.where(
-            (WorldRelation.subject_entity_id == eid) | (WorldRelation.object_entity_id == eid)
-        )
-    if relation_type:
-        q = q.where(WorldRelation.relation_type == validate_relation_type(relation_type))
-    if epistemic_state:
-        q = q.where(WorldRelation.epistemic_state == validate_epistemic_state(epistemic_state))
-    q = q.order_by(WorldRelation.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
-    return list(db.execute(q).scalars().all())
-
-
-def list_facts(
-    db: Session,
-    campaign_id: uuid.UUID,
-    *,
-    entity_id: Any | None = None,
-    epistemic_state: str | None = None,
-    status: str | None = None,
-    include_history: bool = False,
-    limit: int = 100,
-    exclude_restricted: bool = False,
-) -> list[WorldFact]:
-    q = select(WorldFact).where(WorldFact.campaign_id == campaign_id)
-    if exclude_restricted:
-        # See list_relations: visibility must filter before LIMIT so hidden
-        # rows cannot mask visible rows for ordinary members.
-        q = q.where(WorldFact.visibility.notin_(list(RESTRICTED_VISIBILITIES)))
-    if status is not None:
-        q = q.where(WorldFact.status == validate_record_status(status))
-    elif not include_history:
-        q = q.where(WorldFact.status == "active")
-    if epistemic_state:
-        q = q.where(WorldFact.epistemic_state == validate_epistemic_state(epistemic_state))
-    if entity_id is not None:
-        eid = _coerce_uuid(entity_id, field="entity_id")
-        q = q.join(
-            WorldFactEntityRef,
-            (WorldFactEntityRef.fact_id == WorldFact.id)
-            & (WorldFactEntityRef.entity_id == eid),
-        )
-    q = q.order_by(WorldFact.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
-    return list(db.execute(q).scalars().all())
-
-
-def list_records_for_source_turn(
-    db: Session, campaign_id: uuid.UUID, source_turn_id: Any
-) -> dict[str, list]:
-    tid = _coerce_uuid(source_turn_id, field="source_turn_id")
-    relations = list(
-        db.execute(
-            select(WorldRelation).where(
-                WorldRelation.campaign_id == campaign_id, WorldRelation.source_turn_id == tid
-            ).order_by(WorldRelation.created_at.asc())
-        ).scalars().all()
-    )
-    facts = list(
-        db.execute(
-            select(WorldFact).where(
-                WorldFact.campaign_id == campaign_id, WorldFact.source_turn_id == tid
-            ).order_by(WorldFact.created_at.asc())
-        ).scalars().all()
-    )
-    return {"relations": relations, "facts": facts}
-
-
-# ── Internal writers (no revision bump; caller owns the transaction) ────────
-
-def _find_relation_by_idempotency(
-    db: Session, campaign_id: uuid.UUID, idempotency_key: str | None
-) -> WorldRelation | None:
-    if not idempotency_key or not str(idempotency_key).strip():
+    if not key:
         return None
     return db.execute(
-        select(WorldRelation).where(
-            WorldRelation.campaign_id == campaign_id,
-            WorldRelation.idempotency_key == str(idempotency_key).strip(),
+        select(WorldKnowledge).where(
+            WorldKnowledge.campaign_id == campaign_id,
+            WorldKnowledge.idempotency_key == key,
         )
     ).scalars().first()
 
 
-def _find_fact_by_idempotency(
-    db: Session, campaign_id: uuid.UUID, idempotency_key: str | None
-) -> WorldFact | None:
-    if not idempotency_key or not str(idempotency_key).strip():
+def _find_current_knowledge(
+    db: Session, campaign_id: uuid.UUID, subject_id: uuid.UUID,
+    target_kind: str, target_id: uuid.UUID,
+) -> WorldKnowledge | None:
+    q = select(WorldKnowledge).where(
+        WorldKnowledge.campaign_id == campaign_id,
+        WorldKnowledge.subject_entity_id == subject_id,
+        WorldKnowledge.target_kind == target_kind,
+    )
+    if target_kind == "fact":
+        q = q.where(WorldKnowledge.target_fact_id == target_id)
+    elif target_kind == "relation":
+        q = q.where(WorldKnowledge.target_relation_id == target_id)
+    else:
+        q = q.where(WorldKnowledge.target_entity_id == target_id)
+    return db.execute(q.order_by(WorldKnowledge.created_at.asc())).scalars().first()
+
+
+def assert_knowledge(
+    db: Session,
+    campaign: Campaign,
+    *,
+    subject_kind: str,
+    subject_entity_id: Any,
+    target_kind: str,
+    target_fact_id: Any = None,
+    target_relation_id: Any = None,
+    target_entity_id: Any = None,
+    target_id: Any = None,
+    knowledge_state: str = "believes",
+    acquisition_source: Any = None,
+    visibility: str | None = None,
+    provenance: dict | None = None,
+    details: dict | None = None,
+    source_turn_id: Any = None,
+    source_attempt_id: Any = None,
+    source_event_id: Any = None,
+    operation_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> tuple[WorldKnowledge, bool]:
+    """Assert what one subject fictionally holds toward one truth record.
+
+    Upserts the single current row per (subject, target) inside the caller's
+    transaction (flushes; never commits). All references validate BEFORE any
+    write, so a failed assertion leaves both the prior knowledge row and the
+    underlying objective truth untouched.
+    """
+    skind = validate_knower_kind(subject_kind)
+    state = validate_knowledge_state(knowledge_state)
+    vis = canonical_visibility(visibility or "dm_only")
+    key = normalize_idempotency_key(idempotency_key or operation_id)
+
+    subject = _resolve_subject(db, campaign.id, subject_entity_id)
+    kind, tid = _resolve_target(
+        db, campaign.id, target_kind, target_fact_id=target_fact_id,
+        target_relation_id=target_relation_id, target_entity_id=target_entity_id,
+        target_id=target_id,
+    )
+    if key:
+        dup = _find_knowledge_by_idempotency(db, campaign.id, key)
+        if dup is not None:
+            structured_log(
+                logger, logging.INFO, "world_knowledge_duplicate_conflict",
+                campaign_id=str(campaign.id), knowledge_id=str(dup.id),
+                idempotency_key=key,
+            )
+            return dup, False
+    # Re-assertion path: validate the effective row first, then mutate — the
+    # truth tables are never written here by construction. All source
+    # references validate BEFORE any write so a failed assertion leaves both
+    # the prior knowledge row and the underlying truth untouched.
+    current = _find_current_knowledge(db, campaign.id, subject.id, kind, tid)
+    source = validate_acquisition_source(acquisition_source)
+    prov = _normalize_mapping(provenance, field="provenance")
+    if source and "acquisition_source" not in prov:
+        prov = {**prov, "acquisition_source": source}
+    det = dict(details or {})
+    op = (str(operation_id)[:128] if operation_id else None)
+    # Coerce explicitly supplied source refs up front (None = not supplied,
+    # leave the stored value alone on re-assertion).
+    new_source_turn = coerce_optional_uuid(source_turn_id, field="source_ref") if source_turn_id is not None else None
+    new_source_attempt = coerce_optional_uuid(source_attempt_id, field="source_ref") if source_attempt_id is not None else None
+    new_source_event = coerce_optional_uuid(source_event_id, field="source_ref") if source_event_id is not None else None
+
+    if current is not None:
+        current.subject_kind = skind
+        current.knowledge_state = state
+        current.acquisition_source = source
+        current.visibility = vis
+        current.provenance = {**(current.provenance or {}), **prov}
+        if details is not None:
+            current.details = det
+        if source_turn_id is not None:
+            current.source_turn_id = new_source_turn
+        if source_attempt_id is not None:
+            current.source_attempt_id = new_source_attempt
+        if source_event_id is not None:
+            current.source_event_id = new_source_event
+        if op:
+            current.operation_id = op
+        if key and not current.idempotency_key:
+            current.idempotency_key = key
+        db.flush()
+        structured_log(
+            logger, logging.INFO, "world_knowledge_updated",
+            campaign_id=str(campaign.id), knowledge_id=str(current.id),
+            subject_kind=skind, knowledge_state=state, visibility=vis,
+            operation_id=op,
+        )
+        return current, False
+
+    row = WorldKnowledge(
+        id=uuid.uuid4(), campaign_id=campaign.id,
+        subject_kind=skind, subject_entity_id=subject.id,
+        target_kind=kind,
+        target_fact_id=tid if kind == "fact" else None,
+        target_relation_id=tid if kind == "relation" else None,
+        target_entity_id=tid if kind == "entity" else None,
+        knowledge_state=state, acquisition_source=source,
+        visibility=vis, provenance=prov, details=det,
+        source_turn_id=new_source_turn,
+        source_attempt_id=new_source_attempt,
+        source_event_id=new_source_event,
+        operation_id=op, idempotency_key=key,
+    )
+    db.add(row)
+    db.flush()
+    structured_log(
+        logger, logging.INFO, "world_knowledge_asserted",
+        campaign_id=str(campaign.id), knowledge_id=str(row.id),
+        subject_kind=skind, target_kind=kind, knowledge_state=state,
+        visibility=vis, acquisition_source=source, operation_id=op,
+    )
+    return row, True
+
+
+def list_knowledge_for_subject(
+    db: Session, campaign_id: uuid.UUID, subject_entity_id: Any, *,
+    knowledge_state: str | None = None, limit: int = 100,
+) -> list[WorldKnowledge]:
+    sid = coerce_uuid(subject_entity_id, field="subject_entity_id")
+    q = select(WorldKnowledge).where(
+        WorldKnowledge.campaign_id == campaign_id,
+        WorldKnowledge.subject_entity_id == sid,
+    )
+    if knowledge_state is not None:
+        q = q.where(WorldKnowledge.knowledge_state == validate_knowledge_state(knowledge_state))
+    q = q.order_by(WorldKnowledge.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
+    return list(db.execute(q).scalars().all())
+
+
+def list_knowledge_for_target(
+    db: Session, campaign_id: uuid.UUID, target_kind: str, target_id: Any, *,
+    knowledge_state: str | None = None, limit: int = 100,
+) -> list[WorldKnowledge]:
+    kind = validate_knowledge_target_kind(target_kind)
+    tid = coerce_uuid(target_id, field="target_id")
+    q = select(WorldKnowledge).where(
+        WorldKnowledge.campaign_id == campaign_id,
+        WorldKnowledge.target_kind == kind,
+    )
+    if kind == "fact":
+        q = q.where(WorldKnowledge.target_fact_id == tid)
+    elif kind == "relation":
+        q = q.where(WorldKnowledge.target_relation_id == tid)
+    else:
+        q = q.where(WorldKnowledge.target_entity_id == tid)
+    if knowledge_state is not None:
+        q = q.where(WorldKnowledge.knowledge_state == validate_knowledge_state(knowledge_state))
+    q = q.order_by(WorldKnowledge.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
+    return list(db.execute(q).scalars().all())
+
+
+# ── Visibility grants (arbitrary authorized subsets) ────────────────────────
+
+def _find_grant_by_idempotency(
+    db: Session, campaign_id: uuid.UUID, key: str | None
+) -> WorldVisibilityGrant | None:
+    if not key:
         return None
     return db.execute(
-        select(WorldFact).where(
-            WorldFact.campaign_id == campaign_id,
-            WorldFact.idempotency_key == str(idempotency_key).strip(),
+        select(WorldVisibilityGrant).where(
+            WorldVisibilityGrant.campaign_id == campaign_id,
+            WorldVisibilityGrant.idempotency_key == key,
         )
     ).scalars().first()
 
 
-def _verify_supersede_dup(
-    dup_supersedes_id: uuid.UUID | None, prior_id: uuid.UUID, key: str, *, kind: str
-) -> None:
-    """Fail closed when a supersede idempotency key collides across operations.
-
-    A duplicate hit is only a safe retry when it actually supersedes the same
-    prior row; otherwise the key was reused for a different logical operation
-    and accepting it would silently attach history to the wrong chain.
-    """
-    if dup_supersedes_id is None or str(dup_supersedes_id) != str(prior_id):
+def _resolve_grant_target(
+    db: Session, campaign_id: uuid.UUID, target_kind: str, target_id: Any
+) -> uuid.UUID:
+    kind = validate_grant_target_kind(target_kind)
+    tid = coerce_uuid(target_id, field="target_id")
+    record = load_grant_target(db, kind, tid)
+    if record is None or getattr(record, "campaign_id", None) != campaign_id:
         structured_log(
-            logger, logging.WARNING, "world_supersede_key_collision",
-            prior_id=str(prior_id), idempotency_key=key, kind=kind,
+            logger, logging.WARNING, "world_grant_target_unresolved",
+            campaign_id=str(campaign_id), target_kind=kind,
+            reason="record_not_in_campaign",
         )
-        raise ValueError(
-            f"idempotency_key {key!r} already supersedes a different {kind}; "
-            "use a fresh key for a new supersession"
+        raise ValueError(f"grant target {kind}:{tid} not found in campaign {campaign_id}")
+    return tid
+
+
+def _resolve_grantee(db: Session, campaign: Campaign, grantee_user_id: Any) -> uuid.UUID:
+    gid = coerce_uuid(grantee_user_id, field="grantee_user_id")
+    profile = db.get(Profile, gid)
+    if profile is None:
+        raise ValueError(f"grantee {gid} is not a known user")
+    if not is_campaign_participant(db, campaign, gid):
+        raise ValueError(f"grantee {gid} is not a member of campaign {campaign.id}")
+    return gid
+
+
+def grant_visibility(
+    db: Session, campaign: Campaign, *, target_kind: str, target_id: Any,
+    grantee_user_id: Any, granted_by: Any | None = None,
+    operation_id: str | None = None, idempotency_key: str | None = None,
+) -> tuple[WorldVisibilityGrant, bool]:
+    """Authorize one human user for one record (idempotent; flushes only)."""
+    kind = validate_grant_target_kind(target_kind)
+    tid = _resolve_grant_target(db, campaign.id, kind, target_id)
+    gid = _resolve_grantee(db, campaign, grantee_user_id)
+    by = coerce_uuid(granted_by, field="granted_by") if granted_by else None
+    key = normalize_idempotency_key(idempotency_key or operation_id)
+    if key:
+        dup = _find_grant_by_idempotency(db, campaign.id, key)
+        if dup is not None:
+            return dup, False
+    existing = db.execute(
+        select(WorldVisibilityGrant).where(
+            WorldVisibilityGrant.campaign_id == campaign.id,
+            WorldVisibilityGrant.target_kind == kind,
+            WorldVisibilityGrant.target_id == tid,
+            WorldVisibilityGrant.grantee_user_id == gid,
+            WorldVisibilityGrant.revoked_at.is_(None),
         )
-
-
-def _widening_visibility(prior_visibility: str, new_visibility: str) -> bool:
-    """Whether a supersession crosses restricted → member-visible.
-
-    When it does, prior ``provenance``/``details``/``grants`` must NOT be
-    inherited: those fields are serialized verbatim by ``to_dict()``, so
-    inherited DM-only metadata would become readable by ordinary members
-    even when the caller only intended to reveal the new record itself.
-    """
-    return (
-        prior_visibility in RESTRICTED_VISIBILITIES
-        and new_visibility not in RESTRICTED_VISIBILITIES
+    ).scalars().first()
+    if existing is not None:
+        return existing, False
+    row = WorldVisibilityGrant(
+        id=uuid.uuid4(), campaign_id=campaign.id, target_kind=kind,
+        target_id=tid, grantee_user_id=gid, granted_by=by,
+        operation_id=(str(operation_id)[:128] if operation_id else None),
+        idempotency_key=key,
     )
+    db.add(row)
+    db.flush()
+    structured_log(
+        logger, logging.INFO, "world_visibility_granted",
+        campaign_id=str(campaign.id), target_kind=kind,
+        grantee_user_id=str(gid),
+        operation_id=str(operation_id) if operation_id else None,
+    )
+    return row, True
 
 
-def _dialect_upsert_insert(db: Session):
+# ── Viewer projections (server-side, RLS-compatible) ─────────────────────────
+
+def _knowledge_target_ref(row: WorldKnowledge) -> tuple[str, uuid.UUID]:
+    if row.target_kind == "fact" and row.target_fact_id:
+        return "fact", row.target_fact_id
+    if row.target_kind == "relation" and row.target_relation_id:
+        return "relation", row.target_relation_id
+    if row.target_kind == "entity" and row.target_entity_id:
+        return "entity", row.target_entity_id
+    raise ValueError("knowledge row has ambiguous target (fail closed)")
+
+
+def what_does_subject_know(
+    db: Session, campaign: Campaign, subject_entity_id: Any, viewer_user_id: Any, *,
+    knowledge_state: str | None = None, include_target: bool = True, limit: int = 100,
+) -> dict[str, Any]:
+    """Projection: what may viewer U see of subject X's knowledge?
+
+    Fictional attribution (X holds stance S toward T) and human disclosure
+    (may U receive the subject entity? the knowledge row? T?) are checked
+    independently — all must allow, else the entry is counted as denied
+    without leaking ids/content.
+    """
     try:
-        dialect_name = db.get_bind().dialect.name
+        viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
+        subject = _resolve_subject(db, campaign.id, subject_entity_id)
+    except ValueError:
+        return {
+            "subject_entity_id": str(subject_entity_id),
+            "entries": [], "total": 0, "visible": 0, "denied": 0,
+            "denied_reasons": {"record_not_found": 1},
+        }
+    if not may_user_receive(db, campaign, "entity", subject.id, viewer)["allowed"]:
+        # The subject itself is hidden from this viewer: disclose neither its
+        # knowledge rows nor their count.
+        return {
+            "subject_entity_id": str(subject.id),
+            "entries": [], "total": 0, "visible": 0, "denied": 0,
+            "denied_reasons": {"subject_not_visible": 1},
+        }
+    rows = list_knowledge_for_subject(
+        db, campaign.id, subject.id,
+        knowledge_state=knowledge_state, limit=limit,
+    )
+    entries: list[dict] = []
+    denied_reasons: dict[str, int] = {}
+    for row in rows:
+        knowable = may_user_receive(db, campaign, "knowledge", row.id, viewer)
+        if not knowable["allowed"]:
+            denied_reasons["knowledge_not_visible"] = denied_reasons.get("knowledge_not_visible", 0) + 1
+            continue
+        try:
+            tkind, tid = _knowledge_target_ref(row)
+        except ValueError:
+            denied_reasons["ambiguous_visibility"] = denied_reasons.get("ambiguous_visibility", 0) + 1
+            continue
+        target_ok = may_user_receive(db, campaign, tkind, tid, viewer)
+        if not target_ok["allowed"]:
+            denied_reasons["target_not_visible"] = denied_reasons.get("target_not_visible", 0) + 1
+            continue
+        entry: dict[str, Any] = {
+            "knowledge_id": str(row.id),
+            "subject_kind": row.subject_kind,
+            "subject_entity_id": str(row.subject_entity_id),
+            "target_kind": tkind,
+            "target_id": str(tid),
+            "knowledge_state": row.knowledge_state,
+            "acquisition_source": row.acquisition_source,
+        }
+        if include_target:
+            target = load_grant_target(db, tkind, tid)
+            entry["target"] = target.to_dict() if target is not None else None
+        entries.append(entry)
+    denied = len(rows) - len(entries)
+    return {
+        "subject_entity_id": str(subject.id),
+        "entries": entries,
+        "total": len(rows),
+        "visible": len(entries),
+        "denied": denied,
+        "denied_reasons": denied_reasons,
+    }
+
+
+def who_knows_target(
+    db: Session, campaign: Campaign, target_kind: str, target_id: Any,
+    viewer_user_id: Any, *, knowledge_state: str | None = None, limit: int = 100,
+) -> dict[str, Any]:
+    """Projection: which subjects may viewer U see as holding target T?
+
+    The viewer must independently be allowed the target, each knowledge row,
+    AND each knower's subject entity; knower identities behind denied rows or
+    hidden subjects are never listed.
+    """
+    try:
+        kind = validate_knowledge_target_kind(target_kind)
+        tid = coerce_uuid(target_id, field="target_id")
+        viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
+    except ValueError:
+        return {
+            "target_kind": str(target_kind), "target_id": str(target_id),
+            "knowers": [], "total": 0, "visible": 0, "denied": 0,
+            "denied_reasons": {"record_not_found": 1},
+        }
+    if may_user_receive(db, campaign, kind, tid, viewer)["allowed"] is False:
+        return {
+            "target_kind": kind, "target_id": str(tid),
+            "knowers": [], "total": 0, "visible": 0, "denied": 0,
+            "denied_reasons": {"target_not_visible": 1},
+        }
+    rows = list_knowledge_for_target(
+        db, campaign.id, kind, tid, knowledge_state=knowledge_state, limit=limit,
+    )
+    knowers: list[dict] = []
+    denied_reasons: dict[str, int] = {}
+    for row in rows:
+        if not may_user_receive(db, campaign, "knowledge", row.id, viewer)["allowed"]:
+            denied_reasons["knowledge_not_visible"] = denied_reasons.get("knowledge_not_visible", 0) + 1
+            continue
+        if not may_user_receive(db, campaign, "entity", row.subject_entity_id, viewer)["allowed"]:
+            denied_reasons["subject_not_visible"] = denied_reasons.get("subject_not_visible", 0) + 1
+            continue
+        knowers.append({
+            "knowledge_id": str(row.id),
+            "subject_kind": row.subject_kind,
+            "subject_entity_id": str(row.subject_entity_id),
+            "knowledge_state": row.knowledge_state,
+            "acquisition_source": row.acquisition_source,
+        })
+    denied = len(rows) - len(knowers)
+    reasons = dict(denied_reasons)
+    return {
+        "target_kind": kind, "target_id": str(tid),
+        "knowers": knowers, "total": len(rows),
+        "visible": len(knowers), "denied": denied,
+        "denied_reasons": reasons,
+    }
+
+
+def _project_records_for_user(
+    db: Session, campaign: Campaign, viewer_user_id: Any,
+    records: list[Any], target_kind: str,
+) -> dict[str, Any]:
+    try:
+        viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
+    except ValueError:
+        return {
+            "records": [], "total": len(records), "visible": 0,
+            "denied": len(records), "denied_reasons": {"record_not_found": len(records)},
+        }
+    visible: list[dict] = []
+    denied_reasons: dict[str, int] = {}
+    for record in records:
+        verdict = may_user_receive(db, campaign, target_kind, record.id, viewer)
+        if verdict["allowed"]:
+            visible.append(record.to_dict())
+        else:
+            reason = verdict["reason"]
+            denied_reasons[reason] = denied_reasons.get(reason, 0) + 1
+    return {
+        "records": visible,
+        "total": len(records),
+        "visible": len(visible),
+        "denied": len(records) - len(visible),
+        "denied_reasons": denied_reasons,
+    }
+
+
+def project_facts_for_user(
+    db: Session, campaign: Campaign, viewer_user_id: Any,
+    facts: list[WorldFact],
+) -> dict[str, Any]:
+    """Viewer projection over an explicit fact set with leak-free counts."""
+    return _project_records_for_user(db, campaign, viewer_user_id, facts, "fact")
+
+
+# ── #251 judge scoping: subject-unknown restricted texts ─────────────────
+
+RESTRICTED_FACT_SCAN_LIMIT = 100
+RESTRICTED_TEXT_LIMIT = 32
+RESTRICTED_TEXT_CHARS = 500
+
+
+def collect_subject_restricted_fact_texts(
+    db: Session, campaign: Campaign, speaker_subject_ids: Any, *,
+    limit_facts: int = RESTRICTED_FACT_SCAN_LIMIT,
+    limit_texts: int = RESTRICTED_TEXT_LIMIT,
+    max_chars: int = RESTRICTED_TEXT_CHARS,
+) -> dict[str, set[str]]:
+    """Per-speaker fact texts that speaker could not know — for the judge.
+
+    Derived from each speaker's ``WorldKnowledge`` independently of human
+    visibility: a campaign/public OOC fact a speaker never learned is still
+    that speaker's misuse to state, so all visibilities are scanned. A text
+    maps to every resolved speaker lacking knowledge of that fact; speakers
+    that do not resolve to a campaign entity are excluded (their scope is
+    unknowable, never assumed). An explicit ``does_not_know`` stance never
+    counts as coverage. Bounded to recent rows and capped texts; returns
+    possibly-empty; never raises for misshapen input (callers treat failure
+    as no extra scope).
+    """
+    try:
+        speaker_ids = [str(s).strip() for s in (speaker_subject_ids or []) if str(s or "").strip()]
+    except TypeError:
+        return {}
+    subjects: list[WorldEntity] = []
+    for raw in speaker_ids[:16]:
+        try:
+            sid = coerce_uuid(raw, field="subject_entity_id")
+        except ValueError:
+            continue
+        entity = db.get(WorldEntity, sid)
+        if entity is not None and entity.campaign_id == campaign.id:
+            subjects.append(entity)
+    if not subjects:
+        return {}
+    try:
+        known_per_speaker: list[tuple[str, set[str]]] = []
+        for subject in subjects:
+            rows = list_knowledge_for_subject(db, campaign.id, subject.id, limit=200)
+            known: set[str] = set()
+            for row in rows:
+                # An explicit does_not_know stance is not coverage.
+                if row.knowledge_state == "does_not_know":
+                    continue
+                if row.target_kind == "fact" and row.target_fact_id is not None:
+                    known.add(str(row.target_fact_id))
+            known_per_speaker.append((str(subject.id), known))
+        scan = max(1, min(int(limit_facts or 100), 500))
+        facts = list(db.execute(
+            select(WorldFact).where(
+                WorldFact.campaign_id == campaign.id,
+            ).order_by(WorldFact.created_at.desc()).limit(scan)
+        ).scalars().all())
+    except Exception:
+        return {}
+    out: dict[str, set[str]] = {}
+    cap_texts = max(1, min(int(limit_texts or 32), 64))
+    cap_chars = max(1, min(int(max_chars or 500), 4000))
+    total = 0
+    for fact in facts:
+        fid = str(fact.id)
+        content = str(getattr(fact, "content", None) or "").strip()
+        if not content:
+            continue
+        for speaker_id, known in known_per_speaker:
+            if fid in known:
+                continue
+            out.setdefault(speaker_id, set()).add(content[:cap_chars])
+            total += 1
+            if total >= cap_texts:
+                return out
+    return out
+
+
+def project_relations_for_user(
+    db: Session, campaign: Campaign, viewer_user_id: Any,
+    relations: list[WorldRelation],
+) -> dict[str, Any]:
+    """Viewer projection over an explicit relation set with leak-free counts."""
+    return _project_records_for_user(db, campaign, viewer_user_id, relations, "relation")
+
+
+# ── #251 knowledge-visibility lane reader (DM-internal, adjudication-only) ──
+
+KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT = 50
+
+
+def _resolve_subject_for_character(
+    db: Session, campaign_id: uuid.UUID, character_id: Any,
+) -> WorldEntity | None:
+    """Map a canonical PC (characters.id) to its WorldEntity subject, if any.
+
+    PCs materialize into world_entities via post-turn (#217); before that no
+    subject row exists and the lane reports an explicit empty perspective
+    rather than failing. Never raises: unresolved maps to None.
+    """
+    try:
+        cid = coerce_uuid(character_id, field="character_id")
+    except ValueError:
+        return None
+    direct = db.get(WorldEntity, cid)
+    if direct is not None and direct.campaign_id == campaign_id:
+        return direct
+    try:
+        candidates = list(
+            db.execute(
+                select(WorldEntity).where(
+                    WorldEntity.campaign_id == campaign_id,
+                    WorldEntity.entity_type == "character",
+                ).limit(200)
+            ).scalars().all()
+        )
     except Exception:
         return None
-    if dialect_name == "postgresql":
-        from sqlalchemy.dialects.postgresql import insert as pg_insert
-        return pg_insert
-    if dialect_name == "sqlite":
-        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-        return sqlite_insert
+    needle = str(cid)
+    for entity in candidates:
+        details = getattr(entity, "details", None) or {}
+        if isinstance(details, dict):
+            for key in ("character_id", "pc_id", "canonical_character_id"):
+                if str(details.get(key) or "") == needle:
+                    return entity
     return None
 
 
-def _insert_relation_row(
-    db: Session,
-    campaign: Campaign,
-    *,
-    subject_id: uuid.UUID,
-    relation_type: str,
-    object_id: uuid.UUID | None,
-    object_label: str | None,
-    epistemic_state: str,
-    status: str,
-    version: int,
-    supersedes_id: uuid.UUID | None,
-    visibility: str,
-    grants: dict,
-    provenance: dict,
-    details: dict,
-    source_turn_id: uuid.UUID | None,
-    source_attempt_id: uuid.UUID | None,
-    source_event_id: uuid.UUID | None,
-    operation_id: str | None,
-    idempotency_key: str | None,
-) -> tuple[WorldRelation, bool]:
-    """Idempotent row insert shared by create + supersede.
+def _subject_knowledge_value(
+    db: Session, campaign: Campaign, subject: WorldEntity | None, *,
+    character_id: Any = None, perspective: str = "character",
+    limit: int = KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT,
+) -> dict[str, Any]:
+    """One DM-internal perspective snapshot for a resolved-or-empty subject."""
+    if subject is None:
+        return {
+            "character_id": str(character_id) if character_id is not None else None,
+            "subject_entity_id": None,
+            "subject_name": None,
+            "subject_resolved": False,
+            "perspective": perspective,
+            "entries": [],
+            "total": 0,
+            "truncated": False,
+        }
+    rows = list_knowledge_for_subject(db, campaign.id, subject.id, limit=limit + 1)
+    truncated = len(rows) > limit
+    entries: list[dict[str, Any]] = []
+    for row in rows[:limit]:
+        try:
+            tkind, tid = _knowledge_target_ref(row)
+        except ValueError:
+            continue
+        entries.append({
+            "knowledge_id": str(row.id),
+            "target_kind": tkind,
+            "target_id": str(tid),
+            "knowledge_state": row.knowledge_state,
+            "acquisition_source": row.acquisition_source,
+            "visibility": getattr(row, "visibility", "dm_only"),
+        })
+    return {
+        "character_id": str(character_id) if character_id is not None else None,
+        "subject_entity_id": str(subject.id),
+        "subject_name": subject.name,
+        "subject_resolved": True,
+        "perspective": perspective,
+        "entries": entries,
+        "total": len(rows),
+        "truncated": truncated,
+    }
 
-    Returns (row, created). A concurrent duplicate-key winner is returned
-    with created=False instead of raising, so the outer revision transaction
-    stays recoverable on every backend.
+
+def build_knowledge_visibility_values(
+    db: Session, campaign: Campaign, character_ids: Any, *,
+    npc_entity_ids: Any = None,
+    max_entries_per_subject: int = KNOWLEDGE_LANE_MAX_ENTRIES_PER_SUBJECT,
+) -> list[dict[str, Any]]:
+    """DM-internal per-subject knowledge snapshots for the #202 lane.
+
+    Covers acting PCs (``character_ids``) plus scene-relevant non-player
+    subjects (``npc_entity_ids``: NPC/group WorldEntity IDs, e.g. from the
+    current scene's present actors). Returns one value dict per subject plus
+    a single empty value when no subject is relevant at all, so the REQUIRED
+    lane is always satisfiable without fabricating knowledge. Values carry
+    target refs + stances only (no truth text); the DM retrieves full
+    evidence through #212 tools. Raises only on DB failure (caller fails
+    closed); unresolved subjects yield explicit empty entries.
     """
-    if idempotency_key:
-        existing = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
-        if existing is not None:
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign.id), relation_id=str(existing.id),
-                idempotency_key=idempotency_key,
-            )
-            return existing, False
-
-        upsert_insert = _dialect_upsert_insert(db)
-        if upsert_insert is not None:
-            row_id = uuid.uuid4()
-            db.execute(
-                upsert_insert(WorldRelation)
-                .values(
-                    id=row_id,
-                    campaign_id=campaign.id,
-                    subject_entity_id=subject_id,
-                    relation_type=relation_type,
-                    object_entity_id=object_id,
-                    object_label=object_label,
-                    epistemic_state=epistemic_state,
-                    status=status,
-                    version=version,
-                    supersedes_id=supersedes_id,
-                    visibility=visibility,
-                    grants=grants,
-                    provenance=provenance,
-                    details=details,
-                    source_turn_id=source_turn_id,
-                    source_attempt_id=source_attempt_id,
-                    source_event_id=source_event_id,
-                    operation_id=operation_id,
-                    idempotency_key=idempotency_key,
-                )
-                .on_conflict_do_nothing(index_elements=["campaign_id", "idempotency_key"])
-            )
-            stored = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
-            if stored is None:  # pragma: no cover — defensive
-                raise RuntimeError(f"idempotent relation insert for key {idempotency_key!r} left no row")
-            if str(stored.id) == str(row_id):
-                return stored, True
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign.id), relation_id=str(stored.id),
-                idempotency_key=idempotency_key, path="race_winner",
-            )
-            return stored, False
-
-    row = WorldRelation(
-        id=uuid.uuid4(),
-        campaign_id=campaign.id,
-        subject_entity_id=subject_id,
-        relation_type=relation_type,
-        object_entity_id=object_id,
-        object_label=object_label,
-        epistemic_state=epistemic_state,
-        status=status,
-        version=version,
-        supersedes_id=supersedes_id,
-        visibility=visibility,
-        grants=grants,
-        provenance=provenance,
-        details=details,
-        source_turn_id=source_turn_id,
-        source_attempt_id=source_attempt_id,
-        source_event_id=source_event_id,
-        operation_id=operation_id,
-        idempotency_key=idempotency_key,
-    )
-    if idempotency_key is None:
-        db.add(row)
-        db.flush()
-        return row, True
     try:
-        with db.begin_nested():
-            db.add(row)
-            db.flush()
-    except IntegrityError:
+        ids = list(character_ids or [])
+    except TypeError:
+        ids = []
+    try:
+        npc_ids = list(npc_entity_ids or [])
+    except TypeError:
+        npc_ids = []
+    if not ids and not npc_ids:
+        return [{"perspectives": [], "note": "no_pc_in_attempt"}]
+    limit = max(1, min(int(max_entries_per_subject or 50), 200))
+    values: list[dict[str, Any]] = []
+    for character_id in ids:
+        subject = _resolve_subject_for_character(db, campaign.id, character_id)
+        values.append(_subject_knowledge_value(
+            db, campaign, subject, character_id=character_id,
+            perspective="character", limit=limit,
+        ))
+    for npc_id in npc_ids[:32]:
         try:
-            db.expunge(row)
-        except Exception:
-            pass
-        winner = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
-        if winner is not None:
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign.id), relation_id=str(winner.id),
-                idempotency_key=idempotency_key, path="race_winner",
-            )
-            return winner, False
-        raise
-    return row, True
-
-
-def _sync_fact_refs(
-    db: Session, campaign: Campaign, fact: WorldFact, entity_ids: list[uuid.UUID]
-) -> None:
-    db.execute(delete(WorldFactEntityRef).where(WorldFactEntityRef.fact_id == fact.id))
-    for eid in entity_ids:
-        db.add(WorldFactEntityRef(fact_id=fact.id, campaign_id=campaign.id, entity_id=eid))
-    fact.entity_refs = [str(e) for e in entity_ids]
-    db.flush()
-
-
-def create_relation(
-    db: Session,
-    campaign: Campaign,
-    *,
-    subject_entity_id: Any,
-    relation_type: str,
-    object_entity_id: Any | None = None,
-    object_label: str | None = None,
-    epistemic_state: str = "claimed",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    idempotency_key: str | None = None,
-) -> tuple[WorldRelation, bool]:
-    """Insert one relation version inside the caller's transaction.
-
-    A bare claim stores as non-``confirmed`` epistemic state by default, so a
-    player/NPC utterance never becomes objective truth implicitly. Flushes;
-    never commits.
-    """
-    rtype = validate_relation_type(relation_type)
-    epistemic = validate_epistemic_state(epistemic_state)
-    # Fail-closed visibility: unmarked assertions stay restricted.
-    vis = normalize_visibility(visibility or "dm_only")
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    # operation_id-scoped keys keep staged-effect retries aligned with the
-    # entity path, but an explicit idempotency_key always wins.
-    if idempotency_key:
-        key = _normalize_idempotency_key(idempotency_key)
-
-    subject = _resolve_world_entity(db, campaign.id, subject_entity_id, role="subject")
-    obj: WorldEntity | None = None
-    if object_entity_id is not None:
-        obj = _resolve_world_entity(db, campaign.id, object_entity_id, role="object")
-    label = validate_object_label(object_label)
-    if obj is None and not label:
-        raise ValueError("relation requires object_entity_id or object_label")
-    source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
-
-    row, created = _insert_relation_row(
-        db, campaign,
-        subject_id=subject.id, relation_type=rtype,
-        object_id=obj.id if obj else None, object_label=label,
-        epistemic_state=epistemic, status="active", version=1, supersedes_id=None,
-        visibility=vis, grants=_normalize_grants(grants),
-        provenance=_normalize_provenance(provenance),
-        details=dict(details or {}),
-        source_turn_id=turn_id, source_attempt_id=attempt_id, source_event_id=source_event,
-        operation_id=(str(operation_id)[:128] if operation_id else None),
-        idempotency_key=key,
-    )
-    if created:
-        structured_log(
-            logger, logging.INFO, "world_relation_created",
-            campaign_id=str(campaign.id), relation_id=str(row.id),
-            relation_type=rtype, epistemic_state=epistemic, visibility=vis,
-            source_turn_id=str(turn_id) if turn_id else None,
-            source_attempt_id=str(attempt_id) if attempt_id else None,
-            source_event_id=str(source_event) if source_event else None,
-            operation_id=str(operation_id) if operation_id else None,
-        )
-    return row, created
-
-
-def supersede_relation(
-    db: Session,
-    campaign: Campaign,
-    prior_relation_id: Any,
-    *,
-    subject_entity_id: Any | None = None,
-    relation_type: str | None = None,
-    object_entity_id: Any | None = UNSET,
-    object_label: str | None = UNSET,
-    epistemic_state: str | None = None,
-    new_status: str = "active",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    idempotency_key: str | None = None,
-    clear_object: bool = False,
-) -> tuple[WorldRelation, bool]:
-    """Supersede one active relation with a new version, preserving history.
-
-    All reference validation happens BEFORE the prior row is touched, so a
-    failed update never partially supersedes the prior active truth. The
-    insert + prior flip share the caller's transaction (atomic with the
-    source turn / revision commit).
-    """
-    # Load the prior first (read-only, no lifecycle mutation) so a duplicate
-    # retry can be matched against it; the active-state gate runs AFTER the
-    # idempotency lookup so an exact retry succeeds instead of failing on the
-    # now-superseded prior.
-    prior = get_relation_strict(db, campaign.id, _coerce_uuid(prior_relation_id, field="prior_relation_id"))
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if idempotency_key:
-        key = _normalize_idempotency_key(idempotency_key)
-    if key:
-        dup = _find_relation_by_idempotency(db, campaign.id, key)
-        if dup is not None:
-            _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="relation")
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign.id), relation_id=str(dup.id),
-                idempotency_key=key, path="supersede_precheck",
-            )
-            return dup, False
-    if prior.status != "active":
-        raise ValueError(f"relation {prior.id} is {prior.status}, only active relations can be superseded")
-
-    # ── Validate everything before touching prior lifecycle ──────────────
-    rtype = validate_relation_type(relation_type) if relation_type is not None else prior.relation_type
-    epistemic = validate_epistemic_state(epistemic_state) if epistemic_state is not None else prior.epistemic_state
-    status = validate_new_version_status(new_status)
-    vis = normalize_visibility(visibility) if visibility is not None else prior.visibility
-    subject = (
-        _resolve_world_entity(db, campaign.id, subject_entity_id, role="subject")
-        if subject_entity_id is not None else db.get(WorldEntity, prior.subject_entity_id)
-    )
-    if subject is None or subject.campaign_id != campaign.id:  # pragma: no cover — defensive
-        raise ValueError(f"subject entity {prior.subject_entity_id} not found in campaign {campaign.id}")
-    # Key-presence semantics: UNSET (omitted) inherits the prior reference,
-    # explicit None clears it, a value re-points it.
-    obj: WorldEntity | None = None
-    if clear_object:
-        obj = None
-    elif object_entity_id is UNSET:
-        if prior.object_entity_id is not None:
-            obj = db.get(WorldEntity, prior.object_entity_id)
-            if obj is not None and obj.campaign_id != campaign.id:
-                raise ValueError(f"object entity {prior.object_entity_id} not found in campaign {campaign.id}")
-    elif object_entity_id is not None:
-        obj = _resolve_world_entity(db, campaign.id, object_entity_id, role="object")
-    # else explicit None → cleared (obj stays None)
-    if object_label is UNSET:
-        label: str | None = None if clear_object else prior.object_label
-    elif object_label is not None:
-        label = validate_object_label(object_label)
-    else:
-        label = None
-    if obj is None and not label:
-        raise ValueError("relation requires object_entity_id or object_label")
-    source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    # Validate the EFFECTIVE pair (explicit values with prior inheritance
-    # applied first): validating only the supplied halves and then inheriting
-    # the omitted half could persist a turn/attempt pair that never belonged
-    # together. Re-pointing one half requires re-pointing both.
-    turn_id, attempt_id = _resolve_source_turn_refs(
-        db, campaign.id,
-        source_turn_id if source_turn_id is not None else prior.source_turn_id,
-        source_attempt_id if source_attempt_id is not None else prior.source_attempt_id,
-    )
-    if _widening_visibility(prior.visibility, vis):
-        # Restricted → member-visible: keep only explicitly supplied
-        # metadata so prior DM-only context cannot leak into the visible row.
-        merged_provenance = _normalize_provenance(provenance)
-        merged_details = dict(details or {})
-        merged_grants = _normalize_grants(grants)
-        structured_log(
-            logger, logging.INFO, "world_restricted_metadata_dropped",
-            campaign_id=str(campaign.id), prior_relation_id=str(prior.id),
-            prior_visibility=prior.visibility, visibility=vis,
-        )
-    else:
-        merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
-        merged_details = dict(details) if details is not None else dict(prior.details or {})
-        merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
-
-    row, created = _insert_relation_row(
-        db, campaign,
-        subject_id=subject.id, relation_type=rtype,
-        object_id=obj.id if obj else None, object_label=label,
-        epistemic_state=epistemic, status=status, version=int(prior.version or 1) + 1,
-        supersedes_id=prior.id,
-        visibility=vis, grants=merged_grants,
-        provenance=merged_provenance, details=merged_details,
-        source_turn_id=turn_id,
-        source_attempt_id=attempt_id,
-        source_event_id=source_event or prior.source_event_id,
-        operation_id=(str(operation_id)[:128] if operation_id else None),
-        idempotency_key=key,
-    )
-    if not created:
-        return row, False
-    # Race absorbed by upsert (created=False) leaves prior untouched; only the
-    # genuine new version flips prior lifecycle.
-    prior.status = "superseded"
-    prior.superseded_by_id = row.id
-    db.flush()
-    structured_log(
-        logger, logging.INFO, "world_relation_superseded",
-        campaign_id=str(campaign.id), prior_relation_id=str(prior.id),
-        relation_id=str(row.id), prior_epistemic=prior.epistemic_state,
-        epistemic_state=epistemic, version=int(row.version),
-        operation_id=str(operation_id) if operation_id else None,
-    )
-    if prior.epistemic_state != epistemic:
-        structured_log(
-            logger, logging.INFO, "world_relation_epistemic_transition",
-            campaign_id=str(campaign.id), relation_id=str(row.id),
-            prior=prior.epistemic_state, current=epistemic,
-        )
-    return row, True
-
-
-def create_fact(
-    db: Session,
-    campaign: Campaign,
-    *,
-    content: str,
-    entity_refs: list | None = None,
-    epistemic_state: str = "claimed",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    idempotency_key: str | None = None,
-) -> tuple[WorldFact, bool]:
-    """Assert one fact version inside the caller's transaction."""
-    text = validate_fact_content(content)
-    epistemic = validate_epistemic_state(epistemic_state)
-    vis = normalize_visibility(visibility or "dm_only")
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if idempotency_key:
-        key = _normalize_idempotency_key(idempotency_key)
-
-    resolved_refs = _resolve_fact_entity_refs(db, campaign.id, entity_refs)
-    source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
-
-    if key:
-        dup = _find_fact_by_idempotency(db, campaign.id, key)
-        if dup is not None:
-            structured_log(
-                logger, logging.INFO, "world_fact_duplicate_conflict",
-                campaign_id=str(campaign.id), fact_id=str(dup.id), idempotency_key=key,
-            )
-            return dup, False
-        upsert_insert = _dialect_upsert_insert(db)
-        if upsert_insert is not None:
-            row_id = uuid.uuid4()
-            db.execute(
-                upsert_insert(WorldFact)
-                .values(
-                    id=row_id,
-                    campaign_id=campaign.id,
-                    content=text,
-                    entity_refs=[str(e) for e in resolved_refs],
-                    epistemic_state=epistemic,
-                    status="active",
-                    version=1,
-                    visibility=vis,
-                    grants=_normalize_grants(grants),
-                    provenance=_normalize_provenance(provenance),
-                    details=dict(details or {}),
-                    source_turn_id=turn_id,
-                    source_attempt_id=attempt_id,
-                    source_event_id=source_event,
-                    operation_id=(str(operation_id)[:128] if operation_id else None),
-                    idempotency_key=key,
-                )
-                .on_conflict_do_nothing(index_elements=["campaign_id", "idempotency_key"])
-            )
-            stored = _find_fact_by_idempotency(db, campaign.id, key)
-            if stored is None:  # pragma: no cover — defensive
-                raise RuntimeError(f"idempotent fact insert for key {key!r} left no row")
-            if str(stored.id) != str(row_id):
-                # Lost the race: return the winner untouched. Its join index
-                # and entity_refs must NOT be rewritten with this loser's
-                # refs, or entity lookup would point at entities the winning
-                # fact never referenced.
-                structured_log(
-                    logger, logging.INFO, "world_fact_duplicate_conflict",
-                    campaign_id=str(campaign.id), fact_id=str(stored.id),
-                    idempotency_key=key, path="race_winner",
-                )
-                return stored, False
-            _sync_fact_refs(db, campaign, stored, resolved_refs)
-            structured_log(
-                logger, logging.INFO, "world_fact_asserted",
-                campaign_id=str(campaign.id), fact_id=str(stored.id),
-                epistemic_state=epistemic, visibility=vis,
-                operation_id=str(operation_id) if operation_id else None,
-            )
-            return stored, True
-
-    row = WorldFact(
-        id=uuid.uuid4(),
-        campaign_id=campaign.id,
-        content=text,
-        entity_refs=[str(e) for e in resolved_refs],
-        epistemic_state=epistemic,
-        status="active",
-        version=1,
-        visibility=vis,
-        grants=_normalize_grants(grants),
-        provenance=_normalize_provenance(provenance),
-        details=dict(details or {}),
-        source_turn_id=turn_id,
-        source_attempt_id=attempt_id,
-        source_event_id=source_event,
-        operation_id=(str(operation_id)[:128] if operation_id else None),
-        idempotency_key=key,
-    )
-    if key is None:
-        db.add(row)
-        db.flush()
-        _sync_fact_refs(db, campaign, row, resolved_refs)
-    else:
-        try:
-            with db.begin_nested():
-                db.add(row)
-                db.flush()
-                _sync_fact_refs(db, campaign, row, resolved_refs)
-        except IntegrityError:
-            try:
-                db.expunge(row)
-            except Exception:
-                pass
-            winner = _find_fact_by_idempotency(db, campaign.id, key)
-            if winner is not None:
-                structured_log(
-                    logger, logging.INFO, "world_fact_duplicate_conflict",
-                    campaign_id=str(campaign.id), fact_id=str(winner.id),
-                    idempotency_key=key, path="race_winner",
-                )
-                return winner, False
-            raise
-    structured_log(
-        logger, logging.INFO, "world_fact_asserted",
-        campaign_id=str(campaign.id), fact_id=str(row.id),
-        epistemic_state=epistemic, visibility=vis,
-        operation_id=str(operation_id) if operation_id else None,
-    )
-    return row, True
-
-
-def supersede_fact(
-    db: Session,
-    campaign: Campaign,
-    prior_fact_id: Any,
-    *,
-    content: str | None = None,
-    entity_refs: list | None = None,
-    epistemic_state: str | None = None,
-    new_status: str = "active",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    idempotency_key: str | None = None,
-) -> tuple[WorldFact, bool]:
-    """Supersede one active fact with a new version, preserving history.
-
-    Validation precedes any lifecycle mutation so failures leave the prior
-    active truth untouched.
-    """
-    # Read-only prior load first: the active-state gate runs AFTER the
-    # idempotency lookup so an exact retry succeeds instead of failing on the
-    # now-superseded prior.
-    prior = get_fact_strict(db, campaign.id, _coerce_uuid(prior_fact_id, field="prior_fact_id"))
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if idempotency_key:
-        key = _normalize_idempotency_key(idempotency_key)
-    if key:
-        dup = _find_fact_by_idempotency(db, campaign.id, key)
-        if dup is not None:
-            _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="fact")
-            structured_log(
-                logger, logging.INFO, "world_fact_duplicate_conflict",
-                campaign_id=str(campaign.id), fact_id=str(dup.id),
-                idempotency_key=key, path="supersede_precheck",
-            )
-            return dup, False
-    if prior.status != "active":
-        raise ValueError(f"fact {prior.id} is {prior.status}, only active facts can be superseded")
-
-    text = validate_fact_content(content) if content is not None else prior.content
-    epistemic = validate_epistemic_state(epistemic_state) if epistemic_state is not None else prior.epistemic_state
-    status = validate_new_version_status(new_status)
-    vis = normalize_visibility(visibility) if visibility is not None else prior.visibility
-    if entity_refs is not None:
-        resolved_refs = _resolve_fact_entity_refs(db, campaign.id, entity_refs)
-    else:
-        resolved_refs = _resolve_fact_entity_refs(db, campaign.id, list(prior.entity_refs or []))
-    source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    # Effective pair first (see supersede_relation): re-pointing one
-    # half of the turn/attempt provenance requires re-pointing both.
-    turn_id, attempt_id = _resolve_source_turn_refs(
-        db, campaign.id,
-        source_turn_id if source_turn_id is not None else prior.source_turn_id,
-        source_attempt_id if source_attempt_id is not None else prior.source_attempt_id,
-    )
-    if _widening_visibility(prior.visibility, vis):
-        # Restricted → member-visible: keep only explicitly supplied
-        # metadata so prior DM-only context cannot leak into the visible row.
-        merged_provenance = _normalize_provenance(provenance)
-        merged_details = dict(details or {})
-        merged_grants = _normalize_grants(grants)
-        structured_log(
-            logger, logging.INFO, "world_restricted_metadata_dropped",
-            campaign_id=str(campaign.id), prior_fact_id=str(prior.id),
-            prior_visibility=prior.visibility, visibility=vis,
-        )
-    else:
-        merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
-        merged_details = dict(details) if details is not None else dict(prior.details or {})
-        merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
-
-    row = WorldFact(
-        id=uuid.uuid4(),
-        campaign_id=campaign.id,
-        content=text,
-        entity_refs=[str(e) for e in resolved_refs],
-        epistemic_state=epistemic,
-        status=status,
-        version=int(prior.version or 1) + 1,
-        supersedes_id=prior.id,
-        visibility=vis,
-        grants=merged_grants,
-        provenance=merged_provenance,
-        details=merged_details,
-        source_turn_id=turn_id,
-        source_attempt_id=attempt_id,
-        source_event_id=source_event or prior.source_event_id,
-        operation_id=(str(operation_id)[:128] if operation_id else None),
-        idempotency_key=key,
-    )
-    if key is None:
-        db.add(row)
-        db.flush()
-        _sync_fact_refs(db, campaign, row, resolved_refs)
-    else:
-        try:
-            with db.begin_nested():
-                db.add(row)
-                db.flush()
-                _sync_fact_refs(db, campaign, row, resolved_refs)
-        except IntegrityError:
-            try:
-                db.expunge(row)
-            except Exception:
-                pass
-            winner = _find_fact_by_idempotency(db, campaign.id, key)
-            if winner is not None:
-                structured_log(
-                    logger, logging.INFO, "world_fact_duplicate_conflict",
-                    campaign_id=str(campaign.id), fact_id=str(winner.id),
-                    idempotency_key=key, path="race_winner",
-                )
-                return winner, False
-            raise
-    prior.status = "superseded"
-    prior.superseded_by_id = row.id
-    db.flush()
-    structured_log(
-        logger, logging.INFO, "world_fact_superseded",
-        campaign_id=str(campaign.id), prior_fact_id=str(prior.id),
-        fact_id=str(row.id), prior_epistemic=prior.epistemic_state,
-        epistemic_state=epistemic, version=int(row.version),
-        operation_id=str(operation_id) if operation_id else None,
-    )
-    if prior.epistemic_state != epistemic:
-        structured_log(
-            logger, logging.INFO, "world_fact_epistemic_transition",
-            campaign_id=str(campaign.id), fact_id=str(row.id),
-            prior=prior.epistemic_state, current=epistemic,
-        )
-    return row, True
+            eid = coerce_uuid(npc_id, field="subject_entity_id")
+        except ValueError:
+            continue
+        entity = db.get(WorldEntity, eid)
+        subject = entity if entity is not None and entity.campaign_id == campaign.id else None
+        values.append(_subject_knowledge_value(
+            db, campaign, subject, perspective="npc", limit=limit,
+        ))
+    return values

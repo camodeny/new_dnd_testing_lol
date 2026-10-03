@@ -35,6 +35,7 @@ from app.campaigns.service import (
     validate_seed,
 )
 from app.deps.auth import resolve_profile
+from app.visibility.access import is_campaign_participant
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
 import app.adventures.service  # noqa: F401 — registers the adventure.closing worker
@@ -220,7 +221,7 @@ def get_campaign(campaign_id: str, request: Request, db: Session = Depends(get_d
     camp = db.get(Campaign, cid)
     if not camp or camp.is_deleted:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, camp.id, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     # Issue #265 — restore target is derived server-side from the authoritative
     # archive event, never reconstructed from the truncated (limit-200) events
@@ -844,7 +845,7 @@ def list_campaign_domain_events(campaign_id: str, request: Request, db: Session 
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     events = list_campaign_events(db, cid, viewer_id=profile.id, limit=200)
     return {"events": [event.to_dict() for event in events], "revision": camp.revision}
@@ -905,7 +906,7 @@ def list_campaign_members(campaign_id: str, request: Request, db: Session = Depe
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
     return {"members": [_member_lobby_projection(db, camp, m) for m in members]}
@@ -924,7 +925,7 @@ def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
     member_list = list(members)
@@ -1449,7 +1450,7 @@ def get_party_composition(campaign_id: str, request: Request, db: Session = Depe
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
     return {"party_composition": build_party_composition(db, list(members))}
@@ -1473,7 +1474,7 @@ def get_party_advice(campaign_id: str, request: Request, db: Session = Depends(g
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
     composition = build_party_composition(db, list(members))
@@ -1499,7 +1500,7 @@ def get_character_lore(campaign_id: str, character_id: str, request: Request, db
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
     if char is None or char.owner_id != profile.id or char.is_deleted:
@@ -1552,7 +1553,7 @@ def put_character_lore(
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
     if char is None or char.owner_id != profile.id or char.is_deleted:
@@ -1681,7 +1682,7 @@ def delete_character_lore(
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     # Ownership gate BEFORE any lore lookup: probing another player's
     # character must return the same fail-closed 404 whether lore exists or
@@ -1770,7 +1771,7 @@ def get_lore_dm_chat(campaign_id: str, character_id: str, request: Request, db: 
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     # Ownership gate BEFORE any thread lookup: same no-oracle rule as lore.
     char = db.get(Character, char_id)
@@ -1832,7 +1833,7 @@ def post_lore_dm_chat(
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     char = db.get(Character, char_id)
     if char is None or char.owner_id != profile.id or char.is_deleted:
@@ -2009,7 +2010,7 @@ def list_campaign_characters(campaign_id: str, request: Request, db: Session = D
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(
         select(CampaignMember).where(
@@ -2386,7 +2387,7 @@ def get_party_roster(campaign_id: str, request: Request, db: Session = Depends(g
     camp = db.get(Campaign, cid)
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+    if not is_campaign_participant(db, camp, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     return {"party": party_roster(db, camp)}
 
@@ -2850,7 +2851,7 @@ def _adventure_campaign_or_404(db: Session, campaign_id: str) -> Campaign:
 
 
 def _require_adventure_reader(db: Session, campaign: Campaign, profile) -> None:
-    if campaign.owner_id != profile.id and not is_campaign_member(db, campaign.id, profile.id):
+    if not is_campaign_participant(db, campaign, profile.id):
         raise HTTPException(status_code=403, detail="Not a campaign member")
 
 

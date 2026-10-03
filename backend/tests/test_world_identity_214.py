@@ -17,8 +17,8 @@ from app.decisions import DecisionError, DecisionService, record_fail_soft, to_d
 from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
-    normalize_alias)
-from app.world.service import create_entity, promote_new_entities_from_contract
+    normalize_alias, promote_new_entities_from_contract)
+from app.world.service import create_entity
 from models.campaigns import Campaign
 from models.profiles import Profile
 
@@ -239,7 +239,7 @@ def test_confident_defer_never_falls_back():
 
 def test_retry_with_memo_resolves_instead_of_looping():
     from models.dm import DmTurnAttempt
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
 
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
@@ -405,7 +405,7 @@ def _attempt_fake(contract_snapshot):
 
 
 def test_pre_narration_resolution_persists_attempt_local_outcome():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
@@ -428,7 +428,7 @@ def test_pre_narration_resolution_persists_attempt_local_outcome():
 
 
 def test_commit_revalidation_applies_stored_outcome_without_new_decision():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
     snapshot = {"new_entities": [{
@@ -458,7 +458,7 @@ def test_commit_revalidation_applies_stored_outcome_without_new_decision():
 
 
 def test_pre_narration_defer_aborts_before_anything_durable():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     original = make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
@@ -484,7 +484,7 @@ def test_pre_narration_defer_aborts_before_anything_durable():
 
 
 def test_stored_outcome_stale_revision_fails_closed_at_commit():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     snapshot = {"new_entities": [{
@@ -508,7 +508,7 @@ def test_stored_outcome_stale_revision_fails_closed_at_commit():
 
 
 def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     from app.world.identity import IdentityReuseRequiresReadjudication
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
@@ -529,7 +529,7 @@ def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls
 
 def test_pre_narration_bounded_reuse_requires_readjudication():
     from app.world.identity import IdentityReuseRequiresReadjudication
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
 
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")

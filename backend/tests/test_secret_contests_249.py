@@ -216,7 +216,7 @@ def test_secret_pickpocket_opposed_flow(ctx):
         assert result.event.visibility == "private"
 
         # Branch knowledge committed without revealing the secret.
-        from app.world.knowledge import list_facts
+        from app.world.facts import list_facts
 
         facts = [f for f in list_facts(db, ctx["campaign_id"]) if "lifted" in (f.content or "")]
         assert len(facts) == 1
@@ -414,7 +414,7 @@ def test_success_stays_hidden_failure_reveals(ctx):
 # ── Duplicate retry + no shared-event leak ────────────────────────────────
 
 def test_duplicate_retry_applies_once(ctx):
-    from app.world.knowledge import list_facts
+    from app.world.facts import list_facts
 
     db = _db(ctx)
     try:

@@ -71,6 +71,9 @@ from app.decisions import (
     to_decision_request,
 )
 from app.observability.tracing import structured_log
+from app.visibility.access import is_campaign_participant, is_world_authority
+from app.visibility.policy import RESTRICTED_VISIBILITIES, visible_to_viewer, world_event_visibility
+from app.world._common import coerce_uuid, require_provenance
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import (
     CLOCK_EVALUABLE_STATUSES,
@@ -149,13 +152,6 @@ class ClockStaleError(DecisionError):
 # ── Validation (fail closed at creation) ───────────────────────────────────
 
 _CRITERION_KINDS = frozenset({"deterministic", "semantic"})
-
-
-def _uuid(value: Any, field: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ValueError(f"{field} must be a UUID") from exc
 
 
 def _positive_int(value: Any, field: str, *, minimum: int = 1) -> int:
@@ -268,12 +264,6 @@ def validate_stages(value: Any, threshold: int) -> list[dict[str, Any]] | None:
     return sorted(cleaned, key=lambda stage: stage["at"])
 
 
-def _provenance(value: Any) -> dict:
-    if not isinstance(value, dict) or not str(value.get("source") or "").strip():
-        raise ValueError("provenance.source is required for clock changes")
-    return dict(value)
-
-
 def _check_source_refs(
     db: Session, campaign_id: uuid.UUID, *, turn_id: uuid.UUID | None,
     attempt_id: uuid.UUID | None, event_id: uuid.UUID | None,
@@ -306,8 +296,8 @@ def _check_source_refs(
 # ── Creation ───────────────────────────────────────────────────────────────
 
 def get_clock(db: Session, campaign_id: Any, clock_id: Any) -> CampaignClock | None:
-    row = db.get(CampaignClock, _uuid(clock_id, "clock_id"))
-    return row if row is not None and row.campaign_id == _uuid(campaign_id, "campaign_id") else None
+    row = db.get(CampaignClock, coerce_uuid(clock_id, field="clock_id"))
+    return row if row is not None and row.campaign_id == coerce_uuid(campaign_id, field="campaign_id") else None
 
 
 def get_clock_strict(db: Session, campaign_id: uuid.UUID, clock_id: uuid.UUID) -> CampaignClock:
@@ -369,11 +359,11 @@ def create_clock(
     existing row (after verifying it describes the same clock) instead of
     inserting. The world-seed flow composes this with campaign creation.
     """
-    cid = _uuid(campaign.id, "campaign_id")
-    turn_id = _uuid(source_turn_id, "source_turn_id") if source_turn_id else None
-    attempt_id = _uuid(source_attempt_id, "source_attempt_id") if source_attempt_id else None
-    event_id = _uuid(source_event_id, "source_event_id") if source_event_id else None
-    prov = _provenance(provenance)
+    cid = coerce_uuid(campaign.id, field="campaign_id")
+    turn_id = coerce_uuid(source_turn_id, field="source_turn_id") if source_turn_id else None
+    attempt_id = coerce_uuid(source_attempt_id, field="source_attempt_id") if source_attempt_id else None
+    event_id = coerce_uuid(source_event_id, field="source_event_id") if source_event_id else None
+    prov = require_provenance(provenance, subject="clock")
     _check_source_refs(db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id)
     cleaned = _validate_new_clock(
         name=name, status=status, progress=progress, threshold=threshold, stages=stages,
@@ -398,13 +388,6 @@ def create_clock(
     db.add(row)
     db.flush()
     return row, True
-
-
-def _clock_event_visibility(clock_visibility: str) -> str:
-    """Map clock disclosure onto domain-event visibility (member feed safe)."""
-    from app.world.service import world_event_visibility
-
-    return world_event_visibility(clock_visibility)
 
 
 # ── Evidence matching (deterministic, authority lane) ──────────────────────
@@ -479,7 +462,7 @@ def _validate_evidence_refs(
             raise ValueError("evidence ref sequence must be an integer")
         if not (from_sequence <= seq <= to_sequence):
             raise ValueError(f"evidence ref sequence {seq} is outside the evaluated range")
-        ids.append(_uuid(ref.get("event_id"), "evidence ref event_id"))
+        ids.append(coerce_uuid(ref.get("event_id"), field="evidence ref event_id"))
     if not ids:
         return
     rows = db.execute(select(CampaignDomainEvent.id, CampaignDomainEvent.campaign_id).where(
@@ -628,7 +611,7 @@ def build_clock_frame(
             "audience": "member",
             "evidence": [
                 ref for ref in evidence
-                if str((ref.get("visibility") or "public")) not in ("private", "dm_only")
+                if str((ref.get("visibility") or "public")) not in RESTRICTED_VISIBILITIES
             ],
             "evidence_total": evidence_total,
             "source_range": [from_sequence, to_sequence],
@@ -748,8 +731,8 @@ def apply_clock_outcome(
     only the idempotency watermark; advancement/completion commit a domain
     event under campaign revision ordering.
     """
-    cid = _uuid(campaign_id, "campaign_id")
-    clock = get_clock_strict(db, cid, _uuid(clock_id, "clock_id"))
+    cid = coerce_uuid(campaign_id, field="campaign_id")
+    clock = get_clock_strict(db, cid, coerce_uuid(clock_id, field="clock_id"))
     if clock.status not in CLOCK_EVALUABLE_STATUSES:
         raise ClockStaleError(clock.id, frame.state_revision, clock.revision)
     if int(clock.revision or 1) != int(frame.state_revision):
@@ -871,7 +854,7 @@ def apply_clock_outcome(
             **({"completion_effect": dict(clock.completion_effect or {})} if holder["completed"] else {}),
         },
         targets_builder=lambda: {"clock_id": str(clock.id)},
-        visibility_builder=lambda: _clock_event_visibility(clock.visibility),
+        visibility_builder=lambda: world_event_visibility(clock.visibility),
         provenance={"source": "post_turn_clock_evaluation",
                     "frame_state_revision": expected_revision},
     )
@@ -1070,7 +1053,7 @@ def consolidate_clocks_for_range(
     is retried cumulatively. Emits no wall-clock reads: an empty evidence
     window is an explicit no-op.
     """
-    cid = _uuid(campaign_id, "campaign_id")
+    cid = coerce_uuid(campaign_id, field="campaign_id")
     campaign = db.get(Campaign, cid)
     if campaign is None:
         raise ValueError(f"Campaign {campaign_id} not found")
@@ -1126,23 +1109,6 @@ def consolidate_clocks_for_range(
 
 # ── Viewer-aware projection (secrecy first) ────────────────────────────────
 
-def _is_authority(campaign: Campaign, viewer_id: uuid.UUID) -> bool:
-    from app.world.service import is_world_authority
-
-    return is_world_authority(campaign, viewer_id)
-
-
-def _is_member(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> bool:
-    if _is_authority(campaign, viewer_id):
-        return True
-    from app.campaigns.service import is_campaign_member
-
-    try:
-        return bool(is_campaign_member(db, campaign.id, viewer_id))
-    except Exception:
-        return False
-
-
 def project_clocks_for_viewer(
     db: Session, campaign: Campaign, viewer_user_id: Any,
 ) -> dict[str, Any]:
@@ -1153,17 +1119,17 @@ def project_clocks_for_viewer(
     resolution internals. The campaign owner (AI-DM authority lane) sees
     every clock in full.
     """
-    viewer = _uuid(viewer_user_id, "viewer_user_id")
-    if not _is_member(db, campaign, viewer):
+    viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
+    if not is_campaign_participant(db, campaign, viewer):
         return {"clocks": [], "count": 0}
-    authority = _is_authority(campaign, viewer)
+    authority = is_world_authority(campaign, viewer)
     rows = list(db.execute(select(CampaignClock).where(
         CampaignClock.campaign_id == campaign.id,
     ).order_by(CampaignClock.created_at.asc())).scalars().all())
     visible: list[dict[str, Any]] = []
     hidden = 0
     for row in rows:
-        if authority or str(row.visibility) in ("public", "campaign"):
+        if visible_to_viewer(row.visibility, authority):
             data = row.to_dict()
             if not authority:
                 for key in ("provenance", "completion_effect", "resolution",

@@ -1197,7 +1197,7 @@ def commit_turn(
         # transaction: failed commit leaves no half-created authority.
         # Idempotency key per (attempt, temp_id) makes retries safe.
         try:
-            from app.world.service import promote_new_entities_from_contract
+            from app.world.identity import promote_new_entities_from_contract
 
             promoted = promote_new_entities_from_contract(
                 db, campaign, turn, attempt,
@@ -1547,9 +1547,9 @@ def commit_turn(
     # (commit=False), mirroring the encounter hook above.
     if commit:
         try:
-            from app.world import semantic as _semantic
+            from app.world.semantic_index import note_turn_committed
 
-            _semantic.note_turn_committed(
+            note_turn_committed(
                 db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
         except Exception as e:
             logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)

@@ -12,33 +12,26 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.world.service import get_entity_strict
+from app.world._common import coerce_uuid, require_provenance
+from app.visibility.policy import MEMBER_VISIBILITIES
+from app.world.service import UNSET, get_entity_strict
 from models.campaigns import Campaign
 from models.world import NPCState
-
-UNSET: Any = object()
 
 IMPORTANCE = ("incidental", "supporting", "major")
 STATE_FIELDS = frozenset({
     "role", "goals", "disposition", "resources", "current_activity",
     "location_entity_id", "location_name", "importance", "depth",
 })
-VISIBILITIES = frozenset({"public", "campaign", "dm_only"})
-
-
-def _uuid(value: Any, field: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ValueError(f"{field} must be a UUID") from exc
+# Field-level disclosure has no grantee set, so ``private`` is not offered.
+FIELD_VISIBILITIES = MEMBER_VISIBILITIES | {"dm_only"}
 
 
 def _provenance(value: Any, *, source_turn_id: Any, source_attempt_id: Any, source_event_id: Any) -> dict:
-    if not isinstance(value, dict) or not str(value.get("source") or "").strip():
-        raise ValueError("provenance.source is required for NPC state changes")
+    prov = require_provenance(value, subject="NPC state")
     if not any((source_turn_id, source_attempt_id, source_event_id)):
         raise ValueError("NPC state changes require a committed turn, attempt, or event source")
-    return dict(value)
+    return prov
 
 
 def _resolve_npc_source_refs(
@@ -87,15 +80,15 @@ def _visibility_map(value: Any, current: dict | None = None) -> dict:
         if field not in STATE_FIELDS:
             raise ValueError(f"unknown NPC field visibility: {field}")
         normalized = str(visibility).strip().lower()
-        if normalized not in VISIBILITIES:
-            raise ValueError(f"field visibility must be one of {sorted(VISIBILITIES)}")
+        if normalized not in FIELD_VISIBILITIES:
+            raise ValueError(f"field visibility must be one of {sorted(FIELD_VISIBILITIES)}")
         result[field] = normalized
     return result
 
 
 def get_npc_state(db: Session, campaign_id: Any, entity_id: Any) -> NPCState | None:
-    row = db.get(NPCState, _uuid(entity_id, "entity_id"))
-    return row if row is not None and row.campaign_id == _uuid(campaign_id, "campaign_id") else None
+    row = db.get(NPCState, coerce_uuid(entity_id, field="entity_id"))
+    return row if row is not None and row.campaign_id == coerce_uuid(campaign_id, field="campaign_id") else None
 
 
 def apply_npc_state(
@@ -115,10 +108,10 @@ def apply_npc_state(
     and post-turn callers can run inside the outer revision transaction and
     roll back atomically with it.
     """
-    cid, eid = _uuid(campaign.id, "campaign_id"), _uuid(entity_id, "entity_id")
-    turn_id = _uuid(source_turn_id, "source_turn_id") if source_turn_id else None
-    attempt_id = _uuid(source_attempt_id, "source_attempt_id") if source_attempt_id else None
-    event_id = _uuid(source_event_id, "source_event_id") if source_event_id else None
+    cid, eid = coerce_uuid(campaign.id, field="campaign_id"), coerce_uuid(entity_id, field="entity_id")
+    turn_id = coerce_uuid(source_turn_id, field="source_turn_id") if source_turn_id else None
+    attempt_id = coerce_uuid(source_attempt_id, field="source_attempt_id") if source_attempt_id else None
+    event_id = coerce_uuid(source_event_id, field="source_event_id") if source_event_id else None
     prov = _provenance(provenance, source_turn_id=turn_id, source_attempt_id=attempt_id, source_event_id=event_id)
     turn_id, attempt_id, event_id = _resolve_npc_source_refs(
         db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id,
@@ -127,7 +120,7 @@ def apply_npc_state(
     if entity.entity_type != "npc":
         raise ValueError("NPC state may only be attached to an npc world entity")
     if location_entity_id is not UNSET and location_entity_id is not None:
-        location_entity_id = _uuid(location_entity_id, "location_entity_id")
+        location_entity_id = coerce_uuid(location_entity_id, field="location_entity_id")
         location = get_entity_strict(db, cid, location_entity_id)
         if location.entity_type not in {"location", "landmark"}:
             raise ValueError("NPC location must reference a location or landmark entity")

@@ -1,2 +1,1 @@
-"""Visibility domain — fog, line-of-sight, aura visibility."""
-
+"""Visibility domain: who may receive which campaign records."""

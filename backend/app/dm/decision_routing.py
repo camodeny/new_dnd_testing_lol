@@ -766,7 +766,7 @@ def build_retry_deferral_primer(db: Any, attempt: Any) -> dict[str, Any] | None:
 
     Walks the explicit-retry parent chain (abandoned ``explicit_retry``
     attempts) collecting ``via == "deferred"`` identity-resolution memos
-    left by :func:`app.world.service.resolve_new_entity_identities_pre_narration`.
+    left by :func:`app.world.identity.resolve_new_entity_identities_pre_narration`.
     Returns an :func:`attach_primer`-compatible dict, or ``None`` when the
     chain holds no deferral memo.
 

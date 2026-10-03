@@ -41,6 +41,7 @@ from app.combat.service import (
     list_participants,
 )
 from app.observability.tracing import structured_log
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
 from models.combat import Encounter, EncounterParticipant, EncounterSkipVote, EncounterTurnState
@@ -130,23 +131,6 @@ def _active_or_raise(db: Session, encounter: Encounter) -> EncounterParticipant:
 def _is_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
     campaign = db.get(Campaign, campaign_id)
     return campaign is not None and str(campaign.owner_id) == str(user_id)
-
-
-def _is_member(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
-    if campaign is None:
-        return False
-    if str(campaign.owner_id) == str(user_id):
-        return True
-    return (
-        db.execute(
-            select(CampaignMember).where(
-                CampaignMember.campaign_id == campaign_id,
-                CampaignMember.user_id == user_id,
-            )
-        ).scalars().first()
-        is not None
-    )
 
 
 def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterParticipant, actor_id: uuid.UUID) -> None:
@@ -501,7 +485,7 @@ def cast_skip_vote(
         raise TurnError("encounter has ended; initiative is closed and turns are frozen")
     if encounter.status != "active":
         raise TurnError("skip votes require an active encounter")
-    if not _is_member(db, encounter.campaign_id, voter_id):
+    if not is_campaign_participant(db, campaign, voter_id):
         raise TurnAuthorizationError("Only campaign members may vote to skip a turn")
     from app.combat.service import can_view_encounter as _can_view_encounter
 

@@ -226,7 +226,7 @@ def _check_character_owner(db: Session, character_id: uuid.UUID, user_id: uuid.U
 
 
 def _validate_branch_facts(facts: Any, *, field: str) -> list[dict[str, Any]]:
-    from app.world.knowledge import validate_epistemic_state
+    from app.world.facts import validate_epistemic_state
 
     items = list(facts or [])
     if len(items) > 8:
@@ -718,8 +718,8 @@ def resolve_secret_contest(
     Duplicate retries replay the committed outcome.
     """
     from app.campaigns.events import commit_campaign_mutation
-    from app.world.epistemics import grant_visibility
-    from app.world.knowledge import create_fact
+    from app.world.knowledge import grant_visibility
+    from app.world.facts import create_fact
     from models.campaigns import Campaign, CampaignDomainEvent
     from models.dm import SecretContest
 

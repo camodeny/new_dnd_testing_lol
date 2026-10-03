@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
 from models.threads import CampaignThread
 from models.threads import CampaignThreadMember
@@ -224,7 +224,7 @@ def create_private_thread(
             raise ThreadNotFoundError("Campaign not found")
         # Owner counts as member implicitly for campaign membership check,
         # but private access still requires explicit thread membership.
-        if campaign.owner_id != uid and not is_campaign_member(db, campaign_id, uid):
+        if not is_campaign_participant(db, campaign, uid):
             raise ThreadAuthorizationError(f"User {uid} is not a campaign member")
     thread = CampaignThread(
         campaign_id=campaign_id,
@@ -274,7 +274,7 @@ def get_or_create_private_gameplay_thread(
     if campaign is None:
         raise ThreadNotFoundError("Campaign not found")
     for uid in all_ids:
-        if campaign.owner_id != uid and not is_campaign_member(db, campaign_id, uid):
+        if not is_campaign_participant(db, campaign, uid):
             raise ThreadAuthorizationError(f"User {uid} is not a campaign member")
 
     ordered_ids = sorted(str(uid) for uid in all_ids)
@@ -371,9 +371,7 @@ def can_read_thread(
         campaign = db.get(Campaign, campaign_id)
         if campaign is None:
             return False
-        authorized = campaign.owner_id == user_id or is_campaign_member(
-            db, campaign_id, user_id
-        )
+        authorized = is_campaign_participant(db, campaign, user_id)
         if not authorized:
             logger.info(
                 "thread read denied campaign_id=%s thread_id=%s reason=not_campaign_member",
@@ -456,9 +454,7 @@ def list_threads_for_user(
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         return []
-    is_member = campaign.owner_id == user_id or is_campaign_member(
-        db, campaign_id, user_id
-    )
+    is_member = is_campaign_participant(db, campaign, user_id)
     if not is_member:
         return []
     all_threads = (

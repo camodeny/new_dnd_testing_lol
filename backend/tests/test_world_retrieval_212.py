@@ -20,8 +20,8 @@ from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import ContextAudience  # noqa: E402
 from app.dm.contract import EvidenceRequest  # noqa: E402
 from app.dm.evidence import execute_evidence_round, validate_evidence_requests  # noqa: E402
-from app.world.epistemics import assert_knowledge  # noqa: E402
-from app.world.knowledge import (  # noqa: E402
+from app.world.knowledge import assert_knowledge  # noqa: E402
+from app.world.facts import (  # noqa: E402
     create_fact,
     create_relation,
 )

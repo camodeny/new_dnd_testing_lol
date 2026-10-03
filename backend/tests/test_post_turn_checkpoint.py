@@ -20,7 +20,6 @@ from app.post_turn.service import (  # noqa: E402
     get_batch_threshold,
     get_checkpoint,
     get_outstanding_range,
-    get_post_turn_status,
     handle_post_turn_envelope,
     mark_post_turn_skipped,
     maybe_trigger_post_turn,
@@ -75,9 +74,7 @@ def test_checkpoint_defaults_zero_and_exposed():
     c = _campaign(db)
     cp = get_checkpoint(db, c.id)
     assert cp.processed_through_sequence == 0
-    st = get_post_turn_status(db, c.id)
-    assert st["checkpoint"] == 0
-    assert st["outstanding"]["outstanding"] == 0
+    assert get_outstanding_range(db, c.id)["outstanding"] == 0
     db.close()
 
 
@@ -227,15 +224,13 @@ def test_observability_status():
     for i in range(4):
         _commit(db, c.id, i)
     run = maybe_trigger_post_turn(db, c.id, trigger="force")
-    st = get_post_turn_status(db, c.id)
-    assert st["checkpoint"] == 0
-    assert st["outstanding"]["outstanding"] == 4
-    assert st["run_attempts"] >= 1
-    assert st["queue_lag_seconds"] >= 0
+    assert int(get_checkpoint(db, c.id).processed_through_sequence or 0) == 0
+    span = get_outstanding_range(db, c.id)
+    assert span["outstanding"] == 4
+    assert span.get("age_seconds", 0.0) >= 0
     run_post_turn_range(db, c.id, 1, 4, run_id=run.id)
-    st2 = get_post_turn_status(db, c.id)
-    assert st2["checkpoint"] == 4
-    assert st2["outstanding"]["outstanding"] == 0
+    assert int(get_checkpoint(db, c.id).processed_through_sequence or 0) == 4
+    assert get_outstanding_range(db, c.id)["outstanding"] == 0
     db.close()
 
 

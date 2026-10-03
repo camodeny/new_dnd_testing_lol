@@ -21,11 +21,11 @@ from app.dm.context import (  # noqa: E402
     _scope,
     _source,
 )
-from app.world.epistemics import (  # noqa: E402
+from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     build_knowledge_visibility_values,
 )
-from app.world.knowledge import create_fact  # noqa: E402
+from app.world.facts import create_fact  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402

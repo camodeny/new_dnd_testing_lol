@@ -37,6 +37,7 @@ from app.runtime.threads import (
     list_threads_for_user,
     parse_thread_id,
 )
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
 from models.threads import CampaignThread
 from models.threads import CampaignThreadMember
@@ -251,10 +252,7 @@ def build_live_table_snapshot(
         if campaign is None:
             raise SnapshotNotFoundError("Campaign not found")
 
-        from app.campaigns.service import is_campaign_member
-
-        is_member = campaign.owner_id == viewer_id or is_campaign_member(db, campaign_id, viewer_id)
-        if not is_member:
+        if not is_campaign_participant(db, campaign, viewer_id):
             logger.info(
                 "snapshot denied campaign_id=%s viewer_id=%s reason=not_member",
                 campaign_id, viewer_id,

@@ -413,7 +413,7 @@ def test_private_canonical_effects_without_shared_narration(ctx):
         assert (event.payload or {}).get("thread_id") == str(ctx["private_id"])
 
         # Hidden state mutated: the fact is durable but restricted.
-        from app.world.knowledge import list_facts
+        from app.world.facts import list_facts
 
         facts = [f for f in list_facts(db, ctx["campaign_id"]) if "moth" in (f.content or "")]
         assert len(facts) == 1
@@ -629,7 +629,7 @@ def test_duplicate_private_commit_applies_once(ctx):
 
 def test_post_turn_preserves_private_visibility(ctx):
     from app.post_turn.service import run_post_turn_range
-    from app.world.knowledge import list_facts
+    from app.world.facts import list_facts
 
     db = _db(ctx)
     try:

@@ -43,13 +43,13 @@ from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
 from app.dm.effects import _handle_transfer_knowledge  # noqa: E402
 from app.dm.narration import build_narration_judge_evidence  # noqa: E402
 from app.dm.validators import KnowledgeValidator  # noqa: E402
-from app.world.epistemics import (  # noqa: E402
+from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     grant_visibility,
     what_does_subject_know,
     who_knows_target,
 )
-from app.world.knowledge import create_fact  # noqa: E402
+from app.world.facts import create_fact  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -377,7 +377,7 @@ def test_human_disclosure_does_not_create_character_knowledge():
     grant_visibility(
         db, camp, target_kind="fact", target_id=fact.id, grantee_user_id=alice,
         operation_id="op-grant-hum")
-    from app.world.epistemics import may_user_receive
+    from app.visibility.access import may_user_receive
     assert may_user_receive(db, camp, "fact", fact.id, alice)["allowed"] is True
     # ...but no character knowledge row exists for anyone.
     assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
@@ -502,7 +502,7 @@ def test_validator_npc_action_claim_is_knowledge_checked():
 
 
 def test_lane_builder_includes_npc_subjects():
-    from app.world.epistemics import build_knowledge_visibility_values
+    from app.world.knowledge import build_knowledge_visibility_values
 
     Fac, camp, *_ = _setup()
     db = Fac()
@@ -525,7 +525,7 @@ def test_lane_builder_includes_npc_subjects():
 
 
 def test_collect_subject_restricted_fact_texts():
-    from app.world.epistemics import collect_subject_restricted_fact_texts
+    from app.world.knowledge import collect_subject_restricted_fact_texts
 
     Fac, camp, *_ = _setup()
     db = Fac()

@@ -22,7 +22,7 @@ from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
-from app.world.knowledge import (  # noqa: E402
+from app.world.facts import (  # noqa: E402
     EPISTEMIC_STATES,
     create_fact,
     create_relation,
@@ -33,7 +33,8 @@ from app.world.knowledge import (  # noqa: E402
     supersede_fact,
     supersede_relation,
 )
-from app.world.service import create_entity, is_world_authority  # noqa: E402
+from app.visibility.access import is_world_authority  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.dm import DMStream, DMStreamChunk  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -703,8 +704,8 @@ def test_contract_validates_new_knowledge_effect_types():
 def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
     from unittest import mock
 
-    import app.world.knowledge as knowledge
-    from app.world.knowledge import _find_fact_by_idempotency
+    import app.world.facts as facts_mod
+    from app.world.facts import _find_fact_by_idempotency
     from models.world import WorldFactEntityRef
 
     Fac, cid, _owner = _setup()
@@ -731,7 +732,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
             return None
         return real_find(db_, cid_, key_)
 
-    with mock.patch.object(knowledge, "_find_fact_by_idempotency", side_effect=flaky_find):
+    with mock.patch.object(facts_mod, "_find_fact_by_idempotency", side_effect=flaky_find):
         loser, created2 = create_fact(
             db, db.get(Campaign, cid), content="Guild owns Mara (loser).",
             entity_refs=[guild.id], epistemic_state="suspected",

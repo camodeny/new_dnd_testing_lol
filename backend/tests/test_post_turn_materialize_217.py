@@ -30,7 +30,7 @@ from app.post_turn.materialize import (  # noqa: E402
 )
 from app.post_turn.service import get_checkpoint, run_post_turn_range  # noqa: E402
 from app.world.identity import IDENTITY_QUESTION_ID  # noqa: E402
-from app.world.knowledge import (  # noqa: E402
+from app.world.facts import (  # noqa: E402
     list_facts,
     list_relations,
 )
@@ -419,7 +419,7 @@ def test_normal_turn_record_world_event_materializes_fact():
 
 def test_committed_staged_fact_is_not_duplicated():
     """Effects already applied at turn commit are skipped, never recompiled."""
-    from app.world.knowledge import create_fact
+    from app.world.facts import create_fact
     _F, db, c = _setup()
     row, _ = create_fact(
         db, c, content="Committed at turn time.", epistemic_state="confirmed",
@@ -445,8 +445,8 @@ def test_committed_staged_fact_is_not_duplicated():
 
 def test_knowledge_acquisition_hint_for_absent_learner():
     """One PC's discovery becomes that character's stance — never party-wide."""
-    from app.world.epistemics import list_knowledge_for_subject
-    from app.world.knowledge import create_fact
+    from app.world.knowledge import list_knowledge_for_subject
+    from app.world.facts import create_fact
     _F, db, c = _setup()
     hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",
@@ -491,9 +491,10 @@ def test_scene_projection_hint_updates_current_scene():
     assert scene.location_name == "Brindle Tavern"
 
 
-def test_visibility_grant_hint_authorizes_human_access():
-    from app.world.epistemics import has_active_grant
-    from app.world.knowledge import create_fact
+def test_visibility_grant_hint_authorizes_human_access(monkeypatch):
+    import app.realtime.service as realtime
+    from app.visibility.access import has_active_grant
+    from app.world.facts import create_fact
     from models.campaigns import CampaignMember
     _F, db, c = _setup()
     reader = uuid.uuid4()
@@ -508,12 +509,17 @@ def test_visibility_grant_hint_authorizes_human_access():
         {"category": "visibility_grants", "key": "grant-map", "visibility": "dm_only",
          "data": {"target_kind": "fact", "target_ref": str(fact.id),
                   "grantee_user_id": str(reader)}}]})
+    invalidated: list = []
+    monkeypatch.setattr(
+        realtime, "publish_projection_invalidated_for_grantee",
+        lambda _db, campaign, *, grantee_user_id: invalidated.append(grantee_user_id) or 1)
     out = run_post_turn_range(
         db, c.id, event.sequence, event.sequence,
         clock_decision_service=DecisionService(_NeverCall()),
     )
     assert out["result"]["materialization"]["applied"]["visibility_grants"] == 1
     assert has_active_grant(db, c.id, "fact", fact.id, reader) is True
+    assert invalidated == [reader]
 
 
 # ── Round-2: visibility widening cap ───────────────────────────────────────
@@ -589,7 +595,7 @@ def test_generated_widening_is_rejected_not_applied():
 # ── Round-2: bounded digest idempotency keys ──────────────────────────────
 
 def test_long_keys_apply_with_bounded_idempotency():
-    from app.world.knowledge import create_fact  # noqa: F401
+    from app.world.facts import create_fact  # noqa: F401
     _F, db, c = _setup()
     long_key = "k" * 128
     event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
@@ -835,7 +841,7 @@ def test_two_npc_updates_same_range_both_apply():
 # ── Round-5: grants require real provenance ────────────────────────────────
 
 def test_supported_grant_with_missing_provenance_creates_nothing():
-    from app.world.knowledge import create_fact
+    from app.world.facts import create_fact
     from models.campaigns import CampaignMember
     _F, db, c = _setup()
     reader = uuid.uuid4()
@@ -912,7 +918,7 @@ def test_verification_sees_only_cited_source_event():
 
 def test_promoted_keep_distinct_proposal_is_recognized():
     """A turn-promoted proposal (jit-keyed row) compiles to nothing."""
-    from app.world.service import _stable_jit_key
+    from app.world.identity import stable_jit_key
     _F, db, c = _setup()
     first, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
@@ -937,7 +943,7 @@ def test_promoted_keep_distinct_proposal_is_recognized():
     db.add(WorldEntity(
         campaign_id=c.id, entity_type="npc", name="Mira",
         visibility="campaign",
-        idempotency_key=_stable_jit_key(attempt_id, "tmp_npc_1")))
+        idempotency_key=stable_jit_key(attempt_id, "tmp_npc_1")))
     db.flush()
     _c, event = commit_campaign_mutation(
         db, c.id, rev, event_type="dm.turn_committed",
@@ -1115,11 +1121,11 @@ def test_delayed_npc_hint_preserves_newer_update():
 
 
 def test_delayed_knowledge_hint_preserves_newer_turn_stance():
-    from app.world.epistemics import (
+    from app.world.knowledge import (
         assert_knowledge,
         list_knowledge_for_subject,
     )
-    from app.world.knowledge import create_fact
+    from app.world.facts import create_fact
     _F, db, c = _setup()
     hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",
@@ -1158,11 +1164,11 @@ def test_delayed_knowledge_hint_preserves_newer_turn_stance():
 # ── Round-11: merged provenance never hides newer channels ─────────────────
 
 def test_materialized_then_turn_then_delayed_preserves_newer():
-    from app.world.epistemics import (
+    from app.world.knowledge import (
         assert_knowledge,
         list_knowledge_for_subject,
     )
-    from app.world.knowledge import create_fact
+    from app.world.facts import create_fact
     _F, db, c = _setup()
     hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",

@@ -31,8 +31,8 @@ import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import ContextAudience  # noqa: E402
 from app.dm.evidence import execute_evidence_round, validate_evidence_requests  # noqa: E402
-from app.world import semantic  # noqa: E402
-from app.world.knowledge import (  # noqa: E402
+from app.world import semantic, semantic_index  # noqa: E402
+from app.world.facts import (  # noqa: E402
     create_fact,
     create_relation,
     list_facts,
@@ -45,20 +45,21 @@ from app.world.retrieval import (  # noqa: E402
     lookup_fact,
 )
 from app.world.semantic import (  # noqa: E402
-    DEFAULT_MODEL,
     STATUS_DEFER as SEM_DEFER,
     STATUS_NO_MATCH as SEM_NO_MATCH,
     STATUS_OK as SEM_OK,
+    semantic_search,
+)
+from app.world.semantic_index import (  # noqa: E402
+    DEFAULT_MODEL,
     build_source_text,
     index_source_record,
     mark_stale,
     note_authoritative_write,
     note_supersession,
-    note_turn_committed,
     request_semantic_index,
     resolve_embedding_model,
     run_semantic_index_sweep,
-    semantic_search,
 )
 from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
@@ -200,7 +201,7 @@ def test_sweep_records_failure_and_retries_after_backoff(monkeypatch):
     def _boom(*_a, **_k):
         raise RuntimeError("embedder offline")
 
-    monkeypatch.setattr(semantic, "index_source_record", _boom)
+    monkeypatch.setattr(semantic_index, "index_source_record", _boom)
     result = run_semantic_index_sweep(db)
     assert result["indexed"] == [] and result["failed"]
     row = db.execute(
@@ -212,7 +213,7 @@ def test_sweep_records_failure_and_retries_after_backoff(monkeypatch):
     # Inside the backoff window the failed row is not reselected.
     assert str(row.id) not in run_semantic_index_sweep(db)["indexed"]
     row.updated_at = datetime.now(timezone.utc) - timedelta(
-        seconds=semantic.SEMANTIC_RETRY_FAILED_AFTER_SECONDS + 60)
+        seconds=semantic_index.SEMANTIC_RETRY_FAILED_AFTER_SECONDS + 60)
     db.commit()
     assert str(row.id) in run_semantic_index_sweep(db)["indexed"]
     db.refresh(row)
@@ -450,7 +451,7 @@ def test_all_supported_source_types_index_and_resolve():
         assert row is not None and row.status == "active", source_type
 
     for source_type, source_id in targets:
-        record = semantic._current_record(db, cid, source_type, source_id)
+        record = semantic_index.current_source_record(db, cid, source_type, source_id)
         assert record is not None, source_type
         query = build_source_text(db, source_type, record)
         assert query, source_type

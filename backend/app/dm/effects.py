@@ -19,14 +19,12 @@ from typing import Callable, Any
 
 from sqlalchemy.orm import Session
 
+from app.visibility.policy import EFFECT_VISIBILITIES, record_to_effect_visibility
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
 
 logger = logging.getLogger(__name__)
-
-# Visibility ordering for broadening check (least -> most permissive)
-_VISIBILITY_ORDER = {"dm_private": 0, "party_known": 1, "public": 2}
 
 # Effects without explicit visibility are treated as public patches (must not be promoted from private attempts).
 # Relation/fact assertions default to dm_only (fail-closed): a bare claim stays
@@ -75,15 +73,10 @@ def _visibility_of(effect: dict[str, Any]) -> str | None:
     args = effect.get("arguments") or {}
     return args.get("visibility")
 
-# World-record visibility vocabulary (issues #209/#210) maps onto the
-# staged-effect broadening check without widening disclosure: restricted
-# stays restricted, member-visible stays member-visible.
-_EFFECT_VISIBILITY_ALIASES = {"dm_only": "dm_private", "campaign": "party_known", "private": "dm_private"}
-
 def _effective_visibility(effect: dict[str, Any]) -> str:
     vis = _visibility_of(effect)
     if vis is not None:
-        return _EFFECT_VISIBILITY_ALIASES.get(str(vis), str(vis))
+        return record_to_effect_visibility(vis)
     eff_type = effect.get("effect_type")
     return _EFFECT_DEFAULT_VISIBILITY.get(eff_type, "public")
 
@@ -96,7 +89,7 @@ def _assert_visibility_not_broadened(effect: dict[str, Any], attempt_audience: s
       context to a wider audience and is rejected at commit (issue #206).
     """
     effective = _effective_visibility(effect)
-    if effective not in _VISIBILITY_ORDER:
+    if effective not in EFFECT_VISIBILITIES:
         raise ValueError(f"Unknown visibility {effective!r} on staged effect {effect.get('id')}")
     if _is_shared_audience(attempt_audience):
         return
@@ -308,7 +301,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
     commits roll back both the version insert and any prior lifecycle flip,
     so failed updates never partially supersede prior active truth.
     """
-    from app.world.knowledge import create_fact, supersede_fact
+    from app.world.facts import create_fact, supersede_fact
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
@@ -341,7 +334,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
 @register("upsert_relation")
 def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Create or supersede one durable world relation inside the turn-commit txn."""
-    from app.world.knowledge import create_relation, supersede_relation
+    from app.world.facts import create_relation, supersede_relation
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
@@ -391,7 +384,7 @@ def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str
     back with everything else. Duplicate retries keyed by the resolved
     effect key return the existing row without re-mutating.
     """
-    from app.world.epistemics import assert_knowledge
+    from app.world.knowledge import assert_knowledge
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)

@@ -204,14 +204,12 @@ def _hidden_token_ids(
             entity_by_participant[str(participant.id)] = entity
     if not hidden or viewer_user_id is None or campaign is None:
         return hidden
-    try:
-        from app.world import epistemics as _epistemics
-    except Exception:
-        return hidden
+    from app.visibility.access import may_user_receive
+
     revealed: set[str] = set()
     for participant_id, entity in entity_by_participant.items():
         try:
-            verdict = _epistemics.may_user_receive(
+            verdict = may_user_receive(
                 db, campaign, "entity", entity.id, viewer_user_id
             )
         except Exception:

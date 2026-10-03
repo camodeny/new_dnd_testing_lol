@@ -25,8 +25,8 @@ from app.realtime.service import (  # noqa: E402
 )
 from app.snapshot.surfaces import build_surfaces_for_viewer  # noqa: E402
 from app.world import clocks as _clocks  # noqa: E402
-from app.world import epistemics as _epistemics  # noqa: E402
 from app.world import knowledge as _knowledge  # noqa: E402
+from app.world import facts as _facts  # noqa: E402
 from app.world import service as _world  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -80,19 +80,19 @@ def _seed_private_fact(ctx, content="the vault sigil is a moth"):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        decoy, _ = _knowledge.create_fact(
+        decoy, _ = _facts.create_fact(
             db, camp, content="the tavern serves stew",
             visibility="campaign", operation_id="op-decoy-250",
         )
-        secret, _ = _knowledge.create_fact(
+        secret, _ = _facts.create_fact(
             db, camp, content=content,
             visibility="private", operation_id="op-secret-250",
         )
-        dm_only, _ = _knowledge.create_fact(
+        dm_only, _ = _facts.create_fact(
             db, camp, content="the DM tracks a hidden omen",
             visibility="dm_only", operation_id="op-omen-250",
         )
-        _epistemics.grant_visibility(
+        _knowledge.grant_visibility(
             db, camp, target_kind="fact", target_id=secret.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-250",
@@ -180,7 +180,7 @@ def test_hidden_records_do_not_change_unauthorized_serialized_view(ctx):
             build_surfaces_for_viewer(db, camp, ctx["bob"]), sort_keys=True, default=str,
         )
         # Add more secrets Bob cannot see: private fact, private item, secret clock.
-        secret, _ = _knowledge.create_fact(
+        secret, _ = _facts.create_fact(
             db, camp, content="a second moth sigil",
             visibility="private", operation_id="op-secret2-250",
         )
@@ -209,11 +209,11 @@ def test_reveal_expands_projection(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        secret = _knowledge.list_facts(db, camp.id, limit=200)
+        secret = _facts.list_facts(db, camp.id, limit=200)
         secret = [f for f in secret if f.visibility == "private"][0]
         before = build_surfaces_for_viewer(db, camp, ctx["bob"])
         assert all(r["id"] != str(secret.id) for r in before["clues"]["records"])
-        _epistemics.grant_visibility(
+        _knowledge.grant_visibility(
             db, camp, target_kind="fact", target_id=secret.id,
             grantee_user_id=ctx["bob"], granted_by=ctx["owner"],
             operation_id="op-reveal-250",
@@ -268,12 +268,12 @@ def test_hidden_item_and_shop_only_for_grantee(ctx):
             db, camp, entity_type="shop", name="Night Market",
             visibility="private", operation_id="op-shop-250",
         )
-        _epistemics.grant_visibility(
+        _knowledge.grant_visibility(
             db, camp, target_kind="entity", target_id=dagger.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-dagger-250",
         )
-        _epistemics.grant_visibility(
+        _knowledge.grant_visibility(
             db, camp, target_kind="entity", target_id=shop.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-shop-250",
@@ -484,7 +484,7 @@ def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
             db, camp, entity_type="npc", name="Veil Shade",
             visibility="private", operation_id="op-shade-250",
         )
-        _epistemics.grant_visibility(
+        _knowledge.grant_visibility(
             db, camp, target_kind="entity", target_id=shade.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-shade-250",

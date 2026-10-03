@@ -737,7 +737,7 @@ def test_perspective_repair_packet_carries_through_validation(db):
     """Issue #455 review: a contract that passed against the perspective-repaired
     packet must not be re-validated against the unrepaired one (which would
     fail again and start a second full regeneration)."""
-    from app.world.epistemics import assert_knowledge
+    from app.world.knowledge import assert_knowledge
     from app.world.service import create_entity
 
     s, camp_id, thread_id, _ = db

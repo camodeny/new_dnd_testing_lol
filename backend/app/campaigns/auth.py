@@ -9,7 +9,8 @@ import uuid
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.service import parse_campaign_id
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
 
 
@@ -21,7 +22,7 @@ def authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> Ca
     campaign = db.get(Campaign, cid)
     if campaign is None:
         raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.owner_id != user_id and not is_campaign_member(db, cid, user_id):
+    if not is_campaign_participant(db, campaign, user_id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
     return campaign
 

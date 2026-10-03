@@ -13,6 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
 from models.combat import Encounter, EncounterParticipant
@@ -94,15 +95,6 @@ def _lock_campaign_row(db: Session, campaign_id: uuid.UUID) -> Campaign | None:
             except Exception:
                 pass
         return row
-
-
-def _is_campaign_member(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
-    if campaign is None:
-        return False
-    if campaign.owner_id == user_id:
-        return True
-    return db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": user_id}) is not None
 
 
 # ── Stat resolution (code-owned, never guessed) ─────────────────────────────
@@ -224,7 +216,8 @@ def _validate_selection(db: Session, campaign_id: uuid.UUID, participants: list[
             character = db.get(Character, character_id)
             if character is None:
                 raise EncounterError(f"participant {index} character {character_id} not found")
-            if not _is_campaign_member(db, campaign_id, character.owner_id):
+            campaign = db.get(Campaign, campaign_id)
+            if campaign is None or not is_campaign_participant(db, campaign, character.owner_id):
                 raise EncounterError(
                     f"participant {index} character owner is not a member of this campaign"
                 )
@@ -590,7 +583,7 @@ def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         return None
-    if not _is_campaign_member(db, campaign_id, viewer_id):
+    if not is_campaign_participant(db, campaign, viewer_id):
         return None
     encounter = get_active_encounter(db, campaign_id)
     if encounter is None:

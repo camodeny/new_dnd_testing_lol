@@ -657,6 +657,7 @@ def run_post_turn_range(
                     campaign_id, from_sequence, to_sequence, run.id if run else "-")
         if commit:
             _request_range_semantic_index(db, campaign_id, events)
+            _publish_grant_invalidations(db, campaign_id, patch)
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
     except Exception as exc:
@@ -792,6 +793,34 @@ def mark_post_turn_skipped(
     return run
 
 
+def _publish_grant_invalidations(db: Session, campaign_id: uuid.UUID, patch: dict) -> None:
+    """Tell newly granted users' clients to refetch their projection (#250).
+
+    Runs after the range commit; the payload is audience-neutral and a missed
+    event still converges on the next snapshot. Never raises.
+    """
+    try:
+        materialization = (patch or {}).get("materialization") or {}
+        grantees = sorted({
+            str(o["grantee_user_id"]) for o in materialization.get("outcomes") or []
+            if o.get("category") == "visibility_grants" and o.get("outcome") == "applied"
+            and o.get("grantee_user_id")
+        })
+        if not grantees:
+            return
+        from app.realtime.service import publish_projection_invalidated_for_grantee
+
+        campaign = db.get(Campaign, campaign_id)
+        if campaign is None:
+            return
+        for grantee in grantees:
+            publish_projection_invalidated_for_grantee(
+                db, campaign, grantee_user_id=uuid.UUID(grantee))
+    except Exception as exc:  # noqa: BLE001 — realtime is best-effort after commit
+        logger.warning("post_turn grant invalidation publish failed campaign=%s error=%s",
+                       campaign_id, exc)
+
+
 def _request_range_semantic_index(
     db: Session, campaign_id: uuid.UUID, events: list[CampaignDomainEvent],
 ) -> None:
@@ -804,7 +833,7 @@ def _request_range_semantic_index(
     committed checkpoint.
     """
     try:
-        from app.world import semantic as _semantic
+        from app.world.semantic_index import note_authoritative_write
         from models.world import WorldFact, WorldRelation
 
         event_ids = [e.id for e in events]
@@ -816,58 +845,10 @@ def _request_range_semantic_index(
             )).scalars().all()
             entries.extend((source_type, row_id) for row_id in ids)
         entries.extend(("domain_event", event_id) for event_id in event_ids)
-        _semantic.note_authoritative_write(db, campaign_id, entries)
+        note_authoritative_write(db, campaign_id, entries)
     except Exception as exc:  # noqa: BLE001 — derived index work never fails the run
         logger.warning("post_turn semantic index staging failed campaign=%s error=%s",
                        campaign_id, exc)
-
-
-# ── Observability ──────────────────────────────────────────────────────────
-
-
-def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
-    cp = get_checkpoint(db, campaign_id, commit=False)
-    span = get_outstanding_range(db, campaign_id)
-    runs = list(
-        db.execute(
-            select(PostTurnRun).where(PostTurnRun.campaign_id == campaign_id)
-            .order_by(PostTurnRun.created_at.desc()).limit(20)
-        ).scalars().all()
-    )
-    failed = [r for r in runs if r.status == "failed"]
-    last = runs[0] if runs else None
-    retry_count = sum(int(r.attempts or 0) for r in runs)
-    # Issue #222 — safe-lag observability alongside the checkpoint span:
-    # outstanding range size, estimated context cost, safe budget, and the
-    # block state. Guarded: status reporting never raises.
-    try:
-        from app.post_turn.backpressure import evaluate_backpressure
-
-        backpressure = evaluate_backpressure(db, campaign_id)
-    except Exception as exc:  # noqa: BLE001 — observability must not break status
-        backpressure = {"blocked": True, "reason": "estimation_failed",
-                        "error": str(exc)[:300]}
-    # Issue #220 — required unresolved consistency incidents alongside the
-    # checkpoint span. Guarded: status reporting never raises.
-    try:
-        from app.post_turn.incidents import get_consistency_stats
-
-        consistency = get_consistency_stats(db, campaign_id)
-    except Exception as exc:  # noqa: BLE001 — observability must not break status
-        consistency = {"unresolved": 0, "error": str(exc)[:300]}
-    return {
-        "campaign_id": str(campaign_id),
-        "checkpoint": int(cp.processed_through_sequence or 0),
-        "outstanding": span,
-        "backpressure": backpressure,
-        "consistency": consistency,
-        "run_attempts": len(runs),
-        "retry_count": retry_count,
-        "last_run": last.to_dict() if last else None,
-        "last_failure_reason": failed[0].failure_reason if failed else None,
-        "failed_runs": len(failed),
-        "queue_lag_seconds": span.get("age_seconds", 0.0),
-    }
 
 
 # ── Cron sweep driver ──────────────────────────────────────────────────────
