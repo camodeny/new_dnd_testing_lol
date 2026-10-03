@@ -133,62 +133,6 @@ def test_concurrent_duplicates_only_execute_once(tmp_path):
     assert sorted(replayed for _, replayed in results) == [False, True]
 
 
-def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
-    from app.auth.service import TEST_USER_ID
-    from main import app
-
-    engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    Base.metadata.create_all(engine)
-    factory = sessionmaker(bind=engine)
-    campaign_id = uuid.uuid4()
-    with factory() as db:
-        db.add(Profile(id=TEST_USER_ID, email="mock@example.com"))
-        db.add(Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Before"))
-        db.add(CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"))
-        db.commit()
-
-    def override_db():
-        with factory() as db:
-            yield db
-
-    monkeypatch.setenv("NODE_ENV", "test")
-    monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
-        lambda request, db: db.get(Profile, TEST_USER_ID),
-    )
-    monkeypatch.setattr(
-        "app.characters.router.resolve_profile",
-        lambda request, db: db.get(Profile, TEST_USER_ID),
-    )
-    app.dependency_overrides[get_db] = override_db
-    try:
-        client = TestClient(app)
-        body = {
-            "expected_revision": 0,
-            "event_type": "campaign.renamed",
-            "mutate": {"name": "After"},
-        }
-        headers = {"Idempotency-Key": "http-retry-1"}
-        first = client.post(f"/api/campaigns/{campaign_id}/mutations", json=body, headers=headers)
-        second = client.post(f"/api/campaigns/{campaign_id}/mutations", json=body, headers=headers)
-        assert first.status_code == second.status_code == 200
-        assert first.json() == second.json()
-        assert first.headers["X-Idempotent-Replay"] == "false"
-        assert second.headers["X-Idempotent-Replay"] == "true"
-        assert first.json()["campaign"]["revision"] == 1
-
-        mismatch = client.post(
-            f"/api/campaigns/{campaign_id}/mutations",
-            json={**body, "mutate": {"name": "Different"}}, headers=headers,
-        )
-        assert mismatch.status_code == 409
-    finally:
-        app.dependency_overrides.clear()
-
-
 def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
     from app.auth.service import TEST_USER_ID
     from main import app
@@ -211,7 +155,7 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
@@ -231,6 +175,11 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
         assert first.json()["campaign"]["revision"] == 1
         assert first.headers["X-Idempotent-Replay"] == "false"
         assert second.headers["X-Idempotent-Replay"] == "true"
+
+        mismatch = client.put(
+            f"/api/campaigns/{campaign_id}", json={**body, "name": "Different"}, headers=headers,
+        )
+        assert mismatch.status_code == 409
     finally:
         app.dependency_overrides.clear()
 
@@ -255,7 +204,7 @@ def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(

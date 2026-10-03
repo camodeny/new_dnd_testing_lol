@@ -424,7 +424,7 @@ def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch)
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db

@@ -1,18 +1,24 @@
 """Campaigns application/domain helpers — no FastAPI imports.
 
-These helpers are importable without importing the router (circular-safe),
+These helpers are importable without importing the routes (circular-safe),
 so new gameplay modules can reuse validation without pulling in transport.
+Command rejections raise :class:`CampaignCommandError`, which the app maps
+to an HTTP error with the same status and detail.
 """
+import logging
 import random
 import json
 import secrets
 import string as _string
 import uuid as uuid_lib
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models.campaigns import CampaignMember
+from models.campaigns import Campaign, CampaignMember
+from models.threads import CampaignThread
+
+logger = logging.getLogger(__name__)
 
 RANDOM_CAMPAIGN_NAMES = [
     "The Whispering Hollow", "Embers of the Forgotten Keep", "Tides of Shadowfen",
@@ -195,6 +201,23 @@ class CampaignArchivedError(ValueError):
     """
 
 
+class CampaignCommandError(Exception):
+    """A campaign command rejected by domain rules, with its HTTP status.
+
+    Deliberately not a ``ValueError``: the idempotency layer maps stray
+    ``ValueError`` to 400, while these carry their own canonical status.
+    """
+
+    status_code = 409
+
+    def __init__(self, detail, *, status_code: int | None = None, headers: dict | None = None):
+        super().__init__(detail if isinstance(detail, str) else str(detail))
+        if status_code is not None:
+            self.status_code = status_code
+        self.detail = detail
+        self.headers = headers
+
+
 def require_playable_campaign(campaign) -> None:
     """Reject fictional writes while a campaign is archived.
 
@@ -287,3 +310,154 @@ def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
         if not getattr(m, "is_ready", False):
             blockers.append(f"{label} is not ready")
     return {"eligible": not blockers, "blockers": blockers}
+
+
+def parse_character_id(raw) -> uuid_lib.UUID:
+    """Body ``character_id``: 400 when absent, 404 when malformed."""
+    if not raw:
+        raise CampaignCommandError("character_id is required", status_code=400)
+    try:
+        return uuid_lib.UUID(str(raw))
+    except ValueError as exc:
+        raise CampaignCommandError("Character not found", status_code=404) from exc
+
+
+def validated_setup(payload: dict, *, creation: bool = False) -> dict:
+    """Validated campaign setup fields present in ``payload`` (all on creation)."""
+    changes = {}
+    try:
+        if creation or "required_players" in payload:
+            changes["required_players"] = normalize_required_players(payload.get("required_players"))
+        if creation or "loot_mode" in payload:
+            changes["loot_mode"] = normalize_loot_mode(payload.get("loot_mode"))
+        if creation or "difficulty" in payload:
+            changes["difficulty"] = validate_difficulty(payload.get("difficulty"))
+        if "theme" in payload:
+            changes["theme"] = validate_optional_text(payload.get("theme"), field="Theme", max_length=128)
+        if "brief" in payload:
+            changes["brief"] = validate_optional_text(payload.get("brief"), field="Brief", max_length=4000)
+        if creation or "content_boundaries" in payload:
+            changes["content_boundaries"] = validate_content_boundaries(payload.get("content_boundaries"))
+    except ValueError as exc:
+        raise CampaignCommandError(status_code=400, detail=str(exc)) from exc
+    return changes
+
+
+def campaign_settings_changes(payload: dict) -> dict:
+    """Validated lobby-settings update (setup fields + name/description/seed)."""
+    changes = validated_setup(payload)
+    try:
+        if "name" in payload and payload["name"] is not None:
+            changes["name"] = validate_campaign_name(str(payload["name"]))
+        if "description" in payload:
+            changes["description"] = payload["description"]
+        if "random_seed" in payload:
+            changes["random_seed"] = validate_seed(payload.get("random_seed") or "")
+    except ValueError as exc:
+        raise CampaignCommandError(status_code=400, detail=str(exc)) from exc
+    return changes
+
+
+def create_campaign(
+    db: Session,
+    owner_id: uuid_lib.UUID,
+    *,
+    name: str,
+    description: str | None,
+    random_seed: str | None,
+    setup: dict,
+) -> Campaign:
+    """Create a campaign with its owner membership and both shared threads.
+
+    The live-table ``campaign`` thread is created eagerly so snapshot GET is
+    retrieval-only (#196); the pre-start OOC ``lobby`` thread likewise keeps
+    lobby chat GET retrieval-only for fresh campaigns (#243).
+    """
+    campaign = Campaign(
+        owner_id=owner_id,
+        name=name,
+        description=description,
+        random_seed=random_seed,
+        **setup,
+    )
+    db.add(campaign)
+    db.flush()
+    db.add(CampaignMember(campaign_id=campaign.id, user_id=owner_id, role="owner"))
+    db.flush()
+    for thread_type, title in (("campaign", "Campaign"), ("lobby", "Lobby")):
+        db.add(CampaignThread(
+            id=uuid_lib.uuid4(),
+            campaign_id=campaign.id,
+            thread_type=thread_type,
+            title=title,
+            created_by=owner_id,
+        ))
+    db.commit()
+    db.refresh(campaign)
+    return campaign
+
+
+def visible_campaigns(db: Session, user_id: uuid_lib.UUID, *, include_archived: bool) -> list[Campaign]:
+    """Non-deleted campaigns the user owns or belongs to, newest first.
+
+    Archived campaigns are dormant and hidden unless ``include_archived``
+    (issue #265).
+    """
+    member_ids = set(db.execute(
+        select(CampaignMember.campaign_id).where(CampaignMember.user_id == user_id)
+    ).scalars().all())
+    rows = db.execute(
+        select(Campaign)
+        .where(Campaign.is_deleted.is_(False))
+        .order_by(Campaign.updated_at.desc())
+    ).scalars().all()
+    visible = [c for c in rows if c.owner_id == user_id or c.id in member_ids]
+    if not include_archived:
+        visible = [c for c in visible if not is_archived(c)]
+    return visible
+
+
+def member_count(db: Session, campaign_id: uuid_lib.UUID) -> int:
+    return int(db.scalar(
+        select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
+    ) or 0)
+
+
+def update_campaign_settings(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    actor_id: uuid_lib.UUID,
+    expected_revision: int,
+    operation_id: str,
+    changes: dict,
+) -> dict:
+    """Apply lobby settings changes as a revisioned campaign mutation."""
+    from app.campaigns.events import commit_campaign_mutation
+
+    def _mutate(campaign: Campaign):
+        if campaign.status != "lobby":
+            logger.warning(
+                "campaign settings lock rejection campaign_id=%s actor_id=%s status=%s",
+                campaign.id, actor_id, campaign.status,
+            )
+            raise CampaignCommandError(status_code=409, detail="Campaign settings are locked after the lobby")
+        if "required_players" in changes and changes["required_players"] < member_count(db, campaign.id):
+            raise CampaignCommandError(
+                status_code=409, detail="Required players cannot be lower than current membership; remove members first",
+            )
+        for field, value in changes.items():
+            setattr(campaign, field, value)
+
+    campaign, event = commit_campaign_mutation(
+        db,
+        campaign_id,
+        expected_revision,
+        event_type="campaign.settings_updated",
+        operation_id=operation_id,
+        actor_id=actor_id,
+        payload={"changes": changes},
+        mutate=_mutate,
+        commit=False,
+    )
+    return {"campaign": campaign.to_dict(), "event": event.to_dict()}

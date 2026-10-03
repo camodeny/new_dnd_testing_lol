@@ -5,8 +5,11 @@ modules do not import each other. The deployed entrypoint `backend/main.py`
 re-exports `app` from here for backward compat (`from main import app`).
 """
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.campaigns.service import CampaignCommandError
 from app.observability.tracing import TraceMiddleware
 
 load_dotenv()
@@ -28,11 +31,16 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(TraceMiddleware)
 
+    @app.exception_handler(CampaignCommandError)
+    async def campaign_command_error(request: Request, exc: CampaignCommandError):
+        # Same response shape as HTTPException: {"detail": ...}.
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+
     # Import routers lazily to avoid import cycles at module load time
     # if domain modules ever import factory for typing.
     from app.auth.router import router as auth_router
     from app.billing.router import router as billing_router
-    from app.campaigns.router import router as campaigns_router
+    from app.campaigns.routes import router as campaigns_router
     from app.combat.router import router as combat_router
     from app.characters.chat.router import router as chat_router
     from app.characters.router import router as characters_router

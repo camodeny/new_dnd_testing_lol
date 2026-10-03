@@ -41,7 +41,7 @@ def api(monkeypatch):
     for module in (
         "app.characters.router",
         "app.characters.chat.router",
-        "app.campaigns.router",
+        "app.deps.auth",
     ):
         monkeypatch.setattr(
             f"{module}.resolve_profile",

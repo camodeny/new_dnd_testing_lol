@@ -449,7 +449,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     monkeypatch.setattr(
@@ -475,6 +475,7 @@ def test_adventure_api_lifecycle(api):
     )
     assert started.status_code == 200, started.text
     assert started.json()["adventure"]["status"] == "active"
+    aid = started.json()["adventure"]["id"]
 
     # Overlapping start is rejected while one is active.
     overlap = client.post(
@@ -486,7 +487,7 @@ def test_adventure_api_lifecycle(api):
 
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     done = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{aid}/complete",
         json={
             "expected_revision": revision,
             "outcome": "villain_victory",
@@ -505,7 +506,7 @@ def test_adventure_api_lifecycle(api):
     # Idempotent replay of the same completion key returns the same record.
     revision2 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     replay = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{aid}/complete",
         json={
             "expected_revision": revision,
             "outcome": "villain_victory",
@@ -533,7 +534,7 @@ def test_adventure_api_lifecycle(api):
     # Invalid outcome is rejected without closing the new adventure.
     revision3 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     bad = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{again.json()['adventure']['id']}/complete",
         json={"expected_revision": revision3, "outcome": "tie", "reason": "nope"},
         headers={"Idempotency-Key": "adv-bad-1"},
     )
@@ -554,14 +555,14 @@ def test_member_sees_only_public_adventure_fields(api):
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
         db.commit()
 
-    client.post(
+    secret_arc = client.post(
         f"/api/campaigns/{cid}/adventures",
         json={"title": "Secret arc", "metadata": {"dm_notes": "the butler did it"}},
         headers={"Idempotency-Key": "adv-spoiler-start"},
-    )
+    ).json()["adventure"]
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{secret_arc['id']}/complete",
         json={
             "expected_revision": revision,
             "outcome": "capture",
@@ -634,7 +635,7 @@ def test_member_event_feed_hides_dm_reason(api):
     assert started.status_code == 200, started.text
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     done = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{started.json()['adventure']['id']}/complete",
         json={
             "expected_revision": revision,
             "outcome": "failure",

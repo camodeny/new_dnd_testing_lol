@@ -57,5 +57,6 @@ UPDATE campaigns SET owner_id = '<real-user-uuid>'
 ## Tests
 
 Backend tests never use auth env vars: they monkeypatch `resolve_profile`
-per router and use `TEST_USER_ID` (`backend/app/auth/service.py`) as plain
+per router (`app.deps.auth.resolve_profile` for routes using the
+`current_profile` dependency) and use `TEST_USER_ID` (`backend/app/auth/service.py`) as plain
 fixture data. It grants nothing.

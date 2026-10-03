@@ -391,7 +391,6 @@ def run_world_seed(
     from app.world.facts import create_fact, create_relation
     from app.world.service import apply_scene_update, create_entity
     from models.campaigns import Campaign, CampaignMember
-    from models.world import CampaignCurrentScene
 
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:

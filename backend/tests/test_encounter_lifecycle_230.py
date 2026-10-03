@@ -1101,7 +1101,7 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
     monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
-    monkeypatch.setattr("app.campaigns.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)

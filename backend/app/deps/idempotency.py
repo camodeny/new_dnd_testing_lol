@@ -23,6 +23,12 @@ def require_idempotency_key(request: Request, fallback: str | None = None) -> st
     return key
 
 
+def command_keys(request: Request, payload: dict) -> tuple[str | None, str]:
+    """``(operation_id, idempotency_key)`` for a command request body."""
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    return operation_id, require_idempotency_key(request, operation_id)
+
+
 def execute_http_idempotent(
     db: Session,
     response: Response,

@@ -73,7 +73,7 @@ def api(monkeypatch):
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -107,7 +107,7 @@ def api_via_router(monkeypatch):
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db

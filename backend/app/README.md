@@ -27,14 +27,14 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 ## Dependency direction
 
 ```
-transport (app/*/router.py, app/deps/*, FastAPI Request/APIRouter/HTTPException)
+transport (app/*/router.py, app/campaigns/routes/*, app/deps/*, FastAPI Request/APIRouter/HTTPException)
    -> application (app/*/service.py, app/auth/service.py, app/campaigns/service.py)
    -> domain (app/rules/*, models.py pure helpers, value objects)
    -> infrastructure (database.py, app/auth/jwt.py verify_supabase_jwt, providers, observability)
 ```
 
 Rules:
-- **Domain / application MUST NOT import `fastapi`** (`Request`, `APIRouter`, `HTTPException`). Pure helpers take plain values (e.g. `auth_header: str | None`, `token: str`) and raise `app.auth.errors.AuthError` (a `ValueError`); transport adapters translate `AuthError` → `HTTPException`. See `app/auth/service.py` (pure) vs `app/deps/auth.py` (transport).
+- **Domain / application MUST NOT import `fastapi`** (`Request`, `APIRouter`, `HTTPException`). Pure helpers take plain values (e.g. `auth_header: str | None`, `token: str`) and raise `app.auth.errors.AuthError` (a `ValueError`); transport adapters translate `AuthError` → `HTTPException`. See `app/auth/service.py` (pure) vs `app/deps/auth.py` (transport). Campaign commands raise `app.campaigns.service.CampaignCommandError` (status + detail), which `app/factory.py` maps to the same `{"detail": ...}` HTTP error shape.
 - **Provider adapters remain isolated**: gameplay workflows import from `app.providers` (`provider_registry`, `stream_chat`, `ProviderRequest`) and never branch on provider names or import `llm_providers` directly. `app.providers` is the mock seam for tests (see `app/characters/chat/service.py:118`).
 - **One deployable**: no new services or ports; all routers are mounted on the single `FastAPI` instance in `app/factory.py`.
 - New gameplay modules must be importable without importing any `router` or `app/deps/*` module (no circular `router -> service -> router`).
@@ -42,7 +42,7 @@ Rules:
 ## Adding a new gameplay route
 
 1. Add domain logic to `app/<domain>/service.py` (plain functions, no FastAPI).
-2. Expose it via `app/<domain>/router.py` (`APIRouter`, dependency injection, HTTP mapping).
+2. Expose it via `app/<domain>/router.py` (`APIRouter`, dependency injection, HTTP mapping). Campaign-scoped routes use `app.deps.campaign.campaign_for(...)` for load/authorize and `run_campaign_command` for idempotent revision-guarded commands.
 3. Register the router in `app/factory.py:create_app()`.
 
 ## Rollback

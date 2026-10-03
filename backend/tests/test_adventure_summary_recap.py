@@ -48,11 +48,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.adventures.router.resolve_profile",
-        lambda request, db: db.get(Profile, actor["id"]),
-    )
-    monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     app.dependency_overrides[get_db] = override_db
@@ -116,7 +112,7 @@ def _open(client: TestClient, cid: str, key: str = "op-open-1") -> dict:
 
 def _complete(client: TestClient, cid: str, aid: str, rev: int, key: str, **kw) -> dict:
     body = {"expected_revision": rev, "outcome": "victory",
-            "outcome_reason": "The chapel was reclaimed.", "operation_id": key}
+            "public_summary": "The chapel was reclaimed.", "operation_id": key}
     body.update(kw)
     r = client.post(
         f"/api/campaigns/{cid}/adventures/{aid}/complete", json=body,
@@ -238,7 +234,7 @@ def test_review_available_after_continuation_and_summary_never_overrides_authori
         rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-cont")
     _complete(client, camp["id"], adv["id"], rev, "op-complete-cont", outcome="tpk",
-              outcome_reason="The party fell; the world endures.")
+              public_summary="The party fell; the world endures.")
     # Campaign continues: more authoritative events after completion.
     from app.campaigns.events import commit_campaign_mutation
 
@@ -451,12 +447,12 @@ def test_default_source_range_excludes_pre_open_event(api):
     assert "pre-open happening" not in historical
 
 
-def test_current_complete_path_also_produces_summary_and_recap(api):
+def test_completion_with_dm_reason_produces_summary_and_recap(api):
     """Every supported completion path finalizes derived artifacts (#263).
 
-    Adventures completed through the canonical /current/complete endpoint
-    (not just the explicit-target endpoint) must bind the end cursor and
-    produce an AdventureSummary so Review Adventure stays available.
+    Adventures completed with the canonical ``reason``/``public_summary``
+    body must bind the end cursor and produce an AdventureSummary so Review
+    Adventure stays available.
     """
     client, factory, actor, owner = api
     camp = _campaign(client)
@@ -464,7 +460,7 @@ def test_current_complete_path_also_produces_summary_and_recap(api):
     adv = _open(client, cid, key="op-open-current")
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     done = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{adv['id']}/complete",
         json={
             "expected_revision": revision,
             "outcome": "victory",
@@ -689,7 +685,7 @@ def test_public_summary_token_shared_with_hidden_evidence_does_not_fail_generati
     adv = _open(client, camp["id"], key="op-open-overlap")
     out = _complete(
         client, camp["id"], adv["id"], rev, "op-complete-overlap",
-        outcome_reason="The moonstone was recovered.",
+        public_summary="The moonstone was recovered.",
     )
     summary = out["summary"]
     assert summary["status"] == "current", summary.get("error")
@@ -856,7 +852,7 @@ def test_active_legacy_adventure_without_events_starts_at_next_sequence(api):
 def test_legacy_completed_row_finalizes_from_source_event_not_max(api):
     """Repair of a legacy completed row (no end cursor) must not absorb
     post-completion events: the end binds to its own completion event."""
-    from app.adventures.service import finalize_adventure_derived
+    from app.adventures.summaries import finalize_adventure_derived
     from app.campaigns.events import commit_campaign_mutation
 
     client, factory, actor, owner = api

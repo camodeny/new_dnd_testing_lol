@@ -26,7 +26,8 @@ import uuid
 from sqlalchemy.orm import Session
 
 from app.runtime.submissions import MAX_CONTENT_LENGTH, accept_submission, list_submissions
-from app.runtime.threads import get_lobby_thread, get_or_create_lobby_thread
+from app.runtime.threads import get_or_create_lobby_thread
+from app.campaigns.service import CampaignCommandError
 from models.campaigns import Campaign
 from models.threads import CampaignThread, PlayerSubmission, PlayerSubmissionSegment
 
@@ -46,12 +47,16 @@ LOBBY_CHAT_WRITABLE_STATUSES = frozenset({"lobby", "starting"})
 LOBBY_CHAT_HISTORY_LIMIT = 200
 
 
-class LobbyChatValidationError(ValueError):
-    """Malformed lobby chat payload (router maps to HTTP 422)."""
+class LobbyChatValidationError(CampaignCommandError):
+    """Malformed lobby chat payload."""
+
+    status_code = 422
 
 
-class LobbyChatStatusError(ValueError):
-    """Lobby chat write outside the pre-start window (router maps to HTTP 409)."""
+class LobbyChatStatusError(CampaignCommandError):
+    """Lobby chat write outside the pre-start window."""
+
+    status_code = 409
 
 
 def require_lobby_chat_writable(campaign: Campaign) -> None:
@@ -140,15 +145,119 @@ def list_lobby_messages(
     return list_submissions(db, campaign_id, thread_id=str(lobby_thread.id), limit=limit)
 
 
-__all__ = [
-    "LOBBY_CHAT_AUDIENCE",
-    "LOBBY_CHAT_HISTORY_LIMIT",
-    "LOBBY_CHAT_WRITABLE_STATUSES",
-    "LobbyChatStatusError",
-    "LobbyChatValidationError",
-    "get_lobby_thread",
-    "list_lobby_messages",
-    "post_lobby_message",
-    "require_lobby_chat_writable",
-    "validate_lobby_chat_payload",
-]
+def _thread_error(exc: Exception, *, campaign_id: uuid.UUID, user_id: uuid.UUID, action: str) -> CampaignCommandError:
+    from app.runtime.threads import ThreadNotFoundError
+
+    if isinstance(exc, ThreadNotFoundError):
+        return CampaignCommandError("Thread not found", status_code=404)
+    logger.info("lobby_chat %s denied campaign_id=%s user_id=%s", action, campaign_id, user_id)
+    return CampaignCommandError(str(exc), status_code=403)
+
+
+def lobby_chat_snapshot(db: Session, campaign: Campaign, user_id: uuid.UUID) -> dict:
+    """Durable read projection for refresh/reconnect (members only).
+
+    Ensures the lobby thread so pre-existing campaigns converge without a
+    dedicated backfill.
+    """
+    from app.realtime.channels import live_table_channel
+    from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread
+
+    thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
+    db.commit()
+    try:
+        assert_can_read_thread(db, campaign.id, thread.id, user_id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise _thread_error(exc, campaign_id=campaign.id, user_id=user_id, action="read") from exc
+    messages = list_lobby_messages(db, campaign.id, thread)
+    logger.info(
+        "lobby_chat snapshot campaign_id=%s user_id=%s thread_id=%s message_count=%s",
+        campaign.id, user_id, thread.id, len(messages),
+    )
+    return {
+        "thread": thread.to_dict(),
+        "messages": messages,
+        "channel": live_table_channel(campaign.id, thread.id),
+        "campaign_status": campaign.status,
+    }
+
+
+def writable_lobby_thread(db: Session, campaign: Campaign, user_id: uuid.UUID, payload: object) -> tuple[CampaignThread, str]:
+    """Pre-start, write-authorized lobby thread plus the validated content."""
+    from app.runtime.threads import ThreadAuthorizationError, assert_can_write_thread
+
+    require_lobby_chat_writable(campaign)
+    thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
+    db.commit()
+    try:
+        assert_can_write_thread(db, campaign.id, thread.id, user_id)
+    except ThreadAuthorizationError as exc:
+        raise _thread_error(exc, campaign_id=campaign.id, user_id=user_id, action="write") from exc
+    try:
+        content = validate_lobby_chat_payload(payload)
+    except LobbyChatValidationError:
+        logger.info("lobby_chat rejected campaign_id=%s reason=validation", campaign.id)
+        raise
+    return thread, content
+
+
+def post_lobby_chat(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, *, user_id: uuid.UUID, content: str,
+) -> dict:
+    """Post under the campaign lock (flush-only; caller commits).
+
+    Re-checks lobby-writable status and thread membership on the locked row:
+    a concurrent starting->active transition or member removal committing
+    after the transport-level checks must still refuse the write
+    (accept_submission's own lock only re-checks archive).
+    """
+    from sqlalchemy import select
+
+    from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_write_thread
+
+    locked = db.execute(
+        select(Campaign)
+        .where(Campaign.id == campaign_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
+    if locked is None:
+        raise CampaignCommandError("Campaign not found", status_code=404)
+    require_lobby_chat_writable(locked)
+    try:
+        assert_can_write_thread(db, campaign_id, thread_id, user_id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise _thread_error(exc, campaign_id=campaign_id, user_id=user_id, action="write under lock") from exc
+    submission, stored_segments = post_lobby_message(db, campaign=locked, user_id=user_id, content=content)
+    return {
+        "thread": get_or_create_lobby_thread(db, campaign_id, created_by=user_id).to_dict(),
+        "message": submission.to_dict(stored_segments),
+        "campaign_status": locked.status,
+    }
+
+
+def publish_lobby_message(db: Session, result: dict, *, campaign_id: uuid.UUID, thread_id: uuid.UUID) -> None:
+    """Best-effort Realtime projection after the authoritative commit.
+
+    Never rolls back on publish failure; the snapshot GET is the durable
+    recovery path.
+    """
+    try:
+        from app.realtime.service import publish_submission_created
+
+        msg = result.get("message") if isinstance(result, dict) else None
+        if msg and msg.get("id"):
+            db_sub = db.get(PlayerSubmission, uuid.UUID(str(msg["id"])))
+            if db_sub is not None:
+                segs = (
+                    db.query(PlayerSubmissionSegment)
+                    .filter_by(submission_id=db_sub.id)
+                    .order_by(PlayerSubmissionSegment.position)
+                    .all()
+                )
+                publish_submission_created(db, db_sub, segments=segs)
+    except Exception as exc:
+        logger.warning(
+            "lobby_chat realtime publish guard failed campaign_id=%s thread_id=%s error=%s",
+            campaign_id, thread_id, exc,
+        )

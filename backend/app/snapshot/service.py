@@ -136,7 +136,7 @@ def _resolve_thread_readonly(
 
     Unlike `app.runtime.threads.resolve_thread_id`, this does NOT lazily
     create the shared campaign thread. Campaign creation is the sole writer
-    of the shared thread (see `app/campaigns/router.py`), so GET remains
+    of the shared thread (see `app.campaigns.service.create_campaign`), so GET remains
     retryable without side effects as required by #196.
     """
     if not raw_thread_id or raw_thread_id == "main":

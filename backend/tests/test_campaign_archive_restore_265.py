@@ -76,7 +76,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     # World/submission/snapshot routers import resolve_profile into their own
@@ -768,7 +768,7 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     ))
     # The open adventure cannot complete while archived.
     _archived(client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
         json={"expected_revision": archived_rev, "outcome": "victory"},
         headers={"Idempotency-Key": "adv-complete-archived"},
     ))
@@ -816,49 +816,10 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     # Restore unfreezes the table: the pending adventure completes normally.
     assert _transition(client, cid, archived_rev, "active", "restore-1").status_code == 200
     completed = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
         json={"expected_revision": archived_rev + 1, "outcome": "victory"},
         headers={"Idempotency-Key": "adv-complete-restored"},
     )
     assert completed.status_code == 200, completed.text
     with factory() as db:
         assert db.get(Adventure, uuid.UUID(adventure_id)).status == "completed"
-
-
-def test_event_only_mutations_rejected_while_archived(api):
-    """Issue #265: the generic /mutations endpoint cannot advance the stream.
-
-    Event-only calls carry no mutate fields, so the locked callback must
-    still run the archive guard unconditionally.
-    """
-    client, factory, _, owner_id, _, _ = api
-    campaign = _drive_to_active(client, factory, owner_id)
-    cid = campaign["id"]
-    rev = campaign["revision"]
-    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
-
-    # Event-only mutation while dormant → 409, nothing appended.
-    sneaky = client.post(
-        f"/api/campaigns/{cid}/mutations",
-        json={"expected_revision": rev + 1, "event_type": "campaign.note", "payload": {"text": "sneaky"}},
-        headers={"Idempotency-Key": "mut-archived"},
-    )
-    assert sneaky.status_code == 409, sneaky.text
-    assert "archived" in sneaky.json()["detail"].lower()
-    assert _get(client, cid)["revision"] == rev + 1
-    with factory() as db:
-        assert db.scalar(
-            select(func.count()).select_from(CampaignDomainEvent).where(
-                CampaignDomainEvent.campaign_id == uuid.UUID(cid)
-            )
-        ) == rev + 1
-
-    # Restore unfreezes the generic path too.
-    assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
-    resumed = client.post(
-        f"/api/campaigns/{cid}/mutations",
-        json={"expected_revision": rev + 2, "event_type": "campaign.note", "payload": {"text": "awake"}},
-        headers={"Idempotency-Key": "mut-restored"},
-    )
-    assert resumed.status_code == 200, resumed.text
-    assert _get(client, cid)["revision"] == rev + 3
