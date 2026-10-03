@@ -4,7 +4,6 @@ Acceptance criteria:
 - FastAPI startup does not call Alembic upgrade or metadata.create_all()
 - Multiple instances starting concurrently must not attempt DDL
 """
-import asyncio
 import os
 import pathlib
 import re
@@ -43,57 +42,25 @@ def test_main_py_does_not_import_alembic_at_runtime():
     assert "import alembic" not in non_comment
 
 
-def test_lifespan_does_not_trigger_ddl():
-    """Runtime check: entering lifespan must not call alembic or create_all."""
-    # Ensure we re-import main freshly
+def test_app_startup_does_not_trigger_ddl():
+    """Runtime check: starting the app (repeatedly) must not call alembic or create_all."""
+    from fastapi.testclient import TestClient
+
     if "main" in sys.modules:
         del sys.modules["main"]
-    # Allow mock auth so import doesn't need DB
     os.environ["NODE_ENV"] = "test"
-
     import main as main_mod
     import database
 
-    # Mock any DDL entry points — if lifespan calls them, test fails
     mock_upgrade = MagicMock()
-    mock_create_all = MagicMock()
-
-    # Patch where they would be if called
     with patch.dict("sys.modules", {"alembic": MagicMock(), "alembic.command": MagicMock()}):
-        # Also patch Base.metadata.create_all if it still existed
-        with patch.object(database.Base.metadata, "create_all", mock_create_all) as mca:
-            # If main still imported alembic, this mock would catch it
-            mock_upgrade = MagicMock()
+        with patch.object(database.Base.metadata, "create_all", MagicMock()) as mca:
             with patch("alembic.command.upgrade", mock_upgrade, create=True):
-                async def _run():
-                    async with main_mod.lifespan(main_mod.app):
+                for _ in range(3):
+                    with TestClient(main_mod.app):
                         pass
-
-                asyncio.run(_run())
-
                 mock_upgrade.assert_not_called()
                 mca.assert_not_called()
-                mock_create_all.assert_not_called()
-
-
-def test_concurrent_lifespans_do_not_trigger_ddl():
-    """Multiple instances (concurrent lifespans) must not attempt DDL."""
-    if "main" in sys.modules:
-        del sys.modules["main"]
-    os.environ["NODE_ENV"] = "test"
-    import main as main_mod
-    import database
-
-    with patch.object(database.Base.metadata, "create_all", MagicMock()) as mca:
-        async def _run_concurrent():
-            async def _single():
-                async with main_mod.lifespan(main_mod.app):
-                    await asyncio.sleep(0.01)
-
-            await asyncio.gather(_single(), _single(), _single())
-
-        asyncio.run(_run_concurrent())
-        mca.assert_not_called()
 
 
 def test_explicit_migrate_script_exists_and_exits_nonzero_without_db_url(monkeypatch):

@@ -8,11 +8,12 @@ profile/JWT resolution lives in ``app.auth.service`` and ``app.auth.jwt``
 here; domain/application code should accept a resolved ``Profile`` or
 ``owner_id`` instead of importing this module.
 """
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
 from app.auth.errors import AuthError
 from app.auth.service import resolve_profile_pure
+from database import get_db
 
 
 def resolve_profile(request: Request, db: Session):
@@ -28,3 +29,8 @@ def resolve_profile(request: Request, db: Session):
     except AuthError as e:
         # All auth failures are 401 in the previous implementation; preserve detail text.
         raise HTTPException(status_code=401, detail=str(e)) from e
+
+
+def current_profile(request: Request, db: Session = Depends(get_db)):
+    """FastAPI dependency form of :func:`resolve_profile` (cached per request)."""
+    return resolve_profile(request, db)

@@ -5,14 +5,21 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
+from app.campaigns.service import lock_campaign_row, require_playable_campaign
+from app.clock import ms_between, utcnow
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_ended, publish_encounter_ready, publish_encounter_started
+from app.rules.mechanics import MechanicsError, ability_modifier, get_character_mechanics
+from app.threads.service import ThreadNotFoundError, can_read_thread, parse_thread_id
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
 from models.combat import Encounter, EncounterParticipant
@@ -60,49 +67,28 @@ class EncounterAlreadyActiveError(EncounterError):
         )
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def lock_encounter(db: Session, encounter_id: uuid.UUID, error: Callable[[str], Exception]) -> Encounter:
+    encounter = db.execute(
+        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
+    ).scalars().first()
+    if encounter is None:
+        raise error(f"Encounter {encounter_id} not found")
+    return encounter
 
 
-def _aware(value: datetime | None) -> datetime | None:
-    """SQLite returns naive datetimes; treat them as UTC for arithmetic."""
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-def _ms_between(start: datetime | None, end: datetime | None) -> int:
-    start, end = _aware(start), _aware(end)
-    if start is None or end is None:
-        return 0
-    return max(0, int((end - start).total_seconds() * 1000))
-
-
-def _lock_campaign_row(db: Session, campaign_id: uuid.UUID) -> Campaign | None:
-    try:
-        return db.execute(
-            select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-            .execution_options(populate_existing=True)
-        ).scalars().first()
-    except Exception:
-        row = db.get(Campaign, campaign_id)
-        if row is not None:
-            try:
-                db.refresh(row)
-            except Exception:
-                pass
-        return row
-
-
-def _is_campaign_member(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
+def lock_playable_campaign(db: Session, campaign_id: uuid.UUID, error: Callable[[str], Exception]) -> Campaign:
+    campaign = db.execute(
+        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+    ).scalars().first()
     if campaign is None:
-        return False
-    if campaign.owner_id == user_id:
-        return True
-    return db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": user_id}) is not None
+        raise error(f"Campaign {campaign_id} not found")
+    require_playable_campaign(campaign)
+    return campaign
+
+
+def is_campaign_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    campaign = db.get(Campaign, campaign_id)
+    return campaign is not None and str(campaign.owner_id) == str(user_id)
 
 
 # ── Stat resolution (code-owned, never guessed) ─────────────────────────────
@@ -110,8 +96,6 @@ def _is_campaign_member(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID)
 
 def _resolve_pc_stats(db: Session, character_id: uuid.UUID) -> tuple[int, int, dict]:
     """Initiative (modifier, dex) + stat source from the canonical sheet (#224)."""
-    from app.rules.mechanics import MechanicsError, get_character_mechanics
-
     try:
         mechanics = get_character_mechanics(db, character_id)
     except MechanicsError as exc:
@@ -134,16 +118,13 @@ def _resolve_npc_stats(
 
     Precedence: explicit DM selection override > entity details
     (initiative_modifier, else dexterity score / dex_modifier + bonus) > 0.
-    Hidden-visibility entities stay DM-private.
+    NPC/monster stats are always DM-private.
     """
     entity = db.get(WorldEntity, entity_id)
     if entity is None or str(entity.campaign_id) != str(campaign_id):
         raise EncounterError(f"NPC entity {entity_id} not found in this campaign")
     if (entity.entity_type or "").strip().lower() not in ("npc", "monster"):
         raise EncounterError(f"Entity {entity_id} is not an NPC/monster and cannot join combat")
-    from models.combat import HIDDEN_ENTITY_VISIBILITIES
-
-    visibility = "dm_private" if str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES else "public"
     # NPC/monster combat stats are always DM-private per #230 security.
     visibility = "dm_private"
     details = entity.details or {}
@@ -158,7 +139,7 @@ def _resolve_npc_stats(
             raise EncounterError(f"NPC {entity_id} has a malformed dex_modifier") from exc
     elif details.get("dexterity") is not None:
         try:
-            dex_mod = (int(details["dexterity"]) - 10) // 2
+            dex_mod = ability_modifier(int(details["dexterity"]))
         except (TypeError, ValueError) as exc:
             raise EncounterError(f"NPC {entity_id} has a malformed dexterity score") from exc
     if override is not None:
@@ -224,7 +205,8 @@ def _validate_selection(db: Session, campaign_id: uuid.UUID, participants: list[
             character = db.get(Character, character_id)
             if character is None:
                 raise EncounterError(f"participant {index} character {character_id} not found")
-            if not _is_campaign_member(db, campaign_id, character.owner_id):
+            campaign = db.get(Campaign, campaign_id)
+            if campaign is None or not is_campaign_participant(db, campaign, character.owner_id):
                 raise EncounterError(
                     f"participant {index} character owner is not a member of this campaign"
                 )
@@ -232,8 +214,6 @@ def _validate_selection(db: Session, campaign_id: uuid.UUID, participants: list[
             # campaign's active roster — selected by a member — so an owner
             # cannot enroll a member's unrelated character. Terminal lifecycle
             # states (dead/retired) can never join; a missing row means active.
-            from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
-
             roster = db.execute(
                 select(CampaignMember).where(
                     CampaignMember.campaign_id == campaign_id,
@@ -532,8 +512,6 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
     central thread invariant: owner status alone never grants private
     access). Unparseable/missing threads fail closed.
     """
-    from app.runtime.threads import can_read_thread, parse_thread_id
-
     try:
         thread_id = parse_thread_id(encounter.thread_id)
     except Exception:
@@ -573,8 +551,6 @@ def encounter_event_visible_to(db: Session, event, viewer_id: uuid.UUID) -> bool
     thread_ref = payload.get("thread_id") if isinstance(payload, dict) else None
     if not thread_ref:
         return False
-    from app.runtime.threads import can_read_thread, parse_thread_id
-
     try:
         thread_id = parse_thread_id(thread_ref)
     except Exception:
@@ -590,7 +566,7 @@ def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         return None
-    if not _is_campaign_member(db, campaign_id, viewer_id):
+    if not is_campaign_participant(db, campaign, viewer_id):
         return None
     encounter = get_active_encounter(db, campaign_id)
     if encounter is None:
@@ -626,8 +602,6 @@ def _build_encounter_rows(
     # read the encounter's source thread would receive an initiative request
     # they can never see, leaving combat permanently pending. Reject up
     # front instead of persisting an unfulfillable combatant.
-    from app.runtime.threads import can_read_thread, parse_thread_id
-
     try:
         encounter_thread_id = parse_thread_id(turn.thread_id)
     except Exception as exc:
@@ -661,7 +635,7 @@ def _build_encounter_rows(
         source_attempt_id=attempt_id,
         operation_id=operation_id,
         participant_count=len(resolved),
-        initiated_at=_now(),
+        initiated_at=utcnow(),
     )
     db.add(encounter)
     db.flush()
@@ -737,7 +711,7 @@ def _roll_npc_inline(participant: EncounterParticipant, *, raw_d20: int | None) 
     participant.initiative_total = die + int(participant.initiative_modifier)
     participant.roll_source = "dm_runtime"
     participant.initiative_status = "fulfilled"
-    participant.fulfilled_at = _now()
+    participant.fulfilled_at = utcnow()
     return participant
 
 
@@ -754,8 +728,8 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
     for order, pid in enumerate(ordered_ids):
         member = db.get(EncounterParticipant, pid)
         member.sort_order = order
-    ready_at = _now()
-    wait_ms = _ms_between(encounter.initiated_at, ready_at)
+    ready_at = utcnow()
+    wait_ms = ms_between(encounter.initiated_at, ready_at)
     encounter.status = "active"
     encounter.round = 1
     encounter.active_index = 0
@@ -781,8 +755,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
 
     init_turn_states(db, encounter, now=ready_at)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     # Bounded stable transition key: the start operation_id may legally fill
     # the 128-char column, so suffixing it would overflow on PostgreSQL.
     ready_operation_id = f"encounter:{encounter.id}:initiative-ready"
@@ -804,15 +776,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         },
         operation_id=ready_operation_id,
         actor_id=campaign.owner_id,
-        outbox_event_type=ENCOUNTER_READY_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(campaign.id),
-            "thread_id": encounter.thread_id,
-            "turn_order_ids": [str(pid) for pid in ordered_ids],
-            "active_participant_id": str(ordered_ids[0]),
-        },
-        outbox_operation_id=ready_operation_id,
         commit=commit,
     )
     structured_log(
@@ -842,16 +805,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         },
         operation_id=first_turn_operation_id,
         actor_id=campaign.owner_id,
-        outbox_event_type=TURN_STARTED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(campaign.id),
-            "thread_id": encounter.thread_id,
-            "turn_sequence": 1,
-            "active_participant_id": str(ordered_ids[0]),
-            "round": 1,
-        },
-        outbox_operation_id=first_turn_operation_id,
         commit=commit,
     )
     return event
@@ -879,27 +832,21 @@ def start_encounter(
     Idempotent on (campaign_id, operation_id): retries return the original
     encounter + event without duplicating participants or roll requests.
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise EncounterError("operation_id is required (1-128 characters)")
     if start_source not in ("dm_effect", "api"):
         raise EncounterError("start_source must be dm_effect or api")
 
-    campaign = _lock_campaign_row(db, campaign_id)
+    campaign = lock_campaign_row(db, campaign_id)
     if campaign is None:
         raise EncounterError(f"Campaign {campaign_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
     require_playable_campaign(campaign)
     turn, attempt = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
     if start_source == "api" and actor_id is not None:
         # Thread-scoped writes (#230): the actor must read the source
         # turn's thread, mirroring the encounter read boundary. Hidden as
         # not-found so private-thread existence never leaks.
-        from app.runtime.threads import ThreadNotFoundError, can_read_thread, parse_thread_id
-
         try:
             thread_ok = can_read_thread(
                 db, campaign_id, parse_thread_id(turn.thread_id), actor_id
@@ -954,17 +901,10 @@ def start_encounter(
             mutate=_mutate,
             commit=False,
             payload_builder=_payload,
-            outbox_event_type=ENCOUNTER_STARTED_EVENT,
-            outbox_payload={
-                "campaign_id": str(campaign_id),
-                "thread_id": turn.thread_id,
-                "operation_id": operation_id,
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
-        # The shared mutation helper rolls back on every error path, and the
-        # unguarded outbox flush rolls back here: the session is unusable
+        # The shared mutation helper rolls back on every error path, and an
+        # unguarded flush rolls back here: the session is unusable
         # until rolled back, so this rollback is required rather than
         # optional. It never commits partial state — below either returns a
         # genuinely committed same-operation replay or raises.
@@ -999,8 +939,6 @@ def start_encounter(
         operation_id=operation_id, revision=campaign_after.revision,
     )
     if commit:
-        from app.realtime.service import publish_encounter_started
-
         publish_encounter_started(db, encounter)
     return encounter, event
 
@@ -1017,7 +955,7 @@ def start_encounter_inline(
 
     No commit here — the outer turn commit owns both. The caller's
     ``commit_turn`` stages the distinct ``encounter.started`` lifecycle
-    event + outbox hook in the same outer transaction and binds it as the
+    event in the same outer transaction and binds it as the
     start provenance (resolved on read via operation_id).
     Duplicate effect replays return the existing encounter.
     """
@@ -1060,9 +998,7 @@ def roll_npc_initiative(
     ).scalars().first()
     if encounter is None:
         raise EncounterError(f"Encounter {encounter_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, encounter.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, encounter.campaign_id))
     if encounter.status == "active":
         raise EncounterError("initiative is already complete for this encounter")
     if encounter.status != "pending_initiative":
@@ -1082,7 +1018,7 @@ def roll_npc_initiative(
     db.flush()
     campaign = db.get(Campaign, encounter.campaign_id)
     event = _maybe_mark_ready(db, campaign, encounter, commit=False)
-    started = _now()
+    started = utcnow()
     if commit:
         db.commit()
         db.refresh(participant)
@@ -1092,11 +1028,9 @@ def roll_npc_initiative(
         encounter_id=str(encounter.id), participant_id=str(participant.id),
         roll_source="dm_runtime", raw_roll=participant.raw_roll,
         total=participant.initiative_total,
-        latency_ms=round((_now() - started).total_seconds() * 1000, 2),
+        latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
-        from app.realtime.service import publish_encounter_ready
-
         publish_encounter_ready(db, encounter)
     return participant, encounter, event
 
@@ -1116,15 +1050,13 @@ def fulfill_human_initiative(
     idempotent single fulfillment) but resumes the encounter instead of a DM
     turn: no turn-resume side effects.
     """
-    started = _now()
+    started = utcnow()
     encounter = db.execute(
         select(Encounter).where(Encounter.id == encounter_id).with_for_update()
     ).scalars().first()
     if encounter is None:
         raise EncounterError(f"Encounter {encounter_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, encounter.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, encounter.campaign_id))
     if encounter.status != "pending_initiative":
         raise EncounterError(f"encounter cannot accept initiative from status {encounter.status}")
     participant = db.execute(
@@ -1186,12 +1118,12 @@ def fulfill_human_initiative(
     )
     db.add(fulfillment)
     request.status = "fulfilled"
-    request.fulfilled_at = _now()
+    request.fulfilled_at = utcnow()
     participant.raw_roll = int(raw_rolls[0])
     participant.initiative_total = total
     participant.roll_source = "human_app" if source == "app" else "human_physical"
     participant.initiative_status = "fulfilled"
-    participant.fulfilled_at = _now()
+    participant.fulfilled_at = utcnow()
     db.flush()
 
     campaign = db.get(Campaign, encounter.campaign_id)
@@ -1202,16 +1134,170 @@ def fulfill_human_initiative(
         db.refresh(fulfillment)
         db.refresh(participant)
         db.refresh(encounter)
-    wait_ms = _ms_between(encounter.initiated_at, _now())
+    wait_ms = ms_between(encounter.initiated_at, utcnow())
     structured_log(
         logger, logging.INFO, "encounter_initiative_fulfilled",
         encounter_id=str(encounter.id), participant_id=str(participant.id),
         roll_source=participant.roll_source, total=total,
         initiative_wait_ms=wait_ms,
-        latency_ms=round((_now() - started).total_seconds() * 1000, 2),
+        latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
-        from app.realtime.service import publish_encounter_ready
-
         publish_encounter_ready(db, encounter)
     return request, fulfillment, participant, encounter, event
+
+
+# ── DM-turn lifecycle staging (issues #230, #239) ───────────────────────────
+
+
+def _turn_lifecycle_event(db: Session, campaign_id: uuid.UUID, operation_id, event_type: str):
+    from models.campaigns import CampaignDomainEvent
+
+    return db.execute(
+        select(CampaignDomainEvent).where(
+            CampaignDomainEvent.campaign_id == campaign_id,
+            CampaignDomainEvent.operation_id == operation_id,
+            CampaignDomainEvent.event_type == event_type,
+        )
+    ).scalars().first()
+
+
+def stage_turn_encounter_events(
+    db: Session, *, turn: DmTurn, attempt: DmTurnAttempt, turn_event, campaign_after: Campaign,
+) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
+    """Stage encounter lifecycle events for encounters this attempt started/ended.
+
+    The turn commit IS the fictional mutation of a ``start_encounter`` /
+    ``end_encounter`` effect, so each affected encounter gets its own domain
+    event chained in the same outer transaction (one event per revision,
+    preserving the sequence == revision invariant). Fail-closed: a staging
+    failure propagates and aborts the turn commit — a durable start or end
+    without its lifecycle event must never commit. Returns the (started,
+    ended) encounter ids for post-commit realtime delivery.
+    """
+    provenance = {
+        "source": "dm_effect",
+        "turn_event_id": str(turn_event.id),
+        "attempt_id": str(attempt.id),
+    }
+    started_ids: list[uuid.UUID] = []
+    started = db.execute(
+        select(Encounter).where(
+            Encounter.campaign_id == turn.campaign_id,
+            Encounter.source_attempt_id == attempt.id,
+            Encounter.created_event_id.is_(None),
+        )
+    ).scalars().all()
+    for encounter in started:
+        lifecycle = _turn_lifecycle_event(
+            db, turn.campaign_id, encounter.operation_id, ENCOUNTER_STARTED_EVENT)
+        if lifecycle is None:
+            _, lifecycle = commit_campaign_mutation(
+                db,
+                turn.campaign_id,
+                expected_revision=int(campaign_after.revision or 0),
+                event_type=ENCOUNTER_STARTED_EVENT,
+                payload={
+                    "encounter_id": str(encounter.id),
+                    "thread_id": encounter.thread_id,
+                    "participant_count": int(encounter.participant_count or 0),
+                    "start_source": encounter.start_source,
+                    "source_turn_id": str(turn.id),
+                    "source_attempt_id": str(attempt.id),
+                    "participants": [
+                        {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
+                        for p in list_participants(db, encounter.id)
+                    ],
+                },
+                operation_id=encounter.operation_id,
+                actor_id=turn_event.actor_id,
+                provenance=provenance,
+                commit=False,
+            )
+        encounter.created_event_id = lifecycle.id
+        started_ids.append(encounter.id)
+
+    # Only encounters this attempt's own end_encounter effects targeted: the
+    # API end path stages its event immediately, and a turn must never claim
+    # provenance for an end it did not cause.
+    end_targets: list[uuid.UUID] = []
+    for effect in attempt.staged_effects or []:
+        if effect.get("effect_type") != "end_encounter":
+            continue
+        try:
+            end_targets.append(uuid.UUID(str((effect.get("arguments") or {}).get("encounter_id"))))
+        except ValueError:
+            continue
+    ended_ids: list[uuid.UUID] = []
+    ended = db.execute(
+        select(Encounter).where(
+            Encounter.campaign_id == turn.campaign_id,
+            Encounter.id.in_(end_targets),
+            Encounter.status == "ended",
+            Encounter.ended_event_id.is_(None),
+        )
+    ).scalars().all() if end_targets else []
+    if ended:
+        from app.combat.ending import build_final_snapshot, list_end_followups
+
+    for encounter in ended:
+        lifecycle = _turn_lifecycle_event(
+            db, turn.campaign_id, encounter.end_operation_id, ENCOUNTER_ENDED_EVENT)
+        if lifecycle is None:
+            _, lifecycle = commit_campaign_mutation(
+                db,
+                turn.campaign_id,
+                expected_revision=int(campaign_after.revision or 0),
+                event_type=ENCOUNTER_ENDED_EVENT,
+                payload={
+                    "encounter_id": str(encounter.id),
+                    "thread_id": encounter.thread_id,
+                    "outcome": encounter.end_outcome,
+                    "reason": encounter.end_reason,
+                    "round": int(encounter.round or 1),
+                    "turn_sequence": int(encounter.turn_sequence or 0),
+                    "duration_ms": int(encounter.end_duration_ms or 0),
+                    "participant_outcomes": dict(encounter.end_participant_outcomes or {}),
+                    "followup_hooks": [h.hook_type for h in list_end_followups(db, encounter.id)],
+                    "final_state": build_final_snapshot(db, encounter),
+                    "ended_by": str(encounter.ended_by) if encounter.ended_by else None,
+                },
+                operation_id=encounter.end_operation_id,
+                # Issue #239 privacy: owner-only like the API path. The
+                # turn event's actor may be the player whose turn triggered
+                # the DM effect; the ended payload carries DM-private
+                # reason/fates, so the campaign owner (AI-DM path) must own
+                # the event or members would see it as own-actor.
+                actor_id=campaign_after.owner_id,
+                visibility="dm_only",
+                provenance=provenance,
+                commit=False,
+            )
+        encounter.ended_event_id = lifecycle.id
+        ended_ids.append(encounter.id)
+    if started_ids or ended_ids:
+        db.flush()
+    return started_ids, ended_ids
+
+
+def publish_turn_encounter_events(
+    db: Session, started_ids: list[uuid.UUID], ended_ids: list[uuid.UUID],
+) -> None:
+    """Post-commit realtime delivery for staged lifecycle events.
+
+    The staged lifecycle events are authoritative; this direct publish is
+    latency-only and best-effort — it never rolls back committed state.
+    """
+    for ids, publish, label in (
+        (started_ids, publish_encounter_started, "start"),
+        (ended_ids, publish_encounter_ended, "end"),
+    ):
+        if not ids:
+            continue
+        try:
+            for encounter_id in ids:
+                row = db.get(Encounter, encounter_id)
+                if row is not None:
+                    publish(db, row)
+        except Exception as exc:
+            logger.warning("encounter %s post-commit publish skipped error=%s", label, exc)

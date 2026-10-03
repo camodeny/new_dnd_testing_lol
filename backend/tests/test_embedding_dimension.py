@@ -17,10 +17,10 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
-from app.rules import gemini as gemini_mod  # noqa: E402
-from app.rules.embeddings import EMBEDDING_DIM as EMB_DIM, build_embeddings  # noqa: E402
-from app.rules.store import search_vector  # noqa: E402
-from app.rules.ingest import import_fixture_sections  # noqa: E402
+from app.rules_corpus import gemini as gemini_mod  # noqa: E402
+from app.rules_corpus.embeddings import EMBEDDING_DIM as EMB_DIM, build_embeddings  # noqa: E402
+from app.rules_corpus.store import search_vector  # noqa: E402
+from app.rules_corpus.ingest import import_fixture_sections  # noqa: E402
 
 TEST_OFFICIAL_HASH = "8974902d109d6e63672d7c490bde9ccf052410503d9cfa768237154fbc5e3d87"
 

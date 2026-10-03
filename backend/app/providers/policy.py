@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from app.worker.executor import TERMINAL, classify_error
 
 logger = logging.getLogger(__name__)
 
@@ -144,66 +145,9 @@ def classify_execution_failure(exc: BaseException) -> tuple[str, str]:
     if "_API_KEY is not set" in msg or "_MODEL is not set" in msg:
         return "retriable", "missing_provider_config"
     try:
-        from app.worker.executor import TERMINAL, RETRIABLE, classify_error
-
         cls = classify_error(exc)
         if cls == TERMINAL:
             return "terminal", f"worker_terminal:{type(exc).__name__}"
         return "retriable", f"worker_retriable:{type(exc).__name__}"
     except Exception:
         return "terminal", "classification_failed"
-
-
-# ── Recovery observability (process-local counters) ─────────────────────────
-
-_recovery_metrics: dict = {
-    "failover_attempts": 0,
-    "recovery_runs": 0,
-    "recovery_billable": 0,
-    "partial_resumes": 0,
-    "partial_continuations": 0,
-    "exhausted_failures": 0,
-    "failover_reasons": [],
-    "ttft_added_ms_samples": [],
-}
-
-
-def record_failover_attempt(reason: str, provider: str, model: str) -> None:
-    _recovery_metrics["failover_attempts"] += 1
-    _recovery_metrics["failover_reasons"].append(
-        {"reason": reason[:200], "provider": provider, "model": model}
-    )
-
-
-def record_recovery_run(*, billable: bool = False, ttft_added_ms: float = 0.0) -> None:
-    _recovery_metrics["recovery_runs"] += 1
-    if billable:
-        _recovery_metrics["recovery_billable"] += 1
-    if ttft_added_ms:
-        _recovery_metrics["ttft_added_ms_samples"].append(float(ttft_added_ms))
-
-
-def record_partial_resume(method: str) -> None:
-    if method == "direct_resume":
-        _recovery_metrics["partial_resumes"] += 1
-    else:
-        _recovery_metrics["partial_continuations"] += 1
-
-
-def record_exhausted() -> None:
-    _recovery_metrics["exhausted_failures"] += 1
-
-
-def get_recovery_metrics() -> dict:
-    out = {
-        k: (list(v) if isinstance(v, list) else v)
-        for k, v in _recovery_metrics.items()
-    }
-    samples = out["ttft_added_ms_samples"] or [0]
-    out["ttft_added_ms_p50"] = sorted(samples)[len(samples) // 2]
-    return out
-
-
-def reset_recovery_metrics() -> None:
-    for k, v in _recovery_metrics.items():
-        _recovery_metrics[k] = [] if isinstance(v, list) else 0

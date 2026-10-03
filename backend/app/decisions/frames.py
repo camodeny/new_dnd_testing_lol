@@ -461,13 +461,6 @@ def _checked_revision(value: str | int, *, what: str) -> str | int:
     return value
 
 
-def is_stale(frame: DecisionFrame, current_revision: str | int) -> bool:
-    """Whether the frame was enumerated against an older revision."""
-    return frame.state_revision != _checked_revision(
-        current_revision, what="current"
-    )
-
-
 def assert_fresh(frame: DecisionFrame, current_revision: str | int) -> None:
     """Raise :exc:`DecisionError` (stale) when the frame revision moved on."""
     checked = _checked_revision(current_revision, what="current")
@@ -477,40 +470,6 @@ def assert_fresh(frame: DecisionFrame, current_revision: str | int) -> None:
             f"revision {frame.state_revision!r}, current is {current_revision!r}",
             kind="stale",
         )
-
-
-def rebuild_frame(
-    frame: DecisionFrame,
-    *,
-    state: Any,
-    state_revision: str | int,
-    candidates: Iterable[Mapping[str, Any] | CandidateRecord],
-    instructions: str | None = None,
-) -> DecisionFrame:
-    """Rebuild a frame after the authoritative revision changed.
-
-    The fresh candidate set is required: caller code re-enumerates against
-    the newly authorized state and passes the result here. Old domain
-    candidates are never carried into the new revision — carrying them would
-    bless potentially-stale candidates (e.g. targeting entities removed by
-    the new state) as freshly enumerated. Escape candidates are re-appended
-    unless already present. Returns a new frame with a new ``frame_id``.
-    """
-    base = list(enumerate_candidates(candidates))
-    present = {c.id for c in base}
-    for escape in escape_candidates():
-        if escape.id not in present:
-            base.append(escape)
-    return DecisionFrame(
-        decision_class=frame.decision_class,
-        question_id=frame.question_id,
-        instructions=instructions or frame.instructions,
-        state=state,
-        state_revision=state_revision,
-        candidates=tuple(base),
-        frame_id=uuid.uuid4().hex,
-        perspective=frame.perspective,
-    )
 
 
 def revalidate_for_execution(
@@ -568,25 +527,3 @@ def revalidate_for_execution(
                 kind="malformed",
             )
     return candidate
-
-
-def frame_trace(frame: DecisionFrame, policy_version: int | None = None) -> dict[str, Any]:
-    """Trace metadata stamping candidate + frame (+ policy) schema versions."""
-    trace: dict[str, Any] = {
-        "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
-        "frame_schema_version": FRAME_SCHEMA_VERSION,
-        "decision_class": frame.decision_class,
-        "frame_id": frame.frame_id,
-        "question_id": frame.question_id,
-        "state_revision": frame.state_revision,
-        "candidate_ids": [c.id for c in frame.candidates],
-    }
-    if frame.perspective is not None:
-        trace["perspective"] = {
-            "subject_kind": frame.perspective.subject_kind,
-            "subject_entity_id": frame.perspective.subject_entity_id,
-            "known_target_refs": list(frame.perspective.known_target_refs),
-        }
-    if policy_version is not None:
-        trace["policy_schema_version"] = policy_version
-    return trace

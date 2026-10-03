@@ -31,18 +31,24 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.replacements import PcLifecycleError, declare_pc_death
+from app.characters.service import latest_sheet
+from app.clock import ms_between, utcnow
 from app.combat.service import (
     ENCOUNTER_ENDED_EVENT,
     EncounterError,
     list_participants,
+    lock_encounter,
+    lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_ended
 from models.campaigns import Campaign
 from models.combat import (
     END_FOLLOWUP_HOOKS,
@@ -87,25 +93,6 @@ class EndEncounterError(EncounterError):
 
 class EndEncounterAuthorizationError(PermissionError):
     pass
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _aware(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-def _ms_between(start: datetime | None, end: datetime | None) -> int:
-    start, end = _aware(start), _aware(end)
-    if start is None or end is None:
-        return 0
-    return max(0, int((end - start).total_seconds() * 1000))
 
 
 def _validate_end_args(
@@ -155,13 +142,8 @@ def _read_final_hp(db: Session, participant: EncounterParticipant) -> dict | Non
     """
     try:
         if participant.kind == "pc" and participant.character_id is not None:
-            from models.characters import Dnd5eCharacterSheet
 
-            sheet = db.execute(
-                select(Dnd5eCharacterSheet)
-                .where(Dnd5eCharacterSheet.character_id == participant.character_id)
-                .order_by(Dnd5eCharacterSheet.updated_at.desc())
-            ).scalars().first()
+            sheet = latest_sheet(db, participant.character_id)
             if sheet is None:
                 return None
             return {
@@ -191,13 +173,8 @@ def _read_final_conditions(db: Session, participant: EncounterParticipant) -> li
     """Best-effort final condition names from the canonical store (read-only)."""
     try:
         if participant.kind == "pc" and participant.character_id is not None:
-            from models.characters import Dnd5eCharacterSheet
 
-            sheet = db.execute(
-                select(Dnd5eCharacterSheet)
-                .where(Dnd5eCharacterSheet.character_id == participant.character_id)
-                .order_by(Dnd5eCharacterSheet.updated_at.desc())
-            ).scalars().first()
+            sheet = latest_sheet(db, participant.character_id)
             raw = (sheet.conditions or []) if sheet is not None else []
             return [str(i.get("condition", i)) for i in raw if isinstance(i, (dict, str))]
         if participant.npc_entity_id is not None:
@@ -283,8 +260,6 @@ def _apply_slain_deaths(
     the encounter and lifecycle rows untouched. Already-terminal PCs converge
     (duplicate-safe) instead of failing the end.
     """
-    from app.campaigns.replacements import PcLifecycleError, declare_pc_death
-
     declared: list[str] = []
     by_id = {str(p.id): p for p in list_participants(db, encounter.id)}
     for pid, fate in outcomes.items():
@@ -384,7 +359,7 @@ def _transition_rows(
         raise EndEncounterError(
             f"participant_outcomes references unknown participants: {sorted(unknown)}"
         )
-    ended_at = _now()
+    ended_at = utcnow()
     declared_deaths = _apply_slain_deaths(
         db, campaign, encounter, outcomes,
         reason=reason, actor_id=actor_id,
@@ -399,7 +374,7 @@ def _transition_rows(
     encounter.end_participant_outcomes = {
         pid: outcomes.get(pid, "standing") for pid in by_id
     }
-    encounter.end_duration_ms = _ms_between(encounter.initiated_at, ended_at)
+    encounter.end_duration_ms = ms_between(encounter.initiated_at, ended_at)
     encounter.blocked_since = None
     db.flush()
     hooks = _seed_followups(db, encounter)
@@ -428,26 +403,13 @@ def end_encounter(
 
     Returns (encounter, ended_event, followups).
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise EndEncounterError("operation_id is required (1-128 characters)")
     outcome, reason, outcomes = _validate_end_args(outcome, reason, participant_outcomes)
 
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise EndEncounterError(f"Encounter {encounter_id} not found")
-    campaign = db.execute(
-        select(Campaign).where(Campaign.id == encounter.campaign_id).with_for_update()
-    ).scalars().first()
-    if campaign is None:
-        raise EndEncounterError(f"Campaign {encounter.campaign_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(campaign)
+    encounter = lock_encounter(db, encounter_id, EndEncounterError)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, EndEncounterError)
     _check_owner(db, campaign, actor_id)
 
     if encounter.status == "ended":
@@ -530,14 +492,6 @@ def end_encounter(
         # the full payload for owner/audit reads while member feeds
         # (public-or-own-actor) converge via the redacted encounter view.
         visibility="dm_only",
-        outbox_event_type=ENCOUNTER_ENDED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "outcome": outcome,
-        },
-        outbox_operation_id=f"encounter:{encounter.id}:ended",
         provenance={"source": "dm_end_encounter"},
     )
     encounter.ended_event_id = event.id
@@ -560,8 +514,6 @@ def end_encounter(
         operation_id=operation_id, revision=int(campaign_after.revision or 0),
     )
     if commit:
-        from app.realtime.service import publish_encounter_ended
-
         publish_encounter_ended(db, encounter)
     return encounter, event, holder.get("hooks") or []
 

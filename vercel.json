@@ -17,12 +17,6 @@
       "buildCommand": "bash scripts/vercel-migrate.sh"
     }
   },
-  "crons": [
-    {
-      "path": "/api/cron/outbox-relay",
-      "schedule": "0 0 * * *"
-    }
-  ],
   "rewrites": [
     {
       "source": "/api/(.*)",

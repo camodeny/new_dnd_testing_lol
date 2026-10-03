@@ -26,20 +26,17 @@ from app.dm.context import LaneName, assemble_attempt_context  # noqa: E402
 from app.dm.execution import execute_dm_attempt  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.post_turn.backpressure import (  # noqa: E402
-    BackpressureBlocked,
     describe_client_state,
     estimate_unprocessed_cost,
     evaluate_backpressure,
     get_safe_context_budget,
-    require_forward_progress,
 )
 from app.post_turn.service import (  # noqa: E402
     get_checkpoint,
-    get_post_turn_status,
     run_post_turn_range,
 )
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.post_turn import PostTurnRun  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -88,8 +85,6 @@ def _stub_status():
     return {
         LaneName.CURRENT_SCENE: "not_applicable",
         LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
-        LaneName.CLOCKS_PRESSURES: "not_applicable",
-        LaneName.COMBAT_HOOKS: "not_applicable",
         LaneName.RELEVANT_CANON: "not_applicable",
         LaneName.REPAIR_DIRECTIVES: "not_applicable",
     }
@@ -187,8 +182,7 @@ def test_threshold_crossing_pauses_execution_and_fires_critical_catchup(monkeypa
         select(PostTurnRun).where(PostTurnRun.campaign_id == cid)
     ).scalars().all()
     assert any(r.trigger == "critical" for r in runs), "blocked progression must fire critical catch-up"
-    with pytest.raises(BackpressureBlocked):
-        require_forward_progress(db, cid)
+    assert evaluate_backpressure(db, cid)["blocked"] is True
     db.close()
 
 
@@ -286,8 +280,6 @@ def test_estimation_failure_blocks_conservative(monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("cost boom")))
     status = evaluate_backpressure(db, cid)
     assert status["blocked"] is True and status["reason"] == "estimation_failed"
-    with pytest.raises(BackpressureBlocked):
-        require_forward_progress(db, cid)
     db.close()
 
 
@@ -326,14 +318,13 @@ def test_client_state_ready_and_processing_hide_internals():
     assert describe_client_state(None) == {"dm_state": "ready"}
 
 
-def test_post_turn_status_exposes_backpressure_observability():
+def test_backpressure_status_exposes_observability():
     F = _factory()
     cid, _owner, _tid = _campaign(F)
     db = F()
     for i in range(2):
         _commit(db, cid, i)
-    st = get_post_turn_status(db, cid)
-    bp = st["backpressure"]
+    bp = evaluate_backpressure(db, cid)
     assert bp["blocked"] is False
     assert bp["outstanding"] == 2
     assert bp["estimated_bytes"] > 0
@@ -512,8 +503,6 @@ def test_gate_accounts_for_provenance_and_requires_window_lag(monkeypatch):
         )
     status = evaluate_backpressure(db, cid)
     assert status["blocked"] is True and status["reason"] == "over_safe_budget"
-    with pytest.raises(BackpressureBlocked):
-        require_forward_progress(db, cid)
 
     # Estimate covers the assembled shape: still conservative vs records.
     cost = estimate_unprocessed_cost(db, cid)

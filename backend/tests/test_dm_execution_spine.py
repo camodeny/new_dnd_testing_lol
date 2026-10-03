@@ -23,14 +23,14 @@ from models.dm import DMStreamChunk, DmTurn, DmTurnAttempt  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
 
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.contract import CONTRACT_VERSION, ContractValidationError, normalize_contract  # noqa: E402
 from app.dm.execution import (  # noqa: E402
-    DM_TURN_EXECUTE_JOB,
     execute_dm_attempt,
     run_dm_execute_sweep,
 )
 from app.dm.narration import materialize_final_narration  # noqa: E402
-from app.dm_streams.service import reconstruct_text  # noqa: E402
+from app.dm.streams import reconstruct_text  # noqa: E402
 
 
 @pytest.fixture
@@ -60,7 +60,7 @@ def db(tmp_path):
 
 def _submit(s, camp_id, thread_id, text="I step into the torchlit hall."):
     """Normal player submission acceptance (mirrors POST /submissions)."""
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     accept_submission(
@@ -145,12 +145,12 @@ def test_submission_autonomously_executes_to_persisted_dm_reply(db):
 def test_existing_npc_proposal_is_readjudicated_before_narration(db):
     from app.dm.context import LaneName
     from app.world.identity import add_alias
-    from app.world.service import create_entity_inline
+    from app.world.service import create_entity
     from models.world import WorldEntity
 
     s, camp_id, thread_id, _ = db
     campaign = s.get(Campaign, camp_id)
-    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    npc, _ = create_entity(s, campaign, entity_type="npc", name="Mara Venn")
     add_alias(s, npc, "Mara")
     s.commit()
     turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
@@ -201,11 +201,11 @@ def test_existing_npc_proposal_is_readjudicated_before_narration(db):
 
 def test_repeated_existing_npc_proposal_never_streams(db):
     from app.world.identity import IdentityReuseRequiresReadjudication, add_alias
-    from app.world.service import create_entity_inline
+    from app.world.service import create_entity
 
     s, camp_id, thread_id, _ = db
     campaign = s.get(Campaign, camp_id)
-    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    npc, _ = create_entity(s, campaign, entity_type="npc", name="Mara Venn")
     add_alias(s, npc, "Mara")
     s.commit()
     turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
@@ -356,17 +356,6 @@ def test_missing_provider_config_fails_clearly(db):
     assert fresh_attempt.last_error and "API_KEY" in fresh_attempt.last_error
 
 
-def test_worker_handler_registered_for_queue_path():
-    from app.queue.consumer import WORKER_HANDLERS, resolve_worker_handler
-
-    assert DM_TURN_EXECUTE_JOB in WORKER_HANDLERS
-
-    class _Env:
-        job_type = DM_TURN_EXECUTE_JOB
-
-    assert resolve_worker_handler(_Env()) is WORKER_HANDLERS[DM_TURN_EXECUTE_JOB]
-
-
 @pytest.mark.parametrize("regenerate", [False, True])
 def test_evidence_survives_validation_and_regeneration(db, regenerate):
     from models.campaigns import CampaignMember
@@ -445,7 +434,6 @@ def test_two_sessions_only_one_executor_reaches_adjudication(db):
 
 def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch):
     """Scene source failure must never downgrade to not_applicable."""
-    from app.world import service as world_service
 
     s, camp_id, thread_id, _ = db
     _, attempt = _submit(s, camp_id, thread_id)
@@ -454,7 +442,7 @@ def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch)
         raise RuntimeError("simulated scene reader failure")
 
     monkeypatch.setattr(
-        world_service, "build_current_scene_context_record", _boom
+        "app.dm.context.build_current_scene_context_record", _boom
     )
     calls = []
 
@@ -473,10 +461,9 @@ def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch)
 
 
 def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
-    """A non-UndefinedTable DB error naming the scene table must not downgrade."""
+    """A DB error naming the scene table must not downgrade to no-scene."""
     from sqlalchemy.exc import ProgrammingError
 
-    from app.world import service as world_service
 
     s, camp_id, thread_id, _ = db
     _, attempt = _submit(s, camp_id, thread_id)
@@ -491,7 +478,7 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
         )
 
     monkeypatch.setattr(
-        world_service, "build_current_scene_context_record", _denied
+        "app.dm.context.build_current_scene_context_record", _denied
     )
     calls = []
 
@@ -506,51 +493,6 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
     assert calls == []
     fresh_attempt = s.get(DmTurnAttempt, attempt.id)
     assert fresh_attempt.status in ("failed", "failed_visible")
-
-
-def test_missing_scene_table_still_downgrades(db):
-    """Not-yet-migrated rollout: absent scene relation stays compatible."""
-    from sqlalchemy import text
-
-    s, camp_id, thread_id, _ = db
-    _, attempt = _submit(s, camp_id, thread_id)
-    s.execute(text("DROP TABLE campaign_current_scenes"))
-    result = execute_dm_attempt(
-        s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic"
-    )
-    assert result.attempt.status == "succeeded"
-
-
-def test_queue_delivery_executes_dm_attempt(db, monkeypatch):
-    """Real consume_queue_delivery() path uses the single-arg worker contract."""
-    import uuid as _uuid
-
-    import database
-    import app.dm.execution as exec_mod
-    from app.queue.consumer import consume_queue_delivery
-    from app.queue.envelope import WorkerEnvelope
-
-    s, camp_id, thread_id, factory = db
-    _, attempt = _submit(s, camp_id, thread_id)
-    real_execute = exec_mod.execute_dm_attempt
-    fake_adj = _fake_adjudicate()
-
-    def _patched(session, attempt_id, **kw):
-        kw.setdefault("adjudicate", fake_adj)
-        kw.setdefault("narrator", "deterministic")
-        return real_execute(session, attempt_id, **kw)
-
-    monkeypatch.setattr(exec_mod, "execute_dm_attempt", _patched)
-    monkeypatch.setattr(database, "SessionLocal", factory)
-    env = WorkerEnvelope(
-        job_id=_uuid.uuid4(),
-        job_type=DM_TURN_EXECUTE_JOB,
-        payload={"attempt_id": str(attempt.id)},
-    )
-    result, duplicate = consume_queue_delivery(s, env.to_dict())
-    assert duplicate is False
-    assert result["attempt_id"] == str(attempt.id)
-    assert s.get(DmTurnAttempt, attempt.id).status == "succeeded"
 
 
 def test_await_roll_creates_request_and_resumes_on_fulfill(db):
@@ -780,18 +722,18 @@ def test_perspective_repair_packet_carries_through_validation(db):
     """Issue #455 review: a contract that passed against the perspective-repaired
     packet must not be re-validated against the unrepaired one (which would
     fail again and start a second full regeneration)."""
-    from app.world.epistemics import assert_knowledge_inline
-    from app.world.service import create_entity_authoritative
+    from app.world.knowledge import assert_knowledge
+    from app.world.service import create_entity
 
     s, camp_id, thread_id, _ = db
     camp = s.get(Campaign, camp_id)
-    npc, _ = create_entity_authoritative(
-        s, camp_id, 0, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-exec",
+    npc, _ = commit_world_write(
+        s, camp_id, 0, create_entity, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-exec",
     )
-    well, _ = create_entity_authoritative(
-        s, camp_id, 1, entity_type="location", name="Old Well", operation_id="op-well-exec",
+    well, _ = commit_world_write(
+        s, camp_id, 1, create_entity, entity_type="location", name="Old Well", operation_id="op-well-exec",
     )
-    assert_knowledge_inline(
+    assert_knowledge(
         s, camp, subject_kind="npc", subject_entity_id=npc.id,
         target_kind="entity", target_entity_id=well.id,
         knowledge_state="knows", acquisition_source="direct_observation",

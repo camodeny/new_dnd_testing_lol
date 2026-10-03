@@ -40,8 +40,8 @@ from app.combat.service import (  # noqa: E402
 from app.combat.turns import TurnError, cast_skip_vote, consume_resource, end_turn  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.post_turn.service import is_post_turn_relevant  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant, EncounterTurnState  # noqa: E402
@@ -721,6 +721,74 @@ def test_inline_dm_effect_end_path():
             )
 
 
+def test_turn_commit_stages_end_only_for_its_own_end_effects():
+    """A DM turn stages encounter.ended only for encounters its effects ended.
+
+    An unrelated ended encounter still missing its lifecycle event must not
+    be claimed (or given provenance) by whichever turn commits next.
+    """
+    from datetime import datetime, timezone
+
+    from app.dm.contract import normalize_contract
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
+    from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        stray = _ready_party(db, ctx, operation_id="op-start-stray")
+        end_encounter_inline(
+            db, db.get(Campaign, ctx["campaign_id"]), db.get(Encounter, stray.id),
+            {"encounter_id": str(stray.id), "outcome": "retreat", "reason": "Out of band."},
+            "stray-end",
+        )
+        db.commit()
+        target = _ready_party(db, ctx, operation_id="op-start-target",
+                              expected_revision=_revision(db, ctx))
+        db.commit()
+        contract = normalize_contract({
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond",
+            "reason": "the fight ends",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{"text": "The goblins flee.", "claim_kind": "observation",
+                            "origin": "dm_adjudication"}],
+            }],
+            "staged_effects": [{
+                "id": "end-enc-1", "effect_type": "end_encounter",
+                "arguments": {"encounter_id": str(target.id), "outcome": "escape",
+                              "reason": "The goblins melt into the woods."},
+            }],
+        })
+        turn = db.get(DmTurn, ctx["turn_id"])
+        attempt = db.get(DmTurnAttempt, ctx["attempt_id"])
+        stage_validated_attempt(db, attempt.id, contract)
+        stream = DMStream(
+            id=uuid.uuid4(), campaign_id=turn.campaign_id,
+            thread_id=uuid.UUID(str(turn.thread_id)),
+            turn_id=str(turn.id), attempt_id=str(attempt.id),
+            status="streaming", audience=turn.audience,
+        )
+        db.add(stream)
+        db.flush()
+        db.add(DMStreamChunk(id=uuid.uuid4(), stream_id=stream.id, sequence=0,
+                             text="The goblins flee.", byte_length=17))
+        stream.first_chunk_at = datetime.now(timezone.utc)
+        stream.chunk_count = 1
+        db.flush()
+        mark_streaming_started(db, turn.id, attempt.id, stream.id)
+        commit_turn(db, turn.id, attempt.id, expected_revision=_revision(db, ctx))
+
+        target = db.get(Encounter, target.id)
+        assert target.status == "ended"
+        ended_event = find_ended_event(db, target)
+        assert ended_event is not None and target.ended_event_id == ended_event.id
+        assert ended_event.provenance["attempt_id"] == str(attempt.id)
+        stray = db.get(Encounter, stray.id)
+        assert stray.ended_event_id is None
+        assert find_ended_event(db, stray) is None
+
+
 def test_encounter_ended_observability_counters():
     fac, ctx = _fixture()
     with fac() as db:
@@ -775,7 +843,7 @@ def test_http_end_followups_owner_only(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)

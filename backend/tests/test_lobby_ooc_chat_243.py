@@ -51,9 +51,7 @@ def api(monkeypatch):
     def _as(request, db):
         return db.get(Profile, actor["id"])
 
-    monkeypatch.setattr("app.campaigns.router.resolve_profile", _as)
-    monkeypatch.setattr("app.runtime.router.resolve_profile", _as)
-    monkeypatch.setattr("app.realtime.router.resolve_profile", _as)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", _as)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", _as)
     app.dependency_overrides[get_db] = override_db
     try:
@@ -253,7 +251,8 @@ def test_missing_idempotency_key_rejected(api):
 
 def test_realtime_publish_and_channel_auth(api, monkeypatch):
     from app.realtime.channels import live_table_channel
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     client, factory, actor, owner_id, member_id, outsider_id = api
     camp = _create(client)
@@ -371,14 +370,14 @@ def test_coordinate_turn_refuses_lobby_thread(api):
 def test_concurrent_start_transition_refused_under_lock(api, monkeypatch):
     """TOCTOU race: starting->active committing after the transport-level
     checks but before persistence must still refuse the lobby write."""
-    import app.campaigns.router as campaign_router
+    import app.deps.idempotency as idempotency_deps
 
     client, factory, actor, owner_id, member_id, _ = api
     camp = _create(client)
     cid = camp["id"]
     _join(factory, cid, member_id)
 
-    real_require_key = campaign_router.require_idempotency_key
+    real_require_key = idempotency_deps.require_idempotency_key
 
     def _flip_to_active_then_delegate(request, fallback=None):
         with factory() as db:
@@ -388,7 +387,7 @@ def test_concurrent_start_transition_refused_under_lock(api, monkeypatch):
         return real_require_key(request, fallback)
 
     monkeypatch.setattr(
-        campaign_router, "require_idempotency_key", _flip_to_active_then_delegate
+        idempotency_deps, "require_idempotency_key", _flip_to_active_then_delegate
     )
     actor["id"] = member_id
     resp = _post(client, cid, "sneaks in after start", "race-start-1")
@@ -404,14 +403,14 @@ def test_concurrent_start_transition_refused_under_lock(api, monkeypatch):
 def test_concurrent_member_removal_refused_under_lock(api, monkeypatch):
     """TOCTOU race: member removal committing after the transport-level
     checks but before persistence must still refuse the lobby write."""
-    import app.campaigns.router as campaign_router
+    import app.deps.idempotency as idempotency_deps
 
     client, factory, actor, owner_id, member_id, _ = api
     camp = _create(client)
     cid = camp["id"]
     _join(factory, cid, member_id)
 
-    real_require_key = campaign_router.require_idempotency_key
+    real_require_key = idempotency_deps.require_idempotency_key
 
     def _remove_then_delegate(request, fallback=None):
         with factory() as db:
@@ -423,7 +422,7 @@ def test_concurrent_member_removal_refused_under_lock(api, monkeypatch):
         return real_require_key(request, fallback)
 
     monkeypatch.setattr(
-        campaign_router, "require_idempotency_key", _remove_then_delegate
+        idempotency_deps, "require_idempotency_key", _remove_then_delegate
     )
     actor["id"] = member_id
     resp = _post(client, cid, "sneaks in after removal", "race-remove-1")

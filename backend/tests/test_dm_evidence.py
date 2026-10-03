@@ -45,8 +45,6 @@ def _packet(audience=None):
             for ln in [
                 LaneName.CURRENT_SCENE,
                 LaneName.KNOWLEDGE_VISIBILITY,
-                LaneName.CLOCKS_PRESSURES,
-                LaneName.COMBAT_HOOKS,
                 LaneName.RELEVANT_CANON,
                 LaneName.REPAIR_DIRECTIVES,
             ]
@@ -141,7 +139,7 @@ def test_two_pass_evidence():
                     "mode": "need_evidence",
                     "reason": "second",
                     "beats": [],
-                    "evidence_requests": [{"id": "evidence_2", "tool": "get_current_scene"}],
+                    "evidence_requests": [{"id": "evidence_2", "tool": "query_world_timeline"}],
                     "safe_prelude": "Checking scene...",
                 }
             )
@@ -185,7 +183,7 @@ def test_two_pass_evidence():
         )
 
     final, bundle = run_bounded_evidence_loop(
-        initial_packet=packet, adjudicate=adjudicate, tool_handlers={"search_campaign_memory": mem_handler, "get_current_scene": scene_handler}
+        initial_packet=packet, adjudicate=adjudicate, tool_handlers={"search_campaign_memory": mem_handler, "query_world_timeline": scene_handler}
     )
     assert bundle.rounds == 2
     assert final.mode == "respond"
@@ -347,7 +345,7 @@ def test_tool_timeout_retry_with_deadline():
                     "mode": "need_evidence",
                     "reason": "need",
                     "beats": [],
-                    "evidence_requests": [{"id": "evidence_1", "tool": "get_current_scene"}],
+                    "evidence_requests": [{"id": "evidence_1", "tool": "query_world_timeline"}],
                     "safe_prelude": "Checking...",
                 }
             )
@@ -360,7 +358,7 @@ def test_tool_timeout_retry_with_deadline():
             }
         )
 
-    _, bundle = run_bounded_evidence_loop(initial_packet=packet, adjudicate=adjudicate, tool_handlers={"get_current_scene": flaky_handler})
+    _, bundle = run_bounded_evidence_loop(initial_packet=packet, adjudicate=adjudicate, tool_handlers={"query_world_timeline": flaky_handler})
     assert bundle.results[0].retries == 1
     assert bundle.results[0].status == "ok"
 
@@ -385,12 +383,12 @@ def test_tool_timeout_retry_with_deadline():
             "mode": "need_evidence",
             "reason": "need",
             "beats": [],
-            "evidence_requests": [{"id": "evidence_1", "tool": "get_current_scene"}],
+            "evidence_requests": [{"id": "evidence_1", "tool": "query_world_timeline"}],
             "safe_prelude": "Checking...",
         }
     ).evidence_requests
     t0 = time.monotonic()
-    results, trace = execute_evidence_round(req, aud2, tool_handlers={"get_current_scene": slow_handler}, timeout_s=0.1, max_retries=1)
+    results, trace = execute_evidence_round(req, aud2, tool_handlers={"query_world_timeline": slow_handler}, timeout_s=0.1, max_retries=1)
     elapsed = time.monotonic() - t0
     assert results[0].status == "tool_failure"
     assert "timed out" in (results[0].error or "").lower()
@@ -495,7 +493,7 @@ def test_evidence_tool_failure_triggers_retry_then_failure_handling():
             "mode": "need_evidence",
             "reason": "need",
             "beats": [],
-            "evidence_requests": [{"id": "evidence_1", "tool": "get_current_scene"}],
+            "evidence_requests": [{"id": "evidence_1", "tool": "query_world_timeline"}],
             "safe_prelude": "Checking...",
         }
     ).evidence_requests
@@ -503,7 +501,7 @@ def test_evidence_tool_failure_triggers_retry_then_failure_handling():
     def always_fail(req, audience, db=None):
         raise RuntimeError("terminal boom")
 
-    results, _ = execute_evidence_round(req, aud, tool_handlers={"get_current_scene": always_fail}, timeout_s=1.0, max_retries=1)
+    results, _ = execute_evidence_round(req, aud, tool_handlers={"query_world_timeline": always_fail}, timeout_s=1.0, max_retries=1)
     assert results[0].status == "tool_failure"
     assert results[0].retries == 0  # terminal not retried
 
@@ -516,7 +514,7 @@ def test_unexpected_handler_result_type_fails_closed():
             "mode": "need_evidence",
             "reason": "need",
             "beats": [],
-            "evidence_requests": [{"id": "evidence_1", "tool": "get_current_scene"}],
+            "evidence_requests": [{"id": "evidence_1", "tool": "query_world_timeline"}],
             "safe_prelude": "Checking...",
         }
     ).evidence_requests
@@ -529,7 +527,7 @@ def test_unexpected_handler_result_type_fails_closed():
 
     for handler in (string_handler, int_handler):
         with pytest.raises(EvidenceValidationError):
-            execute_evidence_round(req, aud, tool_handlers={"get_current_scene": handler}, timeout_s=1.0)
+            execute_evidence_round(req, aud, tool_handlers={"query_world_timeline": handler}, timeout_s=1.0)
 
 
 def test_evidence_results_carry_stable_source_ids():

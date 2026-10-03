@@ -82,7 +82,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     app.dependency_overrides[get_db] = override_db
@@ -152,7 +152,7 @@ def test_world_seed_solo_happy_path(api):
         assert clock.status == "active"
         assert clock.threshold >= 1
         assert clock.advancement_criteria["kind"] == "deterministic"
-        assert "dm.turn_committed" in clock.advancement_criteria["event_types"]
+        assert "dm.turn_resolved" in clock.advancement_criteria["event_types"]
 
 
 def test_world_seed_multiplayer_covers_party(api):

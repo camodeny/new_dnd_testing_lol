@@ -50,7 +50,7 @@ def db(tmp_path):
 
 
 def _submit(s, camp_id, thread_id, text="I step into the torchlit hall."):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     accept_submission(s, campaign_id=camp_id, user_id=s.get(Campaign, camp_id).owner_id,
@@ -156,12 +156,7 @@ def test_same_model_failover_recovers_and_records_non_billable(db, monkeypatch):
     from app.providers import registry as reg
 
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
-    monkeypatch.setattr("app.providers.execute_chat", _fake_execute)
-    # adjudication imports execute_chat from app.providers at call time;
-    # patch the re-exported reference too.
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     contract, info = adj.adjudicate_with_failover(packet, db=s, role="forward_dm")
     assert contract.mode == "respond"
@@ -205,9 +200,7 @@ def test_failover_path_requests_low_reasoning_effort(db, monkeypatch):
     from app.providers import registry as reg
 
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     contract, _ = adj.adjudicate_with_failover(packet, db=None, role="forward_dm")
     assert contract.mode == "respond"
@@ -267,7 +260,7 @@ def test_narration_only_failure_preserves_contract_and_retries_independently(db)
 def test_partial_stream_resume_and_semantic_continuation(db):
     from app.dm.narration import (continue_partial_stream,
                                   resume_narration_stream)
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)
@@ -321,7 +314,7 @@ def _failed_partial(s, camp_id, thread_id, text=LONG_TEXT, effect=None):
     """Build a failed_visible turn/attempt with a failed partial stream."""
     from app.dm.narration import stream_narration
     from app.dm.turns import mark_attempt_failed, stage_validated_attempt
-    from app.dm_streams.service import fail_stream
+    from app.dm.streams import fail_stream
 
     turn, attempt = _submit(s, camp_id, thread_id, text="I step forward.")
     contract = _contract(text)
@@ -365,7 +358,7 @@ def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
     assert final_turn.status == "succeeded"
     assert final_attempt.status == "succeeded"
     assert event is not None
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     assert get_stream(s, stream_id).status == "completed"
     # Consumed input resolved so it is never re-adjudicated.
@@ -390,7 +383,7 @@ def _crash_after_chunks(s, stream_id, full_text, *, chunks_to_append="all"):
     """Simulate a crash mid-recovery: persist chunks + optionally complete,
     without finalizing the turn."""
     from app.dm.narration import chunk_narration_text
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         list_chunks,
@@ -430,7 +423,7 @@ def test_recover_converges_after_crash_past_completion(db):
 def test_recover_converges_after_crash_mid_suffix(db):
     """Crash after some recovered chunks converges without duplication."""
     from app.dm.recovery import recover_partial_stream
-    from app.dm_streams.service import list_chunks
+    from app.dm.streams import list_chunks
 
     s, camp_id, thread_id, _ = db
     owner = s.get(Campaign, camp_id).owner_id
@@ -442,7 +435,7 @@ def test_recover_converges_after_crash_mid_suffix(db):
         s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
     assert final_turn.status == "succeeded"
     assert final_attempt.status == "succeeded"
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     assert reconstruct_text(s, stream_id) == LONG_TEXT
 
@@ -477,9 +470,7 @@ def test_explicit_retry_executes_as_non_billable_recovery(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     result = execute_dm_attempt(s, fresh.id, narrator="deterministic")
     assert result.attempt.status == "succeeded"
@@ -540,7 +531,7 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
         recover_partial_stream(s, camp_id, turn.id, stream_id,
                                "A completely different story.", actor_id=owner)
     # Prefix-preserving but unfaithful: invented number + consequence.
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     visible = reconstruct_text(s, stream_id)
     with pytest.raises(ValueError):
@@ -553,7 +544,6 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
 # ── Narration failover through the role policy ──────────────────────────────
 
 def test_narration_failover_uses_next_candidate_pre_token(db, monkeypatch):
-    import app.providers as providers_pkg
     from app.dm.adjudication import build_provider_narrator
     from app.dm.narration import NarratorRequest
     from app.providers import registry as reg
@@ -571,7 +561,7 @@ def test_narration_failover_uses_next_candidate_pre_token(db, monkeypatch):
         yield NormalizedStreamEvent(kind="token", text="hello ")
         yield NormalizedStreamEvent(kind="token", text="world")
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.dm.adjudication.stream_chat", _fake_stream)
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("p1", "m"), ("p2", "m")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
@@ -605,7 +595,6 @@ def _provider_narrator_mocks(monkeypatch, *, path, fail_first=None):
     fail_first: exception instance raised by the first provider after
     yielding ``fail_first_prefix`` (None = raise before any yield).
     """
-    import app.providers as providers_pkg
     from app.providers import registry as reg
     from app.providers.contracts import NormalizedStreamEvent
 
@@ -621,7 +610,7 @@ def _provider_narrator_mocks(monkeypatch, *, path, fail_first=None):
         for piece in state["pieces"]:
             yield NormalizedStreamEvent(kind="token", text=piece)
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.dm.adjudication.stream_chat", _fake_stream)
     monkeypatch.setattr(role_policy, "execution_path", lambda role: list(path))
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
@@ -639,7 +628,7 @@ def test_narration_failover_drops_unpersisted_prefix(db, monkeypatch):
         render_deterministic_narration,
         stream_narration,
     )
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
     from app.providers.contracts import ProviderError
 
     s, camp_id, thread_id, _ = db
@@ -742,7 +731,7 @@ def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
     """With flush-only recovery, a crash after completion/transition/staging
     persists nothing: retry converges to exactly one commit."""
     from app.dm.recovery import recover_partial_stream
-    from app.dm_streams.service import list_chunks, reconstruct_text
+    from app.dm.streams import list_chunks, reconstruct_text
 
     s, camp_id, thread_id, _ = db
     owner = s.get(Campaign, camp_id).owner_id
@@ -775,14 +764,14 @@ def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
         def _fail(*a, **k):
             raise RuntimeError("crash during effect/event staging")
 
-        monkeypatch.setattr(turns_mod, "commit_turn_with_effects", _fail)
+        monkeypatch.setattr(turns_mod, "commit_turn", _fail)
 
     with pytest.raises(RuntimeError, match="crash"):
         recover_partial_stream(s, camp_id, turn.id, stream_id, LONG_TEXT,
                                actor_id=owner, commit=False)
     s.rollback()
     # Nothing durable: stream still failed with original prefix, turn failed.
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     assert get_stream(s, stream_id).status == "failed"
     assert len(list_chunks(s, stream_id)) == chunks_before
@@ -848,9 +837,7 @@ def test_automatic_retry_executes_as_non_billable_recovery(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _flaky_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _flaky_execute)
 
     with pytest.raises(ProviderError):
         execute_dm_attempt(s, attempt.id, narrator="deterministic")
@@ -886,9 +873,7 @@ def test_failed_runs_survive_gameplay_rollback(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _always_terminal)
 
     with pytest.raises(ProviderError):
         adjudicate_with_failover(packet, db=s)
@@ -945,9 +930,7 @@ def test_failed_runs_durable_on_postgres(monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _always_terminal)
 
     with Fac() as s:
         with pytest.raises(ProviderError):
@@ -994,9 +977,7 @@ def test_superseded_attempt_executes_as_primary_billable(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     result = execute_dm_attempt(s, child.id, narrator="deterministic")
     assert result.attempt.status == "succeeded"

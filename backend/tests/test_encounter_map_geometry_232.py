@@ -44,8 +44,8 @@ from app.combat.service import (  # noqa: E402
 )
 from app.combat.turns import StaleTurnError, get_turn_state_row  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant  # noqa: E402
@@ -694,12 +694,8 @@ def test_map_redefine_without_placements_preserves_positions():
 
 
 def test_two_moves_same_turn_have_distinct_realtime_event_ids():
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        build_encounter_moved_event,
-        dedupe_events,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import build_encounter_moved_event, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     fac, ctx = _fixture()
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)
@@ -716,8 +712,6 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
             ids = [m["payload"]["event_id"] for m in moved]
             assert ids[0] != ids[1]
             assert ids[0].endswith(str(first.id)) and ids[1].endswith(str(second.id))
-            # The realtime deduper must keep both same-turn moves.
-            assert len(dedupe_events([m["payload"] for m in moved])) == 2
             # Legacy callers without a move id keep the turn-scoped key.
             legacy = build_encounter_moved_event(encounter, participant.id)
             assert legacy["event_id"].endswith(f"{int(encounter.turn_sequence or 0)}")
@@ -726,7 +720,8 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
 
 
 def test_hidden_mover_move_redacts_positions():
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     fac, ctx = _fixture()
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)
@@ -869,7 +864,7 @@ def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DMStream, DMStreamChunk
 
     fac, ctx = _fixture()
@@ -924,7 +919,7 @@ def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision
         stream.chunk_count = 1
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
 
         encounter_map = get_map(db, encounter.id)
         assert encounter_map.revision == 2
@@ -939,7 +934,7 @@ def test_staged_placement_effect_promotes_through_turn_pipeline_and_bumps_revisi
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DMStream, DMStreamChunk
 
     fac, ctx = _fixture()
@@ -996,7 +991,7 @@ def test_staged_placement_effect_promotes_through_turn_pipeline_and_bumps_revisi
         stream.chunk_count = 1
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
 
         assert get_map(db, encounter.id).revision == 2
         placed = get_placement(db, encounter.id, participant.id)

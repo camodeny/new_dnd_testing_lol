@@ -36,8 +36,8 @@ from app.dm.context import (  # noqa: E402
     assemble_context_packet,
 )
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import create_private_thread, get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import create_private_thread, get_or_create_campaign_thread  # noqa: E402
 
 
 FIXTURES = json.loads(
@@ -152,8 +152,6 @@ def _not_applicable_for_empty_stub() -> dict[LaneName, str]:
     return {
         LaneName.CURRENT_SCENE: "not_applicable",
         LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
-        LaneName.CLOCKS_PRESSURES: "not_applicable",
-        LaneName.COMBAT_HOOKS: "not_applicable",
         LaneName.RELEVANT_CANON: "not_applicable",
         LaneName.REPAIR_DIRECTIVES: "not_applicable",
     }
@@ -613,12 +611,12 @@ def test_optional_lane_failure_is_traceable_via_source_errors():
     packet = assemble_context_packet(
         audience=audience,
         records=_empty_records(),
-        lane_status={LaneName.COMBAT_HOOKS: "unavailable"},
-        source_errors={LaneName.COMBAT_HOOKS: ["combat reader timeout"]},
+        lane_status={LaneName.RELEVANT_CANON: "unavailable"},
+        source_errors={LaneName.RELEVANT_CANON: ["canon reader timeout"]},
     )
-    lane = next(item for item in packet.lanes if item.name == LaneName.COMBAT_HOOKS)
+    lane = next(item for item in packet.lanes if item.name == LaneName.RELEVANT_CANON)
     assert lane.authority_status == "unavailable"
-    assert lane.source_errors == ["combat reader timeout"]
+    assert lane.source_errors == ["canon reader timeout"]
     # Required lane with same status must fail closed.
     with pytest.raises(MissingAuthoritativeContextError):
         assemble_context_packet(

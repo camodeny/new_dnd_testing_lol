@@ -4,21 +4,18 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from models.reliability import AIRun
 from models.reliability import OperationTrace
 from .tracing import current_operation_id, current_trace_id, structured_log
 
 logger = logging.getLogger(__name__)
 MILESTONES = {"accepted", "worker_started", "first_visible", "narration_completed", "resolved"}
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _telemetry_write(session_factory, write):
@@ -109,15 +106,11 @@ def start_ai_run(session_factory, *, logical_operation: str, role: str, provider
 
 def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_token_at=None,
                   input_tokens=None, output_tokens=None, cost_usd=None, result_code=None,
-                  error_type=None, campaign_id=None) -> AIRun:
-    """Finalize an AI run, then fail-soft charge the capacity ledger (#253).
+                  error_type=None) -> AIRun:
+    """Finalize an AI run in its own short telemetry transaction.
 
-    When a ``campaign_id`` is supplied for a succeeded run, exactly-once
-    spend accounting runs in a second independent telemetry transaction via
-    ``billing.ledger.charge_completed_run``. Accounting failure is logged
-    and swallowed here — it must never rewrite gameplay — and surfaces
-    later through ``reconcile()``. A succeeded primary run with no usable
-    cost is expected-pending (WARNING), not a telemetry failure.
+    Spend accounting is the caller's follow-up
+    (``app.billing.ledger.charge_finished_run``) once the run commits.
     """
     def write(db):
         run = db.get(AIRun, run_id)
@@ -127,21 +120,7 @@ def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_t
         run.input_tokens = input_tokens; run.output_tokens = output_tokens; run.cost_usd = cost_usd
         run.result_code = result_code; run.error_type = error_type
         return run
-    finished = _telemetry_write(session_factory, write)
-    if status == "succeeded" and campaign_id is not None:
-        def charge(db):
-            from app.billing.ledger import charge_completed_run
-
-            return charge_completed_run(db, run_id=finished.id, campaign_id=campaign_id)
-        try:
-            _telemetry_write(session_factory, charge)
-        except Exception as exc:
-            from app.billing.ledger import AmbiguousCostError
-
-            level = logging.WARNING if isinstance(exc, AmbiguousCostError) else logging.ERROR
-            structured_log(logger, level, "ledger_charge_dropped",
-                           error_type=type(exc).__name__, run_id=str(finished.id))
-    return finished
+    return _telemetry_write(session_factory, write)
 
 
 def telemetry_factory_for(db: Session):

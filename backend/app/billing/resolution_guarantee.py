@@ -47,6 +47,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.billing import ledger as _ledger
+from app.observability.tracing import structured_log
 
 logger = logging.getLogger(__name__)
 
@@ -262,8 +263,6 @@ def evaluate_new_work(
     fails closed for new obligations: ``require_new_ai_work`` uses it so a
     broken meter cannot authorize fresh AI work.
     """
-    from app.observability.tracing import structured_log
-
     if on_policy_error not in ("allow", "deny"):
         raise ValueError("on_policy_error must be 'allow' or 'deny'")
 

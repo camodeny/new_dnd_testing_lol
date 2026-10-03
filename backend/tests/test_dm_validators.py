@@ -17,6 +17,7 @@ import pytest
 
 from app.dm.contract import CONTRACT_VERSION, normalize_contract
 from app.dm.context import AuthorizationScope, ContextAudience, ContextRecord, LaneName, SourceRef, assemble_context_packet
+import app.dm.validators as validators_mod
 from app.dm.validators import (
     ValidatorError,
     ValidatorRejectionError,
@@ -36,8 +37,6 @@ def _packet(*, campaign_id=None, thread_id=None, audience="campaign", user_ids=N
     status = {
         LaneName.CURRENT_SCENE: "not_applicable",
         LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
-        LaneName.CLOCKS_PRESSURES: "not_applicable",
-        LaneName.COMBAT_HOOKS: "not_applicable",
         LaneName.RELEVANT_CANON: "not_applicable",
         LaneName.REPAIR_DIRECTIVES: "not_applicable",
     }
@@ -50,6 +49,40 @@ def _packet(*, campaign_id=None, thread_id=None, audience="campaign", user_ids=N
     return pkt, cid, tid
 
 
+def _known(pkt, ids):
+    """Packet with an entity-registry record naming ``ids`` as canonical."""
+    entities = []
+    for entry in ids:
+        low = str(entry).strip().lower()
+        prefix = low.split(":", 1)[0] if ":" in low else ""
+        kind = "character" if prefix in ("character", "char") else (
+            prefix if prefix in ("npc", "location", "object", "entity") else None)
+        entities.append({"id": str(entry), "kind": kind})
+    if not entities:
+        return pkt
+    registry = ContextRecord(
+        record_id="entity-registry:test", required=False, priority=10,
+        value={"entities": entities},
+        sources=[SourceRef(source_type="world_entity", source_id="registry", source_version="1")],
+        authorization=AuthorizationScope(campaign_id=pkt.audience.campaign_id),
+        visibility="dm_only", use="adjudication_only",
+    )
+    records = {lane.name: list(lane.records) for lane in pkt.lanes}
+    records[LaneName.RELEVANT_CANON].append(registry)
+    status = {lane.name: lane.authority_status for lane in pkt.lanes}
+    status[LaneName.RELEVANT_CANON] = "authoritative"
+    return assemble_context_packet(audience=pkt.audience, records=records, lane_status=status)
+
+
+def _regen_with(pipe, *args, **kwargs):
+    original = validators_mod.default_pipeline
+    validators_mod.default_pipeline = pipe
+    try:
+        return run_with_bounded_regeneration(*args, **kwargs)
+    finally:
+        validators_mod.default_pipeline = original
+
+
 def _base(beats, **over):
     raw = {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": beats}
     raw.update(over)
@@ -59,7 +92,7 @@ def _base(beats, **over):
 def test_voluntary_pc_action_without_declaration_rejected():
     pkt, _, _ = _packet(user_ids=[str(uuid.uuid4())])
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara casts fireball", "claim_kind": "world_fact", "origin": "dm_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"character:char:elara", "char:elara"})
+    r = validate_contract(c, _known(pkt, {"character:char:elara", "char:elara"}))
     assert not r.passed
     assert any(v.code == "voluntary_pc_action_without_player_declaration" for v in r.violations)
     # before first visible chunk: public_projection would still hide, but validator already failed
@@ -77,7 +110,7 @@ def test_valid_player_declaration_passes():
     aud = ContextAudience(campaign_id=cid, thread_id=tid, audience="campaign", user_ids=[str(uuid.uuid4())])
     rec = ContextRecord(record_id="submission:s1", value={"submission_id": "s1"}, sources=[SourceRef(source_type="player_submission", source_id="s1", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="campaign")
     pkt2, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PLAYER_INPUTS: [rec]})
-    r = validate_contract(c, pkt2, known_entity_ids={"char:elara"})
+    r = validate_contract(c, _known(pkt2, {"char:elara"}))
     # agency should pass; provenance should pass because evidence_refs now in known_sources (record_id)
     assert r.passed or all(v.category != "agency" for v in r.violations)
 
@@ -89,7 +122,7 @@ def test_valid_involuntary_consequence_passes():
     pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PLAYER_INPUTS: [rec]})
     # Constrained dice outcome is the only character-authored non-declaration that is allowed
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara is shoved prone by the guard", "claim_kind": "roll_outcome", "origin": "roll_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}, "roll_request_id": "roll_1"}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"char:elara"})
+    r = validate_contract(c, _known(pkt, {"char:elara"}))
     assert r.passed, [v.code for v in r.violations]
 
     # Correct modeling for other imposed consequences is npc actor with pc as target, not pc actor.
@@ -97,7 +130,7 @@ def test_valid_involuntary_consequence_passes():
     know = ContextRecord(record_id="knowledge:npc:guard", value={"character_id": "", "subject_entity_id": "npc:guard", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k1", "target_kind": "entity", "target_id": "char:elara", "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}, sources=[SourceRef(source_type="world_entity", source_id="npc:guard", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="dm_only", use="adjudication_only")
     pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PLAYER_INPUTS: [rec], LaneName.KNOWLEDGE_VISIBILITY: [know]}, extra_status={LaneName.KNOWLEDGE_VISIBILITY: "authoritative"})
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Guard shoves Elara prone", "claim_kind": "observation", "origin": "dm_adjudication", "actor_ref": {"type": "npc", "id": "npc:guard"}, "target_refs": [{"type": "character", "id": "char:elara"}], "trigger_refs": ["s1"]}]}])
-    r2 = validate_contract(c2, pkt, known_entity_ids={"npc:guard", "char:elara"})
+    r2 = validate_contract(c2, _known(pkt, {"npc:guard", "char:elara"}))
     assert r2.passed
 
 
@@ -105,16 +138,16 @@ def test_voluntary_movement_and_attack_still_rejected():
     pkt, _, _ = _packet()
     # Voluntary movement as world_fact with character actor must be rejected even with trigger
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara moved to the door", "claim_kind": "world_fact", "origin": "dm_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}, "trigger_refs": ["submission:s1"]}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"char:elara"})
+    r = validate_contract(c, _known(pkt, {"char:elara"}))
     assert any(v.code == "voluntary_pc_action_without_player_declaration" for v in r.violations)
 
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara hit the guard", "claim_kind": "world_fact", "origin": "dm_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}, "target_refs": [{"type": "npc", "id": "npc:guard"}]}]}])
-    r2 = validate_contract(c2, pkt, known_entity_ids={"char:elara", "npc:guard"})
+    r2 = validate_contract(c2, _known(pkt, {"char:elara", "npc:guard"}))
     assert any(v.code == "voluntary_pc_action_without_player_declaration" for v in r2.violations)
 
     # Substring "hit" inside "white" must not bypass — still voluntary
     c3 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara admires the white wall", "claim_kind": "world_fact", "origin": "dm_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}}]}])
-    r3 = validate_contract(c3, pkt, known_entity_ids={"char:elara"})
+    r3 = validate_contract(c3, _known(pkt, {"char:elara"}))
     assert any(v.code == "voluntary_pc_action_without_player_declaration" for v in r3.violations)
 
 
@@ -124,7 +157,7 @@ def test_voluntary_action_mislabeled_resolver_evidence_still_rejected():
     rec = ContextRecord(record_id="evidence:valid", value={"fact": "some evidence"}, sources=[SourceRef(source_type="evidence", source_id="valid", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="campaign")
     pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.RELEVANT_CANON: [rec]})
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara attacks the guard", "claim_kind": "world_fact", "origin": "resolver_evidence", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["evidence:valid"]}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"char:elara", "npc:guard"})
+    r = validate_contract(c, _known(pkt, {"char:elara", "npc:guard"}))
     assert any(v.code == "voluntary_pc_action_without_player_declaration" for v in r.violations)
 
 
@@ -136,7 +169,7 @@ def test_cross_player_control_rejected():
     sub = ContextRecord(record_id="submission:s1", value={"submission_id": "s1", "sequence": 1, "user_id": other, "character_id": "char:bob", "segments": [{"position": 0, "segment_type": "ic", "text": "I act"}]}, sources=[SourceRef(source_type="player_submission", source_id="s1", source_version="1")], authorization=AuthorizationScope(campaign_id=cid, thread_ids=[tid]), visibility="campaign")
     pkt, _, _ = _packet(campaign_id=cid, thread_id=tid, user_ids=[owner, other], extra_records={LaneName.PROTECTED_PCS: [pc], LaneName.PLAYER_INPUTS: [sub]}, extra_status={LaneName.CHARACTER_STATE: "not_applicable", LaneName.RULESET_IDENTITY: "not_applicable"})
     c = normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": [{"id": "beat_1", "type": "narration", "claims": [{"text": "Bob declares", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:bob"}, "evidence_refs": ["s1"]}]} ], "adjudication_input": {"submission_ids": ["s1"], "segments": [{"position": 0, "segment_type": "ic", "text": "I act"}]}})
-    r = validate_contract(c, pkt, known_entity_ids={"char:bob"})
+    r = validate_contract(c, _known(pkt, {"char:bob"}))
     assert not r.passed
     assert any(v.category == "ownership" for v in r.violations)
 
@@ -145,7 +178,7 @@ def test_invented_entity_rejected_and_new_entity_allowed():
     pkt, _, _ = _packet()
     # unknown canonical id
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See dragon", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "npc:unknown_dragon"}]}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"npc:known"})
+    r = validate_contract(c, _known(pkt, {"npc:known"}))
     assert not r.passed
     assert any(v.code == "unknown_canonical_id" for v in r.violations)
 
@@ -156,27 +189,27 @@ def test_invented_entity_rejected_and_new_entity_allowed():
     pkt3, _, _ = _packet(campaign_id=cid2, thread_id=tid2, extra_records={LaneName.PLAYER_INPUTS: [sub]})
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "sub-uuid-123"}]}]}])
     # Even though submission ID is known as a source, it is not a typed entity, so entity validator should reject
-    r2 = validate_contract(c2, pkt3, known_entity_ids={"character:char:elara"})
+    r2 = validate_contract(c2, _known(pkt3, {"character:char:elara"}))
     assert any(v.code in ("unknown_canonical_id", "missing_identity_authority") for v in r2.violations)
 
     # new entity proposal passes
     c3 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state"}]} ], new_entities=[{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "New Dragon"}])
-    r3 = validate_contract(c3, pkt, known_entity_ids={"npc:known"})
+    r3 = validate_contract(c3, _known(pkt, {"npc:known"}))
     assert r3.passed
 
     # missing identity authority fails closed when refs exist but no allowlist
     c4 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "npc:anything"}]}]}])
-    r4 = validate_contract(c4, pkt, known_entity_ids=set())
+    r4 = validate_contract(c4, _known(pkt, set()))
     # pkt has no typed entities, so should fail closed with missing_identity_authority
     assert any(v.code == "missing_identity_authority" for v in r4.violations)
 
     # typed raw escape: character:123 must not authorize npc with same raw id
     c5 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "character:123"}]}]}])
-    r5 = validate_contract(c5, pkt, known_entity_ids={"character:123"})
+    r5 = validate_contract(c5, _known(pkt, {"character:123"}))
     assert any(v.code == "unknown_canonical_id" for v in r5.violations)
     # bare id 123 should authorize npc 123 (bare wildcard)
     c6 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "123"}]}]}])
-    r6 = validate_contract(c6, pkt, known_entity_ids={"123"})
+    r6 = validate_contract(c6, _known(pkt, {"123"}))
     assert not any(v.code == "unknown_canonical_id" for v in r6.violations)
 
 
@@ -196,37 +229,36 @@ def test_provenance_unknown_source_ref_rejected():
 def test_unsupported_player_theory_promoted_rejected():
     pkt, _, _ = _packet()
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Theory X", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:a"}, "evidence_refs": ["s1"]}, {"text": "Theory X", "claim_kind": "world_fact", "origin": "dm_adjudication"}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"char:a"})
+    r = validate_contract(c, _known(pkt, {"char:a"}))
     assert any(v.code == "player_claim_promoted_to_fact" for v in r.violations)
     # with evidence, promotion is allowed
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Theory X", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:a"}, "evidence_refs": ["s1"]}, {"text": "Theory X", "claim_kind": "world_fact", "origin": "resolver_evidence", "evidence_refs": ["evidence:1"]}]}])
-    r2 = validate_contract(c2, pkt, known_entity_ids={"char:a"})
+    r2 = validate_contract(c2, _known(pkt, {"char:a"}))
     assert not any(v.code == "player_claim_promoted_to_fact" for v in r2.violations)
 
 
 def test_lying_npc_promoted_rejected():
     pkt, _, _ = _packet()
     c = normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": [{"id": "beat_1", "type": "npc_dialogue", "speaker_ref": {"type": "npc", "id": "npc:liar"}, "speaker_public_name": "Liar", "claims": [{"text": "Gold is free", "claim_kind": "npc_utterance", "origin": "dm_adjudication", "actor_ref": {"type": "npc", "id": "npc:liar"}}], "truth_status": "deceptive", "dm_private_context": "Lying"}, {"id": "beat_2", "type": "narration", "claims": [{"text": "Gold is free", "claim_kind": "world_fact", "origin": "dm_adjudication"}]}]})
-    r = validate_contract(c, pkt, known_entity_ids={"npc:liar"})
+    r = validate_contract(c, _known(pkt, {"npc:liar"}))
     assert any(v.code == "npc_utterance_promoted_to_fact" for v in r.violations)
 
 
 def test_private_leak_in_shared_audience_rejected_and_private_allowed():
     pkt, _, _ = _packet(audience="campaign")
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Private secret", "claim_kind": "observation", "origin": "established_state", "visibility": "dm_private"}]}])
-    r = validate_contract(c, pkt, private_fact_texts={"Private secret"})
+    r = validate_contract(c, pkt)
     assert any(v.category == "visibility" for v in r.violations)
     assert any(v.code == "private_fact_in_shared_audience" for v in r.violations)
-    assert any(v.code == "private_semantic_leak" for v in r.violations)
 
     # private audience allows same claim
     pkt_priv, _, _ = _packet(audience="private")
-    r2 = validate_contract(c, pkt_priv, private_fact_texts={"Private secret"})
+    r2 = validate_contract(c, pkt_priv)
     # private audience should not flag visibility; only shared does
     assert r2.passed or not any(v.code == "private_fact_in_shared_audience" for v in r2.violations)
 
 
-def test_stale_canon_contradiction_from_packet_and_typed_facts():
+def test_stale_canon_contradiction_from_packet():
     # packet-derived canon: seal is intact
     cid = str(uuid.uuid4()); tid = str(uuid.uuid4())
     aud = ContextAudience(campaign_id=cid, thread_id=tid, audience="campaign", user_ids=[str(uuid.uuid4())])
@@ -240,12 +272,6 @@ def test_stale_canon_contradiction_from_packet_and_typed_facts():
     c2 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "The seal was cracked before presentation", "claim_kind": "world_fact", "origin": "resolver_evidence", "evidence_refs": ["evidence:1"]}]}])
     r2 = validate_contract(c2, pkt)
     assert not any(v.code == "canon_contradiction" for v in r2.violations)
-
-    # typed canon_facts with explicit forbids
-    pkt2, _, _ = _packet()
-    c3 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "The seal was cracked", "claim_kind": "world_fact", "origin": "dm_adjudication"}]}])
-    r3 = validate_contract(c3, pkt2, canon_facts={"seal_state": {"value": "intact", "forbids": ["cracked"]}})
-    assert any(v.code == "canon_contradiction" for v in r3.violations)
 
 
 def test_fail_closed_on_validator_execution_error():
@@ -266,7 +292,7 @@ def test_fail_closed_on_validator_execution_error():
 def test_rejection_structured_and_regeneration_wires_feedback():
     pkt, _, _ = _packet()
     c_bad = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara casts fireball", "claim_kind": "world_fact", "origin": "dm_adjudication", "actor_ref": {"type": "character", "id": "char:elara"}}]}])
-    r = validate_contract(c_bad, pkt, known_entity_ids={"char:elara"})
+    r = validate_contract(c_bad, _known(pkt, {"char:elara"}))
     assert not r.passed
     fb = format_rejection_for_retry(r)
     assert r.correlation_id in fb
@@ -289,7 +315,7 @@ def test_rejection_structured_and_regeneration_wires_feedback():
     cid = str(uuid.uuid4()); tid = str(uuid.uuid4())
     rec = ContextRecord(record_id="submission:s1", value={"submission_id": "s1"}, sources=[SourceRef(source_type="player_submission", source_id="s1", source_version="1")], authorization=AuthorizationScope(campaign_id=cid), visibility="campaign")
     pkt2, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PLAYER_INPUTS: [rec]})
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt2, known_entity_ids={"char:elara"}, max_regenerations=3)
+    contract, report = run_with_bounded_regeneration(adjudicate, _known(pkt2, {"char:elara"}), max_regenerations=3)
     assert report.passed
     assert len(calls) == 2
     assert calls[0] is None
@@ -299,33 +325,16 @@ def test_rejection_structured_and_regeneration_wires_feedback():
     def always_bad(packet=None, feedback=None):
         return c_bad
     try:
-        run_with_bounded_regeneration(always_bad, pkt, known_entity_ids={"char:elara"}, max_regenerations=1)
+        run_with_bounded_regeneration(always_bad, _known(pkt, {"char:elara"}), max_regenerations=1)
         assert False
     except ValidatorRejectionError:
         pass
 
 
-def test_extension_point_without_rewriting_orchestration():
-    pipe = ValidatorPipeline()
-    n = len(pipe.validators)
-    class MyCombat:
-        name = "my_combat"; category = "combat"
-        def validate(self, contract, packet, **kw):
-            from app.dm.validators import ValidatorResult
-            return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=0.1)
-    pipe.add_validator(MyCombat(), after="rules_validator")
-    assert len(pipe.validators) == n + 1
-    # original default pipeline still has same order
-    pkt, _, _ = _packet()
-    c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Hello", "claim_kind": "observation", "origin": "established_state"}]}])
-    r = pipe.validate(c, pkt)
-    assert any(res.validator == "my_combat" for res in r.results)
-
-
 def test_observability_latency_per_validator():
     pkt, _, _ = _packet()
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara declares", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["s1"]}]}])
-    r = validate_contract(c, pkt, known_entity_ids={"char:elara"})
+    r = validate_contract(c, _known(pkt, {"char:elara"}))
     assert all(res.latency_ms >= 0 for res in r.results)
     assert r.total_latency_ms > 0
     assert len(r.results) == len(ValidatorPipeline().validators)
@@ -354,10 +363,10 @@ def test_entity_typed_vs_bare_allowlist():
     pkt_typed, _, _ = _packet(campaign_id=cid, thread_id=tid, extra_records={LaneName.PROTECTED_PCS: [pc]}, extra_status={LaneName.CHARACTER_STATE: "not_applicable", LaneName.RULESET_IDENTITY: "not_applicable"})
     # npc with same numeric id 123 should NOT be authorized by character:123
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state", "target_refs": [{"type": "npc", "id": "123"}]}]}])
-    r = validate_contract(c, pkt_typed, known_entity_ids=set())
+    r = validate_contract(c, _known(pkt_typed, set()))
     assert any(v.code == "unknown_canonical_id" for v in r.violations)
     # Bare caller-supplied id 123 should authorize any type
-    r2 = validate_contract(c, pkt_typed, known_entity_ids={"123"})
+    r2 = validate_contract(c, _known(pkt_typed, {"123"}))
     assert r2.passed or not any(v.code == "unknown_canonical_id" for v in r2.violations)
 
 
@@ -368,11 +377,11 @@ def test_provenance_includes_adjudication_input():
     # No PLAYER_INPUTS lane, but contract carries adjudication_input
     c = normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": [{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara declares", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["sub-xyz"], "trigger_refs": []}]}], "adjudication_input": {"submission_ids": ["sub-xyz"], "segments": [{"position": 0, "segment_type": "ic", "text": "I act"}]}})
     # With packet present, sub-xyz is in adjudication_input, so should NOT be flagged as unknown_source_ref
-    r = validate_contract(c, pkt, known_entity_ids={"char:elara"})
+    r = validate_contract(c, _known(pkt, {"char:elara"}))
     assert not any(v.code == "unknown_source_ref" for v in r.violations)
     # Hallucinated ref not in adjudication_input should be flagged
     c2 = normalize_contract({"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": [{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara declares", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["hallucinated"], "trigger_refs": []}]}], "adjudication_input": {"submission_ids": ["sub-xyz"], "segments": [{"position": 0, "segment_type": "ic", "text": "I act"}]}})
-    r2 = validate_contract(c2, pkt, known_entity_ids={"char:elara"})
+    r2 = validate_contract(c2, _known(pkt, {"char:elara"}))
     assert any(v.code == "unknown_source_ref" for v in r2.violations)
 
 
@@ -385,7 +394,7 @@ def test_packet_only_retry_fixture():
     c_good = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara declares she waits", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["s1"]}]}])
     calls = []
 
-    def packet_only_adjudicate(packet):
+    def packet_only_adjudicate(packet, feedback=None):
         calls.append(type(packet).__name__ if packet else None)
         if len(calls) == 1:
             assert isinstance(packet, type(pkt))
@@ -395,18 +404,9 @@ def test_packet_only_retry_fixture():
         assert any(lane.name == LaneName.REPAIR_DIRECTIVES and lane.records for lane in packet.lanes)
         return c_good
 
-    contract, report = run_with_bounded_regeneration(packet_only_adjudicate, pkt, known_entity_ids={"char:elara"}, max_regenerations=2)
+    contract, report = run_with_bounded_regeneration(packet_only_adjudicate, _known(pkt, {"char:elara"}), max_regenerations=2)
     assert report.passed
     assert calls == [type(pkt).__name__, type(pkt).__name__]
-
-    # Ensure inner TypeError is not swallowed as signature mismatch
-    def bad_inner(packet, feedback):
-        raise TypeError("inner failure")
-    try:
-        run_with_bounded_regeneration(bad_inner, pkt, known_entity_ids={"char:elara"}, max_regenerations=1)
-        assert False
-    except TypeError as exc:
-        assert "inner failure" in str(exc)
 
 
 def test_structural_normalization_error_retries_with_feedback():
@@ -459,7 +459,7 @@ def test_missing_perspective_narrows_without_model_retry():
         calls.append(feedback)
         return bad
 
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    contract, report = _regen_with(pipe, adjudicate, pkt, max_regenerations=3)
     assert report.passed
     assert len(calls) == 1
     assert contract.mode == "respond"
@@ -479,7 +479,7 @@ def test_missing_perspective_all_offending_degrades_to_silent():
         calls.append(feedback)
         return bad
 
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    contract, report = _regen_with(pipe, adjudicate, pkt, max_regenerations=3)
     assert report.passed
     assert len(calls) == 1
     assert contract.mode == "silent"
@@ -507,7 +507,7 @@ def test_missing_perspective_never_silences_turn_with_effects():
         calls.append(feedback)
         return bad if len(calls) == 1 else good
 
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    contract, report = _regen_with(pipe, adjudicate, pkt, max_regenerations=3)
     assert report.passed
     assert len(calls) == 2
     assert "npc_utterance_ambiguous_knowledge" in calls[1]
@@ -527,7 +527,7 @@ def test_missing_perspective_with_effects_fails_visibly_when_budget_exhausted():
         return bad
 
     with pytest.raises(ValidatorRejectionError):
-        run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=1)
+        _regen_with(pipe, adjudicate, pkt, max_regenerations=1)
     assert len(calls) == 2
 
 
@@ -556,7 +556,7 @@ def test_mixed_violations_still_retry_model_then_narrow():
         calls.append(feedback)
         return bad
 
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, max_regenerations=3)
+    contract, report = _regen_with(pipe, adjudicate, pkt, max_regenerations=3)
     assert report.passed
     assert len(calls) == 2
     assert len(contract.beats) == 1
@@ -590,7 +590,7 @@ def test_perspective_repair_hook_retries_once_and_passes():
                 lane.records.append(rec)
         return new_packet
 
-    contract, report = run_with_bounded_regeneration(adjudicate, pkt, pipeline=pipe, packet_repair=repair, max_regenerations=3)
+    contract, report = _regen_with(pipe, adjudicate, pkt, packet_repair=repair, max_regenerations=3)
     assert report.passed
     assert len(calls) == 2
     assert len(repairs) == 1

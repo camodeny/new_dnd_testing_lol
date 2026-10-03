@@ -9,10 +9,6 @@ import os
 RETRIABLE_STATUS_CODES = {404, 408, 409, 425, 429}
 
 
-def _enabled(value):
-    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on', 'enabled'}
-
-
 def default_max_attempts():
     return max(1, int(os.environ.get('LLM_MAX_ATTEMPTS', os.environ.get('OPENROUTER_MAX_ATTEMPTS', '4'))))
 

@@ -31,7 +31,7 @@ pattern against synthetic profiles. Production Supabase JWT is untouched —
 no mock auth module is introduced.
 
 Model boundary: the scenario runs on #373's deterministic fake-provider
-mode (``app.dm.fake_provider``) installed at the provider boundary. The
+mode (``tests.support.fake_provider``) installed at the provider boundary. The
 production ``adjudicate_with_failover`` path, contract parsing, validation,
 narration, stream persistence, and commit all run unmodified; only the
 external model bytes come from fixtures keyed by logical step/input.
@@ -55,11 +55,11 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.campaigns.campaign_start import OPENING_OOC_TEXT  # noqa: E402
-from app.dm.fake_provider import build_phase0_provider  # noqa: E402
+from tests.support.fake_provider import build_phase0_provider  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
 from app.dm.turns import list_turns  # noqa: E402
-from app.dm_streams.service import reconstruct_text  # noqa: E402
-from app.e2e.diagnostics import (  # noqa: E402
+from app.dm.streams import reconstruct_text  # noqa: E402
+from tests.support.diagnostics import (  # noqa: E402
     CATEGORY_STAGE,
     STAGE_COMMIT,
     STAGE_CONTINUATION,
@@ -431,10 +431,8 @@ def scn(monkeypatch, request):
 
     monkeypatch.setenv("NODE_ENV", "test")
     for module in (
-        "app.campaigns.router",
-        "app.runtime.router",
+        "app.deps.auth",
         "app.snapshot.router",
-        "app.dm.router",
         "app.characters.router",
     ):
         monkeypatch.setattr(
@@ -943,9 +941,8 @@ def run_phase0_solo_scenario(
 ) -> None:
     """Run the one Phase 0 scenario flow for fake and opt-in real AI.
 
-    Deterministic and generative modes require narration for every turn.
-    Experimental decision mode may additionally accept a succeeded, persisted
-    ``silent`` contract without inventing a stream; all other structural,
+    Narration is required for every turn unless ``allow_silent`` accepts a
+    succeeded, persisted ``silent`` contract without inventing a stream; all other structural,
     reconnect, and continuation assertions remain shared.
     """
     # Setup: synthetic fixtures + authoritative select/ready.

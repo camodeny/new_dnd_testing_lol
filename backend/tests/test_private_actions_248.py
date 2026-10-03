@@ -8,7 +8,6 @@ ever emitting public/shared narration or broadening visibility.
 from __future__ import annotations
 
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, select
@@ -23,26 +22,22 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
 from app.campaigns.events import list_campaign_events  # noqa: E402
-from app.decisions import DecisionService  # noqa: E402
-from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
-from app.decisions.contracts import ChoiceResult, DecisionResponse  # noqa: E402
-from app.dm import decision_routing as routing  # noqa: E402
 from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
 from app.dm.execution import execute_dm_attempt  # noqa: E402
-from app.dm.turns import commit_turn_with_effects, coordinate_turn  # noqa: E402
+from app.dm.turns import commit_turn, coordinate_turn  # noqa: E402
 from app.realtime.channels import live_table_channel  # noqa: E402
-from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import (  # noqa: E402
+from app.realtime.service import set_realtime_publisher  # noqa: E402
+from tests.support.realtime import InMemoryRealtimePublisher  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import (  # noqa: E402
     can_read_thread,
     create_private_thread,
     get_or_create_private_gameplay_thread,
 )
 from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
-from models.dm import DmTurn, DmTurnAttempt, PlayerRollRequest  # noqa: E402
+from models.dm import DMStream, DmTurn, DmTurnAttempt, PlayerRollRequest  # noqa: E402
 from models.profiles import Profile  # noqa: E402
-from models.reliability import DecisionTelemetry  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
 
 SECRET = "moonmoth vault passphrase MOTH-SIGIL-248"
@@ -85,6 +80,16 @@ def ctx():
     db.close()
 
 
+def _completed_streams(db, campaign_id, thread_id):
+    return list(db.execute(
+        select(DMStream).where(
+            DMStream.campaign_id == campaign_id,
+            DMStream.thread_id == thread_id,
+            DMStream.status == "completed",
+        ).order_by(DMStream.created_at.asc())
+    ).scalars().all())
+
+
 def _db(ctx):
     return ctx["factory"]()
 
@@ -120,20 +125,6 @@ def _respond_contract(text, staged=()):
     })
 
 
-def _silent_service():
-    return DecisionService(
-        FakeDecisionAdapter({routing.ROUTE_QUESTION_ID: routing.ROUTE_SILENT_ID}))
-
-
-def _failing_decision_service():
-    # No scripted answer: the adapter raises malformed -> generative escape.
-    return DecisionService(FakeDecisionAdapter({}))
-
-
-def _must_not_run(packet, feedback=None):
-    raise AssertionError("generative adjudication must not run on the direct path")
-
-
 # ── Coordination ──────────────────────────────────────────────────────────
 
 def test_private_submission_coordinates_private_turn(ctx):
@@ -149,15 +140,22 @@ def test_private_submission_coordinates_private_turn(ctx):
         db.close()
 
 
-# ── Bounded direct path (no generative call) ──────────────────────────────
+# ── Silent completion keeps private scope ─────────────────────────────────
 
-def test_private_supported_intent_uses_bounded_direct_path(ctx):
+def test_private_silent_turn_commits_private_event(ctx):
     db = _db(ctx)
     try:
         _, turn, attempt = _submit_private(db, ctx, "ooc rest note, nothing happens")
+
+        def _silent(packet, feedback=None):
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION,
+                "mode": "silent",
+                "reason": "no player-visible response required",
+            })
+
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_must_not_run, narrator="deterministic",
-            decision_service=_silent_service(),
+            db, attempt.id, adjudicate=_silent, narrator="deterministic",
         )
         assert result is not None
         assert db.get(DmTurn, turn.id).status == "succeeded"
@@ -165,11 +163,6 @@ def test_private_supported_intent_uses_bounded_direct_path(ctx):
         assert event.visibility == "private"
         assert (event.payload or {}).get("thread_id") == str(ctx["private_id"])
         assert (event.payload or {}).get("audience") == "private"
-        # Decision telemetry carries IDs only — never the secret.
-        rows = db.query(DecisionTelemetry).all()
-        assert rows, "expected routing telemetry"
-        blob = str([(r.candidate_ids, r.selected_id, r.revalidation_error) for r in rows])
-        assert SECRET.split()[0] not in blob and "MOTH-SIGIL-248" not in blob
     finally:
         db.close()
 
@@ -189,7 +182,6 @@ def test_private_creative_action_escalates_with_input_intact(ctx):
 
         result = execute_dm_attempt(
             db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service(),
         )
         assert result is not None
         assert db.get(DmTurn, turn.id).status == "succeeded"
@@ -197,85 +189,36 @@ def test_private_creative_action_escalates_with_input_intact(ctx):
         packet = seen["packet"]
         assert packet.audience.audience == "private"
         assert secret_text in packet.serialize_for_adjudication()
-        # ...while shared telemetry/projections carry no secret content.
-        rows = db.query(DecisionTelemetry).all()
-        blob = str([(r.candidate_ids, r.selected_id, r.revalidation_error) for r in rows])
-        assert "MOTH-SIGIL-248" not in blob
         event = result.event
         assert event.visibility == "private"
     finally:
         db.close()
 
 
-def test_private_frame_contains_only_authorized_state(ctx):
-    db = _db(ctx)
-    try:
-        from app.rolls.service import request_rolls
-
-        _, turn, attempt = _submit_private(db, ctx, "I search the vault for traps.")
-        request_rolls(
-            db, campaign_id=ctx["campaign_id"], turn_id=turn.id, attempt_id=attempt.id,
-            requests=[{
-                "request_key": "trap-check", "requested_user_id": str(ctx["alice"]),
-                "character_id": str(ctx["alice_char"]), "roll_kind": "check",
-                "ability_or_skill": "Perception", "label": "Trap search",
-                "advantage_state": "normal", "reason_public": "Search the vault",
-                "dc_private": 18,
-            }],
-        )
-        db.commit()
-        signals = routing.collect_signals(db, attempt, turn)
-        assert signals.audience == "private"
-        frame = routing.build_route_frame(signals)
-        assert frame.state["audience"] == "private"
-        blob = str(frame.state)
-        # Pending-roll labels only: the hidden DC never enters the frame.
-        assert "Trap search" in blob
-        assert "18" not in blob and "dc_private" not in blob
-    finally:
-        db.close()
-
-
-def test_private_primer_stays_thread_scoped():
-    from app.dm.context import ContextAudience, LaneName
+def test_private_deferral_advisory_stays_thread_scoped():
+    from app.dm.context import (
+        ContextAudience,
+        ForwardDmContextPacket,
+        LaneName,
+        assemble_context_packet,
+        attach_retry_deferral_advisory,
+    )
 
     for audience_kind, expect_visibility in (("private", "private"), ("campaign", "campaign")):
         audience = ContextAudience(
             campaign_id=str(uuid.uuid4()), thread_id=str(uuid.uuid4()),
             audience=audience_kind, user_ids=[str(uuid.uuid4())],
         )
-        lane = SimpleNamespace(name=LaneName.PLAYER_INPUTS, records=[])
-        packet = SimpleNamespace(
-            audience=audience, lanes=[lane],
-            model_copy=lambda deep=False: SimpleNamespace(
-                audience=audience,
-                lanes=[SimpleNamespace(name=LaneName.PLAYER_INPUTS, records=list(lane.records))],
-            ),
+        packet: ForwardDmContextPacket = assemble_context_packet(
+            audience=audience, records={},
+            lane_status={name: "not_applicable" for name in LaneName},
         )
-        primed = routing.attach_primer(
-            packet, {"selected_id": routing.ROUTE_SILENT_ID, "frame_id": "f1",
-                     "probability": 0.6, "confidence": 0.6, "margin": 0.1})
-        (record,) = primed.lanes[0].records
+        primed = attach_retry_deferral_advisory(packet, "disambiguate the figure")
+        lane = next(ln for ln in primed.lanes if ln.name == LaneName.PLAYER_INPUTS)
+        (record,) = lane.records
         assert record.visibility == expect_visibility
         if audience_kind == "private":
             assert record.authorization.thread_ids == [audience.thread_id]
-
-
-def test_unauthorized_attempt_never_builds_frame(ctx):
-    db = _db(ctx)
-    try:
-        _, turn, attempt = _submit_private(db, ctx, "I act in shadow.")
-        # Corrupt the audience binding: frame assembly must refuse.
-        attempt.audience = "campaign"
-        db.add(attempt)
-        db.commit()
-        outcome = routing.route_attempt(
-            db, attempt=attempt, turn=turn, decision_service=_silent_service())
-        assert outcome.directive == "escalate"
-        assert outcome.contract is None
-        assert outcome.trace.get("decision_skipped") is True
-    finally:
-        db.close()
 
 
 # ── Secret rolls: player-supplied, thread-scoped ───────────────────────────
@@ -313,8 +256,7 @@ def test_private_secret_roll_lifecycle(ctx):
             return _await_roll_contract(ctx)
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result.mode == "await_roll"
         assert db.get(DmTurn, turn.id).status == "awaiting_roll"
 
@@ -395,15 +337,14 @@ def test_private_canonical_effects_without_shared_narration(ctx):
             return _private_effect_contract()
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         event = result.event
         assert event.visibility == "private"
         assert (event.payload or {}).get("thread_id") == str(ctx["private_id"])
 
         # Hidden state mutated: the fact is durable but restricted.
-        from app.world.knowledge import list_facts
+        from app.world.facts import list_facts
 
         facts = [f for f in list_facts(db, ctx["campaign_id"]) if "moth" in (f.content or "")]
         assert len(facts) == 1
@@ -427,9 +368,7 @@ def test_private_canonical_effects_without_shared_narration(ctx):
                 rec["channel"] == live_table_channel(ctx["campaign_id"], ctx["private_id"])
 
         # Shared thread has no DM streams from this turn.
-        from app.dm_streams.service import list_streams_for_thread
-
-        assert list_streams_for_thread(db, ctx["campaign_id"], ctx["shared_id"]) == []
+        assert _completed_streams(db, ctx["campaign_id"], ctx["shared_id"]) == []
     finally:
         set_realtime_publisher(None)
         db.close()
@@ -446,8 +385,7 @@ def test_private_event_visible_to_later_private_reasoning_not_shared(ctx):
             return _private_effect_contract()
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         event_id = result.event.id
 
@@ -507,7 +445,7 @@ def test_private_attempt_fails_closed_with_unprocessed_shared_event(ctx):
         result = execute_dm_attempt(
             db, shared_attempt.id,
             adjudicate=lambda packet, feedback=None: _respond_contract("A bell rings across the harbor."),
-            narrator="deterministic", decision_service=_failing_decision_service())
+            narrator="deterministic")
         assert result is not None
         assert result.event.visibility in {"public", "campaign"}
 
@@ -523,58 +461,7 @@ def test_private_attempt_fails_closed_with_unprocessed_shared_event(ctx):
 
 # ── Failure, idempotency, post-turn, access ────────────────────────────────
 
-def test_stale_private_candidate_escalates(ctx):
-    db = _db(ctx)
-    try:
-        _, turn, attempt = _submit_private(db, ctx, "I slip into shadow.")
-
-        def _decide(request):
-            # A newer private submission supersedes this attempt mid-decision.
-            accept_submission(
-                db, campaign_id=ctx["campaign_id"], user_id=ctx["alice"],
-                raw_content="I also hold my breath.",
-                segments=[{"type": "ic", "text": "I also hold my breath."}],
-                thread_id=str(ctx["private_id"]), audience="private")
-            coordinate_turn(db, ctx["campaign_id"], str(ctx["private_id"]),
-                            audience="private", commit=False)
-            db.commit()
-            ids = [c.id for c in request.questions[0].candidates]
-            probs = {i: (1.0 if i == routing.ROUTE_SILENT_ID else 0.0) for i in ids}
-            return DecisionResponse(results={
-                request.questions[0].question_id: ChoiceResult(
-                    question_id=request.questions[0].question_id,
-                    selected_id=routing.ROUTE_SILENT_ID,
-                    probabilities=probs, confidence=1.0)},
-                provider="stub", model="stub", latency_ms=0, trace_id="t",
-                operation_id="o", usage={})
-
-        service = SimpleNamespace(decide=_decide)
-        outcome = routing.route_attempt(
-            db, attempt=attempt, turn=turn, decision_service=service)
-        assert outcome.directive == "escalate"
-        assert outcome.contract is None
-        assert "revalidation_error" in outcome.trace
-        # The stale decision mutated nothing prematurely.
-        assert db.get(DmTurnAttempt, attempt.id).staged_effects in (None, [])
-
-        # The superseding attempt still executes normally with private scope.
-        fresh_turn = db.get(DmTurn, turn.id)
-        assert str(fresh_turn.current_attempt_id) != str(attempt.id)
-
-        def _generative(packet, feedback=None):
-            return _respond_contract("Shadow passes over.")
-
-        result = execute_dm_attempt(
-            db, fresh_turn.current_attempt_id, adjudicate=_generative,
-            narrator="deterministic", decision_service=_failing_decision_service())
-        assert result is not None
-        assert result.event.visibility == "private"
-        assert db.get(DmTurn, turn.id).status == "succeeded"
-    finally:
-        db.close()
-
-
-def test_decision_failure_leaves_no_premature_mutation(ctx):
+def test_adjudication_runs_before_any_staged_mutation(ctx):
     db = _db(ctx)
     try:
         _, turn, attempt = _submit_private(db, ctx, "I attempt something odd.")
@@ -584,8 +471,7 @@ def test_decision_failure_leaves_no_premature_mutation(ctx):
             return _respond_contract("The dark answers.")
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         assert db.get(DmTurn, turn.id).status == "succeeded"
     finally:
@@ -601,14 +487,13 @@ def test_duplicate_private_commit_applies_once(ctx):
             return _private_effect_contract()
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         before = db.query(CampaignDomainEvent).filter_by(
             campaign_id=ctx["campaign_id"]).count()
         fresh_attempt = db.get(DmTurnAttempt, attempt.id)
         op = fresh_attempt.commit_operation_id or str(attempt.id)
-        t2, a2, event2 = commit_turn_with_effects(
+        t2, a2, event2 = commit_turn(
             db, turn.id, attempt.id, operation_id=op)
         after = db.query(CampaignDomainEvent).filter_by(
             campaign_id=ctx["campaign_id"]).count()
@@ -621,7 +506,7 @@ def test_duplicate_private_commit_applies_once(ctx):
 
 def test_post_turn_preserves_private_visibility(ctx):
     from app.post_turn.service import run_post_turn_range
-    from app.world.knowledge import list_facts
+    from app.world.facts import list_facts
 
     db = _db(ctx)
     try:
@@ -631,8 +516,7 @@ def test_post_turn_preserves_private_visibility(ctx):
             return _private_effect_contract()
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         out = run_post_turn_range(
             db, ctx["campaign_id"], result.event.sequence, result.event.sequence)
@@ -649,7 +533,7 @@ def test_post_turn_preserves_private_visibility(ctx):
 
 
 def test_owner_denied_reconnect_stable_private_history(ctx):
-    from app.dm_streams.service import list_streams_for_thread, reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     db = _db(ctx)
     try:
@@ -671,8 +555,7 @@ def test_owner_denied_reconnect_stable_private_history(ctx):
             return _respond_contract("The dark keeps your counsel.")
 
         result = execute_dm_attempt(
-            db, attempt.id, adjudicate=_generative, narrator="deterministic",
-            decision_service=_failing_decision_service())
+            db, attempt.id, adjudicate=_generative, narrator="deterministic")
         assert result is not None
         stream_id = db.get(DmTurnAttempt, attempt.id).stream_id
         assert stream_id is not None
@@ -682,8 +565,8 @@ def test_owner_denied_reconnect_stable_private_history(ctx):
         try:
             assert reconstruct_text(db2, stream_id) != ""
             assert [str(s.id) for s in
-                    list_streams_for_thread(db2, ctx["campaign_id"], ctx["private_id"])]
-            assert list_streams_for_thread(db2, ctx["campaign_id"], ctx["shared_id"]) == []
+                    _completed_streams(db2, ctx["campaign_id"], ctx["private_id"])]
+            assert _completed_streams(db2, ctx["campaign_id"], ctx["shared_id"]) == []
             assert can_read_thread(db2, ctx["campaign_id"], ctx["private_id"], ctx["owner"]) is False
             assert can_read_thread(db2, ctx["campaign_id"], ctx["private_id"], ctx["bob"]) is False
         finally:

@@ -50,7 +50,52 @@ from app.decisions import (
     register_policy,
     to_decision_request,
 )
+from app.dm.turns import DM_TURN_RESOLVED
 from app.observability.tracing import structured_log
+from app.visibility.access import validate_grant_target_kind
+from app.visibility.policy import (
+    disclosure_rank,
+    effect_to_record_visibility,
+    normalize_visibility,
+    visibility_or_dm_only,
+)
+from app.world.facts import (
+    create_fact,
+    create_relation,
+    validate_epistemic_state,
+    validate_fact_content,
+    validate_relation_type,
+)
+from app.world.identity import (
+    DEFER as IDENTITY_DEFER,
+    KEEP_DISTINCT,
+    NEW_ENTITY,
+    build_identity_frame,
+    create_entity_after_resolution,
+    decide_identity,
+    exact_identity,
+    exact_identity_match,
+    normalize_alias,
+    stable_jit_key,
+    stored_identity_outcomes,
+)
+from app.world.knowledge import (
+    assert_knowledge,
+    grant_visibility,
+    list_knowledge_for_subject,
+    validate_knower_kind,
+    validate_knowledge_state,
+    validate_knowledge_target_kind,
+)
+from app.world.npcs import apply_npc_state, get_npc_state
+from app.world.service import (
+    UNSET,
+    apply_scene_update,
+    create_entity,
+    get_current_scene,
+    validate_entity_status,
+    validate_entity_type,
+)
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import WorldEntity
 
@@ -69,19 +114,6 @@ WRITE_CATEGORIES = (
     "knowledge", "scene", "visibility_grants",
 )
 
-# Visibility lattice for the widening cap (finding: a private source event
-# must not certify party-visible memory absent explicit disclosure).
-# Aliases collapse before ranking: party_known -> campaign,
-# dm_private -> dm_only.
-_VISIBILITY_RANK = {"dm_only": 0, "private": 1, "campaign": 2, "public": 3}
-
-# Staged-effect visibility vocabulary (RecordWorldEventArgs/RevealFactArgs)
-# onto the world lattice.
-_EFFECT_VISIBILITY_MAP = {
-    "public": "campaign", "party_known": "campaign", "dm_private": "dm_only",
-    "campaign": "campaign", "private": "private", "dm_only": "dm_only",
-}
-
 # Committed turn events the default compiler reads. Their payloads carry
 # turn_id/attempt_id locators into the durable attempt row, whose staged
 # effects and contract snapshot are committed gameplay — never rewritten.
@@ -89,7 +121,7 @@ _EFFECT_VISIBILITY_MAP = {
 # turn commit to that event type when it closes an adventure); its
 # payload carries the same turn/attempt fields.
 TURN_EVENT_TYPES = frozenset({
-    "dm.turn_committed", "dm.turn_resolved", "adventure.completed",
+    DM_TURN_RESOLVED, "adventure.completed",
 })
 
 # Staged effects already applied durably at turn commit: recompiling them
@@ -171,13 +203,11 @@ def validate_hint(hint: Any, *, event_sequence: int) -> CandidateAssertion:
         raise MaterializeError(f"event {event_sequence}: hint {key!r} data must be an object")
     visibility = hint.get("visibility", "dm_only")
     try:
-        from app.world.service import normalize_visibility
         visibility = normalize_visibility(visibility)
     except ValueError as exc:
         raise MaterializeError(f"event {event_sequence}: hint {key!r} has invalid visibility: {exc}") from exc
     epistemic_state = hint.get("epistemic_state", "claimed")
     if category in ("relations", "facts"):
-        from app.world.knowledge import validate_epistemic_state
         try:
             epistemic_state = validate_epistemic_state(epistemic_state)
         except ValueError as exc:
@@ -185,7 +215,6 @@ def validate_hint(hint: Any, *, event_sequence: int) -> CandidateAssertion:
                 f"event {event_sequence}: hint {key!r} has invalid epistemic_state: {exc}"
             ) from exc
     if category == "knowledge":
-        from app.world.epistemics import validate_knowledge_state
         try:
             validate_knowledge_state(data.get("knowledge_state", "knows"))
         except ValueError as exc:
@@ -236,10 +265,13 @@ def extract_candidates(events: list[CampaignDomainEvent]) -> list[CandidateAsser
 # ── Visibility widening cap ──────────────────────────────────────────────
 
 def visibility_rank(value: Any) -> int:
-    """Rank a visibility string on the disclosure lattice (fail closed)."""
-    from app.world.service import normalize_visibility
-    normalized = normalize_visibility(_EFFECT_VISIBILITY_MAP.get(str(value or "").strip(), value))
-    return _VISIBILITY_RANK[normalized]
+    """Rank a visibility string on the disclosure lattice (fail closed).
+
+    Staged-effect spellings (``party_known``/``dm_private``/effect ``public``)
+    collapse onto record vocabulary before ranking, so a private source event
+    cannot certify party-visible memory absent explicit disclosure.
+    """
+    return disclosure_rank(normalize_visibility(effect_to_record_visibility(value)))
 
 
 def _disclosure_allows(
@@ -289,15 +321,13 @@ def enforce_visibility_cap(
     same-range reveal_fact disclosure matching the assertion. Mechanical
     violations fail the run; generated ones are rejected by the caller.
     """
-    from app.world.service import normalize_visibility
-    target = normalize_visibility(_EFFECT_VISIBILITY_MAP.get(
-        str(assertion.visibility or "").strip(), assertion.visibility))
+    target = normalize_visibility(effect_to_record_visibility(assertion.visibility))
     assertion.visibility = target
     allowed = visibility_rank(source_event.visibility)
     disclosed = _disclosure_allows(
         assertion, disclosures, resolved_entity_id=resolved_entity_id)
     allowed = max(allowed, disclosed)
-    if _VISIBILITY_RANK[target] > allowed:
+    if disclosure_rank(target) > allowed:
         raise MaterializeError(
             f"{assertion.category}/{assertion.key}: visibility {target!r} widens "
             f"source seq {assertion.source_sequence} ({source_event.visibility!r}) "
@@ -319,7 +349,7 @@ def compile_committed_candidates(
 ) -> tuple[list[CandidateAssertion], dict[tuple[str, str], int], dict[str, int]]:
     """Compile candidates from committed turn structures (default source).
 
-    Loads each dm.turn_committed/dm.turn_resolved event's durable attempt
+    Loads each dm.turn_resolved event's durable attempt
     and translates staged effects the turn commit left unpersisted:
 
     - record_world_event -> confirmed-history fact (the commit handler
@@ -418,9 +448,8 @@ def compile_committed_candidates(
                             },
                         },
                     },
-                    visibility=_EFFECT_VISIBILITY_MAP.get(
-                        str(args.get("visibility") or "dm_private").strip(),
-                        "dm_only"),
+                    visibility=visibility_or_dm_only(effect_to_record_visibility(
+                        str(args.get("visibility") or "dm_private").strip())),
                     epistemic_state="confirmed", mechanical=True,
                     source_event_id=event.id, source_sequence=event.sequence,
                     source_effect_id=eff_id or None,
@@ -436,8 +465,7 @@ def compile_committed_candidates(
         if not isinstance(proposals, list):
             raise MaterializeError(
                 f"event {event.sequence}: contract new_entities must be a list")
-        from app.world.service import _stable_jit_key, _stored_identity_outcomes
-        stored_outcomes = _stored_identity_outcomes(attempt)
+        stored_outcomes = stored_identity_outcomes(attempt)
         for proposal in proposals:
             if not isinstance(proposal, dict):
                 raise MaterializeError(
@@ -453,7 +481,7 @@ def compile_committed_candidates(
                 # went through #214 (including KEEP_DISTINCT, which
                 # legitimately shares its name). Re-emitting it would
                 # split the duplicate into a third entity.
-                jit_key = _stable_jit_key(attempt.id, temp_id)
+                jit_key = stable_jit_key(attempt.id, temp_id)
                 promoted = db.execute(select(WorldEntity).where(
                     WorldEntity.campaign_id == campaign.id,
                     WorldEntity.idempotency_key == jit_key,
@@ -499,7 +527,6 @@ def resolve_entity_ref(db: Session, campaign_id: uuid.UUID, ref: Any):
     Returns (entity, how) via exact uuid/alias/name match, or (None, None).
     Name collisions are returned with how="name" for the bounded path.
     """
-    from app.world.identity import exact_identity_match
     return exact_identity_match(db, campaign_id, ref)
 
 
@@ -677,7 +704,6 @@ def _idempotency_key(
 
 def _canonical_name_count(db: Session, campaign_id: uuid.UUID, name: str) -> int:
     """Live canonical entities sharing one normalized name."""
-    from app.world.identity import normalize_alias
     normalized = normalize_alias(name)
     rows = db.execute(select(WorldEntity).where(
         WorldEntity.campaign_id == campaign_id,
@@ -698,17 +724,6 @@ def _apply_entity(
     collisions via #214, or create. Ambiguity without a decision service
     defers fail-closed. The visibility cap re-checks once the canonical
     id is known, so an id-matched reveal authorizes precisely."""
-    from app.world.identity import (
-        DEFER as IDENTITY_DEFER,
-        KEEP_DISTINCT,
-        NEW_ENTITY,
-        build_identity_frame,
-        create_entity_after_resolution,
-        decide_identity,
-        exact_identity,
-    )
-    from app.world.service import create_entity_inline, validate_entity_status, validate_entity_type
-
     data = assertion.data
     name = data.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -750,7 +765,7 @@ def _apply_entity(
     if entity is None:
         collision = exact_identity(db, campaign.id, name)
         if collision is None and _canonical_name_count(db, campaign.id, name) == 0:
-            created, is_new = create_entity_inline(
+            created, is_new = create_entity(
                 db, campaign, entity_type=str(entity_type).strip().lower(),
                 name=name.strip(), summary=data.get("summary"),
                 status=status, visibility=assertion.visibility,
@@ -803,8 +818,6 @@ def _apply_relation(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.knowledge import create_relation_inline, validate_relation_type
-
     data = assertion.data
     relation_type = data.get("relation_type")
     if not isinstance(relation_type, str) or not relation_type.strip():
@@ -828,7 +841,7 @@ def _apply_relation(
                 f"relations/{assertion.key}: requires object_ref or object_label"
             )
         return {"outcome": "rejected", "reason": "missing_object"}
-    row, created = create_relation_inline(
+    row, created = create_relation(
         db, campaign, subject_entity_id=subject.id,
         relation_type=relation_type.strip(),
         object_entity_id=obj.id if obj else None,
@@ -851,8 +864,6 @@ def _apply_fact(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.knowledge import create_fact_inline, validate_fact_content
-
     data = assertion.data
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
@@ -871,7 +882,7 @@ def _apply_fact(
         if entity is None:
             return {"outcome": "deferred", "reason": "unresolvable_entity_ref"}
         entity_ids.append(str(entity.id))
-    row, created = create_fact_inline(
+    row, created = create_fact(
         db, campaign, content=content.strip(), entity_refs=entity_ids,
         epistemic_state=assertion.epistemic_state,
         visibility=assertion.visibility,
@@ -900,8 +911,6 @@ def _apply_npc_state(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.npcs import apply_npc_state_inline, get_npc_state
-
     data = assertion.data
     entity = _resolve_required_ref(db, campaign.id, data.get("entity_ref"), assertion=assertion, role="entity_ref")
     if entity is None:
@@ -914,7 +923,7 @@ def _apply_npc_state(
     if existing is not None:
         # Newer-state channels, strongest signal wins: the provenance
         # channel stamped by this materializer, then the row's revision
-        # channel maintained by authoritative NPC writers (which replace
+        # channel maintained by in-turn NPC writes (which replace
         # provenance without stamping source_sequence).
         known = _provenance_order(existing.provenance)
         campaign_rev = existing.campaign_revision
@@ -938,7 +947,7 @@ def _apply_npc_state(
             updates["location_entity_id"] = location.id
         else:
             updates["location_name"] = str(location_ref)
-    row = apply_npc_state_inline(
+    row = apply_npc_state(
         db, campaign, entity.id,
         # Source-ordered stamp, not the execution-time campaign revision:
         # a delayed range must not make old state look current.
@@ -964,14 +973,9 @@ def _knowledge_current_order(
 ) -> int:
     """Committed ordering of the live stance for one (subject, target).
 
-    Strongest signal wins: the materializer's provenance channel, then
-    the authoritative ``world.knowledge_asserted`` event for the live row
-    (authoritative writers emit the event without assigning the row a
-    turn/source-sequence), then the row's source turn ordering, else
-    unknown (-1, never treated as newer).
+    Strongest signal wins: the materializer's provenance channel, then the
+    row's source turn ordering, else unknown (-1, never treated as newer).
     """
-    from app.world.epistemics import list_knowledge_for_subject
-    from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn
 
     tid: uuid.UUID | None = None
@@ -992,39 +996,16 @@ def _knowledge_current_order(
         )
         if not match:
             continue
-        # Every channel always counts (maximum wins): authoritative
-        # re-assertion merges provenance, so a row first written by
-        # post-turn keeps its old source_sequence even after a newer
-        # authoritative update — the event/turn channels must still be
-        # consulted rather than treated as fallbacks.
+        # Every channel always counts (maximum wins): in-turn re-assertion
+        # merges provenance, so a row first written by post-turn keeps its
+        # old source_sequence even after a newer turn update — the turn
+        # channel must still be consulted rather than treated as a fallback.
         order = _provenance_order(row.provenance)
-        order = max(order, _knowledge_asserted_order(
-            db, campaign_id, row.id))
         if row.source_turn_id is not None:
             turn = db.get(DmTurn, row.source_turn_id)
             if turn is not None and turn.campaign_id == campaign_id:
                 order = max(order, int(turn.source_revision or 0) + 1)
         best = max(best, order)
-    return best
-
-
-def _knowledge_asserted_order(
-    db: Session, campaign_id: uuid.UUID, knowledge_id: uuid.UUID,
-) -> int:
-    """Latest authoritative assertion event sequence for one knowledge row."""
-    from models.campaigns import CampaignDomainEvent
-
-    best = -1
-    events = db.execute(select(CampaignDomainEvent).where(
-        CampaignDomainEvent.campaign_id == campaign_id,
-        CampaignDomainEvent.event_type == "world.knowledge_asserted",
-    )).scalars().all()
-    for event in events:
-        for container in (event.targets, event.payload):
-            if isinstance(container, dict) and str(
-                    container.get("knowledge_id") or "") == str(knowledge_id):
-                best = max(best, int(event.sequence or 0))
-                break
     return best
 
 
@@ -1037,12 +1018,6 @@ def _apply_knowledge(
     Never mutates truth tables by construction; re-assertion updates the
     single current row per (subject, target) in place.
     """
-    from app.world.epistemics import (
-        assert_knowledge_inline,
-        validate_knower_kind,
-        validate_knowledge_target_kind,
-    )
-
     data = assertion.data
     try:
         subject_kind = validate_knower_kind(data.get("subject_kind"))
@@ -1084,7 +1059,7 @@ def _apply_knowledge(
         # A newer committed stance already exists (transfer_knowledge at
         # commit writes in place): never clobber it with older state.
         return {"outcome": "skipped", "reason": "stale_source_order"}
-    row, created = assert_knowledge_inline(
+    row, created = assert_knowledge(
         db, campaign, subject_kind=subject_kind, subject_entity_id=subject.id,
         target_kind=target_kind, **target_ids,
         knowledge_state=data.get("knowledge_state", "knows"),
@@ -1114,8 +1089,6 @@ def _apply_scene(
     numbering (sequence == resulting revision), so a delayed older
     assertion never overwrites newer committed state.
     """
-    from app.world.service import UNSET, apply_scene_update_inline, get_current_scene
-
     data = assertion.data
     if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
         if assertion.mechanical:
@@ -1141,7 +1114,7 @@ def _apply_scene(
         # A newer committed scene already exists (e.g. update_scene at a
         # later commit ran before this delayed range): preserve it.
         return {"outcome": "skipped", "reason": "stale_source_order"}
-    row = apply_scene_update_inline(
+    row = apply_scene_update(
         db, campaign, new_revision=source_order,
         location_entity_id=location_id,
         location_name=patch.get("location_name", data.get("location_name")),
@@ -1165,8 +1138,6 @@ def _apply_visibility_grant(
     Grants are the durable form of explicit disclosure: they widen human
     access without touching fictional-character knowledge or truth rows.
     """
-    from app.world.epistemics import grant_visibility_inline, validate_grant_target_kind
-
     data = assertion.data
     try:
         target_kind = validate_grant_target_kind(data.get("target_kind"))
@@ -1194,7 +1165,7 @@ def _apply_visibility_grant(
                 f"visibility_grants/{assertion.key}: requires target_ref or a target id")
         return {"outcome": "rejected", "reason": "missing_target"}
     try:
-        row, created = grant_visibility_inline(
+        row, created = grant_visibility(
             db, campaign, target_kind=target_kind, target_id=tid,
             grantee_user_id=data.get("grantee_user_id"),
             granted_by=data.get("granted_by"),
@@ -1207,7 +1178,8 @@ def _apply_visibility_grant(
             raise MaterializeError(
                 f"visibility_grants/{assertion.key}: {exc}") from exc
         return {"outcome": "rejected", "reason": f"invalid_grant: {exc}"}
-    return {"outcome": "applied" if created else "duplicate", "grant_id": str(row.id)}
+    return {"outcome": "applied" if created else "duplicate", "grant_id": str(row.id),
+            "grantee_user_id": str(row.grantee_user_id)}
 
 
 def _append_unique(

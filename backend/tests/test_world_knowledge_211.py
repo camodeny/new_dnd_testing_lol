@@ -16,24 +16,29 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
-from app.world.epistemics import (  # noqa: E402
-    assert_knowledge_authoritative,
-    assert_knowledge_inline,
-    grant_visibility_inline,
-    has_active_grant,
-    list_active_grants,
-    may_user_receive,
+from tests.support.world_writes import commit_world_write  # noqa: E402
+from app.visibility.access import may_user_receive  # noqa: E402
+from app.world.knowledge import (  # noqa: E402
+    assert_knowledge,
+    grant_visibility,
     project_facts_for_user,
     project_relations_for_user,
-    revoke_visibility_inline,
     what_does_subject_know,
-    who_knows_target,
 )
-from app.world.knowledge import create_fact_authoritative, create_relation_authoritative  # noqa: E402
-from app.world.service import create_entity_authoritative  # noqa: E402
-from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
+from app.world.facts import create_fact, create_relation  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
+from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldKnowledge, WorldVisibilityGrant  # noqa: E402
+
+
+def _active_grants(db, campaign_id, target_kind, target_id):
+    return db.execute(select(WorldVisibilityGrant).where(
+        WorldVisibilityGrant.campaign_id == campaign_id,
+        WorldVisibilityGrant.target_kind == target_kind,
+        WorldVisibilityGrant.target_id == target_id,
+        WorldVisibilityGrant.revoked_at.is_(None),
+    )).scalars().all()
 
 
 def _engine():
@@ -70,24 +75,24 @@ def _setup():
 
 
 def _entities(db, camp, rev=0):
-    mara, _ = create_entity_authoritative(
-        db, camp.id, rev, entity_type="npc", name="Mara",
+    mara, _ = commit_world_write(
+        db, camp.id, rev, create_entity, entity_type="npc", name="Mara",
         operation_id="op-mara-211",
     )
-    guild, _ = create_entity_authoritative(
-        db, camp.id, rev + 1, entity_type="faction", name="Guild",
+    guild, _ = commit_world_write(
+        db, camp.id, rev + 1, create_entity, entity_type="faction", name="Guild",
         operation_id="op-guild-211",
     )
-    aria, _ = create_entity_authoritative(
-        db, camp.id, rev + 2, entity_type="character", name="Aria",
+    aria, _ = commit_world_write(
+        db, camp.id, rev + 2, create_entity, entity_type="character", name="Aria",
         operation_id="op-aria-211",
     )
-    bram, _ = create_entity_authoritative(
-        db, camp.id, rev + 3, entity_type="character", name="Bram",
+    bram, _ = commit_world_write(
+        db, camp.id, rev + 3, create_entity, entity_type="character", name="Bram",
         operation_id="op-bram-211",
     )
-    party, _ = create_entity_authoritative(
-        db, camp.id, rev + 4, entity_type="faction", name="Party",
+    party, _ = commit_world_write(
+        db, camp.id, rev + 4, create_entity, entity_type="faction", name="Party",
         operation_id="op-party-211",
     )
     return mara, guild, aria, bram, party
@@ -99,8 +104,8 @@ def test_dm_only_truth_exists_with_zero_knowers():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
     mara, *_ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The vault holds a phylactery.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The vault holds a phylactery.",
         entity_refs=[mara.id], epistemic_state="confirmed",
         visibility="dm_only",
         provenance={"source": "dm_adjudication"},
@@ -110,7 +115,6 @@ def test_dm_only_truth_exists_with_zero_knowers():
     assert db.execute(
         select(WorldKnowledge).where(WorldKnowledge.campaign_id == camp.id)
     ).scalars().all() == []
-    assert who_knows_target(db, camp, "fact", fact.id, owner)["total"] == 0
     assert may_user_receive(db, camp, "fact", fact.id, owner)["allowed"] is True
     denied = may_user_receive(db, camp, "fact", fact.id, alice)
     assert denied == {"allowed": False, "reason": "dm_only_requires_authority"}
@@ -126,12 +130,12 @@ def test_one_character_knowledge_and_two_characters_differ():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
     _, _, aria, bram, _ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The bridge is trapped.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The bridge is trapped.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-bridge-truth",
     )
-    k_aria, created_a = assert_knowledge_inline(
+    k_aria, created_a = assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="saw_trap",
@@ -140,7 +144,7 @@ def test_one_character_knowledge_and_two_characters_differ():
     assert created_a is True
     assert k_aria.acquisition_source == "saw_trap"
     assert k_aria.provenance["acquisition_source"] == "saw_trap"
-    k_bram, _ = assert_knowledge_inline(
+    k_bram, _ = assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=bram.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="does_not_know", acquisition_source="was_absent",
@@ -155,11 +159,6 @@ def test_one_character_knowledge_and_two_characters_differ():
     bram_view = what_does_subject_know(db, camp, bram.id, owner)
     assert [(e["target_id"], e["knowledge_state"]) for e in aria_view["entries"]] == [(str(fact.id), "knows")]
     assert [(e["target_id"], e["knowledge_state"]) for e in bram_view["entries"]] == [(str(fact.id), "does_not_know")]
-    # Who-knows lists both stances for the DM.
-    who = who_knows_target(db, camp, "fact", fact.id, owner)
-    assert who["total"] == 2 and who["visible"] == 2
-    by_subject = {k["subject_entity_id"]: k["knowledge_state"] for k in who["knowers"]}
-    assert by_subject == {str(aria.id): "knows", str(bram.id): "does_not_know"}
 
 
 # ── Party belief vs truth ───────────────────────────────────────────────────
@@ -168,13 +167,13 @@ def test_party_belief_can_contradict_truth():
     Fac, camp, owner, *_ = _setup()
     db = Fac()
     _, _, _, _, party = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The Guild guards the bridge.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The Guild guards the bridge.",
         epistemic_state="false", visibility="dm_only",
         provenance={"source": "dm_adjudication"},
         operation_id="op-rumor-truth",
     )
-    row, _ = assert_knowledge_inline(
+    row, _ = assert_knowledge(
         db, camp, subject_kind="party", subject_entity_id=party.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="believes", acquisition_source="tavern_rumor",
@@ -193,18 +192,18 @@ def test_human_visibility_differs_from_character_knowledge():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
     _, _, aria, _, _ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The door glyph explodes on touch.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The door glyph explodes on touch.",
         epistemic_state="confirmed", visibility="private",
         operation_id="op-glyph-truth",
     )
     # Alice the human is granted the handout...
-    grant_visibility_inline(
+    grant_visibility(
         db, camp, target_kind="fact", target_id=fact.id,
         grantee_user_id=alice, granted_by=owner, operation_id="op-grant-alice",
     )
     # ...while Aria the character fictionally does NOT know it.
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="does_not_know", acquisition_source="never_told",
@@ -215,8 +214,8 @@ def test_human_visibility_differs_from_character_knowledge():
     assert aria_proj["entries"][0]["knowledge_state"] == "does_not_know"
     assert aria_proj["entries"][0]["target"]["content"] == "The door glyph explodes on touch."
     # And the reverse: knowledge never implies human access.
-    bram_fact, _ = create_fact_authoritative(
-        db, camp.id, 6, content="Unrelated secret.",
+    bram_fact, _ = commit_world_write(
+        db, camp.id, 6, create_fact, content="Unrelated secret.",
         epistemic_state="confirmed", visibility="private",
         operation_id="op-other-secret",
     )
@@ -231,16 +230,16 @@ def test_arbitrary_subset_visibility_and_owner_denial():
     Fac, camp, owner, alice, bob, carol = _setup()
     db = Fac()
     _, _, aria, _, _ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The conspirators meet at midnight.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The conspirators meet at midnight.",
         epistemic_state="confirmed", visibility="private",
         operation_id="op-conspiracy",
     )
-    grant_visibility_inline(
+    grant_visibility(
         db, camp, target_kind="fact", target_id=fact.id,
         grantee_user_id=alice, granted_by=owner, operation_id="op-g-a",
     )
-    grant_visibility_inline(
+    grant_visibility(
         db, camp, target_kind="fact", target_id=fact.id,
         grantee_user_id=bob, granted_by=owner, operation_id="op-g-b",
     )
@@ -260,7 +259,7 @@ def test_arbitrary_subset_visibility_and_owner_denial():
         "denied_reasons": {"private_requires_grant": 1},
     }
     # Grants are explicit rows, not a boolean.
-    assert len(list_active_grants(db, camp.id, "fact", fact.id)) == 2
+    assert len(_active_grants(db, camp.id, "fact", fact.id)) == 2
     # Aria's fictional knowledge is untouched by human grants.
     assert what_does_subject_know(db, camp, aria.id, owner)["total"] == 0
 
@@ -271,8 +270,8 @@ def test_fail_closed_on_ambiguous_and_missing_visibility():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
     mara, *_ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="Ambiguous record.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="Ambiguous record.",
         visibility="campaign", operation_id="op-ambig",
     )
     # Corrupt visibility at the row level (bypasses validators) → deny.
@@ -299,7 +298,7 @@ def test_fail_closed_on_ambiguous_and_missing_visibility():
     }
     # Unknown visibility string on knowledge writes is rejected, not stored.
     with pytest.raises(ValueError):
-        assert_knowledge_inline(
+        assert_knowledge(
             db, camp, subject_kind="npc", subject_entity_id=mara.id,
             target_kind="fact", target_fact_id=fact.id,
             knowledge_state="suspects", visibility="everyone-ish",
@@ -314,14 +313,14 @@ def test_knowledge_update_failure_leaves_truth_intact():
     Fac, camp, owner, *_ = _setup()
     db = Fac()
     mara, guild, _, _, _ = _entities(db, camp, 0)
-    rel, _ = create_relation_authoritative(
-        db, camp.id, 5, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, camp.id, 5, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign", operation_id="op-rel-truth",
     )
     bogus = uuid.uuid4()
     with pytest.raises(ValueError):
-        assert_knowledge_inline(
+        assert_knowledge(
             db, camp, subject_kind="npc", subject_entity_id=bogus,
             target_kind="relation", target_relation_id=rel.id,
             knowledge_state="knows", operation_id="op-k-bad",
@@ -329,17 +328,17 @@ def test_knowledge_update_failure_leaves_truth_intact():
     db.rollback()
     assert db.get(type(rel), rel.id).epistemic_state == "confirmed"
     assert db.get(type(rel), rel.id).status == "active"
-    assert list_active_grants(db, camp.id, "relation", rel.id) == []
+    assert _active_grants(db, camp.id, "relation", rel.id) == []
     # Cross-campaign target reference fails closed too.
     other = Campaign(id=uuid.uuid4(), owner_id=owner, name="Other", revision=0)
     db.add(other)
     db.flush()
-    outsider, _ = create_entity_authoritative(
-        db, other.id, 0, entity_type="npc", name="Outsider",
+    outsider, _ = commit_world_write(
+        db, other.id, 0, create_entity, entity_type="npc", name="Outsider",
         operation_id="op-outsider-211",
     )
     with pytest.raises(ValueError):
-        assert_knowledge_inline(
+        assert_knowledge(
             db, camp, subject_kind="npc", subject_entity_id=mara.id,
             target_kind="entity", target_entity_id=outsider.id,
             knowledge_state="knows", operation_id="op-k-foreign",
@@ -347,64 +346,22 @@ def test_knowledge_update_failure_leaves_truth_intact():
     db.rollback()
 
 
-def test_revoke_affects_future_reads_without_deleting_provenance():
-    Fac, camp, owner, alice, *_ = _setup()
-    db = Fac()
-    _, _, aria, _, _ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The password is 'moth'.",
-        epistemic_state="confirmed", visibility="private",
-        operation_id="op-password",
-    )
-    grant, created = grant_visibility_inline(
-        db, camp, target_kind="fact", target_id=fact.id,
-        grantee_user_id=alice, granted_by=owner, operation_id="op-g-pw",
-    )
-    assert created is True
-    assert may_user_receive(db, camp, "fact", fact.id, alice)["allowed"] is True
-    assert revoke_visibility_inline(
-        db, camp, target_kind="fact", target_id=fact.id,
-        grantee_user_id=alice, operation_id="op-r-pw",
-    ) is True
-    # Future reads deny...
-    assert may_user_receive(db, camp, "fact", fact.id, alice) == {
-        "allowed": False, "reason": "private_requires_grant",
-    }
-    # ...while the revoked row stays durable provenance (not deleted).
-    rows = db.execute(select(WorldVisibilityGrant)).scalars().all()
-    assert len(rows) == 1
-    assert rows[0].revoked_at is not None
-    assert has_active_grant(db, camp.id, "fact", fact.id, alice) is False
-    assert list_active_grants(db, camp.id, "fact", fact.id) == []
-    # Duplicate grant after revoke is a no-op returning the existing row.
-    again, created2 = grant_visibility_inline(
-        db, camp, target_kind="fact", target_id=fact.id,
-        grantee_user_id=alice, granted_by=owner, operation_id="op-g-pw-2",
-    )
-    assert created2 is True  # new grant row: history preserved, access restored
-    assert may_user_receive(db, camp, "fact", fact.id, alice)["allowed"] is True
-    assert len(db.execute(select(WorldVisibilityGrant)).scalars().all()) == 2
-    # Knowledge rows are independent of the grant lifecycle.
-    assert what_does_subject_know(db, camp, aria.id, owner)["total"] == 0
-    assert grant.to_dict()["grantee_user_id"] == str(alice)
-
-
 def test_no_access_inferred_from_related_shared_records():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
     mara, guild, aria, _, _ = _entities(db, camp, 0)
-    open_rel, _ = create_relation_authoritative(
-        db, camp.id, 5, subject_entity_id=mara.id, relation_type="knows",
+    open_rel, _ = commit_world_write(
+        db, camp.id, 5, create_relation, subject_entity_id=mara.id, relation_type="knows",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign", operation_id="op-open-rel",
     )
-    secret_fact, _ = create_fact_authoritative(
-        db, camp.id, 6, content="Mara's handler is the Guildmaster.",
+    secret_fact, _ = commit_world_write(
+        db, camp.id, 6, create_fact, content="Mara's handler is the Guildmaster.",
         entity_refs=[mara.id, guild.id], epistemic_state="confirmed",
         visibility="private", operation_id="op-handler-secret",
     )
     # Aria fictionally knows the secret; Alice may read the open relation.
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=secret_fact.id,
         knowledge_state="knows", acquisition_source="overheard",
@@ -417,9 +374,6 @@ def test_no_access_inferred_from_related_shared_records():
     }
     proj = project_relations_for_user(db, camp, alice, [open_rel])
     assert proj["visible"] == 1
-    who = who_knows_target(db, camp, "fact", secret_fact.id, alice)
-    assert who["knowers"] == []  # target itself not visible → knowers hidden
-    assert who["denied_reasons"] == {"target_not_visible": 1}
 
 
 # ── Hidden subject is never disclosed through projections ───────────────────
@@ -427,16 +381,16 @@ def test_no_access_inferred_from_related_shared_records():
 def test_hidden_subject_never_disclosed_through_projections():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
-    shade, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="npc", name="Shade",
+    shade, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="npc", name="Shade",
         visibility="dm_only", operation_id="op-shade-211",
     )
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="The vault is unguarded at dawn.",
+    fact, _ = commit_world_write(
+        db, camp.id, 1, create_fact, content="The vault is unguarded at dawn.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-vault-truth",
     )
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="npc", subject_entity_id=shade.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="saw_it",
@@ -451,14 +405,8 @@ def test_hidden_subject_never_disclosed_through_projections():
     assert subj_view["entries"] == []
     assert subj_view["total"] == 0
     assert subj_view["denied_reasons"] == {"subject_not_visible": 1}
-    who = who_knows_target(db, camp, "fact", fact.id, alice)
-    assert who["knowers"] == []
-    assert who["visible"] == 0 and who["total"] == 1 and who["denied"] == 1
-    assert who["denied_reasons"] == {"subject_not_visible": 1}
     # DM authority still sees the full picture in both directions.
     assert what_does_subject_know(db, camp, shade.id, owner)["visible"] == 1
-    owner_who = who_knows_target(db, camp, "fact", fact.id, owner)
-    assert [k["subject_entity_id"] for k in owner_who["knowers"]] == [str(shade.id)]
 
 
 # ── Re-assertion updates source provenance; same-key retry is idempotent ───
@@ -467,15 +415,15 @@ def test_reassertion_updates_provenance_and_same_key_retry_is_idempotent():
     Fac, camp, owner, *_ = _setup()
     db = Fac()
     _, _, aria, _, _ = _entities(db, camp, 0)
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 5, content="The cellar stair creaks.",
+    fact, _ = commit_world_write(
+        db, camp.id, 5, create_fact, content="The cellar stair creaks.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-cellar-truth",
     )
     turn_a, turn_b = uuid.uuid4(), uuid.uuid4()
     rev0 = int(db.get(Campaign, camp.id).revision)
-    row_a, ev_a = assert_knowledge_authoritative(
-        db, camp.id, rev0,
+    row_a, ev_a = commit_world_write(
+        db, camp.id, rev0, assert_knowledge,
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="suspects", acquisition_source="heard_it",
@@ -488,8 +436,8 @@ def test_reassertion_updates_provenance_and_same_key_retry_is_idempotent():
     assert rev1 == rev0 + 1
     # Legitimate re-assertion of the same (subject, target) under a new key
     # is an update: new state + new source provenance, new revision + event.
-    row_b, ev_b = assert_knowledge_authoritative(
-        db, camp.id, rev1,
+    row_b, ev_b = commit_world_write(
+        db, camp.id, rev1, assert_knowledge,
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="saw_it",
@@ -501,25 +449,17 @@ def test_reassertion_updates_provenance_and_same_key_retry_is_idempotent():
     assert row_b.source_turn_id == turn_b
     rev2 = int(db.get(Campaign, camp.id).revision)
     assert rev2 == rev1 + 1
-    # Retry of the ORIGINAL key hits the live row directly: same row, no
-    # revision bump, no second event. (Fresh-key historical retry semantics
-    # belong to the central command-idempotency boundary, not a
-    # world-specific ledger — see #211 scope review.)
-    row_r, ev_r = assert_knowledge_authoritative(
-        db, camp.id, rev2,
+    # Retry of the ORIGINAL key hits the live row directly: same row,
+    # nothing new written. (Fresh-key historical retry semantics belong to
+    # the central command-idempotency boundary, not a world-specific
+    # ledger — see #211 scope review.)
+    row_r, created_r = assert_knowledge(
+        db, db.get(Campaign, camp.id),
         subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="suspects", acquisition_source="heard_it",
         visibility="campaign",
         operation_id="op-k-a", idempotency_key="idem-key-a",
     )
-    assert ev_r is None
+    assert created_r is False
     assert row_r.id == row_a.id
-    assert int(db.get(Campaign, camp.id).revision) == rev2
-    events = db.execute(
-        select(CampaignDomainEvent).where(
-            CampaignDomainEvent.campaign_id == camp.id,
-            CampaignDomainEvent.event_type == "world.knowledge_asserted",
-        )
-    ).scalars().all()
-    assert len(events) == 2

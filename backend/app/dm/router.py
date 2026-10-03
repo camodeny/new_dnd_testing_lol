@@ -2,8 +2,8 @@
 
 Read and lifecycle endpoints for the durable DM turn/attempt state machine.
 Write-side turn assembly is triggered automatically via submission coordination;
-these endpoints allow inspection and explicit lifecycle transitions (streaming,
-commit) for integration tests and the worker runtime.
+these endpoints expose read-only inspection, player-initiated retry, and the
+execution cron trigger.
 """
 
 import logging
@@ -12,23 +12,40 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.campaigns.auth import authorized_campaign, require_owner
-from app.deps.auth import resolve_profile
-from app.runtime.threads import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
+from app.deps.campaign import campaign_for, require_owner, run_campaign_command
+from app.deps.auth import current_profile
+from app.deps.cron import require_cron_secret
+from app.deps.idempotency import require_idempotency_key
+from app.post_turn.backpressure import describe_client_state, evaluate_backpressure
+from app.realtime.service import publish_dm_status
+from app.threads.service import (
+    ThreadAuthorizationError,
+    ThreadNotFoundError,
+    assert_can_read_thread,
+    list_threads_for_user,
+    parse_thread_id,
+    resolve_thread_id,
+)
 from database import get_db
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry")
-def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: Request,
-                       response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+def retry_adjudication(
+    turn_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     from app.dm.recovery import retry_failed_adjudication, execute_committed_attempt
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
@@ -48,21 +65,26 @@ def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: R
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
-    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+    result = run_campaign_command(db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.retry", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
     background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
     return result
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry-narration")
-def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Request,
-                    response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def retry_narration(
+    turn_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Narration-independent retry reusing the preserved structured result."""
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
     from app.dm.recovery import retry_narration_only, execute_committed_attempt
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
@@ -82,15 +104,23 @@ def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Requ
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
-    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+    result = run_campaign_command(db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.retry_narration", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
     background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
     return result
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streams/{stream_id}/continue")
-def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dict, request: Request,
-                    response: Response, db: Session = Depends(get_db)):
+def continue_stream(
+    turn_id: str,
+    stream_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Recover a failed partial stream through the full turn state machine.
 
     Body: {"continued_text": "..."}. The stream is scoped to the authorized
@@ -107,11 +137,8 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     Realtime delivery happens after that commit returns (never before
     durability), via a best-effort post-commit status publish.
     """
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
     from app.dm.recovery import recover_partial_stream
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, sid = uuid.UUID(turn_id), uuid.UUID(stream_id)
@@ -152,7 +179,7 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     # Full semantic identity: stream + complete text. Only the digest is
     # persisted, so nothing is truncated — requests differing anywhere
     # (even past character 4,000) are distinct commands.
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
         scope_id=tid, payload={"stream_id": str(sid), "continued_text": continued},
@@ -169,9 +196,7 @@ def _publish_recovery_status(db: Session, stream_id) -> None:
 
     _logger = _logging.getLogger(__name__)
     try:
-        from app.dm_streams.service import get_stream
-        from app.realtime.service import publish_dm_status
-
+        from app.dm.streams import get_stream
         stream = get_stream(db, stream_id)
         if stream is not None and stream.status == "completed":
             publish_dm_status(db, stream, visible_text=stream.final_text)
@@ -181,9 +206,12 @@ def _publish_recovery_status(db: Session, stream_id) -> None:
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
-def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def list_dm_turns(
+    request: Request,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     thread_raw = request.query_params.get("thread_id")
     from app.dm.turns import list_turns
 
@@ -200,8 +228,6 @@ def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_
             raise HTTPException(status_code=403, detail="Not authorized for this thread") from exc
     # No thread filter: return only turns for threads the user is authorized to see
     # (prevents private-turn metadata leakage)
-    from app.runtime.threads import list_threads_for_user
-
     visible_threads = list_threads_for_user(db, campaign.id, profile.id)
     visible_ids = {str(t.id) for t in visible_threads}
     all_turns = list_turns(db, campaign.id, thread_id=None, limit=200)
@@ -210,9 +236,12 @@ def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns/{turn_id}")
-def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def get_dm_turn(
+    turn_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -243,8 +272,6 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     # Issue #222 — low-key client state: ready vs temporary DM processing
     # delay. Never exposes queues, providers, models, or internals.
     try:
-        from app.post_turn.backpressure import describe_client_state, evaluate_backpressure
-
         readiness = describe_client_state(evaluate_backpressure(db, campaign.id))
     except Exception:
         readiness = {"dm_state": "processing",
@@ -256,213 +283,16 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     }
 
 
-@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streaming")
-def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-    require_owner(campaign, profile.id)
-    try:
-        tid = uuid.UUID(turn_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid turn id") from exc
-    attempt_id_raw = payload.get("attempt_id")
-    if not attempt_id_raw:
-        raise HTTPException(status_code=422, detail="attempt_id is required")
-    try:
-        aid = uuid.UUID(str(attempt_id_raw))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    stream_id_raw = payload.get("stream_id")
-    if not stream_id_raw:
-        raise HTTPException(status_code=422, detail="stream_id is required — transition to streaming requires durable first chunk")
-    from app.dm.turns import AttemptSupersededError, get_turn, mark_streaming_started
-
-    # Verify turn belongs to path campaign (prevents cross-campaign mutation via known UUID)
-    turn_check = get_turn(db, tid)
-    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
-        raise HTTPException(status_code=404, detail="Turn not found")
-    # Preserve private-thread authorization semantics
-    try:
-        t_uuid = parse_thread_id(turn_check.thread_id)
-        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
-    except ThreadNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except ThreadAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-
-    try:
-        turn, attempt = mark_streaming_started(db, tid, aid, stream_id=stream_id_raw)
-        # Re-verify after mutation that turn still belongs to path campaign
-        if str(turn.campaign_id) != str(campaign.id):
-            raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True)}
-    except AttemptSupersededError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        from app.campaigns.service import CampaignArchivedError
-
-        if isinstance(exc, CampaignArchivedError):
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/commit")
-def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-    require_owner(campaign, profile.id)
-    try:
-        tid = uuid.UUID(turn_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid turn id") from exc
-    attempt_id_raw = payload.get("attempt_id")
-    if not attempt_id_raw:
-        raise HTTPException(status_code=422, detail="attempt_id is required")
-    try:
-        aid = uuid.UUID(str(attempt_id_raw))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    from app.dm.turns import get_turn
-
-    turn_check = get_turn(db, tid)
-    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
-        raise HTTPException(status_code=404, detail="Turn not found")
-    try:
-        t_uuid = parse_thread_id(turn_check.thread_id)
-        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
-    except ThreadNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except ThreadAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    from app.dm.turns import AttemptSupersededError, StaleRevisionError, TurnConflictError
-    from app.campaigns.events import RevisionConflictError
-
-    expected = payload.get("expected_revision")
-    if expected is not None:
-        try:
-            expected = int(expected)
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(status_code=422, detail="expected_revision must be an integer") from exc
-
-    mutate_fields = payload.get("mutate") if isinstance(payload.get("mutate"), dict) else None
-
-    def _mutate(camp):
-        if not mutate_fields:
-            return
-        if "name" in mutate_fields and mutate_fields["name"] is not None:
-            from app.campaigns.service import validate_campaign_name
-
-            camp.name = validate_campaign_name(str(mutate_fields["name"]))
-        if "description" in mutate_fields:
-            camp.description = mutate_fields["description"]
-
-    event_type = str(payload.get("event_type") or "dm.turn_resolved")
-    operation_id = str(payload.get("operation_id") or "").strip() or None
-
-    from app.dm.turns import commit_turn
-
-    try:
-        turn, attempt, event = commit_turn(
-            db,
-            tid,
-            aid,
-            expected_revision=expected,
-            mutate=_mutate if mutate_fields else None,
-            event_type=event_type,
-            payload=payload.get("payload") if isinstance(payload.get("payload"), dict) else None,
-            operation_id=operation_id,
-            actor_id=profile.id,
-        )
-        if str(turn.campaign_id) != str(campaign.id):
-            raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True), "event": event.to_dict() if hasattr(event, "to_dict") else None}
-    except AttemptSupersededError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except StaleRevisionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc), headers={"X-Current-Revision": str(exc.actual_revision)}) from exc
-    except RevisionConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc), headers={"X-Current-Revision": str(exc.actual_revision)}) from exc
-    except TurnConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/abandon")
-def abandon_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-    require_owner(campaign, profile.id)
-    try:
-        tid = uuid.UUID(turn_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid turn id") from exc
-    attempt_id_raw = payload.get("attempt_id")
-    if not attempt_id_raw:
-        raise HTTPException(status_code=422, detail="attempt_id is required")
-    try:
-        aid = uuid.UUID(str(attempt_id_raw))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    from app.dm.turns import abandon_visible_attempt, get_turn
-
-    turn_check = get_turn(db, tid)
-    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
-        raise HTTPException(status_code=404, detail="Turn not found")
-    try:
-        t_uuid = parse_thread_id(turn_check.thread_id)
-        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
-    except ThreadNotFoundError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except ThreadAuthorizationError as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except Exception as exc:
-        raise HTTPException(status_code=404, detail="Thread not found") from exc
-
-    reason = str(payload.get("reason") or payload.get("abandonment_reason") or "explicit_retry")
-    try:
-        turn, attempt = abandon_visible_attempt(db, tid, aid, reason=reason, actor_id=profile.id)
-        if str(turn.campaign_id) != str(campaign.id):
-            raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True)}
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-@router.post("/api/campaigns/{campaign_id}/dm-turns/recover")
-def recover_stuck(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-    # Only owner can recover
-    if campaign.owner_id != profile.id:
-        raise HTTPException(status_code=403, detail="Only owner can recover stuck turns")
-    lease = payload.get("lease_seconds", 300)
-    try:
-        lease = int(lease)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=422, detail="lease_seconds must be an integer")
-    from app.dm.turns import recover_stuck_attempts
-
-    recovered = recover_stuck_attempts(db, campaign_id=campaign.id, lease_seconds=lease)
-    return {"recovered": recovered}
-
-
 @router.get("/api/cron/dm-execute")
 def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
     """Autonomous DM execution sweep — issue #354.
 
     Cron trigger (Supabase Cron / scheduler) that claims and executes eligible
     prepared DM attempts through the production pipeline without manual
-    API/database intervention. Same auth guard as the outbox relay cron:
+    API/database intervention. Shared cron auth guard (``app.deps.cron``):
     ``CRON_SECRET`` bearer, or ``ALLOW_INSECURE_CRON=1`` local/test bypass.
     """
-    from app.outbox.router import _require_cron_secret
-
-    _require_cron_secret(request.headers.get("authorization"))
+    require_cron_secret(request.headers.get("authorization"))
     from app.dm.execution import run_dm_execute_sweep
 
     result = run_dm_execute_sweep(db, limit=1)

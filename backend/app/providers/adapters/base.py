@@ -7,7 +7,7 @@ It depends only on the standard library, ``requests``, and the local
 """
 import json
 import os
-from typing import Iterable, Optional
+from typing import Iterable
 
 import requests
 
@@ -52,10 +52,6 @@ class LLMProviderAdapter:
 
     def capabilities_for(self, model):
         return ProviderCapabilities()
-
-    def configured_reasoning_effort(self):
-        """Reasoning-effort knob value to report in provider settings, if any."""
-        return None
 
     # -- request construction ------------------------------------------
     def build_headers(self):

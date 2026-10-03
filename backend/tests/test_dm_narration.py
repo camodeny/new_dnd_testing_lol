@@ -33,10 +33,8 @@ from app.dm.narration import (  # noqa: E402
     chunk_narration_text,
     execute_validated_turn,
     format_recent_conversation,
-    get_narration_metrics,
     materialize_final_narration,
     render_deterministic_narration,
-    reset_narration_metrics,
     resume_narration_stream,
     stream_narration,
     validate_narration_fidelity,
@@ -112,14 +110,6 @@ def db():
         s.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
         s.commit()
         yield s, camp_id, thread_id
-    reset_narration_metrics()
-
-
-@pytest.fixture(autouse=True)
-def _reset_metrics():
-    reset_narration_metrics()
-    yield
-    reset_narration_metrics()
 
 
 # ── projection: audience-safe ───────────────────────────────────────────────
@@ -218,9 +208,7 @@ def test_player_authored_declaration_preserved_with_attribution():
     }])
     text = render_deterministic_narration(build_narration_projection(c), c)
     assert "I will hold the bridge!" in text
-    assert validate_narration_fidelity(
-        text, c, pc_names={"char:elara": "Elara"}
-    ) == []
+    assert validate_narration_fidelity(text, c) == []
 
 
 def test_ordinary_narration_passes_fidelity():
@@ -235,20 +223,21 @@ def test_ordinary_narration_passes_fidelity():
 
 def test_secret_fact_leak_rejected_pre_commit_with_no_persistence(db):
     s, camp_id, thread_id = db
-    c = _respond([_narr_beat("The vault door stands shut.")])
     secret = "the vault code is moonfall"
+    c = _respond([{"id": "beat_1", "type": "narration", "claims": [
+        _claim("The vault door stands shut."),
+        _claim(secret, visibility="dm_private"),
+    ]}])
     bad = "The vault door stands shut. You recall the vault code is moonfall."
     with pytest.raises(NarrationFidelityError) as ei:
         stream_narration(
             s, campaign_id=camp_id, thread_id=thread_id,
             turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
             contract=c, narrator=lambda req: bad,
-            publish_realtime=False, extra_secrets={secret},
+            publish_realtime=False,
         )
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
     assert s.scalar(select(func.count()).select_from(DMStream)) == 0
-    m = get_narration_metrics()
-    assert m["secret_rejections"] >= 1 and m["fidelity_failures"] >= 1
 
 
 def test_unsupported_narrator_addition_rejected():
@@ -265,9 +254,8 @@ def test_consequence_check_ignores_substring_inside_longer_word():
     assert validate_narration_fidelity(good, c) == []
 
 
-def test_pc_agency_violation_rejected(monkeypatch):
-    import app.dm.narration as narration_mod
-    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
+def test_invented_pc_action_is_not_a_narration_fidelity_failure():
+    """PC agency is guarded by the adjudication validators, not narration."""
     c = _respond([{
         "id": "beat_1", "type": "narration",
         "claims": [{
@@ -278,25 +266,7 @@ def test_pc_agency_violation_rejected(monkeypatch):
         }],
     }])
     bad = 'Elara declares, "I hold my ground." Elara charges the dragon and attacks.'
-    with pytest.raises(NarrationFidelityError) as ei:
-        check_narration_fidelity_or_raise(bad, c, pc_names={"char:elara": "Elara"})
-    assert any(v["category"] == "agency_violation" for v in ei.value.violations)
-    m = get_narration_metrics()
-    assert m["agency_rejections"] >= 1
-
-
-def test_pc_agency_gate_disabled_for_playtesting():
-    c = _respond([{
-        "id": "beat_1", "type": "narration",
-        "claims": [{
-            "text": 'Elara declares, "I hold my ground."',
-            "claim_kind": "player_declaration", "origin": "player_transcript",
-            "actor_ref": {"type": "character", "id": "char:elara"},
-            "evidence_refs": ["sub1"], "visibility": "public",
-        }],
-    }])
-    bad = 'Elara declares, "I hold my ground." Elara charges the dragon and attacks.'
-    assert validate_narration_fidelity(bad, c, pc_names={"char:elara": "Elara"}) == []
+    assert validate_narration_fidelity(bad, c) == []
 
 
 def test_contradiction_with_structured_result_rejected():
@@ -310,7 +280,8 @@ def test_contradiction_with_structured_result_rejected():
 # ── streaming: durable-first, realtime-second, TTFT, resume ─────────────────
 
 def test_stream_persists_before_delivery_and_ttft_measured(db, monkeypatch):
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     s, camp_id, thread_id = db
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)
@@ -340,10 +311,6 @@ def test_stream_persists_before_delivery_and_ttft_measured(db, monkeypatch):
         assert "".join(ch.text for ch in persisted) == res.visible_text
         # stable dedupe identity
         assert len({e["payload"]["event_id"] for e in chunk_events}) == res.chunk_count
-        m = get_narration_metrics()
-        assert m["narrations_completed"] == 1
-        assert m["ttft_ms_samples"] and m["total_duration_ms_samples"]
-        assert m["projection_bytes_samples"] == [res.projection_bytes]
     finally:
         from app.realtime.service import SupabaseRealtimePublisher
         set_realtime_publisher(SupabaseRealtimePublisher())
@@ -364,7 +331,7 @@ def test_disconnect_mid_stream_reconstruct_and_resume(db):
     )
     assert not partial.completed and partial.chunk_count == 1
     # client reload reconstructs exactly what became visible
-    from app.dm_streams.service import list_chunks, reconstruct_text
+    from app.dm.streams import list_chunks, reconstruct_text
     assert reconstruct_text(s, partial.stream_id) == partial.visible_text
     assert len(list_chunks(s, partial.stream_id)) == 1
     # resume persists only the missing suffix — no duplication
@@ -538,7 +505,7 @@ def test_numbers_in_safe_prelude_grounded():
 # ── post-validation → narration → commit wiring (review finding 1) ───────
 
 def test_execute_validated_turn_runs_narration_to_commit(db):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     s, camp_id, thread_id = db
@@ -584,7 +551,7 @@ def test_execute_validated_turn_runs_narration_to_commit(db):
 # ── stream-start boundary at first durable chunk (re-review finding 1) ────
 
 def _coordinated_turn(db, camp_id, thread_id, raw_content="I listen at the door."):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     s, _, _ = db
@@ -608,10 +575,10 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
     attempt. Remediation marks the streaming attempt failed-visible (#206
     failure state); the input set stays locked.
     """
-    import app.dm_streams.service as stream_svc
+    import app.dm.streams as stream_svc
     from app.dm.turns import StreamBoundaryError, coordinate_turn
-    from app.dm_streams.service import get_stream
-    from app.runtime.submissions import accept_submission
+    from app.dm.streams import get_stream
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -715,15 +682,16 @@ def test_streaming_provider_persists_chunk0_before_provider_completion(db):
 
 
 def test_incremental_gate_rejects_secret_midstream(db):
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     s, camp_id, thread_id = db
-    c = _respond([_narr_beat(
-        "Torchlight flickers on wet stone as the party descends the stair."
-    )])
+    secret = "the vault code is moonfall"
+    c = _respond([{"id": "beat_1", "type": "narration", "claims": [
+        _claim("Torchlight flickers on wet stone as the party descends the stair."),
+        _claim(secret, visibility="dm_private"),
+    ]}])
     delta1 = render_deterministic_narration(build_narration_projection(c), c)
     assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
-    secret = "the vault code is moonfall"
 
     def _leaky(req):
         yield delta1
@@ -734,7 +702,7 @@ def test_incremental_gate_rejects_secret_midstream(db):
             s, campaign_id=camp_id, thread_id=thread_id,
             turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
             contract=c, narrator=_leaky, chunk_size=48,
-            publish_realtime=False, extra_secrets={secret},
+            publish_realtime=False,
         )
     assert ei.value.persisted_chunks >= 1
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
@@ -745,42 +713,6 @@ def test_incremental_gate_rejects_secret_midstream(db):
     ).scalars().all()) >= 1
 
 
-def test_incremental_gate_rejects_agency_violation_midstream(db, monkeypatch):
-    from app.dm_streams.service import get_stream
-    import app.dm.narration as narration_mod
-    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
-    s, camp_id, thread_id = db
-    c = _respond([{
-        "id": "beat_1", "type": "narration",
-        "claims": [{
-            "text": 'Elara declares, "I hold my ground."',
-            "claim_kind": "player_declaration", "origin": "player_transcript",
-            "actor_ref": {"type": "character", "id": "char:elara"},
-            "evidence_refs": ["sub1"], "visibility": "public",
-        }],
-    }])
-    delta1 = (
-        'Elara declares, "I hold my ground." '
-        "The hall is quiet and the torches burn low."
-    )
-    assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
-
-    def _rogue(req):
-        yield delta1
-        yield " Elara charges the dragon and attacks."
-
-    with pytest.raises(NarrationStreamError) as ei:
-        stream_narration(
-            s, campaign_id=camp_id, thread_id=thread_id,
-            turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
-            contract=c, narrator=_rogue, chunk_size=48,
-            publish_realtime=False, pc_names={"char:elara": "Elara"},
-        )
-    assert ei.value.persisted_chunks >= 1
-    assert any(v["category"] == "agency_violation" for v in ei.value.violations)
-    assert get_stream(s, ei.value.stream_id).status == "failed"
-
-
 def test_full_validation_failure_after_partial_delivery_fails_stream(db):
     """Full gate catches what incremental gates cannot (unsupported addition).
 
@@ -788,7 +720,7 @@ def test_full_validation_failure_after_partial_delivery_fails_stream(db):
     authoritative validation: the stream is failed (partial retained as
     failed-visible audit) with violations attached for the repair path.
     """
-    from app.dm_streams.service import get_stream, reconstruct_text
+    from app.dm.streams import get_stream, reconstruct_text
 
     s, camp_id, thread_id = db
     c = _respond([_narr_beat("The goblin snarls and circles.")])
@@ -817,8 +749,8 @@ def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db)
     """Orchestrator remediation: post-visibility full-gate failure reuses
     the #206 failed-visible state; the input set stays locked."""
     from app.dm.turns import StreamBoundaryError, coordinate_turn
-    from app.dm_streams.service import get_stream
-    from app.runtime.submissions import accept_submission
+    from app.dm.streams import get_stream
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -862,7 +794,7 @@ def test_chunk0_and_streaming_boundary_share_single_commit(db, monkeypatch):
     realtime delivery.
     """
     import app.dm.turns as turns_mod
-    import app.dm_streams.service as stream_svc
+    import app.dm.streams as stream_svc
     import app.realtime.service as realtime_mod
 
     s, camp_id, thread_id = db
@@ -903,7 +835,7 @@ def test_chunk0_and_streaming_boundary_share_single_commit(db, monkeypatch):
     monkeypatch.setattr(s, "commit", _spy_commit)
     monkeypatch.setattr(stream_svc, "append_chunk", _spy_append)
     monkeypatch.setattr(turns_mod, "mark_streaming_started", _spy_boundary)
-    monkeypatch.setattr(realtime_mod, "publish_dm_chunk_created", _spy_publish)
+    monkeypatch.setattr("app.dm.narration.publish_dm_chunk_created", _spy_publish)
 
     out = execute_validated_turn(
         s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
@@ -980,7 +912,7 @@ def test_restarted_worker_finds_streaming_locked_never_prepared_chunked(db):
     """Recovery path: after the atomic chunk-0 commit, a restarted worker
     finds streaming+locked — never prepared+chunked."""
     from app.dm.turns import StreamBoundaryError, coordinate_turn, mark_streaming_started
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -1115,7 +1047,7 @@ def _history_seed(db):
     from models.characters import Character
     from models.threads import PlayerSubmission
 
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     s, camp_id, thread_id = db
     owner = s.execute(select(Profile)).scalars().first()

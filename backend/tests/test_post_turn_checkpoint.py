@@ -20,7 +20,6 @@ from app.post_turn.service import (  # noqa: E402
     get_batch_threshold,
     get_checkpoint,
     get_outstanding_range,
-    get_post_turn_status,
     handle_post_turn_envelope,
     mark_post_turn_skipped,
     maybe_trigger_post_turn,
@@ -28,13 +27,12 @@ from app.post_turn.service import (  # noqa: E402
     run_post_turn_sweep,
     should_trigger_post_turn,
 )
-from app.queue.envelope import WorkerEnvelope  # noqa: E402
+from app.worker.envelope import WorkerEnvelope  # noqa: E402
 from app.worker.executor import execute_worker_job  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.campaigns import CampaignDomainEvent  # noqa: E402
 from models.post_turn import PostTurnCheckpoint, PostTurnRun  # noqa: E402
 from models.profiles import Profile  # noqa: E402
-from models.reliability import Outbox  # noqa: E402
 
 
 def _factory():
@@ -76,9 +74,7 @@ def test_checkpoint_defaults_zero_and_exposed():
     c = _campaign(db)
     cp = get_checkpoint(db, c.id)
     assert cp.processed_through_sequence == 0
-    st = get_post_turn_status(db, c.id)
-    assert st["checkpoint"] == 0
-    assert st["outstanding"]["outstanding"] == 0
+    assert get_outstanding_range(db, c.id)["outstanding"] == 0
     db.close()
 
 
@@ -91,8 +87,6 @@ def test_normal_batch_trigger_and_success_advances():
     run = maybe_trigger_post_turn(db, c.id)
     assert run is not None
     assert (run.from_sequence, run.to_sequence) == (1, 4)
-    # outbox emitted with run id as job id
-    assert db.get(Outbox, run.id) is not None
     out = run_post_turn_range(db, c.id, 1, 4, run_id=run.id)
     assert out["duplicate"] is False
     assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 4
@@ -169,24 +163,6 @@ def test_duplicate_worker_delivery_idempotent():
     db.close()
 
 
-def test_consume_queue_delivery_path(monkeypatch):
-    from app.queue.consumer import consume_queue_delivery
-    import database
-    F = _factory()
-    monkeypatch.setattr(database, "SessionLocal", F)
-    s = F()
-    c = _campaign(s)
-    for i in range(2):
-        _commit(s, c.id, i)
-    run = maybe_trigger_post_turn(s, c.id, trigger="force")
-    body = WorkerEnvelope(job_id=run.id, job_type="post_turn.process", campaign_id=c.id,
-                          payload={"run_id": str(run.id), "campaign_id": str(c.id),
-                                   "from_sequence": 1, "to_sequence": 2, "trigger": "force"}).to_dict()
-    result, dup = consume_queue_delivery(s, body)
-    assert dup is False and result["processed_through"] == 2
-    s.close()
-
-
 def test_checkpoint_never_rolls_back_and_skip_requires_audit():
     F = _factory()
     db = F()
@@ -248,15 +224,13 @@ def test_observability_status():
     for i in range(4):
         _commit(db, c.id, i)
     run = maybe_trigger_post_turn(db, c.id, trigger="force")
-    st = get_post_turn_status(db, c.id)
-    assert st["checkpoint"] == 0
-    assert st["outstanding"]["outstanding"] == 4
-    assert st["run_attempts"] >= 1
-    assert st["queue_lag_seconds"] >= 0
+    assert int(get_checkpoint(db, c.id).processed_through_sequence or 0) == 0
+    span = get_outstanding_range(db, c.id)
+    assert span["outstanding"] == 4
+    assert span.get("age_seconds", 0.0) >= 0
     run_post_turn_range(db, c.id, 1, 4, run_id=run.id)
-    st2 = get_post_turn_status(db, c.id)
-    assert st2["checkpoint"] == 4
-    assert st2["outstanding"]["outstanding"] == 0
+    assert int(get_checkpoint(db, c.id).processed_through_sequence or 0) == 4
+    assert get_outstanding_range(db, c.id)["outstanding"] == 0
     db.close()
 
 
@@ -314,7 +288,7 @@ def test_backlog_before_first_worker_converges_without_new_play():
 
 def test_commit_false_outer_transaction_stages_trigger_atomically(monkeypatch):
     """The HTTP idempotency shape (commit=False + outer commit) still emits
-    the run + outbox rows in the same transaction as the event."""
+    the run row in the same transaction as the event."""
     monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
     F = _factory()
     db = F()
@@ -328,8 +302,7 @@ def test_commit_false_outer_transaction_stages_trigger_atomically(monkeypatch):
         select(_Run).where(_Run.campaign_id == c.id, _Run.from_sequence == 1, _Run.to_sequence == 4)
     ).scalars().first()
     assert staged is not None
-    assert db.get(Outbox, staged.id) is not None
-    # The single outer commit persists event + run + outbox together.
+    # The single outer commit persists event + run together.
     db.commit()
     db.expire_all()
     assert db.execute(
@@ -401,40 +374,6 @@ def test_concurrent_duplicate_triggers_share_one_run(tmp_path):
         t.join()
     assert not errors, f"racing triggers raised: {errors}"
     assert len(results) == 4 and len(set(results)) == 1
-
-
-def test_production_wiring_commit_relay_consume(monkeypatch):
-    """Integration: commit gameplay only; auto-trigger -> relay -> worker."""
-    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
-    import database
-    from app.outbox.relay import run_outbox_relay_once
-    from app.queue import InMemoryQueueAdapter
-    from app.queue.consumer import consume_queue_delivery
-
-    F = _factory()
-    monkeypatch.setattr(database, "SessionLocal", F)
-    queue = InMemoryQueueAdapter()
-    with F() as db:
-        c = _campaign(db)
-        cid = c.id
-        # Production path: only commit_campaign_mutation, never the service.
-        for i in range(4):
-            commit_campaign_mutation(db, cid, expected_revision=i, event_type="game.play",
-                                     payload={"n": i}, operation_id=f"wire-{i}")
-        # Auto-trigger created the run + outbox atomically with the 4th event.
-        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 0
-        status = get_post_turn_status(db, cid)
-        assert status["outstanding"]["outstanding"] == 4
-        assert status["run_attempts"] == 1
-    with F() as db:
-        relay = run_outbox_relay_once(db=db, adapter=queue, claimed_by="wire-test")
-        assert relay["succeeded"] == 1
-    assert queue.depth() == 1
-    with F() as db:
-        result, dup = consume_queue_delivery(db, queue.peek_all()[0].to_dict())
-        assert dup is False and result["processed_through"] == 4
-    with F() as db:
-        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 4
 
 
 def test_post_turn_sweep_cron_endpoint(monkeypatch):

@@ -36,9 +36,9 @@ from app.combat.service import (  # noqa: E402
     start_encounter,
 )
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
-from models.campaigns import Campaign, CampaignMember  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
+from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant  # noqa: E402
 from models.dm import PlayerRollFulfillment, PlayerRollRequest  # noqa: E402
@@ -369,8 +369,6 @@ def test_incomplete_initiative_stays_pending_without_guessing():
 
 
 def test_ready_operation_key_bounded_for_max_length_start_key():
-    from models.reliability import Outbox
-
     fac, ctx = _fixture()
     with fac() as db:
         encounter, _ = _start(
@@ -382,13 +380,13 @@ def test_ready_operation_key_bounded_for_max_length_start_key():
         assert event is not None
         assert event.operation_id == f"encounter:{encounter.id}:initiative-ready"
         assert len(event.operation_id) <= 128
-        outbox_keys = {
+        event_keys = {
             row.operation_id for row in db.execute(
-                select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
+                select(CampaignDomainEvent).where(
+                    CampaignDomainEvent.campaign_id == ctx["campaign_id"])
             ).scalars().all()
         }
-        assert f"encounter:{encounter.id}:initiative-ready" in outbox_keys
-        assert all(len(key or "") <= 128 for key in outbox_keys)
+        assert all(len(key or "") <= 128 for key in event_keys)
 
 
 def test_npc_override_preserves_canonical_dex_tiebreak():
@@ -711,12 +709,12 @@ def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
 
 def test_realtime_hooks_emit_stable_encounter_events():
     from app.realtime.service import (
-        InMemoryRealtimePublisher,
         build_encounter_ready_event,
         build_encounter_started_event,
         get_realtime_publisher,
         set_realtime_publisher,
     )
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     fac, ctx = _fixture()
     previous = get_realtime_publisher()
@@ -789,7 +787,7 @@ def test_http_start_and_duplicate_replay(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, TEST_USER_ID)
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -864,7 +862,7 @@ def test_http_start_with_stale_revision_returns_409(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, TEST_USER_ID)
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -891,11 +889,8 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     from fastapi.testclient import TestClient
 
     from app.auth.service import TEST_USER_ID
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
@@ -945,8 +940,7 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, TEST_USER_ID)
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
-    monkeypatch.setattr("app.rolls.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     previous = get_realtime_publisher()
     recorder = InMemoryRealtimePublisher()
@@ -996,7 +990,7 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
 
 def _private_thread_fixture():
     """Owner-only private thread with its own turn/attempt in this campaign."""
-    from app.runtime.threads import create_private_thread
+    from app.threads.service import create_private_thread
 
     fac, ctx = _fixture()
     with fac() as db:
@@ -1102,8 +1096,7 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
-    monkeypatch.setattr("app.campaigns.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -1176,7 +1169,7 @@ def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -1202,7 +1195,7 @@ def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
 
 def test_api_start_from_unreadable_thread_is_hidden():
     """Direct start from a thread the actor cannot read fails as not-found."""
-    from app.runtime.threads import ThreadNotFoundError, create_private_thread
+    from app.threads.service import ThreadNotFoundError, create_private_thread
 
     fac, ctx = _fixture()
     with fac() as db:
@@ -1239,7 +1232,7 @@ def test_http_start_from_unreadable_thread_returns_404(monkeypatch):
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
-    from app.runtime.threads import create_private_thread
+    from app.threads.service import create_private_thread
 
     fac, ctx = _fixture()
     with fac() as db:
@@ -1268,7 +1261,7 @@ def test_http_start_from_unreadable_thread_returns_404(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -1293,9 +1286,9 @@ def test_private_attempt_promotes_start_encounter():
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
-    from app.runtime.threads import create_private_thread
+    from app.threads.service import create_private_thread
 
     fac, ctx = _fixture()
     with fac() as db:
@@ -1353,7 +1346,7 @@ def test_private_attempt_promotes_start_encounter():
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
         # Previously rejected: public-defaulted effect broadening a private attempt.
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
         encounter = get_active_encounter(db, ctx["campaign_id"])
         assert encounter is not None
         assert encounter.thread_id == str(thread.id)
@@ -1377,7 +1370,6 @@ def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
     """Same-operation integrity races replay; a different active encounter 409s."""
     from sqlalchemy.exc import IntegrityError
 
-    import app.campaigns.events as campaign_events
     import app.combat.service as combat_service
 
     fac, ctx = _fixture()
@@ -1417,7 +1409,7 @@ def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
 
         monkeypatch.setattr(combat_service, "find_by_operation", _find_once_none)
         monkeypatch.setattr(combat_service, "get_active_encounter", _active_once_none)
-        monkeypatch.setattr(campaign_events, "commit_campaign_mutation", _conflict)
+        monkeypatch.setattr(combat_service, "commit_campaign_mutation", _conflict)
         replay, _ = start_encounter(
             db, ctx["campaign_id"], operation_id="op-enc-1", expected_revision=0,
             actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],

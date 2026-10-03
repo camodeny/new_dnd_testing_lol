@@ -7,10 +7,10 @@ provider / credentials / production data.
 Covered here:
 - API response loss replays the committed idempotent result (no re-execution).
 - DB failure mid-transaction rolls back with no partial state.
-- Worker crash before completion is recovered by the stuck-execution sweeper
-  and safely redelivered.
+- Worker crash before completion is reclaimed once its lease expires and
+  safely redelivered.
 - Stale concurrent campaign mutation loses cleanly via revision conflict.
-- Terminal poison work stays durable/inspectable and replays after correction.
+- Terminal poison work stays durable/inspectable (dead letter).
 - Provider-like transient failure recovers through worker retry; terminal
   failure goes straight to dead letter (billing assertions skipped: #259 open).
 - Telemetry failure cannot corrupt gameplay.
@@ -46,19 +46,16 @@ from app.observability.service import (
     mark_milestone,
 )
 from app.observability.tracing import trace_context
-from app.queue.envelope import WorkerEnvelope
-from app.worker import (
+from app.worker.envelope import WorkerEnvelope
+from app.worker.executor import (
     RetriableError,
     TerminalError,
     execute_worker_job,
-    list_failed_work,
-    recover_stuck_executions,
-    replay_failed_job,
 )
 from database import Base
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.profiles import Profile
-from models.reliability import OperationTrace, Outbox, WorkerExecution
+from models.reliability import OperationTrace, WorkerExecution
 from tests.reliability.faults import FaultScenario
 
 
@@ -177,8 +174,6 @@ def test_db_failure_mid_transaction_rolls_back_without_partial_state(tmp_path):
                 event_type="turn.requested",
                 operation_id=operation_id,
                 payload={"synthetic": True},
-                outbox_event_type="turn.resolve",
-                outbox_payload={"campaign_id": str(campaign_id)},
                 mutate=poisoned_mutate,
             )
     with factory() as db:
@@ -186,16 +181,12 @@ def test_db_failure_mid_transaction_rolls_back_without_partial_state(tmp_path):
         events = db.execute(
             select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == campaign_id)
         ).scalars().all()
-        outbox_rows = db.execute(
-            select(Outbox).where(Outbox.operation_id == operation_id)
-        ).scalars().all()
         assert campaign.revision == 0
         assert events == []
-        assert outbox_rows == []
-    scenario.record("converged", final_revision=campaign.revision, domain_events=0, outbox_rows=0)
+    scenario.record("converged", final_revision=campaign.revision, domain_events=0)
 
 
-# ── Worker crash before completion: sweeper recovers, redelivery succeeds ────
+# ── Worker crash before completion: expired lease reclaimed on redelivery ───
 
 
 def test_worker_crash_before_completion_recovers_and_redelivers_once(tmp_path):
@@ -226,8 +217,6 @@ def test_worker_crash_before_completion_recovers_and_redelivers_once(tmp_path):
         db.commit()
     assert scenario.hit_once("worker_crashed_while_running", job_id=envelope.job_id)
 
-    with factory() as db:
-        assert recover_stuck_executions(db, lease_seconds=300) == 1
     handler_calls = 0
 
     def apply_gameplay_effect(_envelope):
@@ -245,7 +234,7 @@ def test_worker_crash_before_completion_recovers_and_redelivers_once(tmp_path):
             return {"campaign_revision": campaign.revision, "event_id": str(event.id)}
 
     with factory() as db:
-        result, duplicate = execute_worker_job(db, envelope, apply_gameplay_effect)
+        result, duplicate = execute_worker_job(db, envelope, apply_gameplay_effect, lease_seconds=300)
     with factory() as db:
         execution = db.get(WorkerExecution, envelope.job_id)
         campaign = db.get(Campaign, campaign_id)
@@ -304,10 +293,10 @@ def test_stale_concurrent_mutation_loses_cleanly_via_revision_conflict(tmp_path)
     scenario.record("converged", final_revision=1, domain_event_count=len(events))
 
 
-# ── Terminal poison work: durable, inspectable, replayable after correction ──
+# ── Terminal poison work: durable and inspectable ───────────────────────────
 
 
-def test_terminal_poison_work_replays_after_correction(tmp_path):
+def test_terminal_poison_work_stays_dead_lettered(tmp_path):
     scenario = FaultScenario("terminal_poison_work_replay")
     engine = _safe_engine(tmp_path)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -326,24 +315,11 @@ def test_terminal_poison_work_replays_after_correction(tmp_path):
         execution = db.get(WorkerExecution, envelope.job_id)
         assert execution.status == "dead_letter"
         assert execution.error_class == "terminal"
-        failed = list_failed_work(db)
-        assert [row.id for row in failed] == [envelope.job_id]
-        # Direct redelivery without replay stays terminal and inspectable.
+        # Direct redelivery stays terminal and inspectable.
         with pytest.raises(TerminalError, match="dead_letter"):
             execute_worker_job(db, envelope, poisoned)
-        assert replay_failed_job(db, envelope.job_id) is not None
-
-    def corrected(_envelope):
-        return {"recovered": True}
-
-    with factory() as db:
-        result, duplicate = execute_worker_job(db, envelope, corrected)
-    with factory() as db:
-        execution = db.get(WorkerExecution, envelope.job_id)
-        assert execution.status == "succeeded"
-        assert list_failed_work(db) == []
-    assert result == {"recovered": True} and duplicate is False
-    scenario.record("converged", replayed=True, final_status=execution.status)
+        assert db.get(WorkerExecution, envelope.job_id).status == "dead_letter"
+    scenario.record("converged", final_status="dead_letter")
 
 
 # ── Provider failure recovery through the worker retry path ──────────────────
@@ -429,8 +405,6 @@ def test_telemetry_failure_cannot_corrupt_gameplay(tmp_path):
                 event_type="turn.requested",
                 operation_id=operation_id,
                 payload={"synthetic": True},
-                outbox_event_type="turn.resolve",
-                outbox_payload={"campaign_id": str(campaign_id)},
             )
             assert campaign.revision == 1
 
@@ -452,10 +426,6 @@ def test_telemetry_failure_cannot_corrupt_gameplay(tmp_path):
             db.execute(
                 select(CampaignDomainEvent).where(CampaignDomainEvent.id == event.id)
             ).scalars().one()
-            is not None
-        )
-        assert (
-            db.execute(select(Outbox).where(Outbox.operation_id == operation_id)).scalars().one()
             is not None
         )
         assert get_trace(db, trace_id)["telemetry_complete"] is False

@@ -1,7 +1,7 @@
 """Deployment scheduling guards.
 
 - Vercel deploys on the Hobby plan, which rejects sub-daily cron expressions
-  (see PR #363). Every cron in vercel.json must run at most once per day.
+  (see PR #363). Any cron in vercel.json must run at most once per day.
 - Fast production scheduling lives in Supabase pg_cron + pg_net SQL files
   (see backend/scripts/supabase/README.md). The post-turn schedule must hit
   the cron endpoint every minute with Vault-backed auth, re-runnable without
@@ -24,10 +24,8 @@ def _crons():
     return json.loads(VERCEL_JSON.read_text(encoding="utf-8")).get("crons", [])
 
 
-def test_vercel_json_is_valid_with_crons():
-    crons = _crons()
-    assert crons, "vercel.json must define crons"
-    for cron in crons:
+def test_vercel_json_crons_target_cron_endpoints():
+    for cron in _crons():
         assert cron.get("path", "").startswith("/api/cron/"), f"unexpected cron {cron}"
         assert cron.get("schedule", "").strip(), f"cron missing schedule: {cron}"
 

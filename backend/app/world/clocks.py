@@ -34,8 +34,9 @@ imply a separate human DM or moderator. This module never advances state
 from wall-clock time: progress moves only against committed domain-event
 evidence, so real-world idle time can never tick a clock.
 
-Conventions mirror ``app.world.npcs`` (inline vs. authoritative writers)
-and ``app.world.identity`` (bounded decision integration + telemetry).
+Conventions mirror ``app.world.npcs`` (writers run inside the caller's
+revision transaction) and ``app.world.identity`` (bounded decision
+integration + telemetry).
 """
 
 from __future__ import annotations
@@ -44,12 +45,15 @@ import logging
 import re
 import uuid
 from datetime import datetime, timezone
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_uuid
 from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.service import lock_campaign_row
 from app.decisions import (
     ACTIVE,
     ESCALATE,
@@ -69,7 +73,11 @@ from app.decisions import (
     shared_trace,
     to_decision_request,
 )
+from app.idempotency import compose_operation_id
 from app.observability.tracing import structured_log
+from app.visibility.access import is_campaign_participant, is_world_authority
+from app.visibility.policy import RESTRICTED_VISIBILITIES, visible_to_viewer, world_event_visibility
+from app.world._common import require_provenance
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import (
     CLOCK_EVALUABLE_STATUSES,
@@ -102,10 +110,8 @@ _ADVANCE_RE = re.compile(r"^ADVANCE_(\d+)$")
 # Domain events recording clock lifecycle. No-change / deferral outcomes
 # emit no domain event (they change no fictional state); they are recorded
 # in decision telemetry plus the post-turn run result instead.
-CLOCK_CREATED_EVENT = "clock.created"
 CLOCK_ADVANCED_EVENT = "clock.advanced"
 CLOCK_COMPLETED_EVENT = "clock.completed"
-CLOCK_RETIRED_EVENT = "clock.retired"
 
 # Bound on evidence refs serialized into one decision state payload.
 MAX_EVIDENCE_REFS = 25
@@ -113,7 +119,7 @@ MAX_EVIDENCE_REFS = 25
 # Clock lifecycle bookkeeping shares the campaign sequence with gameplay
 # but is never gameplay evidence (see collect_evidence).
 CLOCK_LIFECYCLE_EVENT_TYPES = frozenset({
-    CLOCK_CREATED_EVENT, CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT, CLOCK_RETIRED_EVENT,
+    CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT,
 })
 
 register_policy(DecisionClassPolicy(
@@ -147,16 +153,24 @@ class ClockStaleError(DecisionError):
         self.current_revision = current_revision
 
 
+#: Caller-owned veto on revision-bumping clock commits: returns a deferral
+#: reason, or ``None`` to allow. Called once unlocked before any model work
+#: and again under the campaign row lock immediately before the commit.
+ClockCommitGate = Callable[[Session, uuid.UUID], "str | None"]
+
+
+class ClockCommitDeferred(Exception):
+    """A clock commit must wait; nothing was applied and the range retries."""
+
+    def __init__(self, campaign_id: Any, reason: str) -> None:
+        super().__init__(f"clock commit deferred for campaign {campaign_id}: {reason}")
+        self.campaign_id = campaign_id
+        self.reason = reason
+
+
 # ── Validation (fail closed at creation) ───────────────────────────────────
 
 _CRITERION_KINDS = frozenset({"deterministic", "semantic"})
-
-
-def _uuid(value: Any, field: str) -> uuid.UUID:
-    try:
-        return uuid.UUID(str(value))
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ValueError(f"{field} must be a UUID") from exc
 
 
 def _positive_int(value: Any, field: str, *, minimum: int = 1) -> int:
@@ -269,12 +283,6 @@ def validate_stages(value: Any, threshold: int) -> list[dict[str, Any]] | None:
     return sorted(cleaned, key=lambda stage: stage["at"])
 
 
-def _provenance(value: Any) -> dict:
-    if not isinstance(value, dict) or not str(value.get("source") or "").strip():
-        raise ValueError("provenance.source is required for clock changes")
-    return dict(value)
-
-
 def _check_source_refs(
     db: Session, campaign_id: uuid.UUID, *, turn_id: uuid.UUID | None,
     attempt_id: uuid.UUID | None, event_id: uuid.UUID | None,
@@ -307,8 +315,8 @@ def _check_source_refs(
 # ── Creation ───────────────────────────────────────────────────────────────
 
 def get_clock(db: Session, campaign_id: Any, clock_id: Any) -> CampaignClock | None:
-    row = db.get(CampaignClock, _uuid(clock_id, "clock_id"))
-    return row if row is not None and row.campaign_id == _uuid(campaign_id, "campaign_id") else None
+    row = db.get(CampaignClock, coerce_uuid(clock_id, field="clock_id"))
+    return row if row is not None and row.campaign_id == coerce_uuid(campaign_id, field="campaign_id") else None
 
 
 def get_clock_strict(db: Session, campaign_id: uuid.UUID, clock_id: uuid.UUID) -> CampaignClock:
@@ -355,7 +363,7 @@ def _validate_new_clock(
     }
 
 
-def create_clock_inline(
+def create_clock(
     db: Session, campaign: Campaign, *, name: Any, threshold: Any,
     advancement_criteria: Any, status: Any = "pending", progress: Any = None,
     stages: Any = None, completion_criteria: Any = None, completion_effect: Any = None,
@@ -370,11 +378,11 @@ def create_clock_inline(
     existing row (after verifying it describes the same clock) instead of
     inserting. The world-seed flow composes this with campaign creation.
     """
-    cid = _uuid(campaign.id, "campaign_id")
-    turn_id = _uuid(source_turn_id, "source_turn_id") if source_turn_id else None
-    attempt_id = _uuid(source_attempt_id, "source_attempt_id") if source_attempt_id else None
-    event_id = _uuid(source_event_id, "source_event_id") if source_event_id else None
-    prov = _provenance(provenance)
+    cid = coerce_uuid(campaign.id, field="campaign_id")
+    turn_id = coerce_uuid(source_turn_id, field="source_turn_id") if source_turn_id else None
+    attempt_id = coerce_uuid(source_attempt_id, field="source_attempt_id") if source_attempt_id else None
+    event_id = coerce_uuid(source_event_id, field="source_event_id") if source_event_id else None
+    prov = require_provenance(provenance, subject="clock")
     _check_source_refs(db, cid, turn_id=turn_id, attempt_id=attempt_id, event_id=event_id)
     cleaned = _validate_new_clock(
         name=name, status=status, progress=progress, threshold=threshold, stages=stages,
@@ -399,77 +407,6 @@ def create_clock_inline(
     db.add(row)
     db.flush()
     return row, True
-
-
-def _clock_event_visibility(clock_visibility: str) -> str:
-    """Map clock disclosure onto domain-event visibility (member feed safe)."""
-    from app.world.service import world_event_visibility
-
-    return world_event_visibility(clock_visibility)
-
-
-def create_clock_authoritative(
-    db: Session, campaign_id: Any, expected_revision: int, *, name: Any,
-    threshold: Any, advancement_criteria: Any, status: Any = "pending",
-    progress: Any = None, stages: Any = None, completion_criteria: Any = None,
-    completion_effect: Any = None, visibility: Any = "dm_only",
-    provenance: dict | None = None, source_turn_id: Any = None,
-    source_attempt_id: Any = None, source_event_id: Any = None,
-    operation_id: str | None = None, idempotency_key: str | None = None,
-) -> tuple[CampaignClock, Any | None]:
-    """Create a clock under campaign revision ordering with a domain event.
-
-    Duplicate ``idempotency_key`` returns the existing row with no new event.
-    """
-    cid = _uuid(campaign_id, "campaign_id")
-    prov = _provenance(provenance)
-    holder: dict[str, Any] = {}
-    started_ms = _now_ms()
-
-    # Fast idempotent path first: a duplicate key must not bump the revision
-    # or emit a second created event.
-    if idempotency_key:
-        existing = db.execute(select(CampaignClock).where(
-            CampaignClock.campaign_id == cid,
-            CampaignClock.idempotency_key == str(idempotency_key).strip(),
-        )).scalars().first()
-        if existing is not None:
-            try:
-                same_threshold = int(existing.threshold) == int(threshold)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                same_threshold = False
-            if existing.name != str(name or "").strip() or not same_threshold:
-                raise ValueError("idempotency key belongs to a different clock")
-            return existing, None
-
-    def mutate(campaign: Campaign) -> None:
-        holder["row"], holder["created"] = create_clock_inline(
-            db, campaign, name=name, threshold=threshold,
-            advancement_criteria=advancement_criteria, status=status,
-            progress=progress, stages=stages, completion_criteria=completion_criteria,
-            completion_effect=completion_effect, visibility=visibility,
-            provenance=prov, source_turn_id=source_turn_id,
-            source_attempt_id=source_attempt_id, source_event_id=source_event_id,
-            operation_id=operation_id, idempotency_key=idempotency_key,
-        )
-
-    _campaign, event = commit_campaign_mutation(
-        db, cid, expected_revision, event_type=CLOCK_CREATED_EVENT,
-        operation_id=operation_id, mutate=mutate,
-        payload_builder=lambda: {
-            "clock_id": str(holder["row"].id), "name": holder["row"].name,
-            "status": holder["row"].status, "threshold": holder["row"].threshold,
-        },
-        targets_builder=lambda: {"clock_id": str(holder["row"].id)},
-        visibility_builder=lambda: _clock_event_visibility(holder["row"].visibility),
-        provenance=prov,
-    )
-    row = holder["row"]
-    structured_log(
-        logger, logging.INFO, "clock_created", campaign_id=str(cid), clock_id=str(row.id),
-        status=row.status, threshold=row.threshold, update_ms=round(_now_ms() - started_ms, 3),
-    )
-    return row, event
 
 
 # ── Evidence matching (deterministic, authority lane) ──────────────────────
@@ -503,10 +440,9 @@ def collect_evidence(
 
     ``event_types`` filters candidacy; an empty filter admits every event
     type and the ``match`` clause alone decides. Clock lifecycle events
-    (``clock.created/advanced/completed/retired``) never qualify: they are
-    this feature's own bookkeeping in the same campaign sequence, not
-    committed gameplay, so counting them would let a clock tick on its own
-    creation. Matching ignores event visibility: post-turn evaluation runs
+    (``clock.advanced/completed``) never qualify: they are this feature's
+    own bookkeeping in the same campaign sequence, not committed gameplay,
+    so counting them would let a clock tick on its own progress. Matching ignores event visibility: post-turn evaluation runs
     in the authority lane, so DM-private gameplay can advance hidden
     clocks without disclosure.
     """
@@ -545,7 +481,7 @@ def _validate_evidence_refs(
             raise ValueError("evidence ref sequence must be an integer")
         if not (from_sequence <= seq <= to_sequence):
             raise ValueError(f"evidence ref sequence {seq} is outside the evaluated range")
-        ids.append(_uuid(ref.get("event_id"), "evidence ref event_id"))
+        ids.append(coerce_uuid(ref.get("event_id"), field="evidence ref event_id"))
     if not ids:
         return
     rows = db.execute(select(CampaignDomainEvent.id, CampaignDomainEvent.campaign_id).where(
@@ -694,7 +630,7 @@ def build_clock_frame(
             "audience": "member",
             "evidence": [
                 ref for ref in evidence
-                if str((ref.get("visibility") or "public")) not in ("private", "dm_only")
+                if str((ref.get("visibility") or "public")) not in RESTRICTED_VISIBILITIES
             ],
             "evidence_total": evidence_total,
             "source_range": [from_sequence, to_sequence],
@@ -800,16 +736,11 @@ def decide_clock(
 
 # ── Application (deterministic, idempotent, revision-guarded) ──────────────
 
-def _now_ms() -> float:
-    import time as _time
-
-    return _time.monotonic() * 1000.0
-
-
 def apply_clock_outcome(
     db: Session, campaign_id: Any, clock_id: Any, *, frame: DecisionFrame,
     selected_id: str, evidence_refs: list[dict[str, Any]],
     from_sequence: int, to_sequence: int, operation_id: str | None = None,
+    commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Apply one decided outcome after revision + evidence revalidation.
 
@@ -818,10 +749,12 @@ def apply_clock_outcome(
     outcomes, invalid evidence refs, or advancement/completion selected
     with no evidence satisfying the relevant criteria. NO_CHANGE advances
     only the idempotency watermark; advancement/completion commit a domain
-    event under campaign revision ordering.
+    event under campaign revision ordering. ``commit_gate`` is re-checked
+    under the campaign row lock right before that commit and raises
+    :class:`ClockCommitDeferred` (nothing applied) when it vetoes.
     """
-    cid = _uuid(campaign_id, "campaign_id")
-    clock = get_clock_strict(db, cid, _uuid(clock_id, "clock_id"))
+    cid = coerce_uuid(campaign_id, field="campaign_id")
+    clock = get_clock_strict(db, cid, coerce_uuid(clock_id, field="clock_id"))
     if clock.status not in CLOCK_EVALUABLE_STATUSES:
         raise ClockStaleError(clock.id, frame.state_revision, clock.revision)
     if int(clock.revision or 1) != int(frame.state_revision):
@@ -925,6 +858,14 @@ def apply_clock_outcome(
         holder["revision"] = fresh.revision
         holder["status"] = fresh.status
 
+    if commit_gate is not None:
+        # Same lock commit_campaign_mutation takes below (re-entrant within
+        # this transaction), held through the commit so the gate's verdict
+        # cannot go stale before the revision bump lands.
+        lock_campaign_row(db, cid)
+        reason = commit_gate(db, cid)
+        if reason:
+            raise ClockCommitDeferred(cid, reason)
     event_type = CLOCK_COMPLETED_EVENT if (
         completing or int(clock.progress or 0) + int(amount or 0) >= int(clock.threshold)
     ) else CLOCK_ADVANCED_EVENT
@@ -943,7 +884,7 @@ def apply_clock_outcome(
             **({"completion_effect": dict(clock.completion_effect or {})} if holder["completed"] else {}),
         },
         targets_builder=lambda: {"clock_id": str(clock.id)},
-        visibility_builder=lambda: _clock_event_visibility(clock.visibility),
+        visibility_builder=lambda: world_event_visibility(clock.visibility),
         provenance={"source": "post_turn_clock_evaluation",
                     "frame_state_revision": expected_revision},
     )
@@ -967,7 +908,7 @@ def evaluate_clock_for_range(
     events: list[CampaignDomainEvent], *, from_sequence: int, to_sequence: int,
     decision_service: DecisionService | None = None,
     session_factory: Any = None, operation_id: str | None = None,
-    is_authority: bool = True,
+    is_authority: bool = True, commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Evaluate one clock against the unevaluated suffix of a source range.
 
@@ -1004,7 +945,8 @@ def evaluate_clock_for_range(
         max_advance = max(1, int(criteria.get("max_advance", 1)))
         remaining = int(clock.threshold) - int(clock.progress or 0)
         if remaining <= 0:
-            return _complete_threshold(db, campaign, clock, refs, from_sequence, to_sequence, operation_id)
+            return _complete_threshold(db, campaign, clock, refs, from_sequence, to_sequence,
+                                       operation_id, commit_gate)
         available = int(clock.progress_carry or 0) + total
         ticks = min(available // required, max_advance, remaining)
         if ticks <= 0:
@@ -1027,7 +969,7 @@ def evaluate_clock_for_range(
                 ),
                 selected_id=outcome_id, evidence_refs=refs,
                 from_sequence=from_sequence, to_sequence=to_sequence,
-                operation_id=operation_id,
+                operation_id=operation_id, commit_gate=commit_gate,
             )
         except ClockStaleError:
             # No rollback here: a stale clock wrote nothing of its own, and
@@ -1088,7 +1030,7 @@ def evaluate_clock_for_range(
             selected_id=decision.selected_id,
             evidence_refs=completion_refs if judged_complete else refs,
             from_sequence=from_sequence, to_sequence=to_sequence,
-            operation_id=operation_id,
+            operation_id=operation_id, commit_gate=commit_gate,
         )
     except ClockStaleError:
         # Same savepoint-owned isolation as the deterministic path above:
@@ -1108,7 +1050,7 @@ def evaluate_clock_for_range(
 def _complete_threshold(
     db: Session, campaign: Campaign, clock: CampaignClock,
     refs: list[dict[str, Any]], from_sequence: int, to_sequence: int,
-    operation_id: str | None,
+    operation_id: str | None, commit_gate: ClockCommitGate | None,
 ) -> dict[str, Any]:
     """Defensive completion when progress already covers the threshold."""
     frame = build_clock_frame(
@@ -1118,7 +1060,7 @@ def _complete_threshold(
     applied = apply_clock_outcome(
         db, campaign.id, clock.id, frame=frame, selected_id=COMPLETE,
         evidence_refs=refs, from_sequence=from_sequence,
-        to_sequence=to_sequence, operation_id=operation_id,
+        to_sequence=to_sequence, operation_id=operation_id, commit_gate=commit_gate,
     )
     applied["evidence_count"] = len(refs)
     applied["path"] = "deterministic"
@@ -1132,6 +1074,7 @@ def consolidate_clocks_for_range(
     db: Session, campaign_id: Any, from_sequence: int, to_sequence: int,
     events: list[CampaignDomainEvent], *, decision_service: DecisionService | None = None,
     session_factory: Any = None, operation_id: str | None = None,
+    commit_gate: ClockCommitGate | None = None,
 ) -> dict[str, Any]:
     """Evaluate every evaluable clock against one committed source range.
 
@@ -1141,11 +1084,21 @@ def consolidate_clocks_for_range(
     processing error propagates so the post-turn run fails and the range
     is retried cumulatively. Emits no wall-clock reads: an empty evidence
     window is an explicit no-op.
+
+    ``commit_gate`` vetoes revision-bumping commits: checked once up front
+    (before any decision-model call) and again under the campaign row lock
+    per commit. A veto raises :class:`ClockCommitDeferred` so the caller
+    retries the whole range later; clocks already committed this pass keep
+    their watermarks and are not re-applied.
     """
-    cid = _uuid(campaign_id, "campaign_id")
+    cid = coerce_uuid(campaign_id, field="campaign_id")
     campaign = db.get(Campaign, cid)
     if campaign is None:
         raise ValueError(f"Campaign {campaign_id} not found")
+    if commit_gate is not None:
+        reason = commit_gate(db, cid)
+        if reason:
+            raise ClockCommitDeferred(cid, reason)
     # All non-terminal clocks load so dormant/pending skips are explicit
     # per-clock results (a clock may remain dormant without advancing);
     # terminal clocks are never re-evaluated.
@@ -1155,10 +1108,7 @@ def consolidate_clocks_for_range(
     ).order_by(CampaignClock.created_at.asc())).scalars().all())
     results: list[dict[str, Any]] = []
     for clock in clocks:
-        op_id = (
-            f"{operation_id}:clock:{clock.id}:{from_sequence}-{to_sequence}"
-            if operation_id else f"clock:{clock.id}:{from_sequence}-{to_sequence}"
-        )
+        op_id = compose_operation_id(operation_id, "clock", clock.id, f"{from_sequence}-{to_sequence}")
         # One savepoint per clock: a stale skip rolls back only that clock's
         # pending work, never sibling clocks' flushed watermarks or (already
         # committed) advancements. The guards below handle writers that
@@ -1173,8 +1123,12 @@ def consolidate_clocks_for_range(
                 db, campaign, clock, events,
                 from_sequence=from_sequence, to_sequence=to_sequence,
                 decision_service=decision_service, session_factory=session_factory,
-                operation_id=op_id,
+                operation_id=op_id, commit_gate=commit_gate,
             )
+        except ClockCommitDeferred:
+            if savepoint.is_active:
+                savepoint.rollback()
+            raise
         except ClockStaleError:
             if savepoint.is_active:
                 savepoint.rollback()
@@ -1198,23 +1152,6 @@ def consolidate_clocks_for_range(
 
 # ── Viewer-aware projection (secrecy first) ────────────────────────────────
 
-def _is_authority(campaign: Campaign, viewer_id: uuid.UUID) -> bool:
-    from app.world.service import is_world_authority
-
-    return is_world_authority(campaign, viewer_id)
-
-
-def _is_member(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> bool:
-    if _is_authority(campaign, viewer_id):
-        return True
-    from app.campaigns.service import is_campaign_member
-
-    try:
-        return bool(is_campaign_member(db, campaign.id, viewer_id))
-    except Exception:
-        return False
-
-
 def project_clocks_for_viewer(
     db: Session, campaign: Campaign, viewer_user_id: Any,
 ) -> dict[str, Any]:
@@ -1225,17 +1162,17 @@ def project_clocks_for_viewer(
     resolution internals. The campaign owner (AI-DM authority lane) sees
     every clock in full.
     """
-    viewer = _uuid(viewer_user_id, "viewer_user_id")
-    if not _is_member(db, campaign, viewer):
+    viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
+    if not is_campaign_participant(db, campaign, viewer):
         return {"clocks": [], "count": 0}
-    authority = _is_authority(campaign, viewer)
+    authority = is_world_authority(campaign, viewer)
     rows = list(db.execute(select(CampaignClock).where(
         CampaignClock.campaign_id == campaign.id,
     ).order_by(CampaignClock.created_at.asc())).scalars().all())
     visible: list[dict[str, Any]] = []
     hidden = 0
     for row in rows:
-        if authority or str(row.visibility) in ("public", "campaign"):
+        if visible_to_viewer(row.visibility, authority):
             data = row.to_dict()
             if not authority:
                 for key in ("provenance", "completion_effect", "resolution",
@@ -1255,95 +1192,3 @@ def project_clocks_for_viewer(
     return result
 
 
-def get_clock_for_viewer(
-    db: Session, campaign: Campaign, clock_id: Any, viewer_user_id: Any,
-) -> dict[str, Any]:
-    """Fetch one clock for a viewer; unauthorized reads get a blind stub."""
-    viewer = _uuid(viewer_user_id, "viewer_user_id")
-    row = get_clock(db, campaign.id, clock_id)
-    if row is None:
-        raise ValueError(f"clock {clock_id} not found in campaign {campaign.id}")
-    if not _is_member(db, campaign, viewer):
-        return {"clock_id": str(row.id), "visible": False}
-    if _is_authority(campaign, viewer) or str(row.visibility) in ("public", "campaign"):
-        data = row.to_dict()
-        if not _is_authority(campaign, viewer):
-            for key in ("provenance", "completion_effect", "resolution",
-                        "progress_carry", "evaluated_through_sequence",
-                        "operation_id", "idempotency_key",
-                        "source_turn_id", "source_attempt_id", "source_event_id"):
-                data.pop(key, None)
-        return {**data, "visible": True}
-    return {"clock_id": str(row.id), "visible": False}
-
-
-# ── Adventure-resolution hook (later #185/#261 flows call this) ────────────
-
-RETIRE_DISPOSITIONS = frozenset({"retired", "completed"})
-
-
-def retire_clock_authoritative(
-    db: Session, campaign_id: Any, clock_id: Any, expected_revision: int, *,
-    disposition: str, reason: str, successor_clock_id: Any = None,
-    provenance: dict | None = None, operation_id: str | None = None,
-) -> tuple[CampaignClock, Any]:
-    """Resolve a clock at adventure completion: retire, complete, or chain.
-
-    ``disposition="completed"`` marks the threshold met by adventure
-    outcome; ``"retired"`` ends the pressure without completion. An optional
-    ``successor_clock_id`` records a transform chain for later flows to
-    follow — this call never creates the successor itself. Terminal clocks
-    reject a second resolution (fail closed).
-    """
-    cid = _uuid(campaign_id, "campaign_id")
-    disp = str(disposition or "").strip().lower()
-    if disp not in RETIRE_DISPOSITIONS:
-        raise ValueError(f"disposition must be one of {sorted(RETIRE_DISPOSITIONS)}")
-    cleaned_reason = _non_empty_str(reason, "reason", limit=2000)
-    prov = _provenance(provenance)
-    successor = _uuid(successor_clock_id, "successor_clock_id") if successor_clock_id else None
-    clock = get_clock_strict(db, cid, _uuid(clock_id, "clock_id"))
-    if clock.status in CLOCK_TERMINAL_STATUSES:
-        raise ValueError(f"clock {clock.id} is already terminal ({clock.status})")
-    if successor is not None:
-        get_clock_strict(db, cid, successor)
-    holder: dict[str, Any] = {}
-
-    def mutate(campaign: Campaign) -> None:
-        fresh = db.execute(select(CampaignClock).where(
-            CampaignClock.id == clock.id,
-        ).with_for_update()).scalars().first()
-        if fresh is None or fresh.campaign_id != cid:
-            raise ValueError(f"clock {clock_id} vanished during resolution")
-        if fresh.status in CLOCK_TERMINAL_STATUSES:
-            raise ValueError(f"clock {fresh.id} is already terminal ({fresh.status})")
-        fresh.status = "completed" if disp == "completed" else "retired"
-        if disp == "completed":
-            fresh.progress = int(fresh.threshold)
-            fresh.completed_at = datetime.now(timezone.utc)
-        fresh.revision = int(fresh.revision or 1) + 1
-        fresh.resolution = {
-            "outcome": disp, "reason": cleaned_reason,
-            "successor_clock_id": str(successor) if successor else None,
-            "completion_effect": dict(fresh.completion_effect or {}),
-        }
-        holder.update(status=fresh.status, revision=fresh.revision, progress=int(fresh.progress or 0))
-
-    _campaign, event = commit_campaign_mutation(
-        db, cid, expected_revision,
-        event_type=CLOCK_COMPLETED_EVENT if disp == "completed" else CLOCK_RETIRED_EVENT,
-        operation_id=operation_id, mutate=mutate,
-        payload_builder=lambda: {
-            "clock_id": str(clock.id), "disposition": disp, "reason": cleaned_reason,
-            "successor_clock_id": str(successor) if successor else None,
-        },
-        targets_builder=lambda: {"clock_id": str(clock.id)},
-        visibility_builder=lambda: _clock_event_visibility(clock.visibility),
-        provenance=prov,
-    )
-    row = get_clock_strict(db, cid, clock.id)
-    structured_log(
-        logger, logging.INFO, "clock_retired", campaign_id=str(cid), clock_id=str(row.id),
-        disposition=disp,
-    )
-    return row, event

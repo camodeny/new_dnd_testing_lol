@@ -1,7 +1,6 @@
-"""Issue #191 — queue adapter, worker envelope, retries, and failed-work ledger.
+"""Issue #191 — worker envelope, retries, and failed-work ledger.
 
 Covers review blockers:
-- production misconfig must error not silent success
 - atomic committed claim prevents concurrent side effects
 - next_attempt_at enforced before retry
 - duplicate / early redelivery tests
@@ -26,13 +25,11 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
-from app.queue import WorkerEnvelope, new_envelope, InMemoryQueueAdapter, VercelQueueAdapter  # noqa: E402
-from app.worker import (  # noqa: E402
+from app.worker.envelope import WorkerEnvelope, new_envelope  # noqa: E402
+from app.worker.executor import (  # noqa: E402
     RetriableError,
     TerminalError,
     execute_worker_job,
-    list_failed_work,
-    replay_failed_job,
 )
 from models.reliability import WorkerExecution
 
@@ -43,47 +40,7 @@ def _engine(url="sqlite://"):
     return eng
 
 
-# ── Adapter ─────────────────────────────────────────────────────────────────
-
-
-def test_vercel_adapter_misconfigured_raises_not_silent_success(monkeypatch):
-    for var in ("VERCEL_QUEUE_TOKEN", "VERCEL_OIDC_TOKEN"):
-        monkeypatch.delenv(var, raising=False)
-    va = VercelQueueAdapter(topic="test")
-    env = new_envelope(job_type="test.job", payload={"id": "1"})
-    with pytest.raises(RuntimeError, match="OIDC token unavailable"):
-        va.publish(env)
-
-
-def test_vercel_adapter_with_config_does_not_raise_silent(monkeypatch):
-    # With explicit config, publish attempts HTTP (we don't assert success, just not silent)
-    va = VercelQueueAdapter(topic="q", token="tok", base_url="https://example.invalid")
-    env = new_envelope(job_type="test.job", payload={"id": "1"})
-    # Patch urlopen to simulate success
-    import urllib.request
-
-    class FakeResp:
-        status = 200
-
-        def read(self):
-            return b"ok"
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **kw: FakeResp())
-    assert va.publish(env) == str(env.job_id)
-
-
-def test_inmemory_adapter_local_tests_no_broker():
-    mem = InMemoryQueueAdapter()
-    env = new_envelope(job_type="local.test", payload={"campaign_id": str(uuid.uuid4())})
-    mem.publish(env)
-    assert mem.depth() == 1
-    assert len(mem.peek_all()) == 1
+# ── Envelope ────────────────────────────────────────────────────────────────
 
 
 def test_envelope_rejects_snapshot():
@@ -219,7 +176,7 @@ def test_crash_lease_allows_redelivery_after_expiry():
     assert res == {"recovered": True} and dup is False and calls == [1]
 
 
-def test_dead_letter_remains_inspectable_and_replayable():
+def test_dead_letter_remains_inspectable():
     eng = _engine()
     Fac = sessionmaker(bind=eng)
     env = new_envelope(job_type="dead.test", payload={}, job_id=uuid.uuid4())
@@ -230,21 +187,10 @@ def test_dead_letter_remains_inspectable_and_replayable():
     db = Fac()
     with pytest.raises(TerminalError):
         execute_worker_job(db, env, poison)
-    # Inspectable
-    failed = list_failed_work(db)
-    assert any(str(f.id) == str(env.job_id) for f in failed)
-    # Replay resets to pending with same idempotency
-    replayed = replay_failed_job(db, env.job_id)
-    assert replayed.status == "pending"
-
-    def fixed(e):
-        return {"fixed": True}
-
-    res, dup = execute_worker_job(db, env, fixed)
-    assert res == {"fixed": True} and dup is False
-    # Duplicate after replay deduped
-    res2, dup2 = execute_worker_job(db, env, fixed)
-    assert dup2 is True and res2 == res
+    rec = db.get(WorkerExecution, env.job_id)
+    assert rec is not None
+    assert rec.status == "dead_letter"
+    assert "poison" in (rec.last_error or "")
 
 
 def test_lease_expiry_overlap_heartbeat_prevents_live_reclamation(tmp_path):

@@ -44,8 +44,9 @@ import secrets
 import time
 from typing import Any, Callable, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from app.idempotency import execute_idempotent_command
 from app.observability.tracing import structured_log
 from app.rules.mechanics import (
     MECHANICS_VERSION,
@@ -53,7 +54,14 @@ from app.rules.mechanics import (
     MechanicsError,
     get_character_mechanics_for_sheet,
 )
-from app.rules.resolution import combine_advantage, select_d20
+from app.rules.resolution import (
+    call_modifier_hook,
+    combine_advantage,
+    runtime_d20,
+    select_d20,
+    validate_advantage_state,
+)
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -93,10 +101,6 @@ class AttackError(ValueError):
         self.code = code
         self.field = field
         self.details = details or {}
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # ── Normalized combat-stat interface ──────────────────────────────────────
@@ -533,42 +537,6 @@ class DamageHook(Protocol):
     def bonus(self, context: DamageHookContext) -> int: ...
 
 
-def _hook_bonus(
-    hook: DamageHook | Callable[[DamageHookContext], int],
-    context: DamageHookContext,
-    name: str,
-) -> DamageContribution:
-    try:
-        if hasattr(hook, "bonus"):
-            value = hook.bonus(context)  # type: ignore[union-attr]
-        else:
-            value = hook(context)  # type: ignore[operator]
-    except AttackError:
-        raise
-    except Exception as exc:
-        raise AttackError(
-            "hook_failed",
-            f"damage hook {name!r} failed: {exc}",
-            field="hooks",
-            details={"hook": name},
-        ) from exc
-    if type(value) is not int:
-        raise AttackError(
-            "hook_failed",
-            f"damage hook {name!r} must return int, got {type(value).__name__}",
-            field="hooks",
-            details={"hook": name},
-        )
-    type_name = type(hook).__name__
-    if type_name == "function":
-        resolved_name = getattr(hook, "__name__", None) or name
-    elif type_name == "method":
-        resolved_name = type(getattr(hook, "__self__", hook)).__name__
-    else:
-        resolved_name = type_name
-    return DamageContribution(name=resolved_name, value=value, source="hook")
-
-
 # ── Runtime dice (NPC/DM path only — never for PCs) ───────────────────────
 
 
@@ -590,25 +558,6 @@ def runtime_damage_dice(
             "dice_generation_failed",
             f"runtime damage dice generation failed: {exc}",
             field="damage_rolls",
-        ) from exc
-
-
-def runtime_d20(count: int, *, rng: Any | None = None) -> list[int]:
-    """Generate NPC/hidden d20 results on the runtime path (never for PCs)."""
-    if count not in (1, 2):
-        raise AttackError(
-            "invalid_dice_count",
-            f"can generate 1 or 2 d20 results, got {count}",
-            field="dice",
-        )
-    roller = rng if rng is not None else secrets.SystemRandom()
-    try:
-        return [int(roller.randint(1, 20)) for _ in range(count)]
-    except Exception as exc:
-        raise AttackError(
-            "dice_generation_failed",
-            f"runtime dice generation failed: {exc}",
-            field="dice",
         ) from exc
 
 
@@ -761,16 +710,6 @@ def _require_stable_id(value: str | None, *, field: str, what: str) -> str:
     return value
 
 
-def _validate_advantage_state(value: str) -> AdvantageState:
-    if value not in ("normal", "advantage", "disadvantage"):
-        raise AttackError(
-            "invalid_advantage_state",
-            f"advantage_state must be normal/advantage/disadvantage, got {value!r}",
-            field="advantage_state",
-        )
-    return value  # type: ignore[return-value]
-
-
 def _validate_crit_threshold(value: int) -> int:
     if type(value) is not int or not 2 <= value <= 20:
         raise AttackError(
@@ -846,7 +785,7 @@ def resolve_attack_roll(
         state = (
             combine_advantage(sources)
             if sources
-            else _validate_advantage_state(advantage_state or "normal")
+            else validate_advantage_state(advantage_state or "normal", error=AttackError)
         )
         logged_state = state
 
@@ -858,7 +797,7 @@ def resolve_attack_roll(
                     "PC attack dice must be supplied by the player; this service never generates them",
                     field="dice",
                 )
-            dice = runtime_d20(expected_count, rng=rng)
+            dice = runtime_d20(expected_count, rng=rng, error=AttackError)
             die_source: DieSource = "runtime_generated"
         else:
             die_source = "player_supplied" if attacker_kind == "pc" else "dm_supplied"
@@ -1060,7 +999,10 @@ def resolve_damage(
         )
         hook_contribs: list[DamageContribution] = []
         for idx, hook in enumerate(hooks or []):
-            contrib = _hook_bonus(hook, hook_context, name=f"hook_{idx}")
+            hook_name, value = call_modifier_hook(
+                hook, hook_context, name=f"hook_{idx}", label="damage", error=AttackError,
+            )
+            contrib = DamageContribution(name=hook_name, value=value, source="hook")
             if contrib.value:
                 hook_contribs.append(contrib)
 
@@ -1509,8 +1451,6 @@ def apply_attack_consequence(
 
     Returns ``(result, replayed)`` where ``replayed`` is True on dedup hits.
     """
-    from app.idempotency import execute_idempotent_command
-
     return execute_idempotent_command(
         db,
         actor_id=actor_id,

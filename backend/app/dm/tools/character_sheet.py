@@ -20,10 +20,12 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.characters.service import latest_sheet
 from app.dm.context import AuthorizationScope, ContextAudience, SourceRef
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import EvidenceResult
 from app.observability.tracing import structured_log
+from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +67,6 @@ def _resolve_character_ids_for_scope(
     db: Any,
 ) -> list[uuid.UUID]:
     """Resolve evidence scope to concrete character UUIDs, scoped to audience campaign."""
-    from models.campaigns import CampaignMember
     from models.characters import Character
 
     try:
@@ -227,9 +228,6 @@ def handle_ask_character_sheet(
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
-    from models.characters import Dnd5eCharacterSheet
-
     results_payload: list[dict[str, Any]] = []
     sources: list[SourceRef] = []
     auth_user_ids: list[str] = []
@@ -238,9 +236,7 @@ def handle_ask_character_sheet(
     has_success = False
 
     for cid in character_ids[:4]:
-        sheet = db.execute(
-            select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == cid).order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, cid)
         if sheet is None:
             continue
         try:

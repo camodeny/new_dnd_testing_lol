@@ -35,6 +35,8 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.service import CampaignCommandError, require_playable_campaign
+from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
 from models.campaigns import Campaign, CampaignMember, CampaignPcLifecycle
 
@@ -45,12 +47,8 @@ TERMINAL_PC_STATUSES = frozenset({"dead", "retired"})
 INTRODUCTION_STATUSES = frozenset({"na", "pending_introduction", "introduced"})
 
 
-class PcLifecycleError(Exception):
-    """Domain failure with its canonical HTTP mapping."""
-
-    def __init__(self, message: str, *, status_code: int = 409):
-        super().__init__(message)
-        self.status_code = status_code
+class PcLifecycleError(CampaignCommandError):
+    """PC lifecycle rule violation with its canonical HTTP status."""
 
 
 def get_lifecycle(
@@ -210,7 +208,6 @@ def activate_replacement(
     the dead PC: the replacement starts fresh with no inherited knowledge.
     """
     from app.campaigns.service import character_launch_validity
-    from models.characters import Character, Dnd5eCharacterSheet
 
     if str(getattr(campaign, "status", "lobby")) == "lobby":
         raise PcLifecycleError(
@@ -260,11 +257,7 @@ def activate_replacement(
             "A replacement was already activated; one active PC per member",
             status_code=409,
         )
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == new_character.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, new_character.id)
     validity = character_launch_validity(new_character, sheet)
     if not validity["is_valid"]:
         structured_log(
@@ -351,7 +344,7 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
     Never includes secret lore (backstory/notes/etc.) — same boundary as the
     lobby projection.
     """
-    from models.characters import Character, Dnd5eCharacterSheet
+    from models.characters import Character
 
     members = db.execute(
         select(CampaignMember).where(CampaignMember.campaign_id == campaign.id)
@@ -384,11 +377,7 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
         if char is None:
             continue
         row = lifecycles.get(m.selected_character_id)
-        sheet = db.execute(
-            select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == char.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, char.id)
         entry = {
             "character_id": str(char.id),
             "user_id": str(m.user_id),
@@ -416,13 +405,8 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
 
 
 def _canon_entry(db: Session, row: CampaignPcLifecycle, char) -> dict:
-    from models.characters import Dnd5eCharacterSheet
 
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == char.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, char.id)
     return {
         "character_id": str(char.id),
         "user_id": str(row.user_id),
@@ -461,3 +445,160 @@ def is_historical_canon(db: Session, character_id: uuid_lib.UUID) -> bool:
         )
     ).scalars().first()
     return linked is not None
+
+
+# ── Revisioned commands ─────────────────────────────────────────────────────
+#
+# Each wraps a flush-only writer above in ``commit_campaign_mutation``; the
+# archive-dormancy guard (#265) runs on the locked row inside the serialized
+# mutation. Flush-only: the HTTP idempotency guard owns the commit.
+
+
+def commit_pc_death(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    actor_id: uuid_lib.UUID,
+    character_id: uuid_lib.UUID,
+    status: str,
+    cause: str | None,
+    is_tpk: bool,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    from app.campaigns.events import commit_campaign_mutation
+
+    rows: list[CampaignPcLifecycle] = []
+
+    def _mutate(locked: Campaign):
+        require_playable_campaign(locked)
+        rows.append(declare_pc_death(
+            db, locked, character_id, status=status, cause=cause, is_tpk=is_tpk, actor_id=actor_id,
+        ))
+
+    campaign_after, event = commit_campaign_mutation(
+        db,
+        campaign_id,
+        expected_revision,
+        event_type=f"campaign.pc_{status}",
+        operation_id=operation_id,
+        actor_id=actor_id,
+        targets={"character_id": str(character_id)},
+        payload_builder=lambda: {
+            "character_id": str(character_id),
+            "status": rows[0].status,
+            "cause": rows[0].cause,
+            "is_tpk": bool(rows[0].is_tpk),
+        },
+        mutate=_mutate,
+        commit=False,
+    )
+    logger.info(
+        "pc death declared campaign_id=%s actor_id=%s character_id=%s status=%s revision=%s",
+        campaign_id, actor_id, character_id, rows[0].status, campaign_after.revision,
+    )
+    return {
+        "ok": True,
+        "campaign": campaign_after.to_dict(),
+        "lifecycle": rows[0].to_dict(),
+        "event": event.to_dict(),
+    }
+
+
+def commit_replacement(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    user_id: uuid_lib.UUID,
+    character_id: uuid_lib.UUID,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    from app.campaigns.events import commit_campaign_mutation
+    from models.characters import Character
+
+    results: list[dict] = []
+
+    def _mutate(locked: Campaign):
+        require_playable_campaign(locked)
+        member = db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": user_id})
+        if member is None:
+            raise PcLifecycleError("Not a member of this campaign", status_code=403)
+        new_char = db.get(Character, character_id)
+        if new_char is None or new_char.is_deleted:
+            raise PcLifecycleError("Character not found", status_code=404)
+        results.append(activate_replacement(db, locked, member, new_char, actor_id=user_id))
+
+    campaign_after, event = commit_campaign_mutation(
+        db,
+        campaign_id,
+        expected_revision,
+        event_type="campaign.pc_replaced",
+        operation_id=operation_id,
+        actor_id=user_id,
+        targets_builder=lambda: {
+            "user_id": str(user_id),
+            "dead_character_id": results[0]["dead_character_id"],
+            "new_character_id": results[0]["new_character_id"],
+        },
+        payload_builder=lambda: dict(results[0]),
+        mutate=_mutate,
+        commit=False,
+    )
+    logger.info(
+        "pc replacement activated campaign_id=%s actor_id=%s dead=%s new=%s revision=%s",
+        campaign_id, user_id, results[0]["dead_character_id"], results[0]["new_character_id"],
+        campaign_after.revision,
+    )
+    return {
+        "ok": True,
+        "campaign": campaign_after.to_dict(),
+        "replacement": results[0],
+        "event": event.to_dict(),
+    }
+
+
+def commit_introduction(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    actor_id: uuid_lib.UUID,
+    character_id: uuid_lib.UUID,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    from app.campaigns.events import commit_campaign_mutation
+
+    rows: list[CampaignPcLifecycle] = []
+
+    def _mutate(locked: Campaign):
+        require_playable_campaign(locked)
+        rows.append(mark_replacement_introduced(db, locked, character_id, actor_id=actor_id))
+
+    campaign_after, event = commit_campaign_mutation(
+        db,
+        campaign_id,
+        expected_revision,
+        event_type="campaign.pc_introduced",
+        operation_id=operation_id,
+        actor_id=actor_id,
+        targets={"character_id": str(character_id)},
+        payload_builder=lambda: {
+            "character_id": str(character_id),
+            "replacement_of_character_id": (
+                str(rows[0].replacement_of_character_id) if rows[0].replacement_of_character_id else None
+            ),
+        },
+        mutate=_mutate,
+        commit=False,
+    )
+    logger.info(
+        "pc replacement introduced campaign_id=%s actor_id=%s character_id=%s revision=%s",
+        campaign_id, actor_id, character_id, campaign_after.revision,
+    )
+    return {
+        "ok": True,
+        "campaign": campaign_after.to_dict(),
+        "lifecycle": rows[0].to_dict(),
+        "event": event.to_dict(),
+    }

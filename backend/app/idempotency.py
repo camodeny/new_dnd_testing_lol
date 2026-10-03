@@ -26,6 +26,28 @@ class IdempotencyInProgressError(Exception):
     """A durable record exists without a committed result; retry deterministically."""
 
 
+#: Width of every ``operation_id`` column (domain events, world rows, turns).
+OPERATION_ID_MAX_LENGTH = 128
+_OPERATION_ID_HASH_CHARS = 32
+
+
+def compose_operation_id(*parts: object) -> str:
+    """Join operation-id parts with ``:``, bounded to the column width.
+
+    Derived ids append suffixes to caller-supplied operation ids of any
+    length. Ids that fit are returned verbatim; longer ones keep a readable
+    prefix plus a SHA-256 digest of the full composed key, so the result is
+    deterministic (idempotency holds across retries) and distinct inputs
+    stay distinct. ``None``/empty parts are dropped.
+    """
+    composed = ":".join(str(part) for part in parts if part is not None and str(part) != "")
+    if len(composed) <= OPERATION_ID_MAX_LENGTH:
+        return composed
+    digest = hashlib.sha256(composed.encode("utf-8")).hexdigest()[:_OPERATION_ID_HASH_CHARS]
+    prefix = composed[: OPERATION_ID_MAX_LENGTH - _OPERATION_ID_HASH_CHARS - 1]
+    return f"{prefix}~{digest}"
+
+
 def canonical_payload_hash(payload: object) -> str:
     encoded = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str

@@ -1,54 +1,38 @@
 """Application factory — single FastAPI instance, modular routers.
 
-This module is the only place that knows about all routers; domain/application
-modules do not import each other. The deployed entrypoint `backend/main.py`
-re-exports `app` from here for backward compat (`from main import app`).
+This module is the only place that knows about all routers. The deployed
+entrypoint ``backend/main.py`` calls ``create_app()``. See ``app/ARCHITECTURE.md``.
 """
-from contextlib import asynccontextmanager
-
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from app.adventures.router import router as adventures_router
+from app.auth.router import router as auth_router
+from app.billing.router import router as billing_router
+from app.campaigns.routes import router as campaigns_router
+from app.campaigns.service import CampaignCommandError
+from app.characters.chat.router import router as chat_router
+from app.characters.router import router as characters_router
+from app.combat.router import router as combat_router
+from app.dm.router import router as dm_router
+from app.health.router import APP_NAME, APP_VERSION, router as health_router
+from app.observability.router import router as observability_router
 from app.observability.tracing import TraceMiddleware
+from app.post_turn.router import router as post_turn_cron_router
+from app.realtime.router import router as realtime_router
+from app.rolls.router import router as rolls_router
+from app.rules_corpus.router import router as rules_router
+from app.snapshot.router import router as snapshot_router
+from app.submissions.router import router as submissions_router
+from app.threads.router import router as threads_router
 
 load_dotenv()
 
 
-APP_NAME = "dnd-backend"
-APP_VERSION = "0.1.0"
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Migrations are applied explicitly via `alembic upgrade head` or
-    # `python -m scripts.migrate` — never during application startup.
-    # See backend/README.md and backend/scripts/migrate.py (from #187).
-    # Issue #331: optionally run the transactional outbox relay as a
-    # background worker in long-lived runtimes. Disabled by default so
-    # Vercel serverless cold starts stay cheap; enable with
-    # OUTBOX_RELAY_LOOP_ENABLED=1 (serverless uses the /api/cron/outbox-relay
-    # endpoint via Vercel Cron instead). The loop performs no DDL.
-    import asyncio as _asyncio
-    import os as _os
-
-    _task = None
-    if _os.getenv("OUTBOX_RELAY_LOOP_ENABLED", "").lower() in ("1", "true", "yes", "on"):
-        from app.outbox.relay import outbox_relay_background_loop
-
-        _task = _asyncio.create_task(outbox_relay_background_loop())
-    try:
-        yield
-    finally:
-        if _task is not None:
-            _task.cancel()
-            try:
-                await _task
-            except BaseException:
-                pass
-
-
 def create_app() -> FastAPI:
-    app = FastAPI(title=APP_NAME, version=APP_VERSION, lifespan=lifespan)
+    app = FastAPI(title=APP_NAME, version=APP_VERSION)
 
     app.add_middleware(
         CORSMiddleware,
@@ -59,27 +43,10 @@ def create_app() -> FastAPI:
     )
     app.add_middleware(TraceMiddleware)
 
-    # Import routers lazily to avoid import cycles at module load time
-    # if domain modules ever import factory for typing.
-    from app.auth.router import router as auth_router
-    from app.billing.router import router as billing_router
-    from app.campaigns.router import router as campaigns_router
-    from app.combat.router import router as combat_router
-    from app.characters.chat.router import router as chat_router
-    from app.characters.router import router as characters_router
-    from app.health.router import router as health_router
-    from app.runtime.router import router as runtime_router
-    from app.snapshot.router import router as snapshot_router
-    from app.observability.router import router as observability_router
-    from app.world.router import router as world_router
-    from app.dm_streams.router import router as dm_streams_router
-    from app.realtime.router import router as realtime_router
-    from app.dm.router import router as dm_router
-    from app.rolls.router import router as rolls_router
-    from app.rules.router import router as rules_router
-    from app.adventures.router import router as adventures_router
-    from app.outbox.router import router as outbox_cron_router
-    from app.post_turn.router import router as post_turn_cron_router
+    @app.exception_handler(CampaignCommandError)
+    async def campaign_command_error(request: Request, exc: CampaignCommandError):
+        # Same response shape as HTTPException: {"detail": ...}.
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -89,16 +56,14 @@ def create_app() -> FastAPI:
     app.include_router(campaigns_router)
     app.include_router(combat_router)
     app.include_router(adventures_router)
-    app.include_router(world_router)
-    app.include_router(runtime_router)
+    app.include_router(submissions_router)
+    app.include_router(threads_router)
     app.include_router(snapshot_router)
     app.include_router(observability_router)
-    app.include_router(dm_streams_router)
     app.include_router(realtime_router)
     app.include_router(dm_router)
     app.include_router(rolls_router)
     app.include_router(rules_router)
-    app.include_router(outbox_cron_router)
     app.include_router(post_turn_cron_router)
 
     return app

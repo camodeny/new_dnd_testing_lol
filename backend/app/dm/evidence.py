@@ -19,37 +19,37 @@ instead of guessing.  This module mediates that state:
 * traces each request: tool type, latency, result count/source IDs, retries,
   evidence rounds, and TTFT contribution.
 
-Out of scope (deferred to #178/#180):
-* full graph / vector / rules corpus tool bodies;
-* direct mutation tools.
-
-The concrete tool bodies are injectable callables so fixtures can stub them
-without touching the orchestrator.  A minimal in-process default handles the
-three read-only tools as typed no-op stubs returning ``unknown`` so the
-contract validates even before the corpus tools land.
+Every allowed tool has a concrete read-only handler in one static registry
+(character sheet, rules corpus, world retrieval, semantic memory); callers may
+override individual handlers via ``tool_handlers``. Direct mutation tools are
+out of scope.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 import uuid
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.dm.context import (
     AuthorizationScope,
     ContextAudience,
+    ContextBudget,
     ContextRecord,
     ForwardDmContextPacket,
     LaneName,
     SourceRef,
-    assemble_context_packet,
 )
 from app.dm.contract import DmTurnContractV1, EvidenceRequest, normalize_contract
 from app.observability.tracing import structured_log
+from app.schema import StrictModel
+from app.world.retrieval import TOOL_HANDLERS as world_handlers
+from app.world.semantic import handle_search_campaign_memory
 
 logger = logging.getLogger(__name__)
 
@@ -64,21 +64,12 @@ MAX_REQUESTS_PER_ROUND: int = 3
 MAX_TOTAL_REQUESTS: int = 9
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(
-    {"ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules",
+    {"ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules",
      "lookup_world_entity", "traverse_world_relations", "lookup_world_fact",
      "query_world_timeline", "lookup_source_turn", "query_character_knowledge"}
 )
 
-# For forward compatibility, also allow combat/rules hooks as stubs but keep
-# the contract allowlist strict — unknown tools are rejected before execution.
-# The typed stubs below default to unknown if a future tool name arrives.
-
-
 # ── Strict base ──────────────────────────────────────────────────────────────
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
 
 # ── Evidence result ──────────────────────────────────────────────────────────
 
@@ -167,7 +158,6 @@ def _compact(value: Any, depth: int = 0) -> Any:
 def _tool_to_source_type(tool: str) -> str:
     mapping = {
         "ask_character_sheet": "dnd5e_character_sheet",
-        "get_current_scene": "scene",
         "search_campaign_memory": "campaign_memory",
         "lookup_rule": "dnd_srd_rule",
         "search_rules": "dnd_srd_rule",
@@ -215,57 +205,22 @@ def validate_evidence_requests(
     return normalized
 
 
-# ── Tool stubs / registry ────────────────────────────────────────────────────
+# ── Tool registry ────────────────────────────────────────────────────────────
 
-def _default_tool_handler(
-    request: EvidenceRequest,
-    audience: ContextAudience,
-    *,
-    db: Any | None = None,
-) -> EvidenceResult:
-    """Minimal typed stub for the three read-only tools.
+@functools.cache
+def _tool_registry() -> dict[str, Callable[..., Any]]:
+    """Static handler registry for every allowed evidence tool.
 
-    Real implementations from #178/#180 inject via ``tool_handlers``.  This
-    stub returns ``unknown`` with no sources so the loop still exercises
-    bounded retries and the ``unknown`` → uncertainty path.
+    Imported lazily: the handler modules import this module's result types.
     """
-    auth = AuthorizationScope(
-        campaign_id=audience.campaign_id,
-        thread_ids=[audience.thread_id],
-        user_ids=list(audience.user_ids) if request.tool == "ask_character_sheet" else [],
-    )
-    # Private source simulation: if include_private without audience authorization,
-    # the stub marks unauthorized.
-    if request.tool == "ask_character_sheet":
-        if request.include_private and audience.audience != "private":
-            return EvidenceResult(
-                request_id=request.id,
-                tool=request.tool,
-                status="unauthorized",
-                sources=[],
-                visibility="private",
-                authorization=auth,
-                payload=None,
-                error="private sheet data not authorized for this audience",
-            )
-    return EvidenceResult(
-        request_id=request.id,
-        tool=request.tool,
-        status="unknown",
-        sources=[
-            SourceRef(
-                source_type=_tool_to_source_type(request.tool),
-                source_id=request.id,
-                source_version="stub_v1",
-                campaign_revision=None,
-                provenance={"tool": request.tool, "stub": True},
-            )
-        ],
-        visibility="campaign",
-        authorization=auth,
-        payload={"note": "stub: no authoritative source available", "request_id": request.id},
-        result_count=0,
-    )
+    from app.dm.tools import handle_ask_character_sheet
+    from app.dm.tools.rules import TOOL_HANDLERS as rules_handlers
+    return {
+        "ask_character_sheet": handle_ask_character_sheet,
+        "search_campaign_memory": handle_search_campaign_memory,
+        **rules_handlers,
+        **world_handlers,
+    }
 
 
 def _classify_tool_error(exc: BaseException) -> str:
@@ -382,55 +337,6 @@ def evidence_results_to_records(
     return records
 
 
-def augment_packet_with_evidence(
-    packet: ForwardDmContextPacket,
-    new_records: list[ContextRecord],
-) -> ForwardDmContextPacket:
-    """Return a new packet with evidence_results appended (distinct lane)."""
-    # Re-assemble from existing lanes plus new evidence records.
-    # Preserve all existing records and lane status; just extend evidence lane.
-    existing: dict[LaneName, list[ContextRecord]] = {
-        lane.name: list(lane.records) for lane in packet.lanes
-    }
-    # Extend or initialize evidence lane
-    ev_lane_records = existing.get(LaneName.EVIDENCE_RESULTS, [])
-    ev_lane_records = list(ev_lane_records) + list(new_records)
-
-    # Build records mapping for re-assembly
-    records_map: dict[LaneName, list[ContextRecord]] = {}
-    for lane in packet.lanes:
-        if lane.name == LaneName.EVIDENCE_RESULTS:
-            records_map[lane.name] = ev_lane_records
-        else:
-            records_map[lane.name] = list(lane.records)
-
-    lane_status = {lane.name: lane.authority_status for lane in packet.lanes}
-    source_errors = {lane.name: lane.source_errors for lane in packet.lanes}
-
-    # Retrieval dependencies extended with evidence
-    deps = list(packet.observability.retrieval_dependencies) + ["evidence_results"]
-
-    # Budget reuse — evidence records are optional, so total-budget pressure can omit old ones
-    from app.dm.context import ContextBudget
-
-    budget = ContextBudget(
-        max_bytes=packet.observability.serialized_bytes + 32_000,
-        max_tokens=packet.observability.estimated_tokens + 8000,
-    )
-
-    # Reuse assembly helper but keep evidence lane authoritative
-    new_packet = assemble_context_packet(
-        audience=packet.audience,
-        records=records_map,
-        lane_status=lane_status,
-        source_errors=source_errors,
-        budget=budget,
-        retrieval_dependencies=deps,
-    )
-    # Restore original assembly_ms baseline plus evidence latency
-    return new_packet
-
-
 # ── Execution of one round ───────────────────────────────────────────────────
 
 DEFAULT_TOOL_TIMEOUT_S: float = 2.0
@@ -452,28 +358,11 @@ def execute_evidence_round(
     source_ids: list[str] = []
     tool_types: list[str] = []
 
-    handlers = dict(tool_handlers or {})
-    # Auto-register rules corpus handlers if available (issue #223)
-    if "lookup_rule" not in handlers or "search_rules" not in handlers:
-        try:
-            from app.rules.evidence_tools import TOOL_HANDLERS as _rules_handlers
-
-            for k, v in _rules_handlers.items():
-                handlers.setdefault(k, v)
-        except Exception:
-            pass
-    # Auto-register authoritative world retrieval handlers (issue #212)
-    try:
-        from app.world.retrieval import TOOL_HANDLERS as _world_handlers
-
-        for k, v in _world_handlers.items():
-            handlers.setdefault(k, v)
-    except Exception:
-        pass
+    handlers = {**_tool_registry(), **(tool_handlers or {})}
 
     for req in requests:
         tool_types.append(req.tool)
-        handler = handlers.get(req.tool, _default_tool_handler)
+        handler = handlers[req.tool]
         retries = 0
         last_exc: BaseException | None = None
         result: EvidenceResult | None = None
@@ -762,7 +651,16 @@ def run_bounded_evidence_loop(
         except Exception as exc:
             raise EvidenceValidationError(f"failed to mediate evidence to context lane: {exc}") from exc
 
-        packet = augment_packet_with_evidence(packet, records)
+        # Evidence records are optional, so total-budget pressure can omit
+        # older ones; the budget grows with the packet it extends.
+        packet = packet.with_records(
+            {LaneName.EVIDENCE_RESULTS: records},
+            dependency="evidence_results",
+            budget=ContextBudget(
+                max_bytes=packet.observability.serialized_bytes + 32_000,
+                max_tokens=packet.observability.estimated_tokens + 8000,
+            ),
+        )
 
         # Re-adjudicate with enriched context
         current = _normalize(adjudicate(packet))

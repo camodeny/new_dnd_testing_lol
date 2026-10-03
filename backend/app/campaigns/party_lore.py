@@ -17,7 +17,8 @@ from collections import Counter
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import character_launch_validity
+from app.campaigns.service import CampaignCommandError
+from app.characters.service import latest_sheet
 from models.campaigns import Campaign, CampaignCharacterLore, CampaignMember
 
 logger = logging.getLogger(__name__)
@@ -31,16 +32,22 @@ LORE_MAX_LENGTH = 4000
 LORE_WRITABLE_STATUSES = frozenset({"lobby"})
 
 
-class LoreValidationError(ValueError):
-    """Malformed lore payload (router maps to HTTP 422)."""
+class LoreValidationError(CampaignCommandError):
+    """Malformed lore payload."""
+
+    status_code = 422
 
 
-class LoreAuthorizationError(PermissionError):
-    """Private lore access denied — router maps to HTTP 404 (fail closed)."""
+class LoreAuthorizationError(CampaignCommandError):
+    """Private lore access denied — fail-closed 404, no existence leak."""
+
+    status_code = 404
 
 
-class LoreStatusError(ValueError):
-    """Lore write outside the pre-start window (router maps to HTTP 409)."""
+class LoreStatusError(CampaignCommandError):
+    """Lore write outside the pre-start window."""
+
+    status_code = 409
 
 
 def validate_lore_content(payload: object) -> str:
@@ -92,7 +99,7 @@ def build_party_composition(db: Session, members: list[CampaignMember]) -> dict:
     failure here must not fall back to private data — callers surface the
     error, never a secret-bearing payload.
     """
-    from models.characters import Character, Dnd5eCharacterSheet
+    from models.characters import Character
 
     entries: list[dict] = []
     for m in members:
@@ -109,11 +116,7 @@ def build_party_composition(db: Session, members: list[CampaignMember]) -> dict:
         if char_id is not None:
             char = db.get(Character, char_id)
             if char is not None:
-                sheet = db.execute(
-                    select(Dnd5eCharacterSheet)
-                    .where(Dnd5eCharacterSheet.character_id == char.id)
-                    .order_by(Dnd5eCharacterSheet.updated_at.desc())
-                ).scalars().first()
+                sheet = latest_sheet(db, char.id)
                 entry.update(_public_sheet_fields(char, sheet))
         entries.append(entry)
 
@@ -187,19 +190,6 @@ def get_own_lore(
     return assert_lore_readable(row, user_id)
 
 
-def list_lore_presence(db: Session, *, campaign_id: uuid_lib.UUID) -> dict[str, bool]:
-    """Presence map (character_id -> has lore) without content.
-
-    Used for DM/seed observability counts; content stays out of projections.
-    """
-    rows = db.execute(
-        select(CampaignCharacterLore.character_id).where(
-            CampaignCharacterLore.campaign_id == campaign_id
-        )
-    ).all()
-    return {str(r[0]): True for r in rows}
-
-
 def get_seed_lore_bundle(db: Session, *, campaign_id: uuid_lib.UUID) -> list[dict]:
     """DM-internal seed input — issue #245 seam.
 
@@ -235,3 +225,129 @@ def get_seed_lore_bundle(db: Session, *, campaign_id: uuid_lib.UUID) -> list[dic
         for r in rows
         if (str(r.character_id), str(r.user_id)) in selected
     ]
+
+
+def require_own_character(db: Session, character_id: uuid_lib.UUID, user_id: uuid_lib.UUID, *, status_code: int, detail: str):
+    """The caller's own live character, else ``status_code``/``detail``.
+
+    Lore routes gate on ownership BEFORE any lore lookup so probing another
+    player's character fails identically whether lore exists or not.
+    """
+    from models.characters import Character
+
+    char = db.get(Character, character_id)
+    if char is None or char.owner_id != user_id or char.is_deleted:
+        raise CampaignCommandError(detail, status_code=status_code)
+    return char
+
+
+def _lore_row(db: Session, campaign_id: uuid_lib.UUID, character_id: uuid_lib.UUID) -> CampaignCharacterLore | None:
+    return db.execute(
+        select(CampaignCharacterLore).where(
+            CampaignCharacterLore.campaign_id == campaign_id,
+            CampaignCharacterLore.character_id == character_id,
+        )
+    ).scalars().first()
+
+
+def put_lore(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    character_id: uuid_lib.UUID,
+    user_id: uuid_lib.UUID,
+    content: str,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    """Create/update own private lore (versioned; identical content bumps nothing).
+
+    The result is secret-free: raw lore never lands in the idempotency
+    ledger — content travels only via the lore row + GET. Logs record only
+    lengths/versions.
+    """
+    from app.campaigns.events import commit_campaign_mutation
+
+    def _mutate(locked: Campaign):
+        require_lore_writable(locked)
+        require_own_character(
+            db, character_id, user_id, status_code=403, detail="Only your own character's lore can be edited",
+        )
+        existing = _lore_row(db, campaign_id, character_id)
+        if existing is not None:
+            assert_lore_readable(existing, user_id)
+            if existing.content != content:
+                existing.content = content
+                existing.version = int(existing.version or 1) + 1
+        else:
+            db.add(CampaignCharacterLore(
+                campaign_id=campaign_id, character_id=character_id, user_id=user_id,
+                content=content, version=1,
+            ))
+
+    campaign_after, event = commit_campaign_mutation(
+        db, campaign_id, expected_revision,
+        event_type="campaign.character_lore_updated",
+        operation_id=operation_id,
+        actor_id=user_id,
+        targets={"character_id": str(character_id)},
+        payload={"character_id": str(character_id), "content_length": len(content)},
+        # Private lore events stay out of the member-visible feed — the actor
+        # still sees their own via the actor_id rule.
+        visibility="private",
+        mutate=_mutate,
+        commit=False,
+    )
+    row = _lore_row(db, campaign_id, character_id)
+    logger.info(
+        "character_lore updated campaign_id=%s actor_id=%s character_id=%s version=%s content_length=%s revision=%s",
+        campaign_id, user_id, character_id,
+        row.version if row else None, len(content), campaign_after.revision,
+    )
+    return {
+        "ok": True,
+        "campaign": campaign_after.to_dict(),
+        "lore": row.to_dict(include_content=False) if row else None,
+        "event": event.to_dict(),
+    }
+
+
+def delete_lore(
+    db: Session,
+    campaign_id: uuid_lib.UUID,
+    *,
+    character_id: uuid_lib.UUID,
+    user_id: uuid_lib.UUID,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    """Remove own private lore before start; missing own lore is a no-op."""
+    from app.campaigns.events import commit_campaign_mutation
+
+    def _mutate(locked: Campaign):
+        require_lore_writable(locked)
+        require_own_character(db, character_id, user_id, status_code=404, detail="Character lore not found")
+        existing = _lore_row(db, campaign_id, character_id)
+        if existing is None:
+            return
+        if existing.user_id != user_id:
+            raise LoreAuthorizationError("Character lore not found")
+        db.delete(existing)
+
+    campaign_after, event = commit_campaign_mutation(
+        db, campaign_id, expected_revision,
+        event_type="campaign.character_lore_deleted",
+        operation_id=operation_id,
+        actor_id=user_id,
+        targets={"character_id": str(character_id)},
+        payload={"character_id": str(character_id)},
+        # Same private-feed rule as lore updates.
+        visibility="private",
+        mutate=_mutate,
+        commit=False,
+    )
+    logger.info(
+        "character_lore deleted campaign_id=%s actor_id=%s character_id=%s revision=%s",
+        campaign_id, user_id, character_id, campaign_after.revision,
+    )
+    return {"ok": True, "campaign": campaign_after.to_dict(), "event": event.to_dict()}

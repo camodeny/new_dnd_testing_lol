@@ -18,9 +18,11 @@ import time
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
+from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -41,10 +43,6 @@ class MechanicsError(ValueError):
 
 
 # ── Strict base ───────────────────────────────────────────────────────────
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # ── Skill → ability map (2024 PHB standard) ───────────────────────────────
@@ -1108,12 +1106,10 @@ def query_conditions(sheet: Any) -> list[ConditionDetail]:
 
 def get_character_mechanics(db: Any, character_id: uuid.UUID | str, *, include_private: bool = True) -> CharacterMechanics:
     """DB-backed fetch + derivation. Validates character exists and sheet present."""
-    from sqlalchemy import select
 
     # Lazy import to avoid circular
     try:
         from models.characters import Character
-        from models.characters import Dnd5eCharacterSheet
     except Exception as exc:
         raise MechanicsError("model_import_failed", str(exc))
 
@@ -1127,11 +1123,7 @@ def get_character_mechanics(db: Any, character_id: uuid.UUID | str, *, include_p
     if char is None:
         raise MechanicsError("character_not_found", f"character {character_id} not found", field="character_id")
 
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == char.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, char.id)
 
     if sheet is None:
         raise MechanicsError("sheet_not_found", f"no sheet for character {character_id}", field="character_id")

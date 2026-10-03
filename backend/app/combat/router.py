@@ -6,13 +6,12 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.campaigns.auth import authorized_campaign, require_owner
+from app.deps.campaign import campaign_for, require_owner, run_campaign_command
 from app.campaigns.service import CampaignArchivedError
 from app.combat.maps import (
     MapAuthorizationError,
     MapError,
     ensure_map,
-    get_map,
     map_projection,
     move_participant,
     reachable_for,
@@ -44,16 +43,24 @@ from app.combat.turns import (
 )
 from app.combat.ending import (
     EndEncounterAuthorizationError,
-    EndEncounterError,
     end_encounter,
     list_end_followups,
     process_end_followup,
 )
-from app.deps.auth import resolve_profile
-from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+from app.deps.auth import current_profile
+from app.deps.idempotency import require_idempotency_key
 from app.campaigns.events import RevisionConflictError
-from app.runtime.threads import ThreadNotFoundError
+from app.realtime.service import (
+    publish_encounter_ended,
+    publish_encounter_map,
+    publish_encounter_moved,
+    publish_encounter_ready,
+    publish_encounter_started,
+    publish_encounter_turn,
+)
+from app.threads.service import ThreadNotFoundError
 from database import get_db
+from models.campaigns import Campaign
 from models.combat import Encounter
 
 logger = logging.getLogger(__name__)
@@ -93,26 +100,19 @@ def _assert_encounter_visible(db: Session, encounter: Encounter, viewer_id: uuid
 def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -> None:
     """Best-effort realtime delivery after the outer idempotency commit.
 
-    The durable outbox row (enqueued atomically with the mutation) is the
-    guaranteed realtime hook; this direct publish is latency-only and never
-    rolls back authoritative state. Stable event ids make replays idempotent.
+    The committed domain event is authoritative and clients converge via the
+    snapshot; this direct publish is latency-only and never rolls back
+    authoritative state. Stable event ids make replays idempotent.
 
     On ``X-Idempotent-Replay: true`` the stored result is returned without
     advancing state, so rebuilding turn events from the encounter's current
     row could publish a false transition for a later turn (e.g. replaying an
-    old end-turn after a later skip). The outbox already owns delivery there,
-    so replays never trigger the direct publish.
+    old end-turn after a later skip), so replays never trigger the direct
+    publish.
     """
     if replayed:
         return
     try:
-        from app.realtime.service import (
-            publish_encounter_ended,
-            publish_encounter_ready,
-            publish_encounter_started,
-            publish_encounter_turn,
-        )
-
         encounter_id = (result.get("encounter") or {}).get("id")
         if not encounter_id:
             return
@@ -138,9 +138,14 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters", status_code=201)
-def create_encounter(campaign_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def create_encounter(
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     require_owner(campaign, profile.id)
     key = require_idempotency_key(request, payload.get("operation_id"))
     expected_revision = payload.get("expected_revision")
@@ -178,29 +183,16 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
             }
         except EncounterAlreadyActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except CampaignArchivedError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except RevisionConflictError as exc:
-            raise HTTPException(
-                status_code=409, detail=str(exc),
-                headers={"X-Current-Revision": str(exc.actual_revision)},
-            ) from exc
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Source turn not found") from exc
         except EncounterError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.start", scope_type="campaign", scope_id=campaign.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.start", scope_type="campaign", scope_id=campaign.id,
+        payload=payload, execute=execute,
+    )
     _publish_post_commit(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
@@ -209,9 +201,11 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/active")
-def read_active_encounter(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_active_encounter(
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = get_active_encounter(db, campaign.id)
     if encounter is None or not can_view_encounter(db, encounter, profile.id):
         return {"encounter": None}
@@ -219,18 +213,24 @@ def read_active_encounter(campaign_id: str, request: Request, db: Session = Depe
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}")
-def read_encounter(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_encounter(
+    encounter_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     return {"encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id)}
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order")
-def read_turn_order(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_turn_order(
+    encounter_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     is_owner = campaign.owner_id == profile.id
@@ -257,9 +257,15 @@ def read_turn_order(campaign_id: str, encounter_id: str, request: Request, db: S
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/initiative/fulfill")
-def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def fulfill_initiative(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     participant_raw = payload.get("participant_id")
@@ -286,8 +292,6 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
             }
         except EncounterAuthorizationError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except CampaignArchivedError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except EncounterError as exc:
             message = str(exc)
             raise HTTPException(
@@ -299,7 +303,7 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
         (p for p in list_participants(db, encounter.id) if p.id == participant_id), None
     )
     scope_id = participant.roll_request_id if participant and participant.roll_request_id else participant_id
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.initiative_fulfill", scope_type="encounter_participant", scope_id=scope_id,
         payload=payload, execute=execute,
@@ -312,9 +316,15 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/initiative/roll-npc")
-def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def roll_npc(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
@@ -336,8 +346,6 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
                 "encounter": _viewer_view(db, updated, profile.id, is_owner=True),
                 "ready_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
             }
-        except CampaignArchivedError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except EncounterError as exc:
             message = str(exc)
             raise HTTPException(
@@ -345,7 +353,7 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
                 detail=message,
             ) from exc
 
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.npc_roll", scope_type="encounter_participant", scope_id=participant_id,
         payload=payload, execute=execute,
@@ -396,9 +404,12 @@ def _require_revision(payload: dict) -> int:
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-state")
-def read_turn_state(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_turn_state(
+    encounter_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     projection = turn_projection(
@@ -411,9 +422,15 @@ def read_turn_state(campaign_id: str, encounter_id: str, request: Request, db: S
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-turn")
-def post_end_turn(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_end_turn(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     key = require_idempotency_key(request, payload.get("operation_id"))
@@ -440,17 +457,11 @@ def post_end_turn(campaign_id: str, encounter_id: str, payload: dict, request: R
         except Exception as exc:
             raise _turn_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.end_turn", scope_type="encounter", scope_id=encounter.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.end_turn", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     _publish_post_commit(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
@@ -459,9 +470,15 @@ def post_end_turn(campaign_id: str, encounter_id: str, payload: dict, request: R
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/skip-votes")
-def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_skip_vote(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     target_raw = payload.get("target_participant_id")
@@ -492,17 +509,11 @@ def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: 
         except Exception as exc:
             raise _turn_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.skip_vote", scope_type="encounter", scope_id=encounter.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.skip_vote", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     _publish_post_commit(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
@@ -511,9 +522,15 @@ def post_skip_vote(campaign_id: str, encounter_id: str, payload: dict, request: 
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-resources/consume")
-def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_consume_resource(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     participant_raw = payload.get("participant_id")
@@ -545,7 +562,7 @@ def post_consume_resource(campaign_id: str, encounter_id: str, payload: dict, re
         except Exception as exc:
             raise _turn_http_error(exc) from exc
 
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.consume", scope_type="encounter_participant", scope_id=participant_id,
         payload=payload, execute=execute,
@@ -582,8 +599,6 @@ def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, re
     if replayed:
         return
     try:
-        from app.realtime.service import publish_encounter_map, publish_encounter_moved
-
         encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
         if encounter is None:
             return
@@ -599,9 +614,15 @@ def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, re
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map", status_code=201)
-def init_encounter_map(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def init_encounter_map(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
@@ -630,26 +651,26 @@ def init_encounter_map(campaign_id: str, encounter_id: str, payload: dict, reque
         except Exception as exc:
             raise _map_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.map_init", scope_type="encounter", scope_id=encounter.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.map_init", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     _publish_map_post_commit(db, result, str(encounter.id),
                              replayed=response.headers.get("X-Idempotent-Replay") == "true")
     return result
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/terrain")
-def change_encounter_terrain(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def change_encounter_terrain(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
@@ -673,26 +694,23 @@ def change_encounter_terrain(campaign_id: str, encounter_id: str, payload: dict,
         except Exception as exc:
             raise _map_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.terrain_change", scope_type="encounter", scope_id=encounter.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.terrain_change", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     _publish_map_post_commit(db, result, str(encounter.id),
                              replayed=response.headers.get("X-Idempotent-Replay") == "true")
     return result
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map")
-def read_encounter_map(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_encounter_map(
+    encounter_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     projection = map_projection(
@@ -705,9 +723,14 @@ def read_encounter_map(campaign_id: str, encounter_id: str, request: Request, db
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/reachable")
-def read_reachable(campaign_id: str, encounter_id: str, participant_id: str, request: Request, movement_mode: str = "walk", db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_reachable(
+    encounter_id: str,
+    participant_id: str,
+    movement_mode: str = "walk",
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     try:
@@ -722,9 +745,15 @@ def read_reachable(campaign_id: str, encounter_id: str, participant_id: str, req
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/move")
-def post_move(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_move(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
     participant_raw = payload.get("participant_id")
@@ -760,17 +789,11 @@ def post_move(campaign_id: str, encounter_id: str, payload: dict, request: Reque
         except Exception as exc:
             raise _map_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.move", scope_type="encounter_participant", scope_id=participant_id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.move", scope_type="encounter_participant", scope_id=participant_id,
+        payload=payload, execute=execute,
+    )
     _publish_map_post_commit(db, result, str(encounter.id),
                              replayed=response.headers.get("X-Idempotent-Replay") == "true")
     return result
@@ -780,9 +803,15 @@ def post_move(campaign_id: str, encounter_id: str, payload: dict, request: Reque
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end")
-def post_end_encounter(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_end_encounter(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     # The AI is the only DM: ending runs on the campaign-owner path, never a
     # separate human DM role.
     require_owner(campaign, profile.id)
@@ -815,17 +844,11 @@ def post_end_encounter(campaign_id: str, encounter_id: str, payload: dict, reque
         except Exception as exc:
             raise _turn_http_error(exc) from exc
 
-    try:
-        result = execute_http_idempotent(
-            db, response, actor_id=profile.id, idempotency_key=key,
-            command_type="encounter.end", scope_type="encounter", scope_id=encounter.id,
-            payload=payload, execute=execute,
-        )
-    except RevisionConflictError as exc:
-        raise HTTPException(
-            status_code=409, detail=str(exc),
-            headers={"X-Current-Revision": str(exc.actual_revision)},
-        ) from exc
+    result = run_campaign_command(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="encounter.end", scope_type="encounter", scope_id=encounter.id,
+        payload=payload, execute=execute,
+    )
     _publish_post_commit(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
@@ -834,9 +857,12 @@ def post_end_encounter(campaign_id: str, encounter_id: str, payload: dict, reque
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups")
-def read_end_followups(campaign_id: str, encounter_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def read_end_followups(
+    encounter_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     # Issue #239 privacy: hook results carry post-combat custody/death/loot
     # detail (participant IDs) that can name hidden NPC fates — owner-only
     # bookkeeping, matching the process endpoint below. Members converge via
@@ -852,9 +878,15 @@ def read_end_followups(campaign_id: str, encounter_id: str, request: Request, db
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups/process")
-def post_process_end_followup(campaign_id: str, encounter_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def post_process_end_followup(
+    encounter_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
@@ -883,7 +915,7 @@ def post_process_end_followup(campaign_id: str, encounter_id: str, payload: dict
         except Exception as exc:
             raise _turn_http_error(exc) from exc
 
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.end_followup", scope_type="encounter", scope_id=encounter.id,
         payload=payload, execute=execute,

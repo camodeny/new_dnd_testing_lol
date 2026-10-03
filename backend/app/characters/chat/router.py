@@ -6,6 +6,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.party_lore import build_party_advice, build_party_composition
 from app.characters.chat.service import (
     CharacterChatRequest,
     build_party_advisory_text,
@@ -14,6 +15,7 @@ from app.characters.chat.service import (
     save_chat_message,
 )
 from app.deps.auth import resolve_profile
+from app.visibility.access import is_campaign_participant
 from database import get_db
 from models.characters import Character
 from models.characters import CharacterChatMessage
@@ -89,8 +91,6 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
     if raw_campaign:
         import uuid as uuid_lib
 
-        from app.campaigns.party_lore import build_party_advice, build_party_composition
-        from app.campaigns.service import is_campaign_member
         from models.campaigns import Campaign, CampaignMember
 
         try:
@@ -100,7 +100,7 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
         camp = db.get(Campaign, cid)
         if camp is None:
             raise HTTPException(status_code=404, detail="Campaign not found")
-        if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        if not is_campaign_participant(db, camp, profile.id):
             raise HTTPException(status_code=403, detail="Not a member of this campaign")
         members = db.execute(
             select(CampaignMember).where(CampaignMember.campaign_id == cid)

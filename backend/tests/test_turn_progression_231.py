@@ -40,8 +40,8 @@ from app.combat.turns import (  # noqa: E402
     turn_projection,
 )
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant, EncounterSkipVote, EncounterTurnState  # noqa: E402
@@ -578,7 +578,7 @@ def test_stale_skip_vote_after_round_rollover_fails_closed():
 
 
 def test_private_thread_nonreaders_excluded_from_skip_threshold():
-    from app.runtime.threads import create_private_thread
+    from app.threads.service import create_private_thread
 
     fac, ctx = _fixture(third_member=True)
     with fac() as db:
@@ -763,12 +763,12 @@ def test_ic_ooc_chat_non_blocking_during_active_turn():
 
 def test_turn_realtime_projections_have_stable_ids_and_no_hidden_stats():
     from app.realtime.service import (
-        InMemoryRealtimePublisher,
         build_encounter_turn_event,
         get_realtime_publisher,
         publish_encounter_turn,
         set_realtime_publisher,
     )
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     fac, ctx = _fixture()
     previous = get_realtime_publisher()
@@ -880,11 +880,8 @@ def test_hidden_npc_speed_redacted_for_non_owners():
 def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
@@ -900,7 +897,7 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     previous = get_realtime_publisher()
     recorder = InMemoryRealtimePublisher()
@@ -1006,11 +1003,8 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
 def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
@@ -1026,7 +1020,7 @@ def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     previous = get_realtime_publisher()
     recorder = InMemoryRealtimePublisher()

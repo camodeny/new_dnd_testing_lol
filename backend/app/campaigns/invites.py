@@ -1,8 +1,9 @@
 """Lobby invitations — domain helpers for issue #242.
 
-Transport-agnostic: no FastAPI imports. The router owns auth, status codes,
-and transactions; everything here is pure validation, projection, email
-delivery, and observability helpers.
+Transport-agnostic: no FastAPI imports. Routes own authentication and the
+campaign authorization preamble; the invite commands below own validation,
+transactions, email delivery, and observability, and reject with
+:class:`CampaignCommandError`.
 
 Email delivery is env-driven (single canonical integration, stdlib only):
 
@@ -25,7 +26,16 @@ import logging
 import os
 import re
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.clock import utcnow
+from app.campaigns.service import CampaignCommandError, generate_invite_code, is_campaign_member, member_count
+from models.campaigns import Campaign, CampaignInvite, CampaignMember
+from models.profiles import Profile
 
 logger = logging.getLogger(__name__)
 
@@ -33,10 +43,6 @@ INVITE_STATUSES = frozenset({"active", "revoked"})
 DELIVERY_STATUSES = frozenset({"sent", "failed", "skipped"})
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def normalize_code(raw) -> str:
@@ -319,3 +325,310 @@ def _send_via_resend(*, to_email: str, subject: str, body: str, from_addr: str,
     )
     if status >= 300:
         raise RuntimeError(f"resend HTTP {status}")
+
+
+# ── Invite commands ─────────────────────────────────────────────────────────
+
+
+def owner_invites(db: Session, campaign_id: uuid.UUID) -> list[dict]:
+    rows = db.execute(
+        select(CampaignInvite).where(CampaignInvite.campaign_id == campaign_id).order_by(CampaignInvite.created_at.asc())
+    ).scalars().all()
+    return [owner_invite_dict(inv) for inv in rows]
+
+
+def _require_lobby_membership_open(campaign: Campaign) -> None:
+    if campaign.status != "lobby":
+        raise CampaignCommandError("Campaign membership is locked after the lobby", status_code=409)
+
+
+def create_invite(db: Session, campaign: Campaign, *, actor_id: uuid.UUID, payload: dict | None) -> dict:
+    """Mint one invite on the locked campaign row (lobby-only).
+
+    Creation does not bump the fictional revision. ``campaign`` must be
+    loaded ``FOR UPDATE`` so a concurrent start cannot slip between the
+    lobby check and the insert.
+    """
+    if campaign.status != "lobby":
+        logger.warning(
+            "campaign invite creation rejected campaign_id=%s actor_id=%s status=%s",
+            campaign.id, actor_id, campaign.status,
+        )
+    _require_lobby_membership_open(campaign)
+    body = payload if isinstance(payload, dict) else {}
+    try:
+        intended_email = normalize_email(body.get("intended_email"))
+        recipient_label = validate_recipient_label(body.get("recipient_label"))
+        raw_expiry = body.get("expires_at")
+        if raw_expiry is None:
+            raw_expiry = body.get("expires_in_hours")
+        expires_at = parse_expiry(raw_expiry)
+    except ValueError as exc:
+        raise CampaignCommandError(str(exc), status_code=400) from exc
+    for _ in range(5):
+        code = generate_invite_code()
+        if db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first():
+            continue
+        inv = CampaignInvite(
+            id=uuid.uuid4(),
+            campaign_id=campaign.id,
+            code=code,
+            created_by=actor_id,
+            intended_email=intended_email,
+            recipient_label=recipient_label,
+            status="active",
+            expires_at=expires_at,
+        )
+        db.add(inv)
+        db.commit()
+        db.refresh(inv)
+        logger.info(
+            "campaign invite created campaign_id=%s actor_id=%s code_hash=%s has_email=%s",
+            campaign.id, actor_id, code_fingerprint(code), bool(intended_email),
+        )
+        result = owner_invite_dict(inv)
+        result["invite_url"] = invite_url(code)
+        result["invite_url_path"] = f"/invite/{code}"
+        return result
+    raise CampaignCommandError("Failed to generate invite", status_code=500)
+
+
+def revoke_invite(
+    db: Session,
+    campaign_id: uuid.UUID,
+    *,
+    actor_id: uuid.UUID,
+    code: str,
+    expected_revision: int,
+    operation_id: str,
+) -> dict:
+    """Revoke by code: a status flip (row preserved); re-revoking is a no-op.
+
+    Bearer codes never enter domain-event history (member-visible): events
+    correlate by invite id instead.
+    """
+    from app.campaigns.events import commit_campaign_mutation
+
+    revoked: list[CampaignInvite] = []
+
+    def _mutate(locked: Campaign):
+        _require_lobby_membership_open(locked)
+        invite = db.execute(
+            select(CampaignInvite).where(CampaignInvite.campaign_id == campaign_id, CampaignInvite.code == code)
+        ).scalars().first()
+        if invite is None:
+            raise CampaignCommandError("Campaign invite not found", status_code=404)
+        if invite.status != "revoked":
+            invite.status = "revoked"
+            invite.revoked_at = utcnow()
+        revoked.append(invite)
+
+    def _invite_id() -> str | None:
+        return str(revoked[0].id) if revoked else None
+
+    campaign_after, event = commit_campaign_mutation(
+        db,
+        campaign_id,
+        expected_revision,
+        event_type="campaign.invite_revoked",
+        operation_id=operation_id,
+        actor_id=actor_id,
+        targets_builder=lambda: {"invite_id": _invite_id()},
+        payload_builder=lambda: {"invite_id": _invite_id(), "invite_status": "revoked"},
+        mutate=_mutate,
+        commit=False,
+    )
+    logger.info(
+        "campaign invite revoked campaign_id=%s actor_id=%s code_hash=%s revision=%s",
+        campaign_id, actor_id, code_fingerprint(code), campaign_after.revision,
+    )
+    invite_body = owner_invite_dict(revoked[0])
+    invite_body["invite_url"] = invite_url(code)
+    return {"ok": True, "campaign": campaign_after.to_dict(), "invite": invite_body, "event": event.to_dict()}
+
+
+def _campaign_invite(db: Session, campaign_id: uuid.UUID, code: str) -> CampaignInvite:
+    clean = normalize_code(code)
+    if not clean:
+        raise CampaignCommandError("Invite code required", status_code=400)
+    inv = db.execute(
+        select(CampaignInvite).where(CampaignInvite.campaign_id == campaign_id, CampaignInvite.code == clean)
+    ).scalars().first()
+    if inv is None:
+        # A code pasted against the wrong campaign surfaces "not found for
+        # this campaign", not a leak.
+        scoped = db.execute(select(CampaignInvite).where(CampaignInvite.code == clean)).scalars().first()
+        if scoped is not None and scoped.campaign_id != campaign_id:
+            raise CampaignCommandError("Invite not found for this campaign", status_code=404)
+        raise CampaignCommandError("Invite not found", status_code=404)
+    return inv
+
+
+def email_invite(db: Session, campaign: Campaign, *, actor_id: uuid.UUID, code: str, payload: dict) -> dict:
+    """Email one usable invite; delivery failure never invalidates it.
+
+    ``campaign`` must be loaded ``FOR UPDATE``: the lock is held only for
+    validation + persisting the delivery intent; the provider call happens
+    after commit so a slow provider cannot hold the campaign row. A stale
+    email is harmless because acceptance revalidates the invite.
+    """
+    _require_lobby_membership_open(campaign)
+    invite = _campaign_invite(db, campaign.id, code)
+    raw_email = payload.get("to_email") or payload.get("email") or invite.intended_email
+    try:
+        to_email = normalize_email(raw_email)
+    except ValueError as exc:
+        raise CampaignCommandError(str(exc), status_code=400) from exc
+    if not to_email:
+        raise CampaignCommandError("to_email is required", status_code=400)
+    usable, unusable_reason = invite_usability(invite)
+    if not usable:
+        # Never send a link acceptance will reject. Delivery state untouched.
+        raise CampaignCommandError(f"Invite is {unusable_reason}", status_code=410)
+    inviter = db.get(Profile, actor_id)
+    campaign_name = campaign.name
+    invite_id = invite.id
+    invite_code = invite.code
+    inviter_label = inviter.username if inviter else None
+    invite.intended_email = to_email
+    db.commit()
+    sent, error = send_invite_email(
+        to_email=to_email,
+        campaign_name=campaign_name,
+        code=invite_code,
+        inviter_label=inviter_label,
+    )
+    # Short follow-up transaction: persist only the delivery outcome.
+    invite = db.get(CampaignInvite, invite_id)
+    if invite is None:  # pragma: no cover — row deleted mid-send
+        raise CampaignCommandError("Invite not found", status_code=404)
+    invite.intended_email = to_email
+    invite.last_delivery_status = "sent" if sent else "failed"
+    invite.last_delivery_error = error
+    invite.last_delivery_at = utcnow()
+    db.commit()
+    db.refresh(invite)
+    if sent:
+        logger.info(
+            "campaign invite email sent campaign_id=%s actor_id=%s code_hash=%s",
+            campaign.id, actor_id, code_fingerprint(invite.code),
+        )
+    else:
+        logger.warning(
+            "campaign invite email failed campaign_id=%s actor_id=%s code_hash=%s error=%s",
+            campaign.id, actor_id, code_fingerprint(invite.code), error,
+        )
+    invite_body = owner_invite_dict(invite)
+    invite_body["invite_url"] = invite_url(invite.code)
+    # Always 200 while the invite itself is valid: clients branch on
+    # ``delivery.sent`` / ``ok``; the link/code fallback stays usable and
+    # the send is retryable.
+    return {"ok": sent, "invite": invite_body, "delivery": {"sent": sent, "error": error}}
+
+
+def lookup_invite(db: Session, code: str) -> dict:
+    """Pre-membership lookup: minimal safe metadata only (#242 security).
+
+    Never exposes owner id, emails, or campaign internals; revoked/expired
+    invites surface 410 with a stable reason.
+    """
+    clean = normalize_code(code)
+    if not clean:
+        raise CampaignCommandError("Code required", status_code=400)
+    inv = db.execute(select(CampaignInvite).where(CampaignInvite.code == clean)).scalars().first()
+    if not inv:
+        logger.info("invite lookup miss code_hash=%s", code_fingerprint(clean))
+        raise CampaignCommandError("Invite not found", status_code=404)
+    camp = db.get(Campaign, inv.campaign_id)
+    if not camp or camp.is_deleted:
+        raise CampaignCommandError("Campaign not found", status_code=404)
+    usable, reason = invite_usability(inv)
+    members = member_count(db, camp.id)
+    logger.info(
+        "invite lookup code_hash=%s campaign_id=%s usable=%s reason=%s",
+        code_fingerprint(clean), camp.id, usable, reason or "-",
+    )
+    if not usable:
+        raise CampaignCommandError(f"Invite is {reason}", status_code=410)
+    return public_invite_dict(inv, camp, member_count=members)
+
+
+def _accept(db: Session, campaign: Campaign, invite: CampaignInvite, user_id: uuid.UUID) -> dict:
+    """Idempotent membership creation shared by join and code-based accept.
+
+    Lost acks are safe: existing members return ok without a duplicate row.
+    Enforces revocation, expiry, lobby-only lock, and required-player
+    capacity in domain order.
+    """
+    usable, reason = invite_usability(invite)
+    if not usable:
+        logger.warning(
+            "campaign invite accept rejected campaign_id=%s actor_id=%s code_hash=%s reason=%s",
+            campaign.id, user_id, code_fingerprint(invite.code), reason,
+        )
+        raise CampaignCommandError(f"Invite is {reason}", status_code=410)
+    if is_campaign_member(db, campaign.id, user_id):
+        logger.info(
+            "campaign invite duplicate accept campaign_id=%s actor_id=%s code_hash=%s",
+            campaign.id, user_id, code_fingerprint(invite.code),
+        )
+        return {"ok": True, "campaign": campaign.to_dict(), "idempotent": True, "duplicate": True}
+    if campaign.status != "lobby":
+        db.rollback()
+        logger.warning(
+            "campaign join rejected by membership lock campaign_id=%s actor_id=%s status=%s",
+            campaign.id, user_id, campaign.status,
+        )
+    _require_lobby_membership_open(campaign)
+    members = member_count(db, campaign.id)
+    required = int(campaign.required_players or 1)
+    if members >= required:
+        db.rollback()
+        logger.warning(
+            "campaign join rejected full campaign_id=%s actor_id=%s members=%s required=%s",
+            campaign.id, user_id, members, required,
+        )
+        raise CampaignCommandError("Campaign is full", status_code=409)
+    db.add(CampaignMember(campaign_id=campaign.id, user_id=user_id, role="player"))
+    invite.accepted_count = int(invite.accepted_count or 0) + 1
+    db.commit()
+    logger.info(
+        "campaign invite accepted campaign_id=%s actor_id=%s code_hash=%s members=%s",
+        campaign.id, user_id, code_fingerprint(invite.code), members + 1,
+    )
+    return {"ok": True, "campaign": campaign.to_dict(), "idempotent": False, "duplicate": False}
+
+
+def join_campaign(db: Session, campaign: Campaign, *, user_id: uuid.UUID, raw_code) -> dict:
+    """Campaign-scoped join; ``campaign`` must be loaded ``FOR UPDATE``."""
+    code = str(raw_code or "").strip().upper()
+    if not code:
+        raise CampaignCommandError("Invite code required", status_code=400)
+    inv = db.execute(
+        select(CampaignInvite).where(CampaignInvite.campaign_id == campaign.id, CampaignInvite.code == code)
+    ).scalars().first()
+    if inv is None:
+        raise CampaignCommandError("Invalid invite code", status_code=403)
+    return _accept(db, campaign, inv, user_id)
+
+
+def accept_invite_code(db: Session, *, user_id: uuid.UUID, raw_code) -> dict:
+    """Code-based acceptance for the shareable ``/invite/:code`` flow."""
+    code = str(raw_code or "").strip().upper()
+    if not code:
+        raise CampaignCommandError("Invite code required", status_code=400)
+    inv = db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first()
+    if not inv:
+        logger.info("invite accept miss code_hash=%s", code_fingerprint(code))
+        raise CampaignCommandError("Invite not found", status_code=404)
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == inv.campaign_id).with_for_update()
+    ).scalars().first()
+    if not camp or camp.is_deleted:
+        raise CampaignCommandError("Campaign not found", status_code=404)
+    # Revalidate after acquiring the campaign serialization lock: revocation
+    # commits through the same lock, so a revoke that landed between the code
+    # lookup above and this lock must be observed.
+    db.refresh(inv)
+    result = _accept(db, camp, inv, user_id)
+    return {**result, "campaign_id": str(camp.id), "code": inv.code}

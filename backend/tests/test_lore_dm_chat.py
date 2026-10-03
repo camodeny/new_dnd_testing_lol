@@ -48,7 +48,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     # The streaming generator persists the assistant reply through the app
@@ -90,7 +90,6 @@ def _add_member(factory, camp_id, user_id):
 
 
 def _mock_dm(monkeypatch, *, tokens=("Hel", "lo"), proposal="You owe a harbor debt.", captured_requests=None):
-    import app.providers as providers_pkg
     from app.providers.contracts import NormalizedStreamEvent, NormalizedToolCall
 
     class _FakeAdapter:
@@ -114,9 +113,9 @@ def _mock_dm(monkeypatch, *, tokens=("Hel", "lo"), proposal="You owe a harbor de
                 ),
             )
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.campaigns.lore_dm_chat.stream_chat", _fake_stream)
     monkeypatch.setattr(
-        "app.providers.areas.resolve_area",
+        "app.campaigns.lore_dm_chat.resolve_area",
         lambda area: (_FakeAdapter("meta"), "m", "meta"),
     )
 

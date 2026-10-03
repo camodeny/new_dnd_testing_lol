@@ -15,17 +15,18 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import (  # noqa: E402
     ContextRecord,
     _scope,
     _source,
 )
-from app.world.epistemics import (  # noqa: E402
-    assert_knowledge_inline,
+from app.world.knowledge import (  # noqa: E402
+    assert_knowledge,
     build_knowledge_visibility_values,
 )
-from app.world.knowledge import create_fact_authoritative  # noqa: E402
-from app.world.service import create_entity_authoritative  # noqa: E402
+from app.world.facts import create_fact  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 
@@ -65,19 +66,19 @@ def test_unresolved_character_is_explicit_empty():
 def test_resolved_subject_returns_bounded_stance_refs():
     Fac, camp = _setup()
     db = Fac()
-    aria, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="character", name="Aria",
+    aria, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="character", name="Aria",
         operation_id="op-aria-251",
         details={"character_id": "00000000-0000-0000-0000-000000000000"},
     )
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="The bridge is trapped.",
+    fact, _ = commit_world_write(
+        db, camp.id, 1, create_fact, content="The bridge is trapped.",
         entity_refs=[aria.id], epistemic_state="confirmed",
         visibility="dm_only",
         provenance={"source": "dm_adjudication"},
         operation_id="op-truth-251",
     )
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="direct_observation",
@@ -104,19 +105,19 @@ def test_resolved_subject_returns_bounded_stance_refs():
 def test_entries_truncate_at_limit():
     Fac, camp = _setup()
     db = Fac()
-    aria, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="character", name="Aria",
+    aria, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="character", name="Aria",
         operation_id="op-aria-251t",
     )
     for i in range(4):
-        fact, _ = create_fact_authoritative(
-            db, camp.id, i + 1, content=f"Secret fact number {i}.",
+        fact, _ = commit_world_write(
+            db, camp.id, i + 1, create_fact, content=f"Secret fact number {i}.",
             entity_refs=[aria.id], epistemic_state="confirmed",
             visibility="dm_only",
             provenance={"source": "dm_adjudication"},
             operation_id=f"op-truth-251t-{i}",
         )
-        assert_knowledge_inline(
+        assert_knowledge(
             db, camp, subject_kind="character", subject_entity_id=aria.id,
             target_kind="fact", target_fact_id=fact.id,
             knowledge_state="knows", acquisition_source="direct_observation",
@@ -158,15 +159,15 @@ def _setup_repair_scene():
     """Campaign with a recently introduced NPC who knows one location."""
     Fac, camp = _setup()
     db = Fac()
-    npc, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="npc", name="Hooded Traveler",
+    npc, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="npc", name="Hooded Traveler",
         operation_id="op-hood-455",
     )
-    well, _ = create_entity_authoritative(
-        db, camp.id, 1, entity_type="location", name="Old Well",
+    well, _ = commit_world_write(
+        db, camp.id, 1, create_entity, entity_type="location", name="Old Well",
         operation_id="op-well-455",
     )
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="npc", subject_entity_id=npc.id,
         target_kind="entity", target_entity_id=well.id,
         knowledge_state="knows", acquisition_source="direct_observation",

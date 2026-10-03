@@ -449,11 +449,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
-        lambda request, db: db.get(Profile, actor["id"]),
-    )
-    monkeypatch.setattr(
-        "app.dm.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     app.dependency_overrides[get_db] = override_db
@@ -475,6 +471,7 @@ def test_adventure_api_lifecycle(api):
     )
     assert started.status_code == 200, started.text
     assert started.json()["adventure"]["status"] == "active"
+    aid = started.json()["adventure"]["id"]
 
     # Overlapping start is rejected while one is active.
     overlap = client.post(
@@ -486,7 +483,7 @@ def test_adventure_api_lifecycle(api):
 
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     done = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{aid}/complete",
         json={
             "expected_revision": revision,
             "outcome": "villain_victory",
@@ -505,7 +502,7 @@ def test_adventure_api_lifecycle(api):
     # Idempotent replay of the same completion key returns the same record.
     revision2 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     replay = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{aid}/complete",
         json={
             "expected_revision": revision,
             "outcome": "villain_victory",
@@ -533,7 +530,7 @@ def test_adventure_api_lifecycle(api):
     # Invalid outcome is rejected without closing the new adventure.
     revision3 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     bad = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{again.json()['adventure']['id']}/complete",
         json={"expected_revision": revision3, "outcome": "tie", "reason": "nope"},
         headers={"Idempotency-Key": "adv-bad-1"},
     )
@@ -554,14 +551,14 @@ def test_member_sees_only_public_adventure_fields(api):
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
         db.commit()
 
-    client.post(
+    secret_arc = client.post(
         f"/api/campaigns/{cid}/adventures",
         json={"title": "Secret arc", "metadata": {"dm_notes": "the butler did it"}},
         headers={"Idempotency-Key": "adv-spoiler-start"},
-    )
+    ).json()["adventure"]
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{secret_arc['id']}/complete",
         json={
             "expected_revision": revision,
             "outcome": "capture",
@@ -634,7 +631,7 @@ def test_member_event_feed_hides_dm_reason(api):
     assert started.status_code == 200, started.text
     revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
     done = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{started.json()['adventure']['id']}/complete",
         json={
             "expected_revision": revision,
             "outcome": "failure",
@@ -656,30 +653,6 @@ def test_member_event_feed_hides_dm_reason(api):
     assert completed[0]["payload"]["outcome"] == "failure"
     assert completed[0]["payload"]["public_summary"] == "The town falls ill."
     assert "reason" not in completed[0]["payload"]
-
-
-def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
-    import database
-    from app.outbox.service import envelope_for_outbox
-    from app.queue.consumer import consume_queue_delivery
-    from models.reliability import Outbox
-
-    factory, camp_id, _owner = setup
-    monkeypatch.setattr(database, "SessionLocal", factory)
-    with factory() as db:
-        start_adventure(db, camp_id, "Queue arc")
-    adv, _event = _complete(factory, camp_id, "victory", "op-queue")
-    with factory() as db:
-        assert db.get(Adventure, adv.id).closing_status == "pending"
-        # Translate the actual committed outbox row — the exact translation
-        # the relay uses — so queue and sweep share one worker identity.
-        row = db.execute(
-            select(Outbox).where(Outbox.event_type == "adventure.closing")
-        ).scalars().one()
-        result, dup = consume_queue_delivery(db, envelope_for_outbox(row).to_dict())
-        assert dup is False and result["ok"] is True
-    with factory() as db:
-        assert db.get(Adventure, adv.id).closing_status == "succeeded"
 
 
 def test_closing_sweep_converges_pending_work(setup):

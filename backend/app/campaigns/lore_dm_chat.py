@@ -20,6 +20,12 @@ import json
 import logging
 import uuid as uuid_lib
 
+from app.campaigns.service import CampaignCommandError
+from app.characters.chat.service import build_party_advisory_text
+from app.characters.service import latest_sheet
+from app.providers import ProviderRequest as PR, stream_chat
+from app.providers.areas import resolve_area
+
 logger = logging.getLogger(__name__)
 
 #: Chat message bound (chat is conversation, not the lore doc itself).
@@ -65,8 +71,10 @@ LORE_PROPOSAL_TOOL = {
 }
 
 
-class LoreChatValidationError(ValueError):
-    """Malformed lore-DM chat payload (router maps to HTTP 422)."""
+class LoreChatValidationError(CampaignCommandError):
+    """Malformed lore-DM chat payload."""
+
+    status_code = 422
 
 
 def validate_lore_chat_content(payload: object) -> str:
@@ -148,17 +156,6 @@ def save_lore_dm_message(
         logger.warning("failed to save lore-DM chat message: %s", e)
 
 
-def get_lore_dm_model(adapter=None) -> str:
-    from app.providers.areas import resolve_area
-
-    if adapter is not None:
-        model = (adapter.env_model() or "").strip()
-        if model:
-            return model
-    _, model, _ = resolve_area("lore_dm_chat")
-    return model
-
-
 def _extract_proposal(tool_call) -> str | None:
     try:
         args_raw = tool_call.arguments
@@ -193,8 +190,6 @@ def lore_dm_chat_sync_generator(
     context: str,
 ):
     try:
-        from app.providers.areas import resolve_area
-
         adapter, model, _ = resolve_area("lore_dm_chat")
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
@@ -205,8 +200,6 @@ def lore_dm_chat_sync_generator(
     full_text = ""
     proposal: str | None = None
     try:
-        from app.providers import ProviderRequest as PR, stream_chat
-
         pr = PR(
             messages=messages,
             model=model,
@@ -249,3 +242,93 @@ def lore_dm_chat_sync_generator(
             )
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+def list_lore_chat_messages(
+    db, *, campaign_id: uuid_lib.UUID, character_id: uuid_lib.UUID, user_id: uuid_lib.UUID,
+) -> list[dict]:
+    from sqlalchemy import select
+
+    from models.campaigns import CampaignLoreChatMessage
+
+    rows = db.execute(
+        select(CampaignLoreChatMessage)
+        .where(
+            CampaignLoreChatMessage.campaign_id == campaign_id,
+            CampaignLoreChatMessage.character_id == character_id,
+            CampaignLoreChatMessage.user_id == user_id,
+        )
+        .order_by(CampaignLoreChatMessage.created_at.asc())
+    ).scalars().all()
+    return [m.to_dict() for m in rows]
+
+
+def _character_identity(sheet) -> str:
+    if sheet is None:
+        return ""
+    classes = ", ".join(
+        str(c.get("class_name") or "") for c in (getattr(sheet, "classes", None) or [])
+        if isinstance(c, dict) and str(c.get("class_name") or "")
+    ) or getattr(sheet, "char_class", None)
+    bits = []
+    for label, val in (
+        ("race", getattr(sheet, "race", None)),
+        ("classes", classes),
+        ("level", getattr(sheet, "level", None)),
+        ("background", getattr(sheet, "background", None)),
+        ("alignment", getattr(sheet, "alignment", None)),
+    ):
+        if val:
+            bits.append(f"{label} {val}")
+    return "; ".join(bits)
+
+
+def start_lore_chat_turn(db, *, campaign, character, user_id: uuid_lib.UUID, content: str):
+    """Persist the player's message and return the reply stream (lobby-only).
+
+    The DM side is advisory only: proposals become canon solely through the
+    standard lore PUT.
+    """
+    from sqlalchemy import select
+
+    from app.campaigns.members import campaign_members
+    from app.campaigns.party_lore import build_party_advice, build_party_composition, require_lore_writable
+    from models.campaigns import CampaignLoreChatMessage
+
+    require_lore_writable(campaign)
+    user_message = CampaignLoreChatMessage(
+        campaign_id=campaign.id, character_id=character.id, user_id=user_id,
+        role="user", content=content,
+    )
+    db.add(user_message)
+    db.commit()
+    prior = db.execute(
+        select(CampaignLoreChatMessage)
+        .where(
+            CampaignLoreChatMessage.campaign_id == campaign.id,
+            CampaignLoreChatMessage.character_id == character.id,
+            CampaignLoreChatMessage.user_id == user_id,
+            CampaignLoreChatMessage.id != user_message.id,
+        )
+        .order_by(CampaignLoreChatMessage.created_at.desc())
+        .limit(12)
+    ).scalars().all()
+    history = [{"role": m.role, "content": m.content} for m in reversed(prior)]
+    sheet = latest_sheet(db, character.id)
+    composition = build_party_composition(db, campaign_members(db, campaign.id))
+    context = build_lore_dm_context(
+        campaign_name=campaign.name or "",
+        campaign_description=campaign.description,
+        campaign_seed=campaign.random_seed,
+        character_name=character.name or "",
+        character_identity=_character_identity(sheet),
+        party_advisory=build_party_advisory_text(composition, build_party_advice(composition)),
+    )
+    logger.info(
+        "lore_dm_chat campaign_id=%s actor_id=%s character_id=%s content_length=%s",
+        campaign.id, user_id, character.id, len(content),
+    )
+    return lore_dm_chat_sync_generator(
+        campaign_id=campaign.id, character_id=character.id, user_id=user_id,
+        content=content, history=history, context=context,
+    )

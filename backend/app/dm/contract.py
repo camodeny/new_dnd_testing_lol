@@ -33,8 +33,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from enum import Enum
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
@@ -103,9 +102,6 @@ class EntityRef(StrictModel):
         if len(s) > 160:
             raise ValueError("EntityRef.id too long")
         return v
-
-    def normalized_id(self) -> str:
-        return str(self.id)
 
 
 class NewEntityProposal(StrictModel):
@@ -277,7 +273,6 @@ STAGED_EFFECT_TYPES = (
     "record_world_event",
     "update_scene",
     "reveal_fact",
-    "propose_sheet_update",
     "assert_fact",
     "upsert_relation",
     "complete_adventure",
@@ -338,23 +333,6 @@ class UpsertRelationArgs(StrictModel):
     supersedes_relation_id: str | None = Field(default=None, max_length=160)
     clear_object: bool = False
     idempotency_key: str | None = Field(default=None, max_length=128)
-
-class ProposeSheetUpdateArgs(StrictModel):
-    character_id: str | int = Field(description="Durable character id; proposal remains pending")
-    reason: str = Field(min_length=1, max_length=400)
-    changes: list[dict[str, Any]] = Field(min_length=1, max_length=8)
-
-    @field_validator("changes")
-    @classmethod
-    def _validate_changes(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for ch in v:
-            if not isinstance(ch, dict):
-                raise ValueError("changes entries must be objects")
-            if "field" not in ch or "operation" not in ch or "value" not in ch:
-                raise ValueError("each change requires field, operation, value")
-            if ch["operation"] not in ("add", "subtract", "set"):
-                raise ValueError("operation must be add|subtract|set")
-        return v
 
 class CompleteAdventureArgs(StrictModel):
     """DM-declared adventure/arc completion — issue #260.
@@ -667,7 +645,7 @@ class TransferKnowledgeArgs(StrictModel):
     Tell/show/reveal writes what one subject fictionally holds toward one
     truth record. It never mutates truth tables and never grants human
     visibility — those stay separate explicit acts. Promotion-time
-    references resolve fail-closed inside ``assert_knowledge_inline``.
+    references resolve fail-closed inside ``assert_knowledge``.
     """
     subject_kind: Literal["character", "npc", "party", "group"] = Field(description="Kind of knowing subject")
     subject_entity_id: str = Field(min_length=1, max_length=160, description="WorldEntity subject UUID")
@@ -713,13 +691,13 @@ class TransferKnowledgeArgs(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -757,8 +735,6 @@ class StagedEffect(StrictModel):
                 UpdateSceneArgs.model_validate(args)
             elif t == "reveal_fact":
                 RevealFactArgs.model_validate(args)
-            elif t == "propose_sheet_update":
-                ProposeSheetUpdateArgs.model_validate(args)
             elif t == "assert_fact":
                 AssertFactArgs.model_validate(args)
             elif t == "upsert_relation":
@@ -799,7 +775,7 @@ class StagedEffect(StrictModel):
 
 class EvidenceRequest(StrictModel):
     id: str = Field(min_length=1, max_length=48)
-    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
+    tool: Literal["ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
     question: str | None = Field(default=None, max_length=600)
     scope: Literal["current_player", "party", "character_id"] | None = None
     character_id: str | int | None = None
@@ -1023,23 +999,6 @@ class DmTurnContractV1(StrictModel):
 
         return self
 
-    def output_size_metrics(self) -> dict[str, int]:
-        """Cheap size/observability metrics without re-serializing twice when possible."""
-        try:
-            blob = json.dumps(self.model_dump(mode="json"), ensure_ascii=False)
-            bytes_len = len(blob.encode("utf-8"))
-        except Exception:
-            bytes_len = 0
-        claim_count = sum(len(b.claims) for b in self.beats)
-        return {
-            "bytes": bytes_len,
-            "beats": len(self.beats),
-            "claims": claim_count,
-            "staged_effects": len(self.staged_effects),
-            "new_entities": len(self.new_entities),
-            "evidence_requests": len(self.evidence_requests),
-        }
-
 
 # ── Errors and helpers ───────────────────────────────────────────────────────
 
@@ -1116,11 +1075,6 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
                 beat.dm_private_context = "Not established in private canon; do not treat the utterance as authoritative."
 
     return contract
-
-
-def parse_contract(raw: Any) -> DmTurnContractV1:
-    """Alias for normalize_contract for callers that prefer parse_* naming."""
-    return normalize_contract(raw)
 
 
 def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:

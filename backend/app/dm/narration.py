@@ -24,7 +24,7 @@ Pipeline (critical path optimized for TTFT after validation):
    receive narration input without it. Each delta is persisted durably as
    it arrives, so TTFT tracks first-delta arrival, not full generation.
 3. Fidelity gates — cheap incremental gates per delta (``secret_leakage``
-   + ``agency_violation`` on the cumulative visible text, before each
+   + ``internal_jargon`` on the cumulative visible text, before each
    durable persist) plus the authoritative full-output validation at
    provider completion (all categories). A post-delivery full-check
    failure fails the stream via ``fail_stream`` (partial chunks retained
@@ -32,7 +32,7 @@ Pipeline (critical path optimized for TTFT after validation):
    orchestrator marks the attempt failed-visible (see ``mark_attempt_failed``);
    repair requires a NEW stream on a NEW attempt.
 4. ``stream_narration(...)`` — persists each chunk durably via #197
-   (``dm_streams`` service) BEFORE/with realtime delivery via #198, so the
+   (``app.dm.streams``) BEFORE/with realtime delivery via #198, so the
    first visible text is recoverable after disconnect. TTFT is measured
    from validated adjudication to first persisted visible chunk.
     ``on_first_persist`` fires synchronously after chunk 0's durable
@@ -52,9 +52,6 @@ The narrator can never apply game-state effects: this module never touches
 ``commit_turn``/``apply_staged_effects``; staged effects stay attempt-local
 until the separate three-phase commit (#206).
 
-Observability: ``get_narration_metrics()`` tracks projection size,
-provider, TTFT, chunk cadence, fidelity-validation failures,
-secret/agency rejection counts, and total narration duration.
 """
 
 from __future__ import annotations
@@ -69,8 +66,11 @@ from typing import Any, Callable, Iterable, Iterator
 
 from sqlalchemy.orm import Session
 
+from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 from app.dm.contract import DmTurnContractV1, public_projection
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_dm_chunk_created, publish_dm_status
+from app.world.identity import resolve_new_entity_identities_pre_narration
 
 logger = logging.getLogger(__name__)
 
@@ -164,45 +164,6 @@ class NarrationStreamError(NarrationError):
         self.stream_id = stream_id
         self.persisted_chunks = persisted_chunks
         self.violations = violations or []
-
-
-# ── Metrics (process-local observability) ─────────────────────────────────────
-
-_metrics: dict[str, Any] = {
-    "narrations_started": 0,
-    "narrations_completed": 0,
-    "narrations_failed_pre_chunk": 0,
-    "narrations_failed_post_chunk": 0,
-    "fidelity_failures": 0,
-    "secret_rejections": 0,
-    "agency_rejections": 0,
-    "unsupported_rejections": 0,
-    "contradiction_rejections": 0,
-    "ttft_ms_samples": [],
-    "chunk_cadence_ms_samples": [],
-    "total_duration_ms_samples": [],
-    "projection_bytes_samples": [],
-}
-
-
-def get_narration_metrics() -> dict[str, Any]:
-    """Return a snapshot of narration observability counters."""
-    out = {k: (list(v) if isinstance(v, list) else v) for k, v in _metrics.items()}
-    ttfts = out["ttft_ms_samples"] or [0]
-    durs = out["total_duration_ms_samples"] or [0]
-    out["ttft_ms_p50"] = sorted(ttfts)[len(ttfts) // 2]
-    out["ttft_ms_max"] = max(ttfts)
-    out["duration_ms_p50"] = sorted(durs)[len(durs) // 2]
-    return out
-
-
-def _inc(key: str, n: int = 1) -> None:
-    _metrics[key] += n
-
-
-def reset_narration_metrics() -> None:
-    for k, v in _metrics.items():
-        _metrics[k] = [] if isinstance(v, list) else 0
 
 
 # ── 1. Audience-safe projection ───────────────────────────────────────────────
@@ -319,8 +280,6 @@ def build_recent_conversation(
     from models.dm import DMStream as _DMStream
     from models.profiles import Profile as _Profile
     from models.threads import PlayerSubmission as _PlayerSubmission
-
-    from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 
     try:
         thread_uuid = thread_id if isinstance(thread_id, uuid.UUID) else uuid.UUID(str(thread_id))
@@ -439,10 +398,6 @@ def format_recent_conversation(history: list[dict[str, str]]) -> str:
 # ── 2. Deterministic template narrator (no provider) ──────────────────────────
 
 
-def _claim_visible_texts(contract: DmTurnContractV1) -> list[str]:
-    return [c.text for b in contract.beats for c in b.claims if c.visibility == "public"]
-
-
 def render_deterministic_narration(
     projection: dict[str, Any],
     contract: DmTurnContractV1 | None = None,
@@ -559,11 +514,6 @@ _CONSEQUENCE_VERBS = (
     "gains ", "loses ", "takes ", "takes,", " damage", "healed", "heals",
     "unconscious", " dead", "collapses", "explodes",
 )
-_VOLUNTARY_PC_VERBS = (
-    "attacks", "attack ", "casts", "cast ", "stabs", "shoots", "charges",
-    "flees", "steals", "pickpockets", "decides to", "chooses to", "vows to",
-    "lunges", "hurls",
-)
 _SPEECH_ATTRIBUTION_RE = re.compile(
     r'(\b[A-Za-z][\w\'-]*)\s+(says|said|shouts|shouted|whispers|whispered|replies|replied|'
     r'declares|declared|murmurs|murmured|yells|yelled|asks|asked|answers|answered)\s*[:,]?\s*"([^"]+)"'
@@ -595,19 +545,10 @@ _INTERNAL_JARGON_PHRASES = (
     "trigger_refs",
 )
 
-#: Temporary playtesting kill-switch for the narration PC-agency gate.
-#: Adjudication validators still guard agency; this only stops the narrator
-#: fidelity check from rejecting invented voluntary PC action/speech.
-_PC_AGENCY_CHECK_ENABLED = False
 
-
-def _collect_secret_strings(
-    contract: DmTurnContractV1,
-    *,
-    extra_secrets: set[str] | None = None,
-) -> set[str]:
+def _collect_secret_strings(contract: DmTurnContractV1) -> set[str]:
     """All strings the narration must never contain."""
-    secrets: set[str] = set(extra_secrets or set())
+    secrets: set[str] = set()
     for beat in contract.beats:
         if beat.dm_private_context and beat.dm_private_context.strip():
             secrets.add(beat.dm_private_context.strip())
@@ -653,14 +594,13 @@ def validate_narration_fidelity(
     narration: str,
     contract: DmTurnContractV1,
     *,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Check narration against the structured result; return violations.
 
     Categories: ``secret_leakage``, ``unsupported_addition``,
-    ``agency_violation``, ``contradiction``, ``internal_jargon``. Empty
+    ``contradiction``, ``internal_jargon``. PC agency is guarded by the
+    adjudication validators, not re-checked here. Empty
     list means pass. Pure function — safe to run before any persistence.
 
     ``history`` is the recent visible conversation from
@@ -672,14 +612,11 @@ def validate_narration_fidelity(
     violations: list[dict[str, Any]] = []
     text = narration or ""
     low = text.lower()
-    violations: list[dict[str, Any]] = []
-    text = narration or ""
-    low = text.lower()
     claim_texts = [_norm(c.text) for b in contract.beats for c in b.claims if c.visibility == "public"]
     claim_blob = "\n".join(claim_texts)
 
     # — Secret leakage: private truth, hidden DCs, internal IDs —
-    for secret in _collect_secret_strings(contract, extra_secrets=extra_secrets):
+    for secret in _collect_secret_strings(contract):
         # Long secrets: match on a distinctive 24-char slice so minor
         # rewording still counts as a leak of the same fact.
         needle = secret if len(secret) < 24 else secret[:24]
@@ -761,48 +698,6 @@ def validate_narration_fidelity(
             })
             break
 
-    # — PC agency: invented voluntary PC action/speech —
-    # Disabled for playtesting via _PC_AGENCY_CHECK_ENABLED; re-enable once
-    # the new adjudication path proves it rarely trips this gate.
-    if _PC_AGENCY_CHECK_ENABLED:
-        pc_names = pc_names or {}
-        known_pc_tokens: set[str] = set()
-        for beat in contract.beats:
-            for claim in beat.claims:
-                if claim.actor_ref is not None and claim.actor_ref.type == "character":
-                    raw_id = str(claim.actor_ref.id)
-                    known_pc_tokens.add(raw_id.lower())
-                    known_pc_tokens.add(raw_id.split(":")[-1].lower())
-                    if raw_id in pc_names:
-                        known_pc_tokens.add(pc_names[raw_id].lower())
-        # Player-authored declaration texts ground verbatim attribution.
-        declaration_texts = {
-            _norm(c.text) for b in contract.beats for c in b.claims
-            if c.claim_kind == "player_declaration"
-        }
-        for match in _SPEECH_ATTRIBUTION_RE.finditer(text):
-            speaker = match.group(1).lower()
-            quoted = _norm(match.group(3))
-            if speaker in known_pc_tokens and quoted not in declaration_texts:
-                if not any(quoted in ct or ct in quoted for ct in claim_texts if ct):
-                    violations.append({
-                        "category": "agency_violation", "code": "invented_pc_dialogue",
-                        "message": f"Narration invents voluntary PC dialogue for {match.group(1)!r}",
-                    })
-                    break
-        for verb in _VOLUNTARY_PC_VERBS:
-            if _contains_phrase(low, verb) and not _contains_phrase(claim_blob, verb):
-                # Attribute only if a known PC token appears nearby (same sentence).
-                for sentence in re.split(r"[.!?]+", low):
-                    if _contains_phrase(sentence, verb) and any(_contains_phrase(sentence, tok) for tok in known_pc_tokens):
-                        violations.append({
-                            "category": "agency_violation", "code": "invented_pc_action",
-                            "message": f"Narration invents voluntary PC action ({verb.strip()!r})",
-                        })
-                        break
-                if any(v["code"] == "invented_pc_action" for v in violations):
-                    break
-
     # — Contradiction with structured result —
     for claim in claim_texts:
         for a, b in _ANTONYMS:
@@ -821,230 +716,14 @@ def validate_narration_fidelity(
     return violations
 
 
-def _tally_fidelity_violations(violations: list[dict[str, Any]]) -> None:
-    _inc("fidelity_failures")
-    for v in violations:
-        if v["category"] == "secret_leakage":
-            _inc("secret_rejections")
-        elif v["category"] == "agency_violation":
-            _inc("agency_rejections")
-        elif v["category"] == "unsupported_addition":
-            _inc("unsupported_rejections")
-        elif v["category"] == "contradiction":
-            _inc("contradiction_rejections")
-
-
-# ── Semantic judge integration (issue #384, shadow-first) ─────────────────────
-#
-# The semantic judge supplements deterministic fidelity; it never weakens or
-# bypasses a deterministic failure. Wiring is shadow-only: judge verdicts are
-# recorded for calibration (#383) and never change the deterministic outcome.
-# Judges run once per full candidate at completion (the authoritative
-# full-candidate checkpoint), never per token/delta — streaming stays on the
-# cheap incremental deterministic gates per delta.
-
-
-def build_narration_judge_evidence(
-    narration: str,
-    contract: DmTurnContractV1,
-    *,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
-    evidence_revision: str = "",
-    knowledge_restricted_texts: set[str] | None = None,
-    history: list[dict[str, str]] | None = None,
-) -> Any:
-    """Assemble code-owned judge evidence from a narration + contract.
-
-    Supported public content is drawn from the same audience-safe
-    projection the deterministic renderer may emit (public beat claim
-    texts plus text-bearing public fields: speaker names, roll reason /
-    label, open choice, clarify question, safe prelude, table-chat
-    intent) — so the unsupported-addition/secrecy questions never see
-    legitimate renderer output as unsupported. Player-declaration texts
-    ground verbatim PC attribution, secret strings (DM-authorized,
-    server-side judge use only) ground restricted material, and PC tokens
-    ground agency attribution. ``knowledge_restricted_texts`` carries
-    fact texts unknown to the speaking subject (#251 perspective scope)
-    so the secrecy judge flags paraphrased hidden-knowledge misuse, not
-    just literal private-truth leaks. Never imports decision internals at module
-    scope — the import stays local so DM layers keep one direction.
-    """
-    from app.decisions.judges import build_evidence
-
-    public_claims = [
-        c.text for b in contract.beats for c in b.claims if c.visibility == "public"
-    ]
-    try:
-        projection = build_narration_projection(contract)
-    except Exception:
-        projection = None
-    if isinstance(projection, dict):
-        # Mirror render_deterministic_narration's allowed public inputs so
-        # the judge support set equals the renderer-allowed set.
-        for beat in projection.get("beats") or []:
-            name = beat.get("speaker_public_name")
-            if isinstance(name, str) and name.strip():
-                public_claims.append(name.strip())
-        roll = projection.get("roll_request")
-        if isinstance(roll, dict):
-            for key in ("reason_public", "label"):
-                value = roll.get(key)
-                if isinstance(value, str) and value.strip():
-                    public_claims.append(value.strip())
-        for key in (
-            "open_player_choice",
-            "clarify_question",
-            "safe_prelude",
-            "table_chat_intent",
-        ):
-            value = projection.get(key)
-            if isinstance(value, str) and value.strip():
-                public_claims.append(value.strip())
-        # Recent visible history grounds coherence references (names,
-        # numbers, recalled lines the player already saw) so the
-        # unsupported-addition question never flags legitimate continuity.
-        for entry in history or []:
-            text = entry.get("text") if isinstance(entry, dict) else None
-            if isinstance(text, str) and text.strip():
-                public_claims.append(text.strip())
-    else:  # projection unavailable: fall back to direct contract fields
-        for beat in contract.beats:
-            if getattr(beat, "speaker_public_name", None):
-                public_claims.append(str(beat.speaker_public_name).strip())
-        roll_request = getattr(contract, "roll_request", None)
-        if roll_request is not None:
-            for value in (
-                getattr(roll_request, "reason_public", None),
-                getattr(roll_request, "label", None),
-            ):
-                if isinstance(value, str) and value.strip():
-                    public_claims.append(value.strip())
-        for value in (
-            getattr(contract, "open_player_choice", None),
-            getattr(contract, "clarify_question", None),
-            getattr(contract, "safe_prelude", None),
-            getattr(contract, "table_chat_intent", None),
-        ):
-            if isinstance(value, str) and value.strip():
-                public_claims.append(value.strip())
-    declarations = [
-        c.text
-        for b in contract.beats
-        for c in b.claims
-        if c.claim_kind == "player_declaration"
-    ]
-    secrets = sorted(_collect_secret_strings(contract, extra_secrets=extra_secrets))
-    if knowledge_restricted_texts:
-        secrets = sorted(set(secrets) | {s for s in knowledge_restricted_texts if s and str(s).strip()})
-    tokens: set[str] = set()
-    for beat in contract.beats:
-        for claim in beat.claims:
-            if claim.actor_ref is not None and claim.actor_ref.type == "character":
-                raw_id = str(claim.actor_ref.id)
-                tokens.add(raw_id.lower())
-                tokens.add(raw_id.split(":")[-1].lower())
-    for name in (pc_names or {}).values():
-        if name and name.strip():
-            tokens.add(name.strip().lower())
-    return build_evidence(
-        narration or "",
-        public_claim_texts=public_claims,
-        declaration_texts=declarations,
-        secret_texts=secrets,
-        pc_tokens=sorted(tokens),
-        evidence_revision=evidence_revision,
-    )
-
-
-def shadow_judge_narration(
-    narration: str,
-    contract: DmTurnContractV1,
-    deterministic_violations: list[dict[str, Any]] | None,
-    *,
-    judge_service: Any | None = None,
-    judge_session_factory: Any | None = None,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
-    trace_id: str | None = None,
-    campaign_id: Any | None = None,
-    turn_id: Any | None = None,
-    knowledge_restricted_texts: set[str] | None = None,
-    history: list[dict[str, str]] | None = None,
-) -> Any | None:
-    """Run semantic judges in shadow mode over one full narration candidate.
-
-    Fail-soft: returns the shadow verdict or ``None`` (no service, judge
-    failure, telemetry failure). Never raises and never changes the
-    deterministic outcome — a semantic pass cannot overturn a deterministic
-    rejection. This is the full-candidate checkpoint for streamed narration:
-    call once at completion, never per delta.
-    """
-    if judge_service is None:
-        return None
-    try:
-        from app.decisions.judges import shadow_judge
-
-        evidence = build_narration_judge_evidence(
-            narration,
-            contract,
-            extra_secrets=extra_secrets,
-            pc_names=pc_names,
-            evidence_revision=str(trace_id or ""),
-            knowledge_restricted_texts=knowledge_restricted_texts,
-            history=history,
-        )
-        violations = list(deterministic_violations or [])
-        return shadow_judge(
-            judge_service,
-            evidence,
-            deterministic_passed=len(violations) == 0,
-            deterministic_codes=[str(v.get("code", "")) for v in violations if v.get("code")],
-            session_factory=judge_session_factory,
-            trace_id=trace_id,
-            campaign_id=campaign_id,
-            turn_id=turn_id,
-        )
-    except Exception as exc:  # never breaks narration on judge-path failure
-        logger.warning("narration shadow judge dropped: %s", exc)
-        return None
-
-
 def check_narration_fidelity_or_raise(
     narration: str,
     contract: DmTurnContractV1,
     *,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
-    judge_service: Any | None = None,
-    judge_session_factory: Any | None = None,
-    trace_id: str | None = None,
-    campaign_id: Any | None = None,
-    turn_id: Any | None = None,
-    knowledge_restricted_texts: set[str] | None = None,
     history: list[dict[str, str]] | None = None,
 ) -> None:
-    violations = validate_narration_fidelity(
-        narration, contract, extra_secrets=extra_secrets, pc_names=pc_names,
-        history=history,
-    )
-    # Shadow-first semantic judgment (issue #384): calibration only, never
-    # gates. Deterministic failures stay final below.
-    shadow_judge_narration(
-        narration,
-        contract,
-        violations,
-        judge_service=judge_service,
-        judge_session_factory=judge_session_factory,
-        extra_secrets=extra_secrets,
-        pc_names=pc_names,
-        trace_id=trace_id,
-        campaign_id=campaign_id,
-        turn_id=turn_id,
-        knowledge_restricted_texts=knowledge_restricted_texts,
-    )
+    violations = validate_narration_fidelity(narration, contract, history=history)
     if violations:
-        _tally_fidelity_violations(violations)
         structured_log(
             logger, logging.WARNING, "narration_fidelity_rejected",
             violation_count=len(violations),
@@ -1058,33 +737,27 @@ def check_narration_fidelity_or_raise(
 # ── Incremental fidelity policy (streaming providers) ─────────────────────────
 
 #: Violation categories enforced per delta, before each durable persist.
-#: Cheap fail-fast subset of the full gate: secrets, agency violations, and
-#: internal jargon must never become visible, even briefly. The remaining
+#: Cheap fail-fast subset of the full gate: secrets and internal jargon must
+#: never become visible, even briefly. The remaining
 #: categories (unsupported additions, contradictions) need whole-output
 #: context and run authoritatively at provider completion.
-_INCREMENTAL_CATEGORIES = ("secret_leakage", "agency_violation", "internal_jargon")
+_INCREMENTAL_CATEGORIES = ("secret_leakage", "internal_jargon")
 
 
 def validate_narration_incremental(
     narration: str,
     contract: DmTurnContractV1,
-    *,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """Cheap per-delta gate over the cumulative visible text.
 
-    Returns the ``secret_leakage`` / ``agency_violation`` /
-    ``internal_jargon`` subset of :func:`validate_narration_fidelity` —
+    Returns the ``secret_leakage`` / ``internal_jargon`` subset of :func:`validate_narration_fidelity` —
     computed by the same function so incremental and full gates cannot
     disagree on those categories. Pure function — safe to run before each
     persist.
     """
     return [
         v
-        for v in validate_narration_fidelity(
-            narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
-        )
+        for v in validate_narration_fidelity(narration, contract)
         if v["category"] in _INCREMENTAL_CATEGORIES
     ]
 
@@ -1175,22 +848,17 @@ def stream_narration(
     provider: str = PROVIDER_DETERMINISTIC,
     audience: str = "campaign",
     publish_realtime: bool = True,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
     max_chunks_to_persist: int | None = None,
     trace_id: str | None = None,
     on_first_persist: Callable[[uuid.UUID], None] | None = None,
     on_first_persist_tx: Callable[[Session, uuid.UUID], None] | None = None,
-    judge_service: Any | None = None,
-    judge_session_factory: Any | None = None,
-    knowledge_restricted_texts: set[str] | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
     The provider is a streaming contract: it yields text deltas (a batch
     ``str`` is adapted to a single delta; ``None`` runs the deterministic
     template renderer through the same delta loop). Each delta is
-    incrementally gated (secret/agency) and persisted durably via #197
+    incrementally gated (secret/jargon) and persisted durably via #197
     BEFORE its #198 realtime projection, so TTFT tracks first-delta
     arrival rather than full generation. The authoritative full-output
     fidelity gate runs at provider completion.
@@ -1234,7 +902,7 @@ def stream_narration(
     ``max_chunks_to_persist`` is a crash-simulation hook for tests: persist
     at most N chunks and return the partial stream without completing.
     """
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         create_stream,
@@ -1247,7 +915,6 @@ def stream_narration(
     # immediately after adjudication/validation completes, so t_start is the
     # validated-adjudication moment on the critical path.
     t_validated = t_start
-    _inc("narrations_started")
     if not turn_id or not str(turn_id).strip():
         raise ValueError("turn_id is required")
     if not attempt_id or not str(attempt_id).strip():
@@ -1255,7 +922,6 @@ def stream_narration(
 
     projection = build_narration_projection(contract)
     proj_bytes = projection_size_bytes(projection)
-    _metrics["projection_bytes_samples"].append(proj_bytes)
 
     # Recent visible conversation for narrator coherence (fail-soft: a
     # history-query failure must never break narration — the beats alone
@@ -1296,7 +962,6 @@ def stream_narration(
         db.refresh(stream)
     except Exception as exc:
         db.rollback()
-        _inc("narrations_failed_pre_chunk")
         raise NarratorGenerationError(f"Stream creation failed: {exc}") from exc
     stream_id = stream.id
 
@@ -1330,8 +995,6 @@ def stream_narration(
         if not publish_realtime:
             return
         try:
-            from app.realtime.service import publish_dm_chunk_created
-
             publish_dm_chunk_created(db, stream, persisted_chunk)
         except Exception as pub_exc:  # never roll back authoritative state
             logger.warning(
@@ -1348,7 +1011,7 @@ def stream_narration(
         must therefore consult durable state, not the counter.
         """
         try:
-            from app.dm_streams.service import list_chunks as _list_chunks
+            from app.dm.streams import list_chunks as _list_chunks
 
             return len(_list_chunks(db, stream_id))
         except Exception:
@@ -1380,7 +1043,6 @@ def stream_narration(
         now = time.monotonic()
         if seq == 0:
             ttft_ms = (now - t_validated) * 1000
-            _metrics["ttft_ms_samples"].append(ttft_ms)
             if on_first_persist is not None:
                 # Post-commit notification only (must not own the boundary).
                 # A raise here is a post-first-chunk failure: the chunk is
@@ -1398,7 +1060,6 @@ def stream_narration(
                     ) from hook_exc
         else:
             cadence.append((now - last_persist) * 1000)
-            _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
         last_persist = now
         persisted_texts.append(piece)
         _publish_chunk(chunk, seq)
@@ -1444,12 +1105,8 @@ def stream_narration(
                 if delta:
                     full_parts.append(delta)
                     cumulative = "".join(full_parts)
-                    incremental = validate_narration_incremental(
-                        cumulative, contract,
-                        extra_secrets=extra_secrets, pc_names=pc_names,
-                    )
+                    incremental = validate_narration_incremental(cumulative, contract)
                     if incremental:
-                        _tally_fidelity_violations(incremental)
                         if persisted == 0:
                             _delete_invisible_header()
                             raise NarrationFidelityError(
@@ -1501,28 +1158,9 @@ def stream_narration(
 
         # — Authoritative full-output validation at completion —
         violations = validate_narration_fidelity(
-            narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names,
-            history=history,
-        )
-        # Shadow-first semantic judgment (#384): full-candidate checkpoint
-        # only — never per delta, so TTFT/buffering policy holds. Verdict is
-        # calibration-only; deterministic failures below stay final.
-        shadow_judge_narration(
-            narration_text,
-            contract,
-            violations,
-            judge_service=judge_service,
-            judge_session_factory=judge_session_factory,
-            extra_secrets=extra_secrets,
-            pc_names=pc_names,
-            trace_id=trace_id,
-            campaign_id=campaign_id,
-            turn_id=turn_id,
-            knowledge_restricted_texts=knowledge_restricted_texts,
-            history=history,
+            narration_text, contract, history=history,
         )
         if violations:
-            _tally_fidelity_violations(violations)
             if persisted == 0:
                 _delete_invisible_header()
                 raise NarrationFidelityError(
@@ -1541,7 +1179,6 @@ def stream_narration(
                 violations=violations,
             )
     except NarrationStreamError:
-        _inc("narrations_failed_post_chunk")
         raise
     except (NarrationFidelityError, NarrationProjectionError, NarratorGenerationError):
         # Classify by durable state, not the in-memory counter: a boundary
@@ -1552,10 +1189,8 @@ def stream_narration(
         persisted = max(persisted, durable)
         if durable == 0:
             _delete_invisible_header()
-            _inc("narrations_failed_pre_chunk")
             raise
         _fail_visible_stream("narration_stream_error")
-        _inc("narrations_failed_post_chunk")
         raise NarrationStreamError(
             f"Narration stream failed after {persisted} chunk(s)",
             stream_id=stream_id, persisted_chunks=persisted,
@@ -1565,12 +1200,10 @@ def stream_narration(
         persisted = max(persisted, durable)
         if durable == 0:
             _delete_invisible_header()
-            _inc("narrations_failed_pre_chunk")
             if isinstance(exc, NarrationError):
                 raise
             raise NarratorGenerationError(f"Narrator generation failed: {exc}") from exc
         _fail_visible_stream("narration_stream_error")
-        _inc("narrations_failed_post_chunk")
         raise NarrationStreamError(
             f"Narration stream failed after {persisted} chunk(s): {exc}",
             stream_id=stream_id, persisted_chunks=persisted,
@@ -1595,7 +1228,6 @@ def stream_narration(
         db.refresh(stream)
     except Exception as exc:
         db.rollback()
-        _inc("narrations_failed_post_chunk")
         try:
             fail_stream(db, stream.id, reason="narration_complete_error")
             db.commit()
@@ -1607,8 +1239,6 @@ def stream_narration(
         ) from exc
     if publish_realtime:
         try:
-            from app.realtime.service import publish_dm_status
-
             publish_dm_status(db, stream, visible_text=stream.final_text)
         except Exception as pub_exc:
             logger.warning(
@@ -1616,8 +1246,6 @@ def stream_narration(
             )
 
     duration_ms = (time.monotonic() - t_start) * 1000
-    _metrics["total_duration_ms_samples"].append(duration_ms)
-    _inc("narrations_completed")
     structured_log(
         logger, logging.INFO, "narration_streamed",
         stream_id=str(stream.id), turn_id=str(turn_id), attempt_id=str(attempt_id),
@@ -1645,25 +1273,6 @@ class ValidatedTurnResult:
     event: Any
 
 
-def derive_knowledge_speaker_scope(contract: DmTurnContractV1) -> set[str]:
-    """NPC subjects whose unknown facts scope the secrecy judge (#251).
-
-    Mirrors the deterministic ``KnowledgeValidator`` boundary: NPC-attributed
-    ``npc_utterance``/``observation``/``world_fact`` claims are
-    knowledge-bearing for their speaker. Pure (no I/O) — callers resolve
-    the IDs against campaign entities when deriving restricted texts.
-    """
-    return {
-        str(claim.actor_ref.id).strip()
-        for beat in (contract.beats or [])
-        for claim in (beat.claims or [])
-        if claim.claim_kind in ("npc_utterance", "observation", "world_fact")
-        and claim.actor_ref is not None
-        and getattr(claim.actor_ref, "type", None) == "npc"
-        and str(claim.actor_ref.id or "").strip()
-    }
-
-
 def execute_validated_turn(
     db: Session,
     *,
@@ -1674,18 +1283,12 @@ def execute_validated_turn(
     chunk_size: int = 120,
     provider: str = PROVIDER_DETERMINISTIC,
     publish_realtime: bool = True,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
     expected_revision: int | None = None,
-    event_type: str = "dm.turn_resolved",
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
     trace_id: str | None = None,
     identity_decision_service: Any | None = None,
     identity_session_factory: Any | None = None,
-    judge_service: Any | None = None,
-    judge_session_factory: Any | None = None,
-    knowledge_restricted_texts: set[str] | None = None,
 ) -> ValidatedTurnResult:
     """Run a validated structured turn through narration to final commit.
 
@@ -1712,7 +1315,7 @@ def execute_validated_turn(
     (locks the input set at first visibility, so a crash can never leave
     visible narration on a still-prepared attempt); realtime delivery
     happens only after that commit returns.
-    4. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
+    4. ``commit_turn`` — atomic promotion + final commit (#206).
     Failure semantics inherit the callees: pre-first-chunk failure
     (generation/fidelity/identity-DEFER) leaves nothing persisted and is freely retryable
     with the same turn/attempt identity; post-first-chunk failure raises
@@ -1721,13 +1324,13 @@ def execute_validated_turn(
     ``mark_attempt_failed(visible=True)`` (input set stays locked) when it
     had already crossed into streaming. Resume a boundary-crossed partial
     via :func:`resume_narration_stream` (same text only), then
-    ``commit_turn_with_effects`` manually; a fidelity-rejected partial
+    ``commit_turn`` manually; a fidelity-rejected partial
     needs a NEW stream on a NEW attempt.
     """
     from models.dm import DmTurn
 
     from app.dm.turns import (
-        commit_turn_with_effects,
+        commit_turn,
         mark_streaming_started,
         stage_validated_attempt,
     )
@@ -1749,8 +1352,6 @@ def execute_validated_turn(
     # attempt-local; commit only revalidates/applies with no second call.
     if getattr(contract, "new_entities", None):
         from models.campaigns import Campaign as _Campaign
-
-        from app.world.service import resolve_new_entity_identities_pre_narration
 
         _campaign = db.get(_Campaign, turn.campaign_id)
         if _campaign is None:
@@ -1776,35 +1377,6 @@ def execute_validated_turn(
             db_, turn_id, attempt_id, stream_id=stream_id_, commit=False
         )
 
-    # Issue #251 — derive subject-unknown restricted texts for the secrecy
-    # judge when the caller did not supply them. Per-speaker scope from
-    # #211 knowledge, independent of human visibility; flattened with
-    # speaker tags the secrecy prompt interprets. Bounded (recent facts
-    # only, resolved campaign speakers) and fail-soft: derivation failure
-    # leaves the judge on literal secrets, never breaks narration or delays
-    # first-chunk streaming beyond one bounded query.
-    if knowledge_restricted_texts is None:
-        try:
-            from models.campaigns import Campaign as _Campaign
-
-            from app.world.epistemics import collect_subject_restricted_fact_texts
-
-            _speakers = derive_knowledge_speaker_scope(contract)
-            if _speakers:
-                _campaign = db.get(_Campaign, turn.campaign_id)
-                if _campaign is not None:
-                    _scoped = collect_subject_restricted_fact_texts(
-                        db, _campaign, _speakers
-                    )
-                    knowledge_restricted_texts = {
-                        f"[unknown to speaker {speaker}] {text}"
-                        for speaker, texts in _scoped.items()
-                        for text in texts
-                    } or None
-        except Exception as exc:
-            logger.warning("knowledge judge scope derivation dropped: %s", exc)
-            knowledge_restricted_texts = None
-
     try:
         narration = stream_narration(
             db,
@@ -1818,13 +1390,8 @@ def execute_validated_turn(
             provider=provider,
             audience=staged.audience or turn.audience,
             publish_realtime=publish_realtime,
-            extra_secrets=extra_secrets,
-            pc_names=pc_names,
             trace_id=trace_id,
             on_first_persist_tx=_boundary_tx,
-            judge_service=judge_service,
-            judge_session_factory=judge_session_factory,
-            knowledge_restricted_texts=knowledge_restricted_texts,
         )
     except NarrationStreamError:
         # Defined remediation for post-visibility failure: if the
@@ -1858,12 +1425,11 @@ def execute_validated_turn(
         "submission_ids": submission_ids,
         "narration_stream_id": str(narration.stream_id),
     }
-    final_turn, final_attempt, event = commit_turn_with_effects(
+    final_turn, final_attempt, event = commit_turn(
         db,
         turn_id,
         attempt_id,
         expected_revision=expected_revision,
-        event_type=event_type,
         payload=payload,
         operation_id=operation_id,
         actor_id=actor_id,
@@ -1894,14 +1460,11 @@ def resume_narration_stream(
     suffix, then materializes the final narration. Idempotent: already
     persisted chunks are re-used, never duplicated.
     """
-    from app.providers import policy as role_policy
-
     result = _resume_stream_suffix(
         db, stream_id, full_text,
         chunk_size=chunk_size, publish_realtime=publish_realtime,
         completion_reason="narration_resumed",
     )
-    role_policy.record_partial_resume("direct_resume")
     return result
 
 
@@ -1913,14 +1476,7 @@ def continue_partial_stream(
     *,
     chunk_size: int = 120,
     publish_realtime: bool = True,
-    extra_secrets: set[str] | None = None,
-    pc_names: dict[str, str] | None = None,
     commit: bool = True,
-    judge_service: Any | None = None,
-    judge_session_factory: Any | None = None,
-    trace_id: str | None = None,
-    campaign_id: Any | None = None,
-    turn_id: Any | None = None,
 ) -> NarrationResult:
     """Semantically continue a partial visible stream without contradiction.
 
@@ -1935,22 +1491,14 @@ def continue_partial_stream(
     fresh instead) and ``NarrationFidelityError`` /
     ``NarrationStreamError`` on gate failure.
     """
-    from app.dm_streams.service import reconstruct_text
-    from app.providers import policy as role_policy
-
+    from app.dm.streams import reconstruct_text
     visible = reconstruct_text(db, stream_id)
     if not (continued_text or "").startswith(visible):
         raise ValueError(
             "Continued narration contradicts the persisted visible prefix — "
             "cannot continue automatically; use explicit Retry"
         )
-    check_narration_fidelity_or_raise(
-        continued_text, contract,
-        extra_secrets=extra_secrets, pc_names=pc_names,
-        judge_service=judge_service,
-        judge_session_factory=judge_session_factory,
-        trace_id=trace_id, campaign_id=campaign_id, turn_id=turn_id,
-    )
+    check_narration_fidelity_or_raise(continued_text, contract)
     result = _resume_stream_suffix(
         db, stream_id, continued_text,
         chunk_size=chunk_size,
@@ -1960,26 +1508,7 @@ def continue_partial_stream(
         commit=commit,
         completion_reason="narration_continued",
     )
-    role_policy.record_partial_resume("semantic_continuation")
     return result
-
-
-def build_continuation_prompt(
-    projection: dict[str, Any],
-    visible_prefix: str,
-    history: list[dict[str, str]] | None = None,
-) -> str:
-    """Build a regeneration prompt constrained to continue the prefix.
-
-    The persisted prefix is quoted verbatim with an instruction to continue
-    exactly from it without contradicting or restating it differently.
-    """
-    base = build_narrator_prompt(projection, history)
-    return (
-        base + "\nALREADY VISIBLE (do not rewrite, contradict, or restate):\n"
-        + (visible_prefix or "")[:4000]
-        + "\nContinue exactly from the visible text above."
-    )
 
 
 def _resume_stream_suffix(
@@ -1993,7 +1522,7 @@ def _resume_stream_suffix(
     completion_reason: str = "narration_resumed",
 ) -> NarrationResult:
     """Shared suffix-persist + complete for resume/continuation."""
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         get_stream,
@@ -2026,12 +1555,9 @@ def _resume_stream_suffix(
         db.refresh(stream)
         now = time.monotonic()
         cadence.append((now - last) * 1000)
-        _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
         last = now
         if publish_realtime:
             try:
-                from app.realtime.service import publish_dm_chunk_created
-
                 publish_dm_chunk_created(db, stream, chunk)
             except Exception as pub_exc:
                 logger.warning(
@@ -2046,15 +1572,12 @@ def _resume_stream_suffix(
     db.refresh(stream)
     if publish_realtime:
         try:
-            from app.realtime.service import publish_dm_status
-
             publish_dm_status(db, stream, visible_text=stream.final_text)
         except Exception as pub_exc:
             logger.warning(
                 "narration resume status publish failed stream_id=%s error=%s", stream_id, pub_exc
             )
     duration_ms = (time.monotonic() - t_start) * 1000
-    _inc("narrations_completed")
     return NarrationResult(
         stream_id=stream_id, visible_text=reconstruct_text(db, stream_id),
         final_text=stream.final_text, chunk_count=len(plan),
@@ -2066,7 +1589,7 @@ def _resume_stream_suffix(
 
 def materialize_final_narration(db: Session, stream_id: uuid.UUID) -> dict[str, Any]:
     """Read-model for history: final narration text with chunk provenance."""
-    from app.dm_streams.service import get_stream_with_chunks
+    from app.dm.streams import get_stream_with_chunks
 
     stream, chunks, visible_text = get_stream_with_chunks(db, stream_id)
     final = stream.final_text if stream.status == "completed" else None

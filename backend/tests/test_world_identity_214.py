@@ -14,11 +14,11 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base
 import models  # noqa: F401
 from app.decisions import DecisionError, DecisionService, record_fail_soft, to_decision_request
-from app.decisions.adapters.fake import FakeDecisionAdapter
+from tests.support.fake_decisions import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
-    normalize_alias, supersede_entity)
-from app.world.service import create_entity_inline, promote_new_entities_from_contract
+    normalize_alias, promote_new_entities_from_contract)
+from app.world.service import create_entity
 from models.campaigns import Campaign
 from models.profiles import Profile
 
@@ -35,9 +35,9 @@ def setup_db():
 
 
 def make_entity(db, campaign, name, kind="npc", visibility="campaign", idempotency_key=None, **details):
-    return create_entity_inline(db, campaign, entity_type=kind, name=name,
-                                visibility=visibility, details=details,
-                                idempotency_key=idempotency_key)[0]
+    return create_entity(db, campaign, entity_type=kind, name=name,
+                         visibility=visibility, details=details,
+                         idempotency_key=idempotency_key)[0]
 
 
 def test_normalized_alias_and_stable_ref_resolve_without_model():
@@ -173,16 +173,13 @@ def test_bounded_candidates_and_stale_revalidation_fail_closed():
     assert exc.value.kind == "stale"
 
 
-def test_provider_failure_defers_and_supersession_is_auditable():
+def test_provider_failure_defers():
     db, campaign = setup_db()
-    canonical = make_entity(db, campaign, "Mara Venn")
-    duplicate = make_entity(db, campaign, "Mara of the Gate")
+    make_entity(db, campaign, "Mara Venn")
+    make_entity(db, campaign, "Mara of the Gate")
     frame = build_identity_frame(db, campaign, name="Mara", entity_type="npc")
     result = decide_identity(db, campaign, frame, DecisionService(FakeDecisionAdapter()))
     assert result.selected_id == DEFER
-    supersede_entity(db, duplicate, canonical, provenance={"repair_id": "r1"})
-    assert duplicate.superseded_by_id == canonical.id
-    assert duplicate.details["identity_supersession"]["provenance"] == {"repair_id": "r1"}
 
 
 class _NearTieDeferStub:
@@ -242,7 +239,7 @@ def test_confident_defer_never_falls_back():
 
 def test_retry_with_memo_resolves_instead_of_looping():
     from models.dm import DmTurnAttempt
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
 
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
@@ -408,7 +405,7 @@ def _attempt_fake(contract_snapshot):
 
 
 def test_pre_narration_resolution_persists_attempt_local_outcome():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
@@ -431,7 +428,7 @@ def test_pre_narration_resolution_persists_attempt_local_outcome():
 
 
 def test_commit_revalidation_applies_stored_outcome_without_new_decision():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
     snapshot = {"new_entities": [{
@@ -461,7 +458,7 @@ def test_commit_revalidation_applies_stored_outcome_without_new_decision():
 
 
 def test_pre_narration_defer_aborts_before_anything_durable():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     original = make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
@@ -487,7 +484,7 @@ def test_pre_narration_defer_aborts_before_anything_durable():
 
 
 def test_stored_outcome_stale_revision_fails_closed_at_commit():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     snapshot = {"new_entities": [{
@@ -511,7 +508,7 @@ def test_stored_outcome_stale_revision_fails_closed_at_commit():
 
 
 def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls():
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
     from app.world.identity import IdentityReuseRequiresReadjudication
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
@@ -532,7 +529,7 @@ def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls
 
 def test_pre_narration_bounded_reuse_requires_readjudication():
     from app.world.identity import IdentityReuseRequiresReadjudication
-    from app.world.service import resolve_new_entity_identities_pre_narration
+    from app.world.identity import resolve_new_entity_identities_pre_narration
 
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
@@ -572,7 +569,7 @@ def _streaming_setup():
 
 
 def _coordinated_attempt(db, campaign, thread_id):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
     user_id = uuid.uuid4()
     accept_submission(

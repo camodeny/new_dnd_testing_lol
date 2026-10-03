@@ -4,8 +4,7 @@
 
 Use Supabase Cron (`pg_cron`) and `pg_net` to POST to the authenticated
 `/api/cron/dm-execute` endpoint every minute. The endpoint claims at most one
-prepared attempt per request. Vercel's existing daily outbox relay schedule is
-unchanged; the unsupported five-minute Vercel DM schedule is removed.
+prepared attempt per request. No Vercel crons are used.
 
 After deploying #357, enable Cron and pg_net in the production Supabase project.
 In Vault, create `dm_execute_base_url` with the public HTTPS backend origin and
@@ -50,9 +49,8 @@ Same pattern for the authenticated `/api/cron/post-turn` endpoint, every
 minute. The endpoint executes up to 5 pending post-turn runs per request
 through the idempotent worker fence (`WorkerExecution` keyed on run id), so
 concurrent or duplicate deliveries converge instead of duplicating work.
-Queue push delivery stays deferred; this minute sweep is the fast production
-execution path. (Vercel Hobby only allows daily crons, so the Vercel
-schedule is not used for post-turn.)
+The same request then embeds up to 20 pending world semantic index rows
+(placeholders staged by canon writes; failures retry after a backoff).
 
 After deploying #216, in Vault create `post_turn_base_url` with the public
 HTTPS backend origin and `post_turn_cron_secret` with the backend's
@@ -63,9 +61,10 @@ setup outside Alembic. To remove: `SELECT cron.unschedule('dnd-post-turn');`.
 ## Adventure-closing sweep (issue #260)
 
 Same pattern for the authenticated `/api/cron/adventure-closing` endpoint,
-every 5 minutes. The endpoint drives up to 5 completed adventures with
-pending closing work per request through the idempotent worker fence
-(`WorkerExecution` keyed on adventure id), so concurrent or duplicate
+every 5 minutes. The endpoint drives up to 5 pending `adventure.closing`
+rows (staged in the `outbox` table atomically with the completion) per
+request through the idempotent worker fence (`WorkerExecution` keyed on the
+row id), so concurrent or duplicate
 deliveries converge instead of duplicating work. Closing is best-effort:
 failures retry but never invalidate committed completions.
 

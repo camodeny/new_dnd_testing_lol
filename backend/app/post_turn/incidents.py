@@ -1,18 +1,17 @@
 """Post-turn deterministic + semantic consistency incidents — issue #220.
 
-After required materialization (#217), clocks (#218), and summaries (#219),
-post-turn verifies the range for contradictions between newly materialized
-state, completed visible turns, clocks, current scene, facts, and summaries —
-recording explicit consistency incidents instead of silently normalizing
-canon away. The #221 repair workflow consumes incidents; this verifier never
-rewrites canon itself.
+After required materialization (#217) and clocks (#218), post-turn verifies
+the range for contradictions between newly materialized state, completed
+visible turns, clocks, current scene, and facts — recording explicit
+consistency incidents instead of silently normalizing canon away. This
+verifier never rewrites canon itself.
 
 Authority split (under #379; the AI is the only DM):
 
 - Deterministic code owns every exact conflict: entity status/location/clock
-  IDs and numbers, source/revision existence and ordering, and a closed
-  lexical contradiction table for derived prose. These checks run with no
-  model call, and a positive semantic verdict never overrides them.
+  IDs and numbers, and source/revision existence and ordering. These checks
+  run with no model call, and a positive semantic verdict never overrides
+  them.
 - Bounded decisions (``post_turn_consistency`` class, #380/#381 runtime)
   judge only the ambiguous semantic residue — paraphrased/implicit
   contradictions that cannot be decided structurally — among the explicit
@@ -26,10 +25,10 @@ Authority split (under #379; the AI is the only DM):
 Lifecycle: ``open`` (deterministic or semantic contradiction, required) /
 ``deferred`` (uncertain/escape/decision failure or private evidence the
 caller may not see — still required-unresolved) / ``verifier_failed``
-(operational/retryable — still required-unresolved) → ``resolved`` (by the
-#221 repair workflow only). Any required-unresolved incident keeps
-:func:`is_range_complete` false so the post-turn checkpoint cannot report
-complete.
+(operational/retryable — still required-unresolved) → ``resolved`` via
+:func:`resolve_incident`, which currently has no production caller. Any
+required-unresolved incident keeps :func:`is_range_complete` false so the
+post-turn checkpoint cannot report complete.
 
 Incident and decision payloads may carry private evidence: rows are
 DM/operator-only by default, and visibility filtering happens before any
@@ -67,6 +66,10 @@ from app.decisions import (
     to_decision_request,
 )
 from app.observability.tracing import structured_log
+from app.visibility.policy import disclosure_rank, normalize_visibility
+from app.world.clocks import CLOCK_EVALUABLE_STATUSES
+from app.world.identity import exact_identity_match
+from app.world.service import get_current_scene
 from models.campaigns import CampaignDomainEvent
 from models.post_turn import PostTurnConsistencyIncident
 
@@ -122,7 +125,6 @@ STALE_HIDDEN_CONSEQUENCE = "stale_hidden_consequence"
 CLOCK_CONTRADICTION = "clock_contradiction"
 FACT_CONFLICT = "fact_conflict"
 SOURCE_CONFLICT = "source_conflict"
-SUMMARY_CONTRADICTION = "summary_contradiction"
 # Semantic / operational types.
 SEMANTIC_CONTRADICTION = "semantic_contradiction"
 SEMANTIC_DEFERRED = "semantic_deferred"
@@ -135,7 +137,7 @@ class ConsistencyBlocked(RuntimeError):
     """Required unresolved consistency incidents keep the range incomplete.
 
     Raised by the post-turn pipeline integration so the checkpoint stays
-    put for cumulative retry after #221 repair. Carries the incident ids.
+    put for cumulative retry. Carries the incident ids.
     """
 
     def __init__(self, incident_ids: list[str], detail: str = ""):
@@ -223,8 +225,6 @@ def _load_range_events(db: Session, campaign_id: uuid.UUID,
 
 def _resolve_entity(db: Session, campaign_id: uuid.UUID, ref: Any):
     """Exact entity resolution (deterministic; no model calls)."""
-    from app.world.identity import exact_identity_match
-
     try:
         entity, _how = exact_identity_match(db, campaign_id, ref)
     except Exception:
@@ -246,43 +246,6 @@ def _resolve_clock(db: Session, campaign_id: uuid.UUID, ref: Any):
         CampaignClock.name == str(ref or "").strip(),
     )).scalars().all()
     return rows[0] if rows else None
-
-
-# Closed lexical contradiction table (code-owned): exact state-word pairs
-# whose co-occurrence about the same named subject is a deterministic
-# contradiction. Paraphrase ("passed away") is NOT here — that residue goes
-# through bounded semantic judgment.
-_STATE_OPPOSITES: tuple[tuple[str, str], ...] = (
-    ("dead", "alive"),
-    ("dead", "living"),
-    ("dead", "survived"),
-    ("destroyed", "intact"),
-    ("destroyed", "standing"),
-    ("sealed", "open"),
-    ("present", "absent"),
-)
-
-
-def _word_present(text: str, word: str) -> bool:
-    return re.search(rf"\b{re.escape(word)}\b", text or "") is not None
-
-
-def lexical_contradiction(text_a: Any, text_b: Any, *, subject: str = "") -> bool:
-    """Closed-table contradiction check between two prose strings.
-
-    Requires the same subject token (when given) plus opposing state words.
-    Deterministic and conservative: returns False on any ambiguity.
-    """
-    a, b = _normalize(text_a), _normalize(text_b)
-    if not a or not b or a == b:
-        return False
-    if subject and (_normalize(subject) not in a or _normalize(subject) not in b):
-        return False
-    for left, right in _STATE_OPPOSITES:
-        if ((_word_present(a, left) and _word_present(b, right))
-                or (_word_present(a, right) and _word_present(b, left))):
-            return True
-    return False
 
 
 # ── Persistence (idempotent) ───────────────────────────────────────────────
@@ -380,8 +343,6 @@ def detect_proposal_conflicts(
     treats newer committed gameplay as authority — the proposal is stale,
     never the canon.
     """
-    from app.world.service import get_current_scene
-
     findings: list[dict[str, Any]] = []
     by_id = _event_by_id(events)
     for proposal in proposals or []:
@@ -586,12 +547,10 @@ def detect_canon_self_conflicts(
     """Internal canon contradictions computable with no proposals (deterministic).
 
     Covers the deterministic clock contradiction (progress past threshold
-    while still evaluable), dangling source refs, missing visibility
-    metadata on range records, and impossible summary revisions.
+    while still evaluable), dangling source refs, and missing visibility
+    metadata on range records.
     """
-    from models.world import CampaignClock, CampaignSummary, WorldFact, WorldRelation
-    from app.world.clocks import CLOCK_EVALUABLE_STATUSES
-
+    from models.world import CampaignClock, WorldFact, WorldRelation
     findings: list[dict[str, Any]] = []
     known_ids = {e.id for e in events}
     # Clock invariant: progress past threshold while still evaluable.
@@ -653,102 +612,15 @@ def detect_canon_self_conflicts(
                     },
                     "affected": [{"kind": label, "id": str(row.id)}],
                 })
-    # Impossible summary revisions: derived rows cannot outrun canon.
-    summaries = db.execute(select(CampaignSummary).where(
-        CampaignSummary.campaign_id == campaign_id,
-    )).scalars().all()
-    for summary in summaries:
-        if int(summary.source_revision or 0) > max_sequence:
-            findings.append({
-                "incident_type": SOURCE_CONFLICT, "category": "source",
-                "severity": "standard", "target": str(summary.id),
-                "fingerprint": f"summary-revision-ahead:{summary.source_revision}-gt-{max_sequence}",
-                "evidence": {
-                    "canon": {"summary_id": str(summary.id),
-                              "source_range": [summary.from_sequence, summary.to_sequence],
-                              "source_revision": summary.source_revision,
-                              "max_committed_sequence": max_sequence},
-                    "reason": "derived summary revision exceeds committed canon",
-                },
-                "affected": [{"kind": "campaign_summary", "id": str(summary.id)}],
-            })
-    return findings
-
-
-def detect_summary_contradictions(
-    db: Session, campaign_id: uuid.UUID,
-) -> list[dict[str, Any]]:
-    """Deterministic contradictions between current summaries and canon facts.
-
-    Uses only the closed lexical table over a shared named subject — derived
-    prose is checked even though it is lower-authority. Paraphrased conflicts
-    are out of scope here; they belong to the semantic path.
-    """
-    from models.world import CampaignSummary, WorldFact, WorldEntity
-
-    findings: list[dict[str, Any]] = []
-    summaries = db.execute(select(CampaignSummary).where(
-        CampaignSummary.campaign_id == campaign_id,
-        CampaignSummary.status == "current",
-    )).scalars().all()
-    if not summaries:
-        return findings
-    facts = db.execute(select(WorldFact).where(
-        WorldFact.campaign_id == campaign_id,
-        WorldFact.status == "active",
-        WorldFact.epistemic_state == "confirmed",
-    )).scalars().all()
-    if not facts:
-        return findings
-    names = [e.name for e in db.execute(select(WorldEntity).where(
-        WorldEntity.campaign_id == campaign_id,
-        WorldEntity.superseded_by_id.is_(None),
-    )).scalars().all() if e.name]
-    for summary in summaries:
-        for claim in (summary.claims or []):
-            text = claim.get("text") if isinstance(claim, dict) else str(claim)
-            if not text:
-                continue
-            for fact in facts:
-                subject = next(
-                    (n for n in names
-                     if _normalize(n) in _normalize(text)
-                     and _normalize(n) in _normalize(fact.content)),
-                    "",
-                )
-                if not subject:
-                    continue
-                if lexical_contradiction(text, fact.content, subject=subject):
-                    findings.append({
-                        "incident_type": SUMMARY_CONTRADICTION, "category": "summary",
-                        "severity": "standard", "target": str(summary.id),
-                        "fingerprint": f"claim-vs-fact:{claim.get('id') if isinstance(claim, dict) else '?'}"
-                                       f":{fact.id}",
-                        "evidence": {
-                            "canon": {"fact_id": str(fact.id),
-                                      "visibility": fact.visibility,
-                                      "epistemic_state": fact.epistemic_state},
-                            "derived": {"summary_id": str(summary.id),
-                                        "source_range": [summary.from_sequence,
-                                                         summary.to_sequence]},
-                            "reason": "current summary claim deterministically "
-                                      "contradicts a confirmed canon fact",
-                        },
-                        "affected": [{"kind": "campaign_summary", "id": str(summary.id)},
-                                     {"kind": "world_fact", "id": str(fact.id)}],
-                    })
     return findings
 
 
 # ── Bounded semantic judgments (ambiguous residue only) ────────────────────
 
 def _pair_visibility(pair: SemanticPair) -> str:
-    from app.world.service import normalize_visibility
-
-    ranks = {"dm_only": 0, "private": 1, "campaign": 2, "public": 3}
     sides = [pair.canon_claim.get("visibility"), pair.new_claim.get("visibility")]
     try:
-        return min(sides, key=lambda v: ranks[normalize_visibility(v)])
+        return min(sides, key=lambda v: disclosure_rank(normalize_visibility(v)))
     except (ValueError, KeyError, TypeError):
         return "dm_only"
 
@@ -891,7 +763,7 @@ def verify_post_turn_consistency(
     an independent transaction while detection keeps reading the caller's
     flushed-but-uncommitted ``db`` state: the verifier then never commits
     ``db`` itself, so a blocked range rolls back the caller's consolidation
-    writes while incidents stay durable for repair. The caller owns ``db``'s
+    writes while incidents stay durable. The caller owns ``db``'s
     transaction (commit on success, rollback on ``ConsistencyBlocked``).
     Without it, ``commit`` controls ``db`` directly (legacy behavior).
     """
@@ -916,7 +788,6 @@ def verify_post_turn_consistency(
             db, campaign_id, events, list(proposed or []), max_sequence=max_seq)
         deterministic_findings += detect_canon_self_conflicts(
             db, campaign_id, events, max_sequence=max_seq)
-        deterministic_findings += detect_summary_contradictions(db, campaign_id)
         for finding in deterministic_findings:
             row, _created = _store_incident(
                 store_db, campaign_id, from_sequence, to_sequence,
@@ -1056,7 +927,7 @@ def verify_post_turn_consistency(
             pass
         try:
             if durable_db is not None:
-                # Incidents stay durable for repair; the caller's
+                # Incidents stay durable; the caller's
                 # transaction is only flushed — its owner rolls back
                 # the failed range's consolidation writes.
                 durable_db.commit()
@@ -1135,26 +1006,11 @@ def is_range_complete(db: Session, campaign_id: uuid.UUID,
     return len(rows) == 0
 
 
-def list_unresolved_incidents(db: Session, campaign_id: uuid.UUID, *,
-                              dm_internal: bool = True) -> list[dict[str, Any]]:
-    """Repair-facing incident listing (#221 consumes this).
-
-    DM-internal callers get full evidence; anyone else gets redacted
-    type/severity/status metadata only (private evidence never leaks to
-    player-facing correction decisions made here).
-    """
-    rows = db.execute(select(PostTurnConsistencyIncident).where(
-        PostTurnConsistencyIncident.campaign_id == campaign_id,
-        PostTurnConsistencyIncident.status.in_(sorted(UNRESOLVED_STATUSES)),
-    ).order_by(PostTurnConsistencyIncident.created_at.asc())).scalars().all()
-    return [r.to_dict(include_evidence=dm_internal) for r in rows]
-
-
 def resolve_incident(db: Session, incident_id: uuid.UUID, *,
                      resolution: str = "repaired",
                      operation_id: str | None = None,
                      commit: bool = True) -> PostTurnConsistencyIncident:
-    """Mark one incident resolved (repair-workflow hook for #221)."""
+    """Mark one incident resolved."""
     from datetime import datetime, timezone
 
     row = db.get(PostTurnConsistencyIncident, incident_id)
@@ -1176,65 +1032,3 @@ def resolve_incident(db: Session, incident_id: uuid.UUID, *,
         incident_type=row.incident_type, resolution=resolution,
     )
     return row
-
-
-def get_consistency_stats(db: Session, campaign_id: uuid.UUID) -> dict[str, Any]:
-    """Observability: categories, paths, records, ranges, decisions, latency."""
-    rows = db.execute(select(PostTurnConsistencyIncident).where(
-        PostTurnConsistencyIncident.campaign_id == campaign_id,
-    )).scalars().all()
-    by_type: dict[str, int] = {}
-    by_category: dict[str, int] = {}
-    by_path: dict[str, int] = {}
-    by_status: dict[str, int] = {}
-    by_severity: dict[str, int] = {}
-    distribution: dict[str, int] = {}
-    models: dict[str, int] = {}
-    latencies: list[int] = []
-    repeated = 0
-    verifier_failures = 0
-    resolution_seconds: list[float] = []
-    for row in rows:
-        by_type[row.incident_type] = by_type.get(row.incident_type, 0) + 1
-        by_category[row.category or "unknown"] = by_category.get(row.category or "unknown", 0) + 1
-        by_path[row.detection_path] = by_path.get(row.detection_path, 0) + 1
-        by_status[row.status] = by_status.get(row.status, 0) + 1
-        by_severity[row.severity or "unknown"] = by_severity.get(row.severity or "unknown", 0) + 1
-        for key, value in (row.decision_distribution or {}).items():
-            distribution[key] = distribution.get(key, 0) + int(value or 0)
-        if row.decision_model:
-            models[row.decision_model] = models.get(row.decision_model, 0) + 1
-        if row.detection_latency_ms is not None:
-            latencies.append(int(row.detection_latency_ms))
-        repeated += max(0, int(row.repeat_count or 1) - 1)
-        if row.incident_type == VERIFIER_FAILURE:
-            verifier_failures += 1
-        if row.status == RESOLVED_STATUS and row.resolved_at and row.created_at:
-            try:
-                resolution_seconds.append(
-                    max(0.0, (row.resolved_at - row.created_at).total_seconds()))
-            except TypeError:
-                pass
-    affected = sum(len(r.affected_records or []) for r in rows)
-    return {
-        "campaign_id": str(campaign_id),
-        "incidents": len(rows),
-        "unresolved": sum(by_status.get(s, 0) for s in UNRESOLVED_STATUSES),
-        "by_type": by_type,
-        "by_category": by_category,
-        "by_detection_path": by_path,
-        "by_status": by_status,
-        "by_severity": by_severity,
-        "affected_records": affected,
-        "decision_class": INCIDENT_DECISION_CLASS,
-        "decision_distribution": distribution,
-        "decision_models": models,
-        "decision_policy": dict(INCIDENT_POLICY),
-        "repeated_incidents": repeated,
-        "verifier_failures": verifier_failures,
-        "avg_detection_latency_ms": (
-            sum(latencies) / len(latencies) if latencies else None),
-        "avg_time_to_resolution_seconds": (
-            sum(resolution_seconds) / len(resolution_seconds)
-            if resolution_seconds else None),
-    }

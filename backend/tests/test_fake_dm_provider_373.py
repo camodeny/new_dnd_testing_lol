@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.dm.fake_provider import (
+from tests.support.fake_provider import (
     FAKE_MODEL_NAME,
     FAKE_PROVIDER_NAME,
     FakeDMProvider,
@@ -227,12 +227,11 @@ def test_install_is_explicit_and_test_scoped(monkeypatch):
     provider = build_phase0_provider(freeform_turns=(), post_reconnect_turn="Later.")
     provider.install(monkeypatch)
     import app.dm.adjudication as adjudication
-    import app.providers as providers_pkg
 
     adapter, model, name = adjudication.resolve_dm_provider()
     assert name == FAKE_PROVIDER_NAME
     assert model == FAKE_MODEL_NAME
-    response = providers_pkg.execute_chat(adapter, _dm_request([]))
+    response = adjudication.execute_chat(adapter, _dm_request([]))
     assert "phase0-reply-opening" in response.content
     # monkeypatch undoes both patches at test end — asserted implicitly by
     # test_real_providers_unaffected_outside_test_mode running uninstalled.

@@ -65,7 +65,7 @@ def api(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
@@ -73,7 +73,7 @@ def api(monkeypatch):
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -99,7 +99,7 @@ def api_via_router(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
@@ -107,7 +107,7 @@ def api_via_router(monkeypatch):
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -239,8 +239,8 @@ def test_snapshot_pagination_does_not_force_full_transcript(api):
 
 def test_snapshot_omits_private_data_server_side(api, monkeypatch):
     client, factory, campaign_id, member_id, outsider_id = api
-    from app.runtime.threads import create_private_thread
-    from app.runtime.submissions import accept_submission
+    from app.threads.service import create_private_thread
+    from app.submissions.service import accept_submission
 
     with factory() as db:
         t = create_private_thread(db, campaign_id=campaign_id, created_by=TEST_USER_ID, member_ids=[member_id], title="secret")

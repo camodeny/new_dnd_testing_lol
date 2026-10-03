@@ -17,6 +17,8 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
+from app.world.service import apply_scene_update, create_entity  # noqa: E402
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.campaigns import CampaignDomainEvent  # noqa: E402
 from models.campaigns import CampaignMember  # noqa: E402
@@ -74,16 +76,13 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     # World/submission/snapshot routers import resolve_profile into their own
     # namespaces — patch each transport surface this suite exercises.
     for module in (
-        "app.world.router",
-        "app.runtime.router",
         "app.snapshot.router",
-        "app.rolls.router",
     ):
         monkeypatch.setattr(
             f"{module}.resolve_profile",
@@ -126,13 +125,14 @@ def _drive_to_active(client, factory, owner_id, **overrides) -> dict:
     return _get(client, cid)
 
 
-def _set_scene(client, cid: str, revision: int, key: str, fictional_time: str = "Day 3, dusk"):
-    response = client.put(
-        f"/api/campaigns/{cid}/world/current-scene",
-        json={"expected_revision": revision, "fictional_time": fictional_time},
-        headers={"Idempotency-Key": key},
-    )
-    return response
+def _set_scene(factory, cid: str, revision: int, fictional_time: str = "Day 3, dusk") -> None:
+    with factory() as db:
+        commit_world_write(db, uuid.UUID(cid), revision, apply_scene_update, fictional_time=fictional_time)
+
+
+def _add_entity(factory, cid: str, revision: int, name: str) -> None:
+    with factory() as db:
+        commit_world_write(db, uuid.UUID(cid), revision, create_entity, entity_type="npc", name=name)
 
 
 def _state_fingerprint(factory, cid: uuid.UUID) -> dict:
@@ -181,14 +181,9 @@ def test_archive_preserves_all_durable_state_and_hides_from_active_list(api):
     rev = campaign["revision"]
 
     # Durable world/canon state established before archiving.
-    assert _set_scene(client, cid, rev, "scene-1").status_code == 200
+    _set_scene(factory, cid, rev)
     rev += 1
-    entity = client.post(
-        f"/api/campaigns/{cid}/world/entities",
-        json={"expected_revision": rev, "entity_type": "npc", "name": "Mira"},
-        headers={"Idempotency-Key": "entity-1"},
-    )
-    assert entity.status_code == 200, entity.text
+    _add_entity(factory, cid, rev, "Mira")
     rev += 1
     # Private thread with restricted membership.
     private_id = uuid.uuid4()
@@ -229,7 +224,7 @@ def test_restore_reactivates_same_campaign_and_live_table_flow(api):
     campaign = _drive_to_active(client, factory, owner_id)
     cid = campaign["id"]
     rev = campaign["revision"]
-    assert _set_scene(client, cid, rev, "scene-1", fictional_time="Day 5, dawn").status_code == 200
+    _set_scene(factory, cid, rev, fictional_time="Day 5, dawn")
     rev += 1
     with factory() as db:
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
@@ -307,7 +302,7 @@ def test_archived_table_freezes_fictional_time(api):
     campaign = _drive_to_active(client, factory, owner_id)
     cid = campaign["id"]
     rev = campaign["revision"]
-    assert _set_scene(client, cid, rev, "scene-1", fictional_time="Day 7, noon").status_code == 200
+    _set_scene(factory, cid, rev, fictional_time="Day 7, noon")
     rev += 1
     assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
 
@@ -318,14 +313,6 @@ def test_archived_table_freezes_fictional_time(api):
         headers={"Idempotency-Key": "sub-1"},
     )
     assert submission.status_code == 409
-    scene = _set_scene(client, cid, rev + 1, "scene-2", fictional_time="Day 8")
-    assert scene.status_code == 409
-    entity = client.post(
-        f"/api/campaigns/{cid}/world/entities",
-        json={"expected_revision": rev + 1, "entity_type": "npc", "name": "Sneaky"},
-        headers={"Idempotency-Key": "entity-sneaky"},
-    )
-    assert entity.status_code == 409
 
     # Autonomous post-turn work neither triggers nor consolidates while archived.
     from app.post_turn.service import (
@@ -357,7 +344,7 @@ def test_archived_table_freezes_fictional_time(api):
         db.commit()
     with factory() as db:
         assert get_checkpoint(db, uuid.UUID(cid)).processed_through_sequence == max_seq
-    assert _set_scene(client, cid, rev + 2, "scene-3", fictional_time="Day 8").status_code == 200
+    _set_scene(factory, cid, rev + 2, fictional_time="Day 8")
 
 
 def test_post_turn_checkpoint_cannot_advance_after_concurrent_archive(api):
@@ -562,7 +549,7 @@ def test_campaign_detail_reports_server_side_restore_target(api):
 
 def test_roll_writes_rejected_while_archived(api):
     from app.dm.turns import coordinate_turn
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
@@ -641,7 +628,7 @@ def test_roll_writes_rejected_while_archived(api):
 def test_locked_row_recheck_rejects_late_submission(api):
     """Service-level guard: accept_submission refuses archived campaigns."""
     from app.campaigns.service import CampaignArchivedError
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
@@ -779,7 +766,7 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     ))
     # The open adventure cannot complete while archived.
     _archived(client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
         json={"expected_revision": archived_rev, "outcome": "victory"},
         headers={"Idempotency-Key": "adv-complete-archived"},
     ))
@@ -827,49 +814,10 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     # Restore unfreezes the table: the pending adventure completes normally.
     assert _transition(client, cid, archived_rev, "active", "restore-1").status_code == 200
     completed = client.post(
-        f"/api/campaigns/{cid}/adventures/current/complete",
+        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
         json={"expected_revision": archived_rev + 1, "outcome": "victory"},
         headers={"Idempotency-Key": "adv-complete-restored"},
     )
     assert completed.status_code == 200, completed.text
     with factory() as db:
         assert db.get(Adventure, uuid.UUID(adventure_id)).status == "completed"
-
-
-def test_event_only_mutations_rejected_while_archived(api):
-    """Issue #265: the generic /mutations endpoint cannot advance the stream.
-
-    Event-only calls carry no mutate fields, so the locked callback must
-    still run the archive guard unconditionally.
-    """
-    client, factory, _, owner_id, _, _ = api
-    campaign = _drive_to_active(client, factory, owner_id)
-    cid = campaign["id"]
-    rev = campaign["revision"]
-    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
-
-    # Event-only mutation while dormant → 409, nothing appended.
-    sneaky = client.post(
-        f"/api/campaigns/{cid}/mutations",
-        json={"expected_revision": rev + 1, "event_type": "campaign.note", "payload": {"text": "sneaky"}},
-        headers={"Idempotency-Key": "mut-archived"},
-    )
-    assert sneaky.status_code == 409, sneaky.text
-    assert "archived" in sneaky.json()["detail"].lower()
-    assert _get(client, cid)["revision"] == rev + 1
-    with factory() as db:
-        assert db.scalar(
-            select(func.count()).select_from(CampaignDomainEvent).where(
-                CampaignDomainEvent.campaign_id == uuid.UUID(cid)
-            )
-        ) == rev + 1
-
-    # Restore unfreezes the generic path too.
-    assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
-    resumed = client.post(
-        f"/api/campaigns/{cid}/mutations",
-        json={"expected_revision": rev + 2, "event_type": "campaign.note", "payload": {"text": "awake"}},
-        headers={"Idempotency-Key": "mut-restored"},
-    )
-    assert resumed.status_code == 200, resumed.text
-    assert _get(client, cid)["revision"] == rev + 3

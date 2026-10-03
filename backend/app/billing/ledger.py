@@ -28,9 +28,10 @@ Deterministic accounting authority (code-owned, never delegated to a model):
 - These functions only ``flush``; the caller owns commit/rollback so an
   accounting failure can never rewrite completed gameplay. Gameplay code
   must treat ledger errors as fail-soft telemetry-style failures.
-- Production charging enters through :func:`charge_completed_run`, called
-  fail-soft from the authoritative AI-run finalization path after the run
-  commits; it reuses the same exactly-once invariants above.
+- Production charging enters through :func:`charge_finished_run` (a
+  fail-soft wrapper over :func:`charge_completed_run`), called by AI-run
+  callers after ``finish_ai_run`` commits the run; it reuses the same
+  exactly-once invariants above.
 
 Billing state must never enter DM narrative / rules inputs: this module
 imports only ledger/config/models. ``app/dm/context.py`` has no billing
@@ -39,6 +40,7 @@ lane (covered by test).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -54,6 +56,9 @@ from models.usage import (
     ENTRY_TYPE_AI_SPEND,
     CampaignUsageEntry,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 class AccountingError(RuntimeError):
@@ -360,6 +365,28 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
         trace.campaign_id = campaign_id
         db.flush()
     return record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
+
+
+def charge_finished_run(session_factory, *, run_id, campaign_id) -> None:
+    """Fail-soft charge of one finalized AI run in its own short transaction.
+
+    ``session_factory`` must create an independent session so accounting
+    can neither commit nor roll back gameplay. Failure is logged and
+    swallowed — it surfaces later through :func:`reconcile`. A succeeded
+    primary run with no usable cost is expected-pending (WARNING).
+    """
+    try:
+        with session_factory() as db:
+            try:
+                charge_completed_run(db, run_id=run_id, campaign_id=campaign_id)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+    except Exception as exc:
+        level = logging.WARNING if isinstance(exc, AmbiguousCostError) else logging.ERROR
+        logger.log(level, "ledger_charge_dropped error_type=%s run_id=%s",
+                   type(exc).__name__, run_id)
 
 
 def _campaign_trace_ids(db: Session, campaign_id) -> list[str]:

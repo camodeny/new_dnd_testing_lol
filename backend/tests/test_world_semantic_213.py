@@ -28,42 +28,40 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import ContextAudience  # noqa: E402
 from app.dm.evidence import execute_evidence_round, validate_evidence_requests  # noqa: E402
-from app.queue.adapter import new_envelope  # noqa: E402
-from app.queue.envelope import WorkerEnvelope  # noqa: E402
-from app.world import semantic  # noqa: E402
-from app.world.knowledge import (  # noqa: E402
-    create_fact_authoritative,
-    create_relation_authoritative,
+from app.world import semantic, semantic_index  # noqa: E402
+from app.world.facts import (  # noqa: E402
+    create_fact,
+    create_relation,
     list_facts,
     list_relations,
-    supersede_fact_authoritative,
+    supersede_fact,
 )
 from app.world.retrieval import (  # noqa: E402
     STATUS_DEFER,
     STATUS_OK,
-    apply_rerank,
     lookup_fact,
 )
 from app.world.semantic import (  # noqa: E402
-    DEFAULT_MODEL,
-    DEFAULT_VERSION,
-    SEMANTIC_INDEX_JOB_TYPE,
     STATUS_DEFER as SEM_DEFER,
     STATUS_NO_MATCH as SEM_NO_MATCH,
     STATUS_OK as SEM_OK,
-    build_source_text,
-    get_semantic_stats,
-    handle_world_semantic_index,
-    index_source_record,
-    mark_stale,
-    note_turn_committed,
-    request_semantic_index,
-    resolve_embedding_model,
     semantic_search,
 )
-from app.world.service import create_entity_authoritative  # noqa: E402
+from app.world.semantic_index import (  # noqa: E402
+    DEFAULT_MODEL,
+    build_source_text,
+    index_source_record,
+    mark_stale,
+    note_authoritative_write,
+    note_supersession,
+    request_semantic_index,
+    resolve_embedding_model,
+    run_semantic_index_sweep,
+)
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldEmbedding  # noqa: E402
@@ -97,9 +95,10 @@ def _setup():
 
 def _seed_fact(db, cid, rev=0, content="Asha hides the key in Cinder Keep.",
                visibility="campaign", operation_id="op-sem-fact"):
-    fact, _ = create_fact_authoritative(
-        db, cid, rev, content=content, epistemic_state="confirmed",
+    fact, event = commit_world_write(
+        db, cid, rev, create_fact, content=content, epistemic_state="confirmed",
         visibility=visibility, operation_id=operation_id)
+    note_authoritative_write(db, cid, [("world_fact", fact.id), ("domain_event", event.id)])
     return fact
 
 
@@ -147,52 +146,107 @@ def test_embedding_model_version_change_does_not_corrupt_old_rows():
     assert hit_v1.embedding_version == "1"
 
 
-def test_writer_hook_enqueues_async_index_without_breaking_canon():
-    from app.queue.adapter import get_queue_adapter
-
+def test_write_hook_stages_async_index_without_breaking_canon():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    adapter = get_queue_adapter()
-    depth_before = adapter.depth() if hasattr(adapter, "depth") else 0
     fact = _seed_fact(db, cid, operation_id="op-sem-hook")
-    # Canon write succeeded; derived placeholder + envelope are best-effort.
+    # Canon write succeeded; the derived placeholder is best-effort.
     assert fact.id is not None
     placeholder = db.execute(
-        __import__("sqlalchemy").select(WorldEmbedding).where(
-            WorldEmbedding.source_id == fact.id)
+        select(WorldEmbedding).where(WorldEmbedding.source_id == fact.id)
     ).scalars().first()
     assert placeholder is not None and placeholder.status == "stale"
-    if hasattr(adapter, "depth"):
-        assert adapter.depth() >= depth_before
+    assert placeholder.error == "awaiting_async_index"
 
 
-def test_worker_handler_is_idempotent():
-    Fac, cid, _owner, _player, _ = _setup()
+def test_sweep_indexes_pending_rows_and_is_idempotent():
+    Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    fact = _seed_fact(db, cid)
-    from app.worker.executor import execute_worker_job
+    fact = _seed_fact(db, cid, operation_id="op-sem-sweep")
+    pending = db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
+    ).scalars().all()
+    assert pending and all(r.status == "stale" for r in pending)
 
-    envelope = new_envelope(
-        job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid, aggregate_id=cid,
-        operation_id="op-sem-worker", idempotency_key=f"semidx-test:{fact.id}",
-        payload={"campaign_id": str(cid), "source_type": "world_fact",
-                 "source_id": str(fact.id), "embedding_model": DEFAULT_MODEL,
-                 "embedding_version": DEFAULT_VERSION},
-    )
-    result, duplicate = execute_worker_job(
-        db, envelope, lambda env: handle_world_semantic_index(env, db))
-    assert duplicate is False
-    assert result["status"] == "active"
-    result2, duplicate2 = execute_worker_job(
-        db, envelope, lambda env: handle_world_semantic_index(env, db))
-    assert duplicate2 is True
-    assert result2["status"] == "active"
-    rows = db.execute(
-        __import__("sqlalchemy").select(WorldEmbedding).where(
+    result = run_semantic_index_sweep(db)
+    assert result["failed"] == []
+    assert set(result["indexed"]) == {str(r.id) for r in pending}
+    row = db.execute(
+        select(WorldEmbedding).where(
             WorldEmbedding.source_id == fact.id,
             WorldEmbedding.embedding_model == DEFAULT_MODEL)
+    ).scalars().one()
+    assert row.status == "active" and row.error is None
+    assert row.source_version != "pending"
+    query = build_source_text(db, "world_fact", fact)
+    outcome = semantic_search(db, cid, query, owner, dm_internal=True)
+    assert outcome.status == SEM_OK
+    assert outcome.packets[0].source_id == str(fact.id)
+
+    # Nothing left to do; the active vector is untouched.
+    assert run_semantic_index_sweep(db) == {"indexed": [], "failed": []}
+    rows = db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.source_id == fact.id)
     ).scalars().all()
     assert len(rows) == 1
+
+
+def test_sweep_records_failure_and_retries_after_backoff(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    Fac, cid, _owner, _player, _ = _setup()
+    db = Fac()
+    fact = _seed_fact(db, cid, operation_id="op-sem-fail")
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("embedder offline")
+
+    monkeypatch.setattr(semantic_index, "index_source_record", _boom)
+    result = run_semantic_index_sweep(db)
+    assert result["indexed"] == [] and result["failed"]
+    row = db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.source_id == fact.id)
+    ).scalars().one()
+    assert row.status == "failed" and "embedder offline" in row.error
+    monkeypatch.undo()
+
+    # Inside the backoff window the failed row is not reselected.
+    assert str(row.id) not in run_semantic_index_sweep(db)["indexed"]
+    row.updated_at = datetime.now(timezone.utc) - timedelta(
+        seconds=semantic_index.SEMANTIC_RETRY_FAILED_AFTER_SECONDS + 60)
+    db.commit()
+    assert str(row.id) in run_semantic_index_sweep(db)["indexed"]
+    db.refresh(row)
+    assert row.status == "active"
+
+
+def test_post_turn_cron_drains_semantic_index(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import database
+    from app.factory import create_app
+
+    monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    Fac, cid, _owner, _player, _ = _setup()
+    with Fac() as db:
+        fact = _seed_fact(db, cid, operation_id="op-sem-cron")
+        fact_id = fact.id
+    app = create_app()
+
+    def _db():
+        with Fac() as s:
+            yield s
+
+    app.dependency_overrides[database.get_db] = _db
+    resp = TestClient(app).post("/api/cron/post-turn")
+    assert resp.status_code == 200
+    assert resp.json()["semantic_index"]["failed"] == []
+    with Fac() as db:
+        row = db.execute(
+            select(WorldEmbedding).where(WorldEmbedding.source_id == fact_id)
+        ).scalars().one()
+        assert row.status == "active"
 
 
 # ── staleness / supersession ─────────────────────────────────────────────────
@@ -221,11 +275,12 @@ def test_superseded_source_is_retired_and_replaced():
     index_source_record(db, cid, "world_fact", fact.id)
     old_query = build_source_text(db, "world_fact", fact)
 
-    fixed, _ = supersede_fact_authoritative(
-        db, cid, 1, fact.id, content="The bridge has fallen.",
+    fixed, _ = commit_world_write(
+        db, cid, 1, supersede_fact, fact.id, content="The bridge has fallen.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-supersede")
-    # Writer hook retired the prior source's vectors.
+    note_supersession(db, cid, ("world_fact", fact.id), ("world_fact", fixed.id))
+    # Supersession hook retired the prior source's vectors.
     prior_rows = db.execute(
         __import__("sqlalchemy").select(WorldEmbedding).where(
             WorldEmbedding.source_id == fact.id)
@@ -247,8 +302,8 @@ def test_superseded_source_is_retired_and_replaced():
 def test_version_mismatch_detected_at_search_time():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mara",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Mara",
         visibility="campaign", operation_id="op-sem-ent")
     row = index_source_record(db, cid, "world_entity", entity.id)
     assert row.status == "active"
@@ -279,8 +334,8 @@ def test_search_is_campaign_scoped():
 
     fact = _seed_fact(db, cid, content="Campaign A battle plan.")
     index_source_record(db, cid, "world_fact", fact.id)
-    other_fact, _ = create_fact_authoritative(
-        db, other.id, 0, content="Campaign B secret ritual.",
+    other_fact, _ = commit_world_write(
+        db, other.id, 0, create_fact, content="Campaign B secret ritual.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-other")
     index_source_record(db, other.id, "world_fact", other_fact.id)
@@ -340,46 +395,6 @@ def test_empty_index_defers_to_direct_retrieval():
     assert direct.status == STATUS_OK and len(direct.packets) == 1
 
 
-def test_rerank_only_reorders_authorized_candidates():
-    Fac, cid, owner, _player, _ = _setup()
-    db = Fac()
-    first = _seed_fact(db, cid, content="First chronicle entry.",
-                       operation_id="op-sem-r1")
-    second = _seed_fact(db, cid, rev=1, content="Second chronicle entry.",
-                        operation_id="op-sem-r2")
-    for fact in (first, second):
-        index_source_record(db, cid, "world_fact", fact.id)
-    outcome = semantic_search(db, cid, build_source_text(db, "world_fact", first),
-                              owner, dm_internal=True, min_similarity=-1.0,
-                              limit=10)
-    assert len(outcome.packets) == 2
-    by_id = {f"{p.source_type}:{p.source_id}": p for p in outcome.packets}
-
-    # Invented candidate IDs are rejected; deterministic order is kept.
-    rejected = apply_rerank(
-        list(outcome.packets), order=["world_fact:00000000-0000-0000-0000-000000000000"])
-    assert rejected.fallback is True
-    assert rejected.reranked is False
-    assert [p.source_id for p in rejected.packets] == [p.source_id for p in outcome.packets]
-    # Provenance untouched by the rejected rerank.
-    assert rejected.packets[0].provenance["retrieved_by"] == "world_retrieval_212"
-
-    # A valid subset order reorders presentation only.
-    target = f"world_fact:{second.id}"
-    reordered = apply_rerank(list(outcome.packets), order=[target])
-    assert reordered.reranked is True
-    assert reordered.packets[0].source_id == str(second.id)
-    assert reordered.packets[0].retrieval_score == by_id[target].retrieval_score
-
-    # Reranker failure falls back to similarity order, never loses evidence.
-    def _boom(_candidates):
-        raise RuntimeError("reranker down")
-
-    fell_back = apply_rerank(list(outcome.packets), reranker=_boom)
-    assert fell_back.fallback is True
-    assert len(fell_back.packets) == 2
-
-
 def test_embedding_failure_falls_back_to_direct_retrieval(monkeypatch):
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
@@ -397,22 +412,6 @@ def test_embedding_failure_falls_back_to_direct_retrieval(monkeypatch):
     assert direct.status == STATUS_OK
 
 
-def test_semantic_stats_observability():
-    Fac, cid, _owner, _player, _ = _setup()
-    db = Fac()
-    fact = _seed_fact(db, cid)
-    index_source_record(db, cid, "world_fact", fact.id)
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == 1
-    # The authoritative write also enqueued its domain event (stale
-    # placeholder awaiting async index) — derived work stays observable.
-    assert stats["stale"] == 1
-    assert stats["total"] == 2
-    mark_stale(db, cid, "world_fact", fact.id)
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == 0 and stats["stale"] == 2
-
-
 def test_all_supported_source_types_index_and_resolve():
     from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn
@@ -420,12 +419,12 @@ def test_all_supported_source_types_index_and_resolve():
 
     Fac, cid, owner, player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Asha",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Asha",
         summary="Asha guards Cinder Keep.", visibility="campaign",
         operation_id="op-sem-all-ent")
-    rel, _ = create_relation_authoritative(
-        db, cid, 1, subject_entity_id=entity.id, relation_type="guards",
+    rel, _ = commit_world_write(
+        db, cid, 1, create_relation, subject_entity_id=entity.id, relation_type="guards",
         object_label="Cinder Keep", epistemic_state="confirmed",
         visibility="campaign", operation_id="op-sem-all-rel")
     fact = _seed_fact(db, cid, rev=2, operation_id="op-sem-all-fact")
@@ -444,24 +443,21 @@ def test_all_supported_source_types_index_and_resolve():
                ("source_turn", turn.id), ("scene", cid)]
     for source_type, source_id in targets:
         if source_type == "scene":
-            from app.world.service import set_scene_authoritative
-            set_scene_authoritative(
-                db, cid, 3, location_name="Cinder Keep",
+            from app.world.service import apply_scene_update
+            commit_world_write(
+                db, cid, 3, apply_scene_update, location_name="Cinder Keep",
                 operation_id="op-sem-all-scene")
         row = index_source_record(db, cid, source_type, source_id)
         assert row is not None and row.status == "active", source_type
 
     for source_type, source_id in targets:
-        record = semantic._current_record(db, cid, source_type, source_id)
+        record = semantic_index.current_source_record(db, cid, source_type, source_id)
         assert record is not None, source_type
         query = build_source_text(db, source_type, record)
         assert query, source_type
         outcome = semantic_search(db, cid, query, owner, dm_internal=True)
         assert outcome.status == SEM_OK, source_type
         assert outcome.packets[0].source_id == str(source_id), source_type
-
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == len(targets)
 
 
 # ── #203 mediation integration ───────────────────────────────────────────────
@@ -565,7 +561,6 @@ def test_default_model_selection_prefers_configured_real_model(monkeypatch):
 
 
 def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
-    import app.rules.gemini as gemini_mod
 
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
                 "GEMINI_EMBEDDING_MODEL"):
@@ -582,7 +577,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
 
         return _fake_provider
 
-    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _fake_factory)
+    monkeypatch.setattr("app.world.semantic_index.make_gemini_provider", _fake_factory)
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
@@ -608,7 +603,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
               output_dimensionality=None):
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _boom)
+    monkeypatch.setattr("app.world.semantic_index.make_gemini_provider", _boom)
     with pytest.raises(RuntimeError, match="no provider"):
         index_source_record(db, cid, "world_fact", fact.id,
                             embedding_model="gemini-embedding-2")
@@ -622,7 +617,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
 
 def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
     from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DMStream, DMStreamChunk
 
     accept_submission(
@@ -657,15 +652,15 @@ def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
 
 
 def test_committed_turn_staged_effects_become_searchable():
-    from app.runtime.threads import get_or_create_campaign_thread
+    from app.threads.service import get_or_create_campaign_thread
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mara",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Mara",
         visibility="campaign", operation_id="op-turn-ent")
-    guild, _ = create_entity_authoritative(
-        db, cid, 1, entity_type="faction", name="Guild",
+    guild, _ = commit_world_write(
+        db, cid, 1, create_entity, entity_type="faction", name="Guild",
         visibility="campaign", operation_id="op-turn-guild")
     thread = get_or_create_campaign_thread(db, cid, created_by=owner)
     db.commit()
@@ -698,23 +693,13 @@ def test_committed_turn_staged_effects_become_searchable():
         ("source_turn", str(turn.id)), ("domain_event", str(event.id))}
     assert all(p.status == "stale" for p in placeholders)
 
-    # Driving the worker handler indexes each record; exact-text search
-    # resolves each back to its authoritative row.
-    for source_type, source_id in (("world_relation", rels[0].id),
-                                   ("world_fact", facts[0].id),
-                                   ("source_turn", turn.id),
-                                   ("domain_event", event.id)):
-        envelope = new_envelope(
-            job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
-            aggregate_id=cid, operation_id=f"op-turn-idx-{source_type}",
-            idempotency_key=f"semidx-turn-test:{source_type}:{source_id}",
-            payload={"campaign_id": str(cid), "source_type": source_type,
-                     "source_id": str(source_id),
-                     "embedding_model": DEFAULT_MODEL,
-                     "embedding_version": DEFAULT_VERSION},
-        )
-        result = handle_world_semantic_index(envelope, db)
-        assert result["status"] == "active", source_type
+    # The sweep indexes each record; exact-text search resolves each back
+    # to its authoritative row.
+    result = run_semantic_index_sweep(db, limit=50)
+    assert result["failed"] == []
+    assert all(r.status == "active" for r in db.execute(
+        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
+    ).scalars().all())
     for source_type, record in (("world_relation", rels[0]),
                                 ("world_fact", facts[0])):
         query = build_source_text(db, source_type, record)
@@ -728,42 +713,11 @@ def test_committed_turn_staged_effects_become_searchable():
     assert turn_outcome.packets[0].source_id == str(turn.id)
 
 
-def test_authoritative_write_enqueues_its_domain_event():
-    Fac, cid, _owner, _player, _ = _setup()
-    db = Fac()
-    fact, event = create_fact_authoritative(
-        db, cid, 0, content="The bridge has fallen.",
-        epistemic_state="confirmed", visibility="campaign",
-        operation_id="op-sem-evt")
-    assert event is not None
-    # The committing domain event is a declared semantic source: its async
-    # index placeholder exists alongside the record's.
-    rows = {str(r.source_id): r for r in db.execute(
-        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
-    ).scalars().all()}
-    assert str(fact.id) in rows
-    assert str(event.id) in rows
-    assert rows[str(event.id)].source_type == "domain_event"
-    # The worker indexes the event under the authoritative seq version.
-    envelope = new_envelope(
-        job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
-        aggregate_id=cid, operation_id="op-sem-evt-idx",
-        idempotency_key=f"semidx-evt-test:{event.id}",
-        payload={"campaign_id": str(cid), "source_type": "domain_event",
-                 "source_id": str(event.id),
-                 "embedding_model": DEFAULT_MODEL,
-                 "embedding_version": DEFAULT_VERSION},
-    )
-    result = handle_world_semantic_index(envelope, db)
-    assert result["status"] == "active"
-    assert result["source_version"] == f"seq{int(event.sequence)}"
-
-
 def test_domain_event_embedding_version_matches_evidence_packet():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    _fact, event = create_fact_authoritative(
-        db, cid, 0, content="The bridge has fallen.",
+    _fact, event = commit_world_write(
+        db, cid, 0, create_fact, content="The bridge has fallen.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-evtver")
     row = index_source_record(db, cid, "domain_event", event.id)
@@ -777,73 +731,51 @@ def test_domain_event_embedding_version_matches_evidence_packet():
     assert outcome.packets[0].source_version == row.source_version
 
 
-def test_same_id_version_change_rebuilds_new_worker_job():
-    from app.worker.executor import execute_worker_job
-    from app.world.service import set_scene_authoritative
+def test_same_id_version_change_rebuilds_index():
+    from app.world.service import apply_scene_update
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    scene, _ = set_scene_authoritative(
-        db, cid, 0, location_name="Cinder Keep",
+    scene, _ = commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Cinder Keep",
         operation_id="op-scene-1")
     assert scene is not None
-    jid1 = request_semantic_index(db, cid, "scene", cid)
-    assert jid1 is not None
+    assert request_semantic_index(db, cid, "scene", cid) is not None
 
-    def _run(job_id_str):
-        envelope = new_envelope(
-            job_id=uuid.UUID(str(job_id_str)),
-            job_type=SEMANTIC_INDEX_JOB_TYPE, campaign_id=cid,
-            aggregate_id=cid, operation_id=f"op-scene-idx-{job_id_str}",
-            idempotency_key=f"semidx-scene-test:{job_id_str}",
-            payload={"campaign_id": str(cid), "source_type": "scene",
-                     "source_id": str(cid), "embedding_model": DEFAULT_MODEL,
-                     "embedding_version": DEFAULT_VERSION},
-        )
-        return execute_worker_job(
-            db, envelope, lambda env: handle_world_semantic_index(env, db))
+    def _scene_row():
+        return db.execute(
+            select(WorldEmbedding).where(
+                WorldEmbedding.campaign_id == cid,
+                WorldEmbedding.source_type == "scene",
+                WorldEmbedding.embedding_model == DEFAULT_MODEL)
+        ).scalars().one()
 
-    result1, duplicate1 = _run(jid1)
-    assert duplicate1 is False
-    assert result1["status"] == "active"
-    first_version = result1["source_version"]
+    run_semantic_index_sweep(db, limit=50)
+    row = _scene_row()
+    assert row.status == "active"
+    first_version = row.source_version
 
     # Same-ID source change: the scene row keeps its id, the version moves.
     rev1 = int(scene.revision)
-    scene2, _ = set_scene_authoritative(
-        db, cid, 1, location_name="Ember Gate",
+    scene2, _ = commit_world_write(
+        db, cid, 1, apply_scene_update, location_name="Ember Gate",
         operation_id="op-scene-2")
     assert scene2 is not None
     assert int(scene2.revision) == rev1 + 1
-    jid2 = request_semantic_index(db, cid, "scene", cid)
-    assert jid2 is not None
-    # A new logical job id: the ledger must not serve the stale cached hit.
-    assert jid2 != jid1
-    result2, duplicate2 = _run(jid2)
-    assert duplicate2 is False
-    assert result2["status"] == "active"
-    assert result2["source_version"] != first_version
-    row = db.execute(
-        select(WorldEmbedding).where(
-            WorldEmbedding.campaign_id == cid,
-            WorldEmbedding.source_type == "scene",
-            WorldEmbedding.embedding_model == DEFAULT_MODEL)
-    ).scalars().first()
-    assert row is not None and row.status == "active"
-    assert row.source_version == result2["source_version"]
-
-    # Same-version re-request stays idempotent (ledger duplicate, no re-run)
-    # and — crucially — leaves the valid vector serving instead of
-    # stranding it stale: the duplicate job returns the cached hit without
-    # invoking the handler, so staling here would never be repaired.
-    jid3 = request_semantic_index(db, cid, "scene", cid)
-    assert jid3 == jid2
-    result3, duplicate3 = _run(jid3)
-    assert duplicate3 is True
-    assert result3["status"] == "active"
+    request_semantic_index(db, cid, "scene", cid)
+    db.refresh(row)
+    assert row.status == "stale"
+    run_semantic_index_sweep(db, limit=50)
     db.refresh(row)
     assert row.status == "active"
-    assert row.source_version == result2["source_version"]
+    assert row.source_version != first_version
+    second_version = row.source_version
+
+    # Same-version re-request leaves the valid vector serving.
+    assert request_semantic_index(db, cid, "scene", cid) is None
+    db.refresh(row)
+    assert row.status == "active"
+    assert row.source_version == second_version
 
 
 def test_hidden_top_hit_does_not_suppress_visible_result():

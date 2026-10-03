@@ -630,7 +630,7 @@ def api(monkeypatch, ctx):
     # so the hostname check exercises the allowlist path (evil hosts stay 400).
     monkeypatch.setenv("FRONTEND_URL", "https://app.test")
     monkeypatch.setattr(
-        "app.billing.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db

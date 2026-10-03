@@ -62,11 +62,3 @@ def structured_log(logger: logging.Logger, level: int, event: str, **fields) -> 
     safe.update(event=event, trace_id=current_trace_id(), operation_id=current_operation_id())
     logger.log(level, json.dumps(safe, default=str, sort_keys=True))
 
-
-def otel_attributes(**fields) -> dict:
-    """OpenTelemetry-compatible attributes; callers may attach them to any span."""
-    return {
-        "dnd.trace_id": current_trace_id(),
-        "dnd.operation_id": current_operation_id(),
-        **{f"dnd.{key}": value for key, value in fields.items()},
-    }

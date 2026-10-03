@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
-from app.runtime.threads import can_read_thread, get_or_create_campaign_thread  # noqa: E402
+from app.threads.service import can_read_thread, get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -50,7 +50,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -74,7 +74,7 @@ def test_shared_history_available_to_campaign_members(api, monkeypatch):
     assert r.status_code == 201
     shared_tid = r.json()["submission"]["thread_id"]
     # member reads shared history via GET
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r2 = client.get(f"/api/campaigns/{campaign_id}/submissions")
     assert r2.status_code == 200
     assert len(r2.json()["submissions"]) == 1
@@ -98,13 +98,13 @@ def test_private_thread_only_authorized_can_read(api, monkeypatch):
     assert r2.status_code == 201
 
     # member can read private history
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r3 = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
     assert r3.status_code == 200
     assert len(r3.json()["submissions"]) == 1
 
     # outsider (campaign member but not thread member) cannot read — hidden as 404
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
     r4 = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
     assert r4.status_code == 404
 
@@ -119,7 +119,7 @@ def test_private_thread_only_authorized_can_read(api, monkeypatch):
     assert private_tid not in ids
 
     # member's list does include private thread
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r7 = client.get(f"/api/campaigns/{campaign_id}/threads")
     assert private_tid in [t["id"] for t in r7.json()["threads"]]
 
@@ -127,7 +127,7 @@ def test_private_thread_only_authorized_can_read(api, monkeypatch):
 def test_ai_dm_thread_is_idempotent_and_private_from_owner_and_other_players(api, monkeypatch):
     client, factory, campaign_id, member_id, outsider_id = api
 
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     first = client.post(f"/api/campaigns/{campaign_id}/threads/dm")
     retry = client.post(f"/api/campaigns/{campaign_id}/threads/dm")
 
@@ -145,11 +145,11 @@ def test_ai_dm_thread_is_idempotent_and_private_from_owner_and_other_players(api
         ).count() == 1
 
     # Campaign ownership is not a private-thread bypass.
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
     owner_read = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}")
     assert owner_read.status_code == 404
 
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
     other_player_read = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}")
     assert other_player_read.status_code == 404
     assert private_tid not in [t["id"] for t in client.get(f"/api/campaigns/{campaign_id}/threads").json()["threads"]]
@@ -158,7 +158,7 @@ def test_ai_dm_thread_is_idempotent_and_private_from_owner_and_other_players(api
 def test_direct_thread_is_idempotent_for_pair_and_visible_only_to_pair(api, monkeypatch):
     client, _, campaign_id, member_id, outsider_id = api
 
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     first = client.post(
         f"/api/campaigns/{campaign_id}/threads/direct",
         json={"participant_id": str(outsider_id)},
@@ -168,7 +168,7 @@ def test_direct_thread_is_idempotent_for_pair_and_visible_only_to_pair(api, monk
     assert first.json()["thread"]["private_kind"] == "direct"
 
     # The reverse direction resolves to the same logical pair.
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
     reverse = client.post(
         f"/api/campaigns/{campaign_id}/threads/direct",
         json={"participant_id": str(member_id)},
@@ -178,7 +178,7 @@ def test_direct_thread_is_idempotent_for_pair_and_visible_only_to_pair(api, monk
     assert reverse.json()["thread"]["id"] == private_tid
 
     # The campaign owner was not selected and cannot discover or read the thread.
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
     assert client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}").status_code == 404
     assert private_tid not in [t["id"] for t in client.get(f"/api/campaigns/{campaign_id}/threads").json()["threads"]]
 
@@ -188,11 +188,11 @@ def test_owner_without_membership_cannot_read_private(api, monkeypatch):
     owner_id = TEST_USER_ID
     # Create private thread between member and outsider — owner NOT included
     with factory() as db:
-        from app.runtime.threads import create_private_thread
+        from app.threads.service import create_private_thread
         t = create_private_thread(db, campaign_id=campaign_id, created_by=member_id, member_ids=[outsider_id], title="No Owner")
         private_tid = str(t.id)
         # Add a submission directly via service (simulates private message)
-        from app.runtime.submissions import accept_submission
+        from app.submissions.service import accept_submission
         accept_submission(db, campaign_id=campaign_id, user_id=member_id, raw_content="secret", segments=[{"type": "ooc", "text": "secret"}], thread_id=private_tid, audience="private")
         db.commit()
 
@@ -213,14 +213,13 @@ def test_revoked_membership_immediately_denies_but_preserves_history(api, monkey
     client.post(f"/api/campaigns/{campaign_id}/submissions", json={"content": "before revoke", "thread_id": private_tid}, headers={"Idempotency-Key": "rev-1"})
     # owner revokes member by deleting membership
     with factory() as db:
-        from app.runtime.threads import remove_thread_member
-        assert remove_thread_member(db, uuid.UUID(private_tid), member_id) is True
+        db.delete(db.get(CampaignThreadMember, {"thread_id": uuid.UUID(private_tid), "user_id": member_id}))
         db.commit()
         # history still durable
         assert db.query(PlayerSubmission).filter_by(thread_id=private_tid).count() == 1
 
     # revoked member can no longer read — hidden as 404, history still durable
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r2 = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
     assert r2.status_code == 404
     # and revoked member cannot write — also 404
@@ -387,7 +386,7 @@ def test_get_or_create_preserves_pending_work_through_shared_thread_race(api):
 
 def test_immediate_execution_targets_new_attempt_and_skips_direct_messages(api, monkeypatch):
     from app.dm.turns import coordinate_turn
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DmTurnAttempt
 
     client, factory, campaign_id, member_id, _ = api

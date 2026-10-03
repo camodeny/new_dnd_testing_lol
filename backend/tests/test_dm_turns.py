@@ -20,8 +20,8 @@ from models.campaigns import CampaignMember
 from models.dm import DMStream
 from models.dm import DMStreamChunk
 from models.profiles import Profile
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 
 
 def _create_stream_with_chunk(db, campaign_id, thread_id_str, turn, attempt, text="The DM begins narration."):
@@ -682,3 +682,31 @@ def test_retry_rejects_partial_output_and_preserves_roll_evidence():
         assert fresh.staged_effects == []
         assert db.get(DmTurnAttempt, old.id).status == 'abandoned'
         db.rollback()
+
+
+def test_superseded_attempt_cannot_request_rolls_from_stale_session():
+    """Playtest regression: an executor session that loaded its attempt before
+    a concurrent pre-stream supersession must not resurrect it as
+    ``awaiting_roll`` (which wedged the turn: the successor could never
+    narrate past the pending roll, and resuming collided on attempt_number).
+    """
+    from app.rolls.service import RollLifecycleError, request_rolls
+
+    Fac, cid, owner, p2, tid = _setup_campaign()
+    executor = Fac()
+    accept_submission(executor, campaign_id=cid, user_id=owner, raw_content="I search", segments=[{"type": "ic", "text": "I search"}], thread_id=tid)
+    executor.commit()
+    turn, attempt = coordinate_turn(executor, cid, tid)
+    assert turn.current_attempt_id == attempt.id  # executor's identity map now holds both rows
+
+    other = Fac()
+    accept_submission(other, campaign_id=cid, user_id=p2, raw_content="I follow", segments=[{"type": "ic", "text": "I follow"}], thread_id=tid)
+    other.commit()
+    _turn, successor = coordinate_turn(other, cid, tid)
+    assert successor.attempt_number == 2
+
+    with pytest.raises(RollLifecycleError, match="current turn attempt"):
+        request_rolls(executor, campaign_id=cid, turn_id=turn.id, attempt_id=attempt.id, requests=[{"request_key": "k1"}])
+    executor.rollback()
+    check = Fac()
+    assert check.get(DmTurnAttempt, attempt.id).status == "superseded"

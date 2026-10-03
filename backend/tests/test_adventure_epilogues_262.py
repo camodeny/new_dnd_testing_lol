@@ -568,15 +568,12 @@ def test_roll_through_mismatched_route_resolves_nothing(table, monkeypatch):
                 CampaignDomainEvent.event_type == EPILOGUE_EVENT,
             )
         ).scalars().all()
-    monkeypatch.setattr(
-        adv_router, "resolve_profile", lambda request, db: db.get(Profile, alice)
-    )
     with factory() as db:
         with pytest.raises(HTTPException) as excinfo:
             adv_router.fulfill_epilogue_roll_endpoint(
-                str(camp_id), str(adv2_id), str(epi_id),
+                str(adv2_id), str(epi_id),
                 {"die_value": 15, "modifier": 2, "expected_revision": revision_before},
-                request=None, db=db,
+                profile=db.get(Profile, alice), camp=db.get(Campaign, camp_id), db=db,
             )
         assert excinfo.value.status_code == 404
         db.rollback()

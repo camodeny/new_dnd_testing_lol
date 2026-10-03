@@ -7,7 +7,7 @@ client-side.
 
 Surfaces:
 - ``knowledge``: active facts + relations the viewer may receive
-  (``app.world.epistemics`` grant-aware authorization, leak-free counts).
+  (``app.visibility.access`` grant-aware authorization, leak-free counts).
 - ``clues``: alias over the visible fact records (clues are content-bearing
   facts; kept as a separate key so UI can render them distinctly without a
   second query).
@@ -44,6 +44,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.combat.service import get_snapshot_encounter
+from app.visibility.access import is_campaign_participant, is_world_authority, may_user_receive
+from app.world import clocks as _clocks, facts as _facts, knowledge as _knowledge, service as _world
 from models.campaigns import Campaign
 
 logger = logging.getLogger(__name__)
@@ -81,33 +84,18 @@ def _empty_surface(reason: str | None = None) -> dict[str, Any]:
     return out
 
 
-def _is_member(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> bool:
-    try:
-        from app.campaigns.service import is_campaign_member
-
-        return bool(
-            campaign.owner_id == viewer_id
-            or is_campaign_member(db, campaign.id, viewer_id)
-        )
-    except Exception:
-        return False
-
-
 def _knowledge_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
-    from app.world import epistemics as _epistemics
-    from app.world import knowledge as _knowledge
-
     try:
-        facts = _knowledge.list_facts(
+        facts = _facts.list_facts(
             db, campaign.id, status="active", limit=_FACT_SCAN_LIMIT
         )
-        relations = _knowledge.list_relations(
+        relations = _facts.list_relations(
             db, campaign.id, status="active", limit=_RELATION_SCAN_LIMIT
         )
-        fact_proj = _epistemics.project_facts_for_user(db, campaign, viewer_id, facts)
-        rel_proj = _epistemics.project_relations_for_user(
+        fact_proj = _knowledge.project_facts_for_user(db, campaign, viewer_id, facts)
+        rel_proj = _knowledge.project_relations_for_user(
             db, campaign, viewer_id, relations
         )
         return {
@@ -134,9 +122,6 @@ def _entity_surface(
     *,
     is_authority: bool,
 ) -> dict[str, Any]:
-    from app.world import epistemics as _epistemics
-    from app.world import service as _world
-
     try:
         rows = _world.list_entities(db, campaign.id, limit=_ENTITY_SCAN_LIMIT)
         records: list[dict[str, Any]] = []
@@ -147,7 +132,7 @@ def _entity_surface(
                 continue
             total += 1
             try:
-                verdict = _epistemics.may_user_receive(
+                verdict = may_user_receive(
                     db, campaign, "entity", row.id, viewer_id
                 )
             except Exception:
@@ -184,8 +169,6 @@ def _maps_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
     try:
-        from app.combat.service import get_snapshot_encounter
-
         encounter = get_snapshot_encounter(db, campaign.id, viewer_id)
     except Exception as exc:
         logger.warning(
@@ -205,8 +188,6 @@ def _clocks_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
     try:
-        from app.world import clocks as _clocks
-
         return _clocks.project_clocks_for_viewer(db, campaign, viewer_id)
     except Exception as exc:
         logger.warning(
@@ -236,7 +217,11 @@ def build_surfaces_for_viewer(
             "maps": {"visible": False, "error": "projection_failed"},
             "clocks": {"clocks": [], "count": 0, "error": "projection_failed"},
         }
-    if not _is_member(db, campaign, viewer):
+    try:
+        member = is_campaign_participant(db, campaign, viewer)
+    except Exception:
+        member = False
+    if not member:
         logger.info(
             "surfaces denied campaign_id=%s reason=not_member", campaign.id,
         )
@@ -249,9 +234,7 @@ def build_surfaces_for_viewer(
             "clocks": {"clocks": [], "count": 0},
         }
 
-    from app.world import service as _world
-
-    is_authority = bool(_world.is_world_authority(campaign, viewer))
+    is_authority = is_world_authority(campaign, viewer)
 
     knowledge = _knowledge_surface(db, campaign, viewer)
     items = _entity_surface(

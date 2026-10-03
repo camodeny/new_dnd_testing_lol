@@ -22,7 +22,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
-from app.dm.fake_provider import FakeDMProvider  # noqa: E402
+from tests.support.fake_provider import FakeDMProvider  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import CampaignDomainEvent, CampaignMember  # noqa: E402
@@ -83,11 +83,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
-        lambda request, db: db.get(Profile, actor["id"]),
-    )
-    monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
     app.dependency_overrides[get_db] = override_db
@@ -100,7 +96,7 @@ def api(monkeypatch):
 @pytest.fixture
 def fake_provider(monkeypatch):
     provider = FakeDMProvider()
-    from app.dm.fake_provider import phase0_respond_contract
+    from tests.support.fake_provider import phase0_respond_contract
     provider.register_step(
         "play-1", phase0_respond_contract(marker="intro-reply-1", reason="intro pc one"),
         inputs=(MSG_1,),

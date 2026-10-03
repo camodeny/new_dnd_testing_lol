@@ -1,2 +1,2 @@
-"""Realtime / projections domain — websocket fan-out and read models."""
+"""Realtime — audience-safe Supabase Realtime broadcast projections and channel authorization."""
 

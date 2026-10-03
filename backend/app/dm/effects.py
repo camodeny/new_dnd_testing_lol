@@ -1,7 +1,7 @@
 """Staged effect registry — issue #206.
 
 Typed, non-generic effect application. Effects remain attempt-local until
-atomic commit via commit_turn_with_effects; this registry is the extensible
+atomic commit via commit_turn; this registry is the extensible
 promotion point.
 
 Handlers are intentionally narrow: they receive (db, campaign, effect_dict, turn, attempt)
@@ -19,21 +19,64 @@ from typing import Callable, Any
 
 from sqlalchemy.orm import Session
 
+from app.adventures.service import (
+    complete_adventure_inline,
+    find_by_operation,
+    get_current_adventure,
+    stage_adventure_closing,
+)
+from app.characters.service import latest_sheet
+from app.combat.ending import EndEncounterError as _EndError, end_encounter_inline as _end_inline
+from app.combat.maps import (
+    MapError as _MapError,
+    update_placements_inline as _update_placements_inline,
+    update_terrain_inline as _update_terrain_inline,
+)
+from app.combat.service import start_encounter_inline
+from app.rules.attacks import (
+    AttackError as _AttackError,
+    HitPoints as _HitPoints,
+    apply_damage as _apply_damage,
+)
+from app.rules.state import (
+    CONCENTRATION_BREAKING_CONDITIONS as _BREAKING,
+    STATE_EFFECT_TYPES as _STATE_TYPES,
+    StateError as _StateError,
+    add_condition as _add,
+    break_concentration as _break_conc,
+    break_concentration as _break,
+    has_condition as _has,
+    mark_npc_section_visibility as _mark,
+    normalize_condition_name as _norm,
+    record_death_save as _record,
+    remove_condition as _remove,
+    replace_concentration as _replace,
+    reset_death_saves as _reset,
+    restore_resource as _restore,
+    restore_spell_slot as _restore_slot,
+    set_exhaustion as _set_exhaustion,
+    set_resource as _set,
+    spend_resource as _spend,
+    spend_spell_slot as _spend_slot,
+    start_concentration as _start,
+    tick_conditions as _tick,
+    update_condition as _update,
+)
+from app.visibility.policy import EFFECT_VISIBILITIES, record_to_effect_visibility
+from app.world.facts import create_fact, create_relation, supersede_fact, supersede_relation
+from app.world.knowledge import assert_knowledge
+from app.world.service import UNSET, UNSET as _UNSET, apply_scene_update
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
 
 logger = logging.getLogger(__name__)
 
-# Visibility ordering for broadening check (least -> most permissive)
-_VISIBILITY_ORDER = {"dm_private": 0, "party_known": 1, "public": 2}
-
 # Effects without explicit visibility are treated as public patches (must not be promoted from private attempts).
 # Relation/fact assertions default to dm_only (fail-closed): a bare claim stays
 # restricted unless the contract explicitly widens it (issue #210).
 _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "update_scene": "public",
-    "propose_sheet_update": "public",
     "assert_fact": "dm_private",
     "upsert_relation": "dm_private",
     # Encounter selection references canonical identities only; stat
@@ -75,15 +118,10 @@ def _visibility_of(effect: dict[str, Any]) -> str | None:
     args = effect.get("arguments") or {}
     return args.get("visibility")
 
-# World-record visibility vocabulary (issues #209/#210) maps onto the
-# staged-effect broadening check without widening disclosure: restricted
-# stays restricted, member-visible stays member-visible.
-_EFFECT_VISIBILITY_ALIASES = {"dm_only": "dm_private", "campaign": "party_known", "private": "dm_private"}
-
 def _effective_visibility(effect: dict[str, Any]) -> str:
     vis = _visibility_of(effect)
     if vis is not None:
-        return _EFFECT_VISIBILITY_ALIASES.get(str(vis), str(vis))
+        return record_to_effect_visibility(vis)
     eff_type = effect.get("effect_type")
     return _EFFECT_DEFAULT_VISIBILITY.get(eff_type, "public")
 
@@ -96,7 +134,7 @@ def _assert_visibility_not_broadened(effect: dict[str, Any], attempt_audience: s
       context to a wider audience and is rejected at commit (issue #206).
     """
     effective = _effective_visibility(effect)
-    if effective not in _VISIBILITY_ORDER:
+    if effective not in EFFECT_VISIBILITIES:
         raise ValueError(f"Unknown visibility {effective!r} on staged effect {effect.get('id')}")
     if _is_shared_audience(attempt_audience):
         return
@@ -207,8 +245,6 @@ def _reject_duplicate_state_mutations(staged_effects: list[dict[str, Any]]) -> N
     missing/blank ``mutation_id`` is also rejected: the logical mutation
     identity is required for the exactly-once guarantee.
     """
-    from app.rules.state import STATE_EFFECT_TYPES as _STATE_TYPES
-
     seen: dict[str, str] = {}
     for eff in staged_effects:
         if eff.get("effect_type") not in _STATE_TYPES:
@@ -248,8 +284,6 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     commit leaves no half-applied scene. ``new_revision`` is the resulting
     campaign revision (prior + 1), keeping scene changes in revision order.
     """
-    from app.world.service import UNSET, apply_scene_update_inline
-
     args = effect.get("arguments") or {}
     patch = args.get("scene_patch") or {}
     if not isinstance(patch, dict):
@@ -277,7 +311,7 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
         environment = patch["state"]
     else:
         environment = None
-    apply_scene_update_inline(
+    apply_scene_update(
         db, campaign, new_revision=prior + 1,
         # Key-presence: explicit null clears the canonical location reference
         # while omission preserves it (same as actors/environment above).
@@ -308,14 +342,12 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
     commits roll back both the version insert and any prior lifecycle flip,
     so failed updates never partially supersede prior active truth.
     """
-    from app.world.knowledge import create_fact_inline, supersede_fact_inline
-
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
     idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_fact_id")
     if supersedes:
-        supersede_fact_inline(
+        supersede_fact(
             db, campaign, supersedes,
             content=args.get("content"),
             entity_refs=args.get("entity_refs"),
@@ -326,7 +358,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
             operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
-        create_fact_inline(
+        create_fact(
             db, campaign, content=args.get("content") or "",
             entity_refs=args.get("entity_refs"),
             epistemic_state=args.get("epistemic_state") or "claimed",
@@ -341,8 +373,6 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
 @register("upsert_relation")
 def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Create or supersede one durable world relation inside the turn-commit txn."""
-    from app.world.knowledge import create_relation_inline, supersede_relation_inline
-
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
     idempotency_key = _resolve_effect_key(attempt, effect)
@@ -350,8 +380,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
     if supersedes:
         # Key-presence: absent object keys inherit the prior reference;
         # explicit null clears it (clear_object clears both sides at once).
-        from app.world.service import UNSET as _UNSET
-        supersede_relation_inline(
+        supersede_relation(
             db, campaign, supersedes,
             subject_entity_id=args.get("subject_entity_id"),
             relation_type=args.get("relation_type"),
@@ -365,7 +394,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
             operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
-        create_relation_inline(
+        create_relation(
             db, campaign,
             subject_entity_id=args.get("subject_entity_id"),
             relation_type=args.get("relation_type") or "",
@@ -385,19 +414,17 @@ def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str
     """Record explicit in-fiction disclosure as a knowledge stance (#251).
 
     Tell/show/reveal writes what one subject fictionally holds toward one
-    truth record via ``assert_knowledge_inline`` — it never mutates truth
+    truth record via ``assert_knowledge`` — it never mutates truth
     tables and never grants human visibility. Runs inside the outer
     ``commit_campaign_mutation`` so a failed turn commit rolls the stance
     back with everything else. Duplicate retries keyed by the resolved
     effect key return the existing row without re-mutating.
     """
-    from app.world.epistemics import assert_knowledge_inline
-
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
     idempotency_key = _resolve_effect_key(attempt, effect)
     transfer_kind = str(args.get("transfer_kind") or "explicit_disclosure").strip().lower() or "explicit_disclosure"
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign,
         subject_kind=args.get("subject_kind"),
         subject_entity_id=args.get("subject_entity_id"),
@@ -419,12 +446,6 @@ def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str
     )
 
 
-@register("propose_sheet_update")
-def _handle_propose_sheet_update(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
-    args = effect.get("arguments") or {}
-    logger.info("effect propose_sheet_update effect_id=%s character_id=%s changes=%s", effect.get("id"), args.get("character_id"), len(args.get("changes") or []))
-
-
 @register("complete_adventure")
 def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Close the campaign's adventure arc inside the turn-commit txn (issue #260).
@@ -440,12 +461,6 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
     """
     import uuid as _uuid
 
-    from app.adventures.service import (
-        ADVENTURE_CLOSING_JOB,
-        complete_adventure_inline,
-        find_by_operation,
-        get_current_adventure,
-    )
     from models.campaigns import Adventure
 
     args = effect.get("arguments") or {}
@@ -497,28 +512,9 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
         operation_id=operation_key,
     )
 
-    # Enqueue downstream closing work (recap/rewards) in the same transaction:
+    # Stage downstream closing work (recap/rewards) in the same transaction:
     # best-effort, never invalidates the committed completion.
-    from app.observability.tracing import current_trace_id
-    from models.reliability import Outbox as _Outbox
-
-    db.add(_Outbox(
-        id=_uuid.uuid4(),
-        aggregate_type="campaign",
-        aggregate_id=campaign.id,
-        campaign_id=campaign.id,
-        event_type=ADVENTURE_CLOSING_JOB,
-        operation_id=operation_key,
-        trace_id=current_trace_id(),
-        payload={
-            "adventure_id": str(adventure.id),
-            "campaign_id": str(campaign.id),
-            "outcome": adventure.outcome,
-            "operation_id": operation_key,
-        },
-        status="pending",
-        attempts=0,
-    ))
+    stage_adventure_closing(db, adventure, operation_id=operation_key)
     # Derived summary finalization happens post-commit in the turn commit
     # path (issue #263): the authoritative completion event/revision only
     # exists after commit_campaign_mutation returns, so binding the end
@@ -542,8 +538,6 @@ def _handle_start_encounter(db: Session, campaign: Campaign, effect: dict[str, A
     against an already-started encounter is a no-op returning the existing
     row; a genuinely new start while one is pending/active fails closed.
     """
-    from app.combat.service import start_encounter_inline
-
     args = effect.get("arguments") or {}
     operation_key = _resolve_effect_key(attempt, effect)
     encounter = start_encounter_inline(db, campaign, turn, attempt, args, operation_key)
@@ -581,9 +575,6 @@ def _handle_end_encounter(db: Session, campaign: Campaign, effect: dict[str, Any
         raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
     operation_key = _resolve_effect_key(attempt, effect)
 
-    from app.combat.ending import EndEncounterError as _EndError
-    from app.combat.ending import end_encounter_inline as _end_inline
-
     try:
         encounter = _end_inline(db, campaign, encounter, args, operation_key)
     except _EndError as exc:
@@ -620,9 +611,6 @@ def _handle_update_map_terrain(db: Session, campaign: Campaign, effect: dict[str
         raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
     operation_key = _resolve_effect_key(attempt, effect)
 
-    from app.combat.maps import MapError as _MapError
-    from app.combat.maps import update_terrain_inline as _update_terrain_inline
-
     try:
         encounter_map = _update_terrain_inline(db, campaign, encounter, args, operation_key)
     except _MapError as exc:
@@ -658,9 +646,6 @@ def _handle_update_map_placement(db: Session, campaign: Campaign, effect: dict[s
         raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
     operation_key = _resolve_effect_key(attempt, effect)
 
-    from app.combat.maps import MapError as _MapError
-    from app.combat.maps import update_placements_inline as _update_placements_inline
-
     try:
         encounter_map = _update_placements_inline(db, campaign, encounter, args, operation_key)
     except _MapError as exc:
@@ -689,10 +674,6 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
 
     from sqlalchemy import select as _select
 
-    from app.rules.attacks import AttackError as _AttackError
-    from app.rules.attacks import HitPoints as _HitPoints
-    from app.rules.attacks import apply_damage as _apply_damage
-
     args = effect.get("arguments") or {}
     target_kind = args.get("target_kind")
     if target_kind not in ("pc", "npc"):
@@ -711,7 +692,7 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
 
     if target_kind == "pc":
         from models.campaigns import CampaignMember
-        from models.characters import Character, Dnd5eCharacterSheet
+        from models.characters import Character
 
         character = db.get(Character, target_id)
         if character is None:
@@ -728,11 +709,7 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
         ).scalars().first()
         if roster is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
-        sheet = db.execute(
-            _select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == character.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, character.id)
         if sheet is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
         try:
@@ -859,8 +836,6 @@ def _mark_npc_section(target: _StateTarget, section: str, visibility: Any) -> No
     """Preserve staged visibility in NPC marker map (no-op for PCs)."""
     if target.kind != "npc":
         return
-    from app.rules.state import mark_npc_section_visibility as _mark
-
     _mark(target._details, section, visibility)
 
 
@@ -881,7 +856,7 @@ def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) 
 
     if target_kind == "pc":
         from models.campaigns import CampaignMember
-        from models.characters import Character, Dnd5eCharacterSheet
+        from models.characters import Character
 
         character = db.get(Character, target_id)
         if character is None:
@@ -894,11 +869,7 @@ def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) 
         ).scalars().first()
         if roster is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
-        sheet = db.execute(
-            _select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == character.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, character.id)
         if sheet is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
         return _StateTarget(kind="pc", row=sheet, campaign_id=campaign.id)
@@ -920,34 +891,6 @@ def _handle_apply_condition(db: Session, campaign: Campaign, effect: dict[str, A
     breaks active concentration (2024 linkage hook); exhaustion transitions
     sync the exhaustion column and the structural entry together.
     """
-    from app.rules.state import (
-        CONCENTRATION_BREAKING_CONDITIONS as _BREAKING,
-    )
-    from app.rules.state import (
-        StateError as _StateError,
-    )
-    from app.rules.state import (
-        add_condition as _add,
-    )
-    from app.rules.state import (
-        break_concentration as _break_conc,
-    )
-    from app.rules.state import (
-        normalize_condition_name as _norm,
-    )
-    from app.rules.state import (
-        remove_condition as _remove,
-    )
-    from app.rules.state import (
-        set_exhaustion as _set_exhaustion,
-    )
-    from app.rules.state import (
-        tick_conditions as _tick,
-    )
-    from app.rules.state import (
-        update_condition as _update,
-    )
-
     args = effect.get("arguments") or {}
     op = args.get("op")
     mutation_id = args.get("mutation_id")
@@ -1036,13 +979,6 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
     unknown names/slots fail closed before any write, and a failed turn
     commit rolls the write back.
     """
-    from app.rules.state import StateError as _StateError
-    from app.rules.state import restore_resource as _restore
-    from app.rules.state import restore_spell_slot as _restore_slot
-    from app.rules.state import set_resource as _set
-    from app.rules.state import spend_resource as _spend
-    from app.rules.state import spend_spell_slot as _spend_slot
-
     args = effect.get("arguments") or {}
     op = args.get("op")
     mutation_id = args.get("mutation_id")
@@ -1091,11 +1027,6 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
 @register("apply_concentration")
 def _handle_apply_concentration(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Apply a concentration start/replace/break to canonical state (issue #227)."""
-    from app.rules.state import StateError as _StateError
-    from app.rules.state import break_concentration as _break
-    from app.rules.state import replace_concentration as _replace
-    from app.rules.state import start_concentration as _start
-
     args = effect.get("arguments") or {}
     op = args.get("op")
     mutation_id = args.get("mutation_id")
@@ -1147,14 +1078,6 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
     - death breaks active concentration;
     - natural-20 revival restores 1 HP and clears ``unconscious``.
     """
-    from app.rules.state import StateError as _StateError
-    from app.rules.state import add_condition as _add
-    from app.rules.state import break_concentration as _break_conc
-    from app.rules.state import has_condition as _has
-    from app.rules.state import record_death_save as _record
-    from app.rules.state import remove_condition as _remove
-    from app.rules.state import reset_death_saves as _reset
-
     args = effect.get("arguments") or {}
     op = args.get("op")
     mutation_id = args.get("mutation_id")
@@ -1261,6 +1184,3 @@ def _resolve_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:
         return _scoped_effect_key(attempt, explicit)
     return _default_effect_key(attempt, effect)
 
-
-def list_registered_effect_types() -> list[str]:
-    return sorted(_REGISTRY.keys())

@@ -10,13 +10,16 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.service import lock_campaign_row, require_playable_campaign
+from app.clock import utcnow
+from app.combat.service import EncounterAuthorizationError, EncounterError, fulfill_human_initiative
+from app.dm.turns import create_attempt, lock_turn_and_attempt
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
-from models.campaigns import CampaignMember
 from models.characters import Character
 from models.combat import EncounterParticipant
 from models.dm import DmTurn
@@ -38,14 +41,6 @@ class RollAuthorizationError(PermissionError):
     pass
 
 
-class PendingRollsError(RollLifecycleError):
-    pass
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _text(payload: dict, name: str, maximum: int) -> str:
     value = str(payload.get(name) or "").strip()
     if not value or len(value) > maximum:
@@ -61,28 +56,12 @@ def _uuid(payload: dict, name: str) -> uuid.UUID:
 
 
 def _lock_turn_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn, DmTurnAttempt]:
-    turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-    attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None or attempt.turn_id != turn.id:
         raise RollLifecycleError("Turn or attempt not found")
     if turn.current_attempt_id != attempt.id:
         raise RollLifecycleError("Roll requests must belong to the current turn attempt")
     return turn, attempt
-
-
-def _lock_campaign_row(db: Session, campaign_id: uuid.UUID) -> Campaign | None:
-    """Lock the campaign lifecycle row — issue #265.
-
-    Archive/restore serializes on this same row via commit_campaign_mutation,
-    so holding the lock until commit means a roll write that observed
-    ``active`` cannot commit after archive has committed (and vice versa).
-    Consistent lock order everywhere is request/turn locks first, then the
-    campaign row; archive only ever takes the campaign row.
-    """
-    return db.execute(
-        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-        .execution_options(populate_existing=True)
-    ).scalars().first()
 
 
 def _validate_request(db: Session, campaign_id: uuid.UUID, payload: dict) -> dict:
@@ -95,8 +74,7 @@ def _validate_request(db: Session, campaign_id: uuid.UUID, payload: dict) -> dic
     if character is None or character.owner_id != requested_user_id:
         raise RollLifecycleError("character_id must be controlled by requested_user_id")
     campaign = db.get(Campaign, campaign_id)
-    member = db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": requested_user_id})
-    if campaign is None or (campaign.owner_id != requested_user_id and member is None):
+    if campaign is None or not is_campaign_participant(db, campaign, requested_user_id):
         raise RollLifecycleError("requested_user_id must be a campaign member")
     kind = str(payload.get("roll_kind") or "")
     advantage = str(payload.get("advantage_state") or "normal")
@@ -132,9 +110,7 @@ def request_rolls(
     # Issue #265 — roll writes advance the table; serialize with the
     # campaign lifecycle row so a write that observed active cannot commit
     # after archive has committed.
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, campaign_id))
+    require_playable_campaign(lock_campaign_row(db, campaign_id))
     if turn.status not in {"pending", "awaiting_roll"} or attempt.status not in {"prepared", "running", "awaiting_roll"}:
         raise RollLifecycleError("Current attempt cannot request rolls from its present state")
     values = [_validate_request(db, campaign_id, item) for item in requests]
@@ -185,24 +161,26 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
         evidence.append(item)
     parent_attempt.status = "superseded"
     parent_attempt.invalidation_reason = "player_roll_input_available"
-    parent_attempt.invalidated_at = _now()
+    parent_attempt.invalidated_at = utcnow()
     campaign = db.get(Campaign, turn.campaign_id)
-    next_attempt = DmTurnAttempt(
-        turn_id=turn.id, attempt_number=parent_attempt.attempt_number + 1, status="prepared",
-        campaign_id=turn.campaign_id, thread_id=turn.thread_id, audience=turn.audience,
+    next_attempt = create_attempt(
+        db, turn, parent=parent_attempt, roll_evidence=evidence,
         source_revision=int(campaign.revision if campaign else parent_attempt.source_revision),
-        input_set_revision=turn.input_set_revision, submission_ids=list(turn.submission_ids or []),
-        parent_attempt_id=parent_attempt.id, roll_evidence=evidence,
-        assembly_window_start=turn.assembly_window_start, assembly_window_end=turn.assembly_window_end,
     )
-    db.add(next_attempt)
-    db.flush()
     turn.status = "pending"
-    turn.current_attempt_id = next_attempt.id
     turn.streaming_attempt_id = None
     logger.info("player_roll turn_resumed campaign_id=%s turn_id=%s old_attempt_id=%s new_attempt_id=%s evidence_count=%s",
                 turn.campaign_id, turn.id, parent_attempt.id, next_attempt.id, len(evidence))
     return next_attempt
+
+
+def _kept_dice_value(advantage_state: str, raw_rolls: list[int]) -> int:
+    """Advantage keeps the higher of two d20s, disadvantage the lower; otherwise dice sum."""
+    if len(raw_rolls) == 2 and advantage_state == "advantage":
+        return max(raw_rolls)
+    if len(raw_rolls) == 2 and advantage_state == "disadvantage":
+        return min(raw_rolls)
+    return sum(raw_rolls)
 
 
 def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, payload: dict) -> tuple[PlayerRollRequest, PlayerRollFulfillment, DmTurnAttempt | None, dict | None]:
@@ -226,12 +204,6 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == request_id).limit(1)
     ).scalars().first()
     if linked is not None:
-        from app.combat.service import (
-            EncounterAuthorizationError,
-            EncounterError,
-            fulfill_human_initiative,
-        )
-
         participant = db.get(EncounterParticipant, linked)
         try:
             req_row, fulfillment, _, updated, event = fulfill_human_initiative(
@@ -253,9 +225,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, req.campaign_id))
     if req.requested_user_id != actor_id:
         logger.warning("player_roll invalid_attempt request_id=%s actor_id=%s reason=unauthorized", request_id, actor_id)
         raise RollAuthorizationError("Only the requested character's controller may fulfill this roll")
@@ -282,6 +252,13 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         raise RollLifecycleError("modifier and total must be integers; total is required") from exc
     if not -10000 <= modifier <= 10000 or not -10000 <= total <= 10000:
         raise RollLifecycleError("modifier and total must be between -10000 and 10000")
+    if raw_rolls:
+        # Deterministic authority: dice arithmetic stays in code, never trusted
+        # blindly (mirrors #230 initiative). Physical rolls reported without
+        # dice carry only the player's total and have nothing to recompute.
+        dice = _kept_dice_value(req.advantage_state, raw_rolls)
+        if total != dice + modifier:
+            raise RollLifecycleError(f"total {total} must equal dice {dice} + modifier {modifier}")
     metadata = payload.get("raw_metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise RollLifecycleError("raw_metadata must be an object")
@@ -291,7 +268,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     )
     db.add(fulfillment)
     req.status = "fulfilled"
-    req.fulfilled_at = _now()
+    req.fulfilled_at = utcnow()
     db.flush()
     turn = db.get(DmTurn, req.turn_id)
     attempt = db.get(DmTurnAttempt, req.attempt_id)
@@ -316,9 +293,7 @@ def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict |
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, req.campaign_id))
     if req.status != "pending":
         raise RollLifecycleError(f"Roll request cannot be changed from status {req.status}")
     turn = db.get(DmTurn, req.turn_id)
@@ -326,7 +301,7 @@ def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict |
     if turn is None or attempt is None:
         raise RollLifecycleError("Owning turn or attempt no longer exists")
     req.status = "replaced" if replacement else "cancelled"
-    req.cancelled_at = _now()
+    req.cancelled_at = utcnow()
     created: list[PlayerRollRequest] = []
     if replacement:
         created = request_rolls(db, campaign_id=req.campaign_id, turn_id=turn.id, attempt_id=attempt.id,

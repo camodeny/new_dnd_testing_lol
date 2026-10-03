@@ -15,6 +15,8 @@ import logging
 import uuid
 
 from sqlalchemy import select
+
+from app.clock import utcnow
 from models.campaigns import Campaign
 from models.dm import DmTurn, DmTurnAttempt, DMStream
 
@@ -23,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = False):
     """Build the fresh logical attempt; caller owns flush/commit."""
-    from app.dm.turns import _now
+    from app.dm.turns import create_attempt
 
-    now = _now()
+    now = utcnow()
     # Abandon the failed attempt: staged effects stay on the old row for
     # audit but are never promoted (commit_operation_id is attempt-scoped,
     # so the fresh attempt cannot duplicate prior staged effects).
@@ -38,32 +40,16 @@ def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = F
             stream.status = "abandoned"
             stream.abandoned_at = now
             stream.abandonment_reason = "explicit_retry"
-    attempt = DmTurnAttempt(
-        id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign.id,
-        thread_id=turn.thread_id, audience=turn.audience,
-        attempt_number=old.attempt_number + 1, parent_attempt_id=old.id,
-        status="prepared", source_revision=campaign.revision,
-        input_set_revision=turn.input_set_revision,
-        submission_ids=list(old.submission_ids or []),
-        roll_evidence=list(old.roll_evidence or []),
-        assembly_window_start=old.assembly_window_start,
-        assembly_window_end=old.assembly_window_end,
-        # Fresh logical attempt: new idempotency scope, no staged effects
-        # carried over (re-staged on success), no stream attached.
-        staged_effects=[],
+    # Fresh logical attempt from the original accepted intent: new
+    # idempotency scope, no staged effects carried over (re-staged on
+    # success), no stream attached.
+    attempt = create_attempt(
+        db, turn, source_revision=campaign.revision, parent=old,
+        submission_ids=old.submission_ids, roll_evidence=old.roll_evidence,
+        assembly_window=(old.assembly_window_start, old.assembly_window_end),
         contract_snapshot=dict(old.contract_snapshot)
         if (reuse_contract and old.contract_snapshot) else None,
-        commit_operation_id=None,
-        retry_count=0,
-        next_retry_at=None,
-        last_error=None,
-        error_class=None,
     )
-    # Fresh idempotency scope for the new logical attempt.
-    attempt.commit_operation_id = str(attempt.id)
-    db.add(attempt)
-    db.flush()
-    turn.current_attempt_id = attempt.id
     turn.status = "pending"
     turn.source_revision = campaign.revision
     turn.streaming_attempt_id = None
@@ -189,7 +175,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
 
     Single orchestration helper for partial-stream recovery (HTTP route +
     any future trigger): scope-check → fidelity-gated continuation →
-    recovered-streaming transition → ``commit_turn_with_effects`` (staged
+    recovered-streaming transition → ``commit_turn`` (staged
     effects promoted exactly once with the normal idempotency/revision
     guards). Caller-supplied text ALWAYS goes through the contract fidelity
     gate; there is no ungated resume path for untrusted input.
@@ -209,10 +195,10 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     from app.dm.turns import (
         StaleRevisionError,
         TurnConflictError,
-        commit_turn_with_effects,
+        commit_turn,
         mark_recovered_streaming,
     )
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         DMStreamStateError,
         get_stream,
         reopen_failed_stream,
@@ -281,7 +267,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         "recovery": "partial_stream_continuation",
     }
     try:
-        final_turn, final_attempt, event = commit_turn_with_effects(
+        final_turn, final_attempt, event = commit_turn(
             db, turn.id, old.id,
             payload=payload,
             operation_id=old.commit_operation_id or str(old.id),

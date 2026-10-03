@@ -5,11 +5,11 @@ required consolidation for a range succeeds. Failed ranges stay outstanding
 and the next run cumulatively covers checkpoint+1 through the current
 eligible sequence, so nothing accepted is silently dropped.
 
-Transport: triggers enqueue through the transactional outbox (#190) with the
-run id as outbox/job id; the relay publishes to the queue and the worker
-executes idempotently via WorkerExecution fencing (#191).
+Transport: triggers stage a durable ``PostTurnRun`` row; the
+``/api/cron/post-turn`` sweep executes it idempotently via WorkerExecution
+fencing (#191) with the run id as the worker job id.
 
-The memory/repair contents of a post-turn patch are built by the
+The memory contents of a post-turn patch are built by the
 explicit materializer (issue #217) behind ``consolidate_fn``-style
 default consolidation: ``materialize_range`` compiles the range into
 validated durable writes (entities, relations, facts, NPC state,
@@ -26,12 +26,21 @@ import uuid
 from datetime import datetime, timezone
 from collections.abc import Callable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.dm.turns import has_in_flight_turn
+from app.observability.service import telemetry_factory_for
+from app.observability.tracing import current_trace_id
+from app.realtime.service import publish_projection_invalidated_for_grantee
+from app.worker.envelope import new_envelope
+from app.worker.executor import execute_worker_job
+from app.world.clocks import ClockCommitDeferred, consolidate_clocks_for_range
+from app.world.semantic_index import note_authoritative_write
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.post_turn import PostTurnCheckpoint, PostTurnRun
+from models.reliability import WorkerExecution
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +209,7 @@ def should_trigger_post_turn(outstanding_relevant: int, trigger: str = NORMAL, *
     return outstanding_relevant >= th
 
 
-# ── Trigger (outbox emission) ──────────────────────────────────────────────
+# ── Trigger (durable run staging) ──────────────────────────────────────────────
 
 
 def maybe_trigger_post_turn(
@@ -213,11 +222,10 @@ def maybe_trigger_post_turn(
     threshold: int | None = None,
     commit: bool = True,
 ) -> PostTurnRun | None:
-    """Evaluate the batch policy and enqueue a cumulative post-turn run via outbox.
+    """Evaluate the batch policy and stage a cumulative post-turn run.
 
     Returns the run (new or existing duplicate) or None when below threshold.
-    The run id is reused as the outbox id / worker job_id for end-to-end
-    idempotency.
+    The run id is reused as the worker job_id for end-to-end idempotency.
 
     NORMAL triggers measure the threshold against relevant events NEW since
     the latest live-run coverage (not the whole checkpoint gap), so a lagging
@@ -262,8 +270,6 @@ def maybe_trigger_post_turn(
         logger.info("post_turn trigger duplicate campaign=%s %s-%s run=%s", campaign_id, from_seq, to_seq, existing.id)
         return existing
 
-    from app.observability.tracing import current_trace_id
-
     run = PostTurnRun(
         id=uuid.uuid4(),
         campaign_id=campaign_id,
@@ -280,36 +286,12 @@ def maybe_trigger_post_turn(
     # one winner. A savepoint (not a full rollback) keeps the caller's outer
     # transaction intact so the loser can reuse the winning run — including
     # when called atomically from inside commit_campaign_mutation().
-    from models.reliability import Outbox as _Outbox
-
     try:
         with db.begin_nested():
             db.add(run)
             db.flush()
-            # Atomic outbox emission in the same transaction (#190 pattern).
-            db.add(
-                _Outbox(
-                    id=run.id,
-                    aggregate_type="campaign",
-                    aggregate_id=campaign_id,
-                    campaign_id=campaign_id,
-                    event_type=POST_TURN_JOB_TYPE,
-                    operation_id=operation_id,
-                    trace_id=run.trace_id,
-                    payload={
-                        "run_id": str(run.id),
-                        "campaign_id": str(campaign_id),
-                        "from_sequence": from_seq,
-                        "to_sequence": to_seq,
-                        "trigger": trigger,
-                    },
-                    status="pending",
-                    attempts=0,
-                )
-            )
-            db.flush()
     except IntegrityError:
-        # Lost the race (duplicate range row or outbox id) — reuse winner.
+        # Lost the race (duplicate range row) — reuse winner.
         dup = db.execute(
             select(PostTurnRun).where(
                 PostTurnRun.campaign_id == campaign_id,
@@ -342,6 +324,20 @@ def maybe_trigger_post_turn(
 
 
 # ── Consolidation (worker side) ────────────────────────────────────────────
+
+
+DM_TURN_IN_FLIGHT = "dm_turn_in_flight"
+
+
+def dm_turn_commit_gate(db: Session, campaign_id: uuid.UUID) -> str | None:
+    """Veto post-turn revision bumps while a DM turn awaits its commit.
+
+    An in-flight turn pinned ``source_revision`` and commits against it, so
+    a clock commit landing first would fail that turn stale after its
+    narration already streamed. Deferral is ordinary backpressure: the
+    range retries on a later sweep once the table is between turns.
+    """
+    return DM_TURN_IN_FLIGHT if has_in_flight_turn(db, campaign_id) else None
 
 
 def _validate_range_contiguous(db: Session, campaign_id: uuid.UUID, from_seq: int, to_seq: int) -> list[CampaignDomainEvent]:
@@ -521,6 +517,30 @@ def run_post_turn_range(
             logger.warning("post_turn locked archive check failed campaign=%s error=%s", campaign_id, exc)
             return False
 
+    def _defer(reason: str) -> dict:
+        """Hand the range back untouched: pending, attempt not consumed."""
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.info(
+            "post_turn deferred campaign=%s range=%s-%s reason=%s",
+            campaign_id, effective_from, to_sequence, reason,
+        )
+        fresh = db.get(PostTurnRun, run.id)
+        if fresh is not None and fresh.status not in ("succeeded", "skipped"):
+            fresh.status = "pending"
+            fresh.attempts = max(0, int(fresh.attempts or 0) - 1)
+            fresh.failure_reason = None
+            fresh.result = {"deferred": True, "reason": reason}
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+        return {"deferred": True, "reason": reason,
+                "from_sequence": from_sequence, "to_sequence": to_sequence,
+                "processed_through": processed}
+
     def _retire_skipped(reason: str) -> dict:
         logger.info(
             "post_turn skipped campaign=%s range=%s-%s reason=%s",
@@ -563,6 +583,11 @@ def run_post_turn_range(
             material_campaign = db.get(Campaign, campaign_id)
             if material_campaign is None:
                 raise RuntimeError(f"post-turn campaign {campaign_id} not found")
+            # The range is all-or-nothing and its clocks cannot commit while
+            # a DM turn is in flight: skip every model call until it lands.
+            in_flight = dm_turn_commit_gate(db, campaign_id)
+            if in_flight:
+                return _defer(in_flight)
             patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
             patch["materialization"] = materialize_range(
                 db, material_campaign, events, effective_from, to_sequence,
@@ -574,23 +599,20 @@ def run_post_turn_range(
             # a clock-processing failure raises here so the run fails and the
             # checkpoint stays put for cumulative retry. Custom
             # consolidate_fn callers own their content and opt out.
-            from app.world.clocks import consolidate_clocks_for_range
-
             patch["clocks"] = consolidate_clocks_for_range(
                 db, campaign_id, effective_from, to_sequence, events,
                 decision_service=clock_decision_service,
                 session_factory=clock_telemetry_factory,
                 operation_id=operation_id,
+                commit_gate=dm_turn_commit_gate,
             )
             # Issue #220 — consistency verification is required consolidation:
             # deterministic + semantic contradictions against committed canon
             # become explicit incidents instead of silent normalization. A
             # required unresolved incident fails the run (checkpoint stays
-            # put; #221 repair resolves, then a cumulative retry converges).
+            # put for cumulative retry).
             # Custom consolidate_fn callers own their content and opt out.
             from app.post_turn.incidents import ConsistencyBlocked, verify_post_turn_consistency
-
-            from app.observability.service import telemetry_factory_for
 
             incident_factory = (
                 clock_telemetry_factory
@@ -605,7 +627,7 @@ def run_post_turn_range(
                 # Incidents persist on an independent transaction: the
                 # ConsistencyBlocked raise below fails the run (whose
                 # handler rolls back this range's materialization/clock
-                # writes), while incidents stay durable for #221 repair.
+                # writes), while incidents stay durable.
                 # The worker session is flush-only here; the checkpoint
                 # commit below persists a successful range atomically.
                 durable_session_factory=incident_factory,
@@ -680,14 +702,13 @@ def run_post_turn_range(
             db.commit()
         logger.info("post_turn consolidated campaign=%s %s-%s run=%s",
                     campaign_id, from_sequence, to_sequence, run.id if run else "-")
-        _best_effort_running_summary(
-            db, campaign_id, to_sequence,
-            decision_service=clock_decision_service,
-            session_factory=clock_telemetry_factory,
-            commit=commit,
-        )
+        if commit:
+            _request_range_semantic_index(db, campaign_id, events)
+            _publish_grant_invalidations(db, campaign_id, patch)
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
+    except ClockCommitDeferred as exc:
+        return _defer(exc.reason)
     except Exception as exc:
         # Failure reason is durable even though the checkpoint is unchanged.
         _fail(exc)
@@ -696,7 +717,7 @@ def run_post_turn_range(
 
 
 def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
-    """Queue-worker handler for ``post_turn.process`` envelopes.
+    """Worker handler for ``post_turn.process`` envelopes.
 
     Single-argument worker contract (see execute_worker_job); owns its DB
     session via SessionLocal with a ``db`` seam for tests.
@@ -742,15 +763,6 @@ def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
         # Production worker owns its session factory: decision telemetry
         # persists on short independent transactions, fail-soft by design.
         return _run(session, telemetry_factory=SessionLocal)
-
-
-def register_post_turn_worker() -> None:
-    from app.queue.consumer import WORKER_HANDLERS
-
-    WORKER_HANDLERS[POST_TURN_JOB_TYPE] = handle_post_turn_envelope
-
-
-register_post_turn_worker()
 
 
 # ── Explicit audited skip ──────────────────────────────────────────────────
@@ -830,96 +842,59 @@ def mark_post_turn_skipped(
     return run
 
 
-# ── Observability ──────────────────────────────────────────────────────────
+def _publish_grant_invalidations(db: Session, campaign_id: uuid.UUID, patch: dict) -> None:
+    """Tell newly granted users' clients to refetch their projection (#250).
 
-
-def _best_effort_running_summary(
-    db: Session,
-    campaign_id: uuid.UUID,
-    to_sequence: int,
-    *,
-    decision_service=None,
-    session_factory=None,
-    commit: bool = True,
-) -> None:
-    """Issue #219 — refresh the running summary over the processed prefix.
-
-    Independently retryable derived work: any failure is swallowed (with a
-    rollback of the summary-only transaction) so it never threatens the
-    already-committed checkpoint advancement or authoritative state above.
-
-    Verification runs on the runtime decision service by default (same
-    pattern as #217 materialize / #218 clocks), so normal post-turn
-    processing can actually produce a context-eligible ``current`` summary.
-    A down/unconfigured verifier fails closed to ``deferred`` — retryable,
-    never silently canon — rather than permanent ``pending``.
+    Runs after the range commit; the payload is audience-neutral and a missed
+    event still converges on the next snapshot. Never raises.
     """
     try:
-        from app.decisions import DecisionService
-        from app.world import summaries as _summaries
-
+        materialization = (patch or {}).get("materialization") or {}
+        grantees = sorted({
+            str(o["grantee_user_id"]) for o in materialization.get("outcomes") or []
+            if o.get("category") == "visibility_grants" and o.get("outcome") == "applied"
+            and o.get("grantee_user_id")
+        })
+        if not grantees:
+            return
         campaign = db.get(Campaign, campaign_id)
         if campaign is None:
             return
-        _summaries.consolidate_summary_for_range(
-            db, campaign, 1, int(to_sequence),
-            decision_service=decision_service or DecisionService(),
-            session_factory=session_factory,
-            operation_id=f"post-turn-summary:1-{to_sequence}",
-            commit=commit,
-        )
-    except Exception as exc:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        logger.warning("post_turn running summary failed campaign=%s error=%s",
+        for grantee in grantees:
+            publish_projection_invalidated_for_grantee(
+                db, campaign, grantee_user_id=uuid.UUID(grantee))
+    except Exception as exc:  # noqa: BLE001 — realtime is best-effort after commit
+        logger.warning("post_turn grant invalidation publish failed campaign=%s error=%s",
                        campaign_id, exc)
 
 
-def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
-    cp = get_checkpoint(db, campaign_id, commit=False)
-    span = get_outstanding_range(db, campaign_id)
-    runs = list(
-        db.execute(
-            select(PostTurnRun).where(PostTurnRun.campaign_id == campaign_id)
-            .order_by(PostTurnRun.created_at.desc()).limit(20)
-        ).scalars().all()
-    )
-    failed = [r for r in runs if r.status == "failed"]
-    last = runs[0] if runs else None
-    retry_count = sum(int(r.attempts or 0) for r in runs)
-    # Issue #222 — safe-lag observability alongside the checkpoint span:
-    # outstanding range size, estimated context cost, safe budget, and the
-    # block state. Guarded: status reporting never raises.
-    try:
-        from app.post_turn.backpressure import evaluate_backpressure
+def _request_range_semantic_index(
+    db: Session, campaign_id: uuid.UUID, events: list[CampaignDomainEvent],
+) -> None:
+    """Stage #213 semantic indexing for a consolidated range.
 
-        backpressure = evaluate_backpressure(db, campaign_id)
-    except Exception as exc:  # noqa: BLE001 — observability must not break status
-        backpressure = {"blocked": True, "reason": "estimation_failed",
-                        "error": str(exc)[:300]}
-    # Issue #220 — required unresolved consistency incidents alongside the
-    # checkpoint span. Guarded: status reporting never raises.
+    Materialization writes facts/relations after the turn commit, so the
+    turn-commit hook (``note_turn_committed``) never sees them. Stages the
+    range's domain events plus facts/relations citing them; the semantic
+    sweep embeds them later. Best-effort: never raises past the already
+    committed checkpoint.
+    """
     try:
-        from app.post_turn.incidents import get_consistency_stats
+        from models.world import WorldFact, WorldRelation
 
-        consistency = get_consistency_stats(db, campaign_id)
-    except Exception as exc:  # noqa: BLE001 — observability must not break status
-        consistency = {"unresolved": 0, "error": str(exc)[:300]}
-    return {
-        "campaign_id": str(campaign_id),
-        "checkpoint": int(cp.processed_through_sequence or 0),
-        "outstanding": span,
-        "backpressure": backpressure,
-        "consistency": consistency,
-        "run_attempts": len(runs),
-        "retry_count": retry_count,
-        "last_run": last.to_dict() if last else None,
-        "last_failure_reason": failed[0].failure_reason if failed else None,
-        "failed_runs": len(failed),
-        "queue_lag_seconds": span.get("age_seconds", 0.0),
-    }
+        event_ids = [e.id for e in events]
+        entries: list[tuple[str, uuid.UUID]] = []
+        for source_type, model in (("world_fact", WorldFact), ("world_relation", WorldRelation)):
+            ids = db.execute(select(model.id).where(
+                model.campaign_id == campaign_id,
+                model.source_event_id.in_(event_ids),
+            )).scalars().all()
+            entries.extend((source_type, row_id) for row_id in ids)
+        entries.extend(("domain_event", event_id) for event_id in event_ids)
+        note_authoritative_write(db, campaign_id, entries)
+    except Exception as exc:  # noqa: BLE001 — derived index work never fails the run
+        logger.warning("post_turn semantic index staging failed campaign=%s error=%s",
+                       campaign_id, exc)
 
 
 # ── Cron sweep driver ──────────────────────────────────────────────────────
@@ -991,8 +966,6 @@ def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
 
 def _envelope_for_run(run: PostTurnRun):
     """Build the worker envelope for a durable run (locator only)."""
-    from app.queue.adapter import new_envelope
-
     return new_envelope(
         job_id=run.id,
         job_type=POST_TURN_JOB_TYPE,
@@ -1021,12 +994,9 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     ``execute_worker_job``) and ``running`` runs whose lease expired
     (executor crash between the running marker and the CAS commit; the
     prefix-conditional update makes re-execution safe) — and run each
-    through the idempotent worker fence. Queue push delivery (when a
-    subscriber is configured) converges on the same run rows via job_id.
+    through the idempotent worker fence.
     """
     from datetime import timedelta as _timedelta
-
-    from app.worker.executor import execute_worker_job
 
     try:
         repaired = repair_missing_post_turn_runs(db)
@@ -1057,16 +1027,32 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     )
     executed: list[str] = []
     failed: list[dict] = []
-    skipped: list[str] = []
+    deferred: list[str] = []
     for run in candidates:
+        if dm_turn_commit_gate(db, run.campaign_id):
+            # Cheap pre-claim check: no worker claim, no attempt spent.
+            logger.info("post_turn deferred campaign=%s run=%s reason=%s",
+                        run.campaign_id, run.id, DM_TURN_IN_FLIGHT)
+            deferred.append(str(run.id))
+            continue
         try:
             env = _envelope_for_run(run)
-            execute_worker_job(db, env, lambda e, _db=db: handle_post_turn_envelope(e, _db),
-                               max_attempts=max_attempts)
-            executed.append(str(run.id))
+            result, _duplicate = execute_worker_job(
+                db, env, lambda e, _db=db: handle_post_turn_envelope(e, _db),
+                max_attempts=max_attempts)
+            if isinstance(result, dict) and result.get("deferred"):
+                # A turn started mid-run and the locked gate vetoed the clock
+                # commit. Deferral is not an execution: drop the ledger row
+                # so the next sweep re-runs the job instead of replaying it.
+                db.execute(delete(WorkerExecution).where(WorkerExecution.id == run.id))
+                db.commit()
+                deferred.append(str(run.id))
+            else:
+                executed.append(str(run.id))
         except Exception as exc:  # noqa: BLE001 — sweep must survive bad runs
             db.rollback()
             logger.warning("post_turn sweep run_failed run=%s error=%s", run.id, exc)
             failed.append({"run_id": str(run.id), "error": str(exc)[:300]})
-    logger.info("post_turn sweep repaired=%s executed=%s failed=%s", len(repaired), len(executed), len(failed))
-    return {"repaired": repaired, "executed": executed, "failed": failed, "skipped": skipped}
+    logger.info("post_turn sweep repaired=%s executed=%s deferred=%s failed=%s",
+                len(repaired), len(executed), len(deferred), len(failed))
+    return {"repaired": repaired, "executed": executed, "failed": failed, "deferred": deferred}

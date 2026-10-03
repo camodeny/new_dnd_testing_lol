@@ -34,15 +34,14 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
 from app.combat.geometry import (
-    FEET_PER_SQUARE,
     GeometryError,
     cheapest_path,
     feet_to_squares,
@@ -54,11 +53,18 @@ from app.combat.geometry import (
     validate_rect,
     zone_cell_effect,
 )
-from app.combat.service import EncounterAuthorizationError, EncounterError, list_participants
+from app.combat.service import (
+    EncounterError,
+    is_campaign_owner,
+    list_participants,
+    lock_encounter,
+    lock_playable_campaign,
+)
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_map, publish_encounter_moved
+from app.visibility.access import may_user_receive
 from models.campaigns import Campaign
 from models.combat import (
-    DIAGONAL_POLICIES,
     MOVEMENT_MODES,
     TERRAIN_KINDS,
     Encounter,
@@ -99,34 +105,8 @@ class MapAuthorizationError(PermissionError):
     pass
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _lock_encounter(db: Session, encounter_id: uuid.UUID) -> Encounter:
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise MapError(f"Encounter {encounter_id} not found", reason="no_map")
-    return encounter
-
-
-def _require_playable(db: Session, campaign_id: uuid.UUID) -> Campaign:
-    from app.campaigns.service import require_playable_campaign
-
-    campaign = db.execute(
-        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-    ).scalars().first()
-    if campaign is None:
-        raise MapError(f"Campaign {campaign_id} not found", reason="no_map")
-    require_playable_campaign(campaign)
-    return campaign
-
-
-def _is_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
-    return campaign is not None and str(campaign.owner_id) == str(user_id)
+def _no_map(message: str) -> MapError:
+    return MapError(message, reason="no_map")
 
 
 # ── Reads ────────────────────────────────────────────────────────────────────
@@ -204,14 +184,10 @@ def _hidden_token_ids(
             entity_by_participant[str(participant.id)] = entity
     if not hidden or viewer_user_id is None or campaign is None:
         return hidden
-    try:
-        from app.world import epistemics as _epistemics
-    except Exception:
-        return hidden
     revealed: set[str] = set()
     for participant_id, entity in entity_by_participant.items():
         try:
-            verdict = _epistemics.may_user_receive(
+            verdict = may_user_receive(
                 db, campaign, "entity", entity.id, viewer_user_id
             )
         except Exception:
@@ -469,39 +445,6 @@ def _bump_map_revision(encounter_map: EncounterMap) -> None:
     encounter_map.revision = int(encounter_map.revision or 1) + 1
 
 
-def _emit_map_event(
-    db: Session,
-    campaign: Campaign,
-    encounter: Encounter,
-    *,
-    expected_revision: int,
-    operation_id: str,
-    payload: dict,
-    commit: bool,
-):
-    from app.campaigns.events import commit_campaign_mutation
-
-    _, event = commit_campaign_mutation(
-        db,
-        campaign.id,
-        expected_revision=int(expected_revision),
-        event_type=MAP_UPDATED_EVENT,
-        payload={"encounter_id": str(encounter.id), "thread_id": encounter.thread_id, **payload},
-        operation_id=operation_id,
-        actor_id=campaign.owner_id,
-        outbox_event_type=MAP_UPDATED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "map_revision": payload.get("map_revision"),
-        },
-        outbox_operation_id=operation_id,
-        commit=commit,
-    )
-    return event
-
-
 def ensure_map(
     db: Session,
     encounter_id: uuid.UUID,
@@ -527,9 +470,9 @@ def ensure_map(
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise MapError("operation_id is required (1-128 characters)")
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
-    if not _is_owner(db, encounter.campaign_id, actor_id):
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
+    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
         raise MapAuthorizationError("Only the campaign owner may define encounter map geometry")
     if encounter.status not in ("pending_initiative", "active"):
         raise MapError(f"maps require a pending or active encounter (status {encounter.status})")
@@ -622,8 +565,6 @@ def ensure_map(
         holder["zone_count"] = len(zone_rows)
         holder["placement_count"] = len(full)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     try:
         campaign_after, event = commit_campaign_mutation(
             db,
@@ -644,13 +585,6 @@ def ensure_map(
                 "placement_count": holder["placement_count"],
                 "init": existing is None,
             },
-            outbox_event_type=MAP_UPDATED_EVENT,
-            outbox_payload={
-                "encounter_id": str(encounter.id),
-                "campaign_id": str(encounter.campaign_id),
-                "thread_id": encounter.thread_id,
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
         db.rollback()
@@ -670,8 +604,6 @@ def ensure_map(
         zone_count=holder["zone_count"], operation_id=operation_id,
     )
     if commit:
-        from app.realtime.service import publish_encounter_map
-
         publish_encounter_map(db, encounter)
     return encounter_map, event
 
@@ -698,9 +630,9 @@ def update_terrain(
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise MapError("operation_id is required (1-128 characters)")
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
-    if not _is_owner(db, encounter.campaign_id, actor_id):
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
+    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
         raise MapAuthorizationError("Only the campaign owner may change encounter terrain")
     encounter_map = get_map(db, encounter.id)
     if encounter_map is None:
@@ -741,8 +673,6 @@ def update_terrain(
         holder["zone_count"] = len(list_zones(db, encounter_map.id))
         holder["stranded"] = _stranded_placements(db, encounter, encounter_map)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     def _terrain_payload() -> dict:
         # The domain event is thread-scoped/shared history: stranded flags
         # carry exact cells, so hidden-entity tokens are filtered here too
@@ -770,14 +700,6 @@ def update_terrain(
         mutate=_mutate,
         commit=False,
         payload_builder=_terrain_payload,
-        outbox_event_type=MAP_UPDATED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "map_revision": int(encounter_map.revision or 1),
-        },
-        outbox_operation_id=operation_id,
     )
     db.flush()
     if commit:
@@ -792,8 +714,6 @@ def update_terrain(
         operation_id=operation_id,
     )
     if commit:
-        from app.realtime.service import publish_encounter_map
-
         publish_encounter_map(db, encounter)
     return encounter_map, event
 
@@ -1076,8 +996,8 @@ def move_participant(
     except (TypeError, ValueError) as exc:
         raise MapError("expected_turn_sequence must be an integer", reason="stale_turn") from exc
 
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
 
     # Idempotent replay first: a duplicate command returns the recorded
     # outcome without touching position or budget (duplicate_retry signal).
@@ -1143,7 +1063,7 @@ def move_participant(
     # Preview/commit consistency (same inputs, same occupancy) removes the
     # probing oracle where a reachable cell fails only because a hidden
     # token stands there. Owners keep the full authoritative collision set.
-    actor_is_owner = _is_owner(db, encounter.campaign_id, actor_id)
+    actor_is_owner = is_campaign_owner(db, encounter.campaign_id, actor_id)
     occupied = _occupied_cells(
         db, encounter.id, exclude_participant_id=participant.id,
         include_hidden=actor_is_owner,
@@ -1230,8 +1150,6 @@ def move_participant(
         db.flush()
         holder["move"] = move
 
-    from app.campaigns.events import commit_campaign_mutation
-
     def _moved_payload() -> dict:
         # A hidden token's coordinates must not ride the shared/thread-scoped
         # event: non-owners get a position-free invalidation (the movement
@@ -1268,7 +1186,6 @@ def move_participant(
             "map_revision": int(encounter_map.revision or 1),
         }
 
-    hidden_mover = str(participant.id) in _hidden_token_ids(db, encounter.id)
     try:
         _, event = commit_campaign_mutation(
             db,
@@ -1280,15 +1197,6 @@ def move_participant(
             mutate=_mutate,
             commit=False,
             payload_builder=_moved_payload,
-            outbox_event_type=MOVED_EVENT,
-            outbox_payload={
-                "encounter_id": str(encounter.id),
-                "campaign_id": str(encounter.campaign_id),
-                "thread_id": encounter.thread_id,
-                "participant_id": str(participant.id),
-                **({} if hidden_mover else {"to": {"col": goal[0], "row": goal[1]}}),
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
         # Lost the ledger race: the winner's row is the authoritative outcome.
@@ -1329,8 +1237,6 @@ def move_participant(
         path_calc_latency_ms=latency_ms,
     )
     if commit:
-        from app.realtime.service import publish_encounter_moved
-
         publish_encounter_moved(db, encounter, participant.id, move_id=str(move.id))
     return move, encounter, event
 
@@ -1441,14 +1347,3 @@ def map_projection(
         "stranded_placements": stranded,
     }
 
-
-def get_snapshot_map(
-    db: Session, campaign_id: uuid.UUID, viewer_id: uuid.UUID, *, is_owner: bool = False
-) -> dict | None:
-    """Reconnect-safe map projection for the live-table snapshot."""
-    from app.combat.service import get_active_encounter
-
-    encounter = get_active_encounter(db, campaign_id)
-    if encounter is None:
-        return None
-    return map_projection(db, encounter, viewer_id=viewer_id, is_owner=is_owner)

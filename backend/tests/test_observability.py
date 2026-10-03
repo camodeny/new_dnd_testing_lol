@@ -19,14 +19,13 @@ from database import Base
 from app.campaigns.events import commit_campaign_mutation
 from app.observability.service import begin_operation, fail_soft, finish_ai_run, get_trace, mark_milestone, start_ai_run
 from app.observability.tracing import current_trace_id, structured_log, trace_context
-from app.outbox.service import enqueue_outbox, envelope_for_outbox
+from app.worker.envelope import new_envelope
 from app.worker.executor import execute_worker_job
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 from models.profiles import Profile
 from models.reliability import AIRun
 from models.reliability import OperationTrace
-from models.reliability import Outbox
 from models.reliability import WorkerExecution
 
 
@@ -37,7 +36,7 @@ def _setup():
     return factory, factory()
 
 
-def test_trace_survives_api_context_outbox_envelope_and_worker():
+def test_trace_survives_api_context_envelope_and_worker():
     factory, db = _setup()
     trace_id = "trace-synthetic-192"
     operation_id = "turn-42"
@@ -45,8 +44,7 @@ def test_trace_survives_api_context_outbox_envelope_and_worker():
     with trace_context(trace_id, operation_id):
         trace = begin_operation(factory, submitted_at=start)
         mark_milestone(factory, trace_id, "accepted", at=start + timedelta(milliseconds=12))
-        outbox = enqueue_outbox(db, event_type="turn.resolve", operation_id=operation_id, payload={"turn_id": "42"})
-    envelope = envelope_for_outbox(outbox)
+        envelope = new_envelope(job_type="turn.resolve", operation_id=operation_id, payload={"turn_id": "42"})
     assert envelope.trace_id == trace.trace_id == trace_id
     assert envelope.operation_id == operation_id
 
@@ -109,7 +107,7 @@ def test_trace_id_validation_matches_persisted_64_character_limit():
         assert len(generated) == 32
 
 
-def test_campaign_domain_event_and_outbox_share_trace_lineage():
+def test_campaign_domain_event_carries_trace_lineage():
     _, db = _setup()
     owner_id = uuid.uuid4()
     campaign_id = uuid.uuid4()
@@ -124,11 +122,9 @@ def test_campaign_domain_event_and_outbox_share_trace_lineage():
             0,
             event_type="campaign.tested",
             operation_id="domain-operation",
-            outbox_event_type="campaign.tested",
         )
     persisted = db.get(CampaignDomainEvent, event.id)
     assert persisted.trace_id == "domain-trace"
-    assert envelope_for_outbox(db.query(Outbox).one()).trace_id == "domain-trace"
 
 
 def test_fail_soft_durably_marks_dropped_telemetry_without_raising():
