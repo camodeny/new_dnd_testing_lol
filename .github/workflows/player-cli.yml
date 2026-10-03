@@ -1,0 +1,24 @@
+name: Player CLI
+
+on:
+  pull_request:
+    paths: ['tools/player-cli/**', '.github/workflows/player-cli.yml']
+  push:
+    branches: [main]
+    paths: ['tools/player-cli/**', '.github/workflows/player-cli.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  player-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm run check && npm test
+        working-directory: tools/player-cli
