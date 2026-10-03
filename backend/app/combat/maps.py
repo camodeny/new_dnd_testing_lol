@@ -192,7 +192,10 @@ def _hidden_token_ids(
             )
         except Exception:
             continue
-        if verdict.get("allowed"):
+        # Only an explicit grant reveals a token. The owner's DM-authority
+        # pass is not a reveal: owner callers opt in via ``is_owner``, and the
+        # player-lane table view must not inherit it.
+        if verdict.get("allowed") and verdict.get("reason") == "explicit_grant":
             revealed.add(participant_id)
     return hidden - revealed
 

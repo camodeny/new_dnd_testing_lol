@@ -2,9 +2,9 @@
 import React, { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import StoryAtlas from './StoryAtlas'
+import CampaignTable from './CampaignTable'
 import { campaignMembers, gameplayThreads } from '@/lib/api'
-import type { Campaign, Character, Message, Session, User } from '@/types'
+import type { Campaign, Message, Session, User } from '@/types'
 
 vi.mock('next/navigation', () => ({ useRouter: () => ({ push: vi.fn() }) }))
 vi.mock('@/lib/api', () => ({
@@ -25,8 +25,7 @@ if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = function () {}
 }
 
-const campaign = { id: 'c', name: 'Table', revision: 0, owner_id: 'owner' } as Campaign
-const characters = [{ id: 'pc1', name: 'Hero', race: 'Human' }] as Character[]
+const campaign = { id: 'c', name: 'Table', revision: 0, owner_id: 'owner', required_players: 2 } as Campaign
 const session = { id: 's', campaign_id: 'c', status: 'active', created_at: new Date().toISOString() } as Session
 const currentUser = { id: 'me', username: 'Me' } as User
 const messages = [{
@@ -59,15 +58,14 @@ afterEach(async () => {
 async function renderAtlas(aiPaused: boolean) {
   await act(async () => {
     root.render(
-      <StoryAtlas
+      <CampaignTable
         campaign={campaign}
-        characters={characters}
         session={session}
         messages={messages}
         hasOlderMessages={false}
         currentUser={currentUser}
-        currentCharacter={characters[0]}
-        encounterMap={null}
+        table={null}
+        rollRequests={[]}
         aiThinking={false}
         aiThinkingStatus=""
         isOwner={false}
@@ -77,7 +75,6 @@ async function renderAtlas(aiPaused: boolean) {
         onSendMessage={onSendMessage}
         onLoadOlderMessages={async () => {}}
         onStartSession={async () => {}}
-        onEncounterMapChange={() => {}}
         onExitToCampaigns={() => {}}
       />,
     )
@@ -108,7 +105,7 @@ async function pressEnter() {
   await act(async () => {})
 }
 
-describe('StoryAtlas capacity pause (#255)', () => {
+describe('CampaignTable capacity pause (#255)', () => {
   it('keeps the unsent draft editable while paused', async () => {
     await renderAtlas(true)
     expect(textarea().disabled).toBe(false)
@@ -133,12 +130,13 @@ describe('StoryAtlas capacity pause (#255)', () => {
   it('keeps non-AI surfaces accessible while paused', async () => {
     await renderAtlas(true)
     const text = container.textContent ?? ''
-    // Chat history, capacity notice, private-thread nav, and party roster.
+    // Chat history, capacity notice, conversation switcher, and side panel.
     expect(text).toContain('I light a torch.')
     expect(text).toContain('Campaign capacity notice')
-    expect(text).toContain('Conversations')
-    expect(text).toContain('Campaign table')
-    expect(text).toContain('Hero')
+    expect(text).toContain('The table')
+    expect(text).toContain('Character')
+    expect(text).toContain('Journal')
+    expect(text).toContain('Party')
   })
 
   it('sends normally when capacity is not paused', async () => {

@@ -39,13 +39,14 @@ it('retries the saved attempt and reuses the command after a lost acknowledgemen
   expect(refresh).toHaveBeenCalledOnce()
 })
 
-it('only provides roll entry for the assigned player and never displays private DCs', async () => {
+it('leaves the viewer’s own roll to the conversation card and only notes others’ rolls', async () => {
   const rolls = ['me', 'other'].map((user, index) => ({ id: String(index), requested_user_id: user,
-    character_id: `pc-${user}`, status: 'pending', label: 'Perception', reason_public: 'Study the fog',
+    character_id: `pc-${user}`, status: 'pending', label: `Perception ${user}`, reason_public: 'Study the fog',
     advantage_state: 'advantage', dc_private: 17 }))
   await act(async () => root.render(<DmTurnControls campaignId="c" userId="me" dmState={{ status: 'awaiting_roll', streaming: false }}
     rolls={rolls} refresh={refresh} />))
-  expect(container.querySelectorAll('form')).toHaveLength(1)
-  expect(container.textContent).toContain('Waiting for a player')
+  expect(container.querySelectorAll('form')).toHaveLength(0)
+  expect(container.textContent).toContain('Waiting for a player’s Perception other roll')
+  expect(container.textContent).not.toContain('Perception me')
   expect(container.textContent).not.toContain('17')
 })

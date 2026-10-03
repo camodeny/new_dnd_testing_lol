@@ -43,6 +43,7 @@ export function projectLiveTableMessages({
       content: typeof event.raw_content === 'string' ? event.raw_content : '',
       created_at: timestamp(event.accepted_at ?? event.timestamp),
       sender_name: character?.name ?? (isCurrentUser ? currentUser.username : 'Player'),
+      is_own: Boolean(isCurrentUser),
       is_ic: typedSegments.length > 0 && typedSegments.every((segment) => segment.type === 'ic'),
       segments: typedSegments,
     }

@@ -11,6 +11,8 @@
  * - Realtime outage never blocks authoritative snapshot fetch.
  */
 
+import type { ProjectionError, TableProjection } from '@/lib/table'
+
 export type RealtimeEventType = 'submission.created' | 'dm.chunk' | 'dm.status' | 'dm.thinking' | 'revision'
 
 export interface RealtimeEvent {
@@ -127,6 +129,11 @@ export interface PlayerRollForRealtime {
   label: string
   reason_public: string
   advantage_state: string
+  roll_kind?: string
+  ability_or_skill?: string
+  fulfilled_at?: string | null
+  /** Present once fulfilled; dice/total only when the roll is public. */
+  fulfillment?: { total?: number; raw_rolls?: number[]; modifier?: number; source?: string } | null
 }
 
 export interface SnapshotForRealtime {
@@ -164,6 +171,9 @@ export interface SnapshotForRealtime {
    * session's store. Key any local cache by (campaignId, userId, revision).
    */
   surfaces?: Record<string, unknown>
+  /** Player-lane table projection: character, party, scene, journal, and
+   *  encounter, filtered server-side for the viewer as a player. */
+  table?: TableProjection | ProjectionError
 }
 
 /**

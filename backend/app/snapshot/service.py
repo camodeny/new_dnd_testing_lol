@@ -439,6 +439,21 @@ def build_live_table_snapshot(
             )
             surfaces_projection = {"error": "projection_failed"}
 
+        # Player-lane table projection (character, party, scene, journal,
+        # encounter). Sections fail closed inside the builder; a
+        # builder-level failure degrades like surfaces rather than denying
+        # reconnect.
+        try:
+            from app.snapshot.table import build_table_for_viewer
+
+            table_projection = build_table_for_viewer(db, campaign, viewer_id)
+        except Exception as exc:
+            logger.warning(
+                "snapshot table projection failed campaign_id=%s viewer_id=%s error=%s",
+                campaign_id, viewer_id, exc,
+            )
+            table_projection = {"error": "projection_failed"}
+
         snapshot: dict[str, Any] = {
             "campaign": campaign.to_dict(),
             "revision": revision,
@@ -470,6 +485,7 @@ def build_live_table_snapshot(
             "roll_requests": roll_requests,
             "encounter": encounter_projection,
             "surfaces": surfaces_projection,
+            "table": table_projection,
             "extensions": {},
             "reconciliation": {
                 "snapshot_revision": revision,

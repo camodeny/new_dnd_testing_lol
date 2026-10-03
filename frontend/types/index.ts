@@ -64,6 +64,8 @@ export interface Message {
   content: string
   created_at: string
   sender_name?: string
+  /** True when the current user sent this message. */
+  is_own?: boolean
   is_ic?: boolean
   segments?: Array<{ type: 'ic' | 'ooc'; text: string }>
 }
@@ -191,35 +193,6 @@ export interface CampaignWorld {
   public_intro?: string
   world_state?: string
   created_at?: string
-}
-
-export interface EncounterMap {
-  id: string
-  campaign_id: string
-  name?: string
-  width?: number
-  height?: number
-  is_active?: boolean
-  placements?: MapPlacement[]
-  initiative_order?: InitiativeEntry[]
-  current_turn_actor_id?: string
-}
-
-export interface MapPlacement {
-  actor_type: string
-  actor_id: string
-  col: number
-  row: number
-  name?: string
-  hp?: number
-  max_hp?: number
-}
-
-export interface InitiativeEntry {
-  actor_type: string
-  actor_id: string
-  initiative: number
-  name?: string
 }
 
 export interface ApiError extends Error {
