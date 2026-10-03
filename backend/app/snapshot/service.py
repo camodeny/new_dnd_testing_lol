@@ -30,7 +30,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.runtime.threads import (
+from app.threads.service import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
     get_campaign_thread,
@@ -134,7 +134,7 @@ def _resolve_thread_readonly(
 ) -> uuid.UUID:
     """Resolve thread identifier without durable side effects.
 
-    Unlike `app.runtime.threads.resolve_thread_id`, this does NOT lazily
+    Unlike `app.threads.service.resolve_thread_id`, this does NOT lazily
     create the shared campaign thread. Campaign creation is the sole writer
     of the shared thread (see `app.campaigns.service.create_campaign`), so GET remains
     retryable without side effects as required by #196.
@@ -268,7 +268,7 @@ def build_live_table_snapshot(
             raise SnapshotNotFoundError(str(exc)) from exc
 
         try:
-            from app.runtime.threads import assert_can_read_thread
+            from app.threads.service import assert_can_read_thread
             thread = assert_can_read_thread(db, campaign_id, resolved_tid, viewer_id)
         except ThreadNotFoundError as exc:
             raise SnapshotNotFoundError(str(exc)) from exc

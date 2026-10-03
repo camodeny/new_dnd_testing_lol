@@ -11,14 +11,14 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.rules.ids import (
+from app.rules_corpus.ids import (
     check_collisions,
     content_hash,
     derive_rule_id_with_path,
     load_aliases,
     slugify,
 )
-from app.rules.metadata import (
+from app.rules_corpus.metadata import (
     ATTRIBUTION,
     CANARY_RULES,
     CORPUS_ID,

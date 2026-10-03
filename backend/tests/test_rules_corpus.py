@@ -14,12 +14,12 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base
 from models.rules import RulesCorpus, RulesCorpusImport, RulesEmbedding, RulesSection
-from app.rules.ids import derive_rule_id_with_path, derive_source_section_id, slugify, check_collisions
-from app.rules.metadata import ATTRIBUTION, CORPUS_ID, CORPUS_VERSION, LICENSE, OFFICIAL_SRD_URL
-from app.rules.ingest import import_fixture_sections, normalize_raw_sections, parse_cantilux_json
-from app.rules.store import hybrid_search, lookup_by_rule_id, lookup_by_locator, search_lexical
-from app.rules.embeddings import build_embeddings
-from app.rules.evidence_tools import handle_lookup_rule, handle_search_rules
+from app.rules_corpus.ids import derive_rule_id_with_path, derive_source_section_id, slugify, check_collisions
+from app.rules_corpus.metadata import ATTRIBUTION, CORPUS_ID, CORPUS_VERSION, LICENSE, OFFICIAL_SRD_URL
+from app.rules_corpus.ingest import import_fixture_sections, normalize_raw_sections, parse_cantilux_json
+from app.rules_corpus.store import hybrid_search, lookup_by_rule_id, lookup_by_locator, search_lexical
+from app.rules_corpus.embeddings import build_embeddings
+from app.rules_corpus.evidence_tools import handle_lookup_rule, handle_search_rules
 from app.dm.context import ContextAudience
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import ALLOWED_TOOLS, validate_evidence_requests
@@ -288,8 +288,8 @@ def test_promotion_accepts_exact_pinned_hash_and_rejects_mismatch(db):
     with pytest.raises(ValueError, match="Official artifact hash mismatch"):
         import_fixture_sections(db, tampered, source_artifact_hash="c" * 64, validate_canaries=True)
     # Derivative hash alone (hash of normalized content) must not be accepted as official for pinned version
-    from app.rules.ingest import compute_sha256
-    from app.rules.ids import content_hash
+    from app.rules_corpus.ingest import compute_sha256
+    from app.rules_corpus.ids import content_hash
 
     derivative = compute_sha256([content_hash(s["body"]) for s in SAMPLE_SECTIONS])
     # derivative != pinned, so should be rejected for 5.2.1
@@ -313,7 +313,7 @@ def test_promotion_rejects_unmapped_corpus_version(db):
 
 
 def test_promotion_rejects_missing_or_corrupt_manifest(db, monkeypatch):
-    from app.rules import ingest as ingest_mod
+    from app.rules_corpus import ingest as ingest_mod
 
     import pathlib
 
@@ -438,7 +438,7 @@ def test_stub_embeddings_log_explicit_degradation(db, monkeypatch, caplog):
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
     monkeypatch.delenv("GOOGLE_GENAI_API_KEY", raising=False)
-    with caplog.at_level(logging.WARNING, logger="app.rules.embeddings"):
+    with caplog.at_level(logging.WARNING, logger="app.rules_corpus.embeddings"):
         bid = build_embeddings(db, embedding_model="stub-hash-v1", build_id="stub-log-1")
     assert bid == "stub-log-1"
     assert any("stub" in r.message.lower() and ("lexical" in r.message.lower() or "fallback" in r.message.lower()) for r in caplog.records), \

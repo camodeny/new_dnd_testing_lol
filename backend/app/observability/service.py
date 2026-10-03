@@ -4,21 +4,18 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from models.reliability import AIRun
 from models.reliability import OperationTrace
 from .tracing import current_operation_id, current_trace_id, structured_log
 
 logger = logging.getLogger(__name__)
 MILESTONES = {"accepted", "worker_started", "first_visible", "narration_completed", "resolved"}
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _telemetry_write(session_factory, write):

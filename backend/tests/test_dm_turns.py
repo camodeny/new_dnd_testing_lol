@@ -20,8 +20,8 @@ from models.campaigns import CampaignMember
 from models.dm import DMStream
 from models.dm import DMStreamChunk
 from models.profiles import Profile
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 
 
 def _create_stream_with_chunk(db, campaign_id, thread_id_str, turn, attempt, text="The DM begins narration."):

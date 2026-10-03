@@ -22,7 +22,7 @@ from app.dm.streams import (  # noqa: E402
     fail_stream,
     get_stream_with_chunks,
 )
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 

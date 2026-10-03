@@ -32,6 +32,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.campaigns.service import CampaignCommandError, generate_invite_code, is_campaign_member, member_count
 from models.campaigns import Campaign, CampaignInvite, CampaignMember
 from models.profiles import Profile
@@ -42,10 +43,6 @@ INVITE_STATUSES = frozenset({"active", "revoked"})
 DELIVERY_STATUSES = frozenset({"sent", "failed", "skipped"})
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-
-
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def normalize_code(raw) -> str:

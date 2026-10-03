@@ -21,11 +21,12 @@ from collections.abc import Iterable, Mapping
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
+from app.schema import StrictModel
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 from models.campaigns import CampaignMember
@@ -43,10 +44,6 @@ logger = logging.getLogger(__name__)
 CONTEXT_VERSION = "forward_dm_context_v1"
 DEFAULT_MAX_BYTES = 64_000
 DEFAULT_MAX_TOKENS = 16_000
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class LaneName(str, Enum):

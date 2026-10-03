@@ -15,6 +15,8 @@ import logging
 import uuid
 
 from sqlalchemy import select
+
+from app.clock import utcnow
 from models.campaigns import Campaign
 from models.dm import DmTurn, DmTurnAttempt, DMStream
 
@@ -23,9 +25,9 @@ logger = logging.getLogger(__name__)
 
 def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = False):
     """Build the fresh logical attempt; caller owns flush/commit."""
-    from app.dm.turns import _now, create_attempt
+    from app.dm.turns import create_attempt
 
-    now = _now()
+    now = utcnow()
     # Abandon the failed attempt: staged effects stay on the old row for
     # audit but are never promoted (commit_operation_id is attempt-scoped,
     # so the fresh attempt cannot duplicate prior staged effects).

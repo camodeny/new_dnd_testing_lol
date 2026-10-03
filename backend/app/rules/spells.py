@@ -41,7 +41,7 @@ import re
 import time
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.observability.tracing import structured_log
 from app.rules.mechanics import (
@@ -50,6 +50,7 @@ from app.rules.mechanics import (
     MechanicsError,
     get_character_mechanics_for_sheet,
 )
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -76,16 +77,12 @@ class SpellError(ValueError):
         self.details = details or {}
 
 
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
 # ── Supported-spell catalog (common launch patterns) ──────────────────────
 #
 # Prioritizes common spells / mechanical patterns, not exhaustive scripting.
 # Each entry carries its authoritative rule/source ref for dispute and
 # explanation paths. Citations preserve CC BY attribution for SRD 5.2.1
-# content (see app/rules/metadata.py:ATTRIBUTION); PHB 2024 refs name the
+# content (see app/rules_corpus/metadata.py:ATTRIBUTION); PHB 2024 refs name the
 # print source for spells outside the SRD excerpt.
 
 CastingTime = Literal["action", "bonus_action", "reaction"]

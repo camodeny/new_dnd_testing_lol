@@ -7,7 +7,7 @@ import logging
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from app.rules.store import lookup_by_rule_id, hybrid_search
+from app.rules_corpus.store import lookup_by_rule_id, hybrid_search
 from models.rules import RulesCorpus
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
@@ -49,7 +49,7 @@ def search(q: str = Query(..., max_length=240), limit: int = Query(5, ge=1, le=2
             if row:
                 embedding_model = row[0]
                 try:
-                    from app.rules.gemini import gemini_embed_query
+                    from app.rules_corpus.gemini import gemini_embed_query
                 except ImportError as exc:
                     logger.warning("rules search embedding gemini module unavailable error=%s", exc)
                 else:

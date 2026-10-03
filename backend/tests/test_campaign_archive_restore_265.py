@@ -82,9 +82,7 @@ def api(monkeypatch):
     # World/submission/snapshot routers import resolve_profile into their own
     # namespaces — patch each transport surface this suite exercises.
     for module in (
-        "app.runtime.router",
         "app.snapshot.router",
-        "app.rolls.router",
     ):
         monkeypatch.setattr(
             f"{module}.resolve_profile",
@@ -551,7 +549,7 @@ def test_campaign_detail_reports_server_side_restore_target(api):
 
 def test_roll_writes_rejected_while_archived(api):
     from app.dm.turns import coordinate_turn
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
@@ -630,7 +628,7 @@ def test_roll_writes_rejected_while_archived(api):
 def test_locked_row_recheck_rejects_late_submission(api):
     """Service-level guard: accept_submission refuses archived campaigns."""
     from app.campaigns.service import CampaignArchivedError
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)

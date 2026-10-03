@@ -561,7 +561,7 @@ def test_default_model_selection_prefers_configured_real_model(monkeypatch):
 
 
 def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
-    import app.rules.gemini as gemini_mod
+    import app.rules_corpus.gemini as gemini_mod
 
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
                 "GEMINI_EMBEDDING_MODEL"):
@@ -618,7 +618,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
 
 def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
     from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DMStream, DMStreamChunk
 
     accept_submission(
@@ -653,7 +653,7 @@ def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
 
 
 def test_committed_turn_staged_effects_become_searchable():
-    from app.runtime.threads import get_or_create_campaign_thread
+    from app.threads.service import get_or_create_campaign_thread
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()

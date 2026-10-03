@@ -520,7 +520,7 @@ def test_numbers_in_safe_prelude_grounded():
 # ── post-validation → narration → commit wiring (review finding 1) ───────
 
 def test_execute_validated_turn_runs_narration_to_commit(db):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     s, camp_id, thread_id = db
@@ -566,7 +566,7 @@ def test_execute_validated_turn_runs_narration_to_commit(db):
 # ── stream-start boundary at first durable chunk (re-review finding 1) ────
 
 def _coordinated_turn(db, camp_id, thread_id, raw_content="I listen at the door."):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     s, _, _ = db
@@ -593,7 +593,7 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
     import app.dm.streams as stream_svc
     from app.dm.turns import StreamBoundaryError, coordinate_turn
     from app.dm.streams import get_stream
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -765,7 +765,7 @@ def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db)
     the #206 failed-visible state; the input set stays locked."""
     from app.dm.turns import StreamBoundaryError, coordinate_turn
     from app.dm.streams import get_stream
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -927,7 +927,7 @@ def test_restarted_worker_finds_streaming_locked_never_prepared_chunked(db):
     """Recovery path: after the atomic chunk-0 commit, a restarted worker
     finds streaming+locked — never prepared+chunked."""
     from app.dm.turns import StreamBoundaryError, coordinate_turn, mark_streaming_started
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
     s, camp_id, thread_id = db
@@ -1062,7 +1062,7 @@ def _history_seed(db):
     from models.characters import Character
     from models.threads import PlayerSubmission
 
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     s, camp_id, thread_id = db
     owner = s.execute(select(Profile)).scalars().first()

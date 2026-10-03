@@ -598,7 +598,7 @@ def publish_projection_invalidated_for_grantee(
     the count of successful publishes. Never raises. Call AFTER db.commit().
     """
     try:
-        from app.runtime.threads import list_threads_for_user
+        from app.threads.service import list_threads_for_user
 
         threads = list_threads_for_user(db, campaign.id, grantee_user_id)
     except Exception as exc:

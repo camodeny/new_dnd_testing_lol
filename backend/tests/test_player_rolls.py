@@ -16,8 +16,8 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.dm.turns import coordinate_turn, mark_streaming_started  # noqa: E402
 from app.rolls.service import RollAuthorizationError, fulfill_roll  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -71,7 +71,7 @@ def roll_api(monkeypatch):
 
     executed = []
     monkeypatch.setattr("app.dm.recovery.execute_committed_attempt", executed.append)
-    monkeypatch.setattr("app.rolls.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
@@ -165,6 +165,66 @@ def test_multiple_players_remain_independently_pending_and_authorized(roll_api):
     assert player_result.json()["resumed_attempt"]["turn_id"] == str(ctx["turn_id"])
 
 
+def test_fulfill_rejects_total_that_does_not_match_dice_arithmetic(roll_api):
+    ctx = roll_api
+    owner_req, player_req = create_requests(ctx, two=True).json()["roll_requests"]
+    url = f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{{}}/fulfill'
+    forged = ctx["client"].post(
+        url.format(owner_req["id"]),
+        json={"source": "app", "raw_rolls": [14], "modifier": 3, "total": 20},
+        headers={"Idempotency-Key": "forged-total"},
+    )
+    assert forged.status_code == 422
+    assert "must equal dice 14 + modifier 3" in forged.json()["detail"]
+    physical_forged = ctx["client"].post(
+        url.format(owner_req["id"]),
+        json={"source": "physical", "raw_rolls": [3, 4], "modifier": 1, "total": 9},
+        headers={"Idempotency-Key": "forged-physical"},
+    )
+    assert physical_forged.status_code == 422
+    # Advantage keeps the higher d20, never the sum of both dice.
+    summed = ctx["client"].post(
+        url.format(player_req["id"]),
+        json={"source": "app", "raw_rolls": [18, 7], "modifier": 1, "total": 26},
+        headers={"Idempotency-Key": "summed-advantage", "X-Test-User": str(ctx["player"])},
+    )
+    assert summed.status_code == 422
+    with ctx["factory"]() as db:
+        assert db.execute(select(PlayerRollFulfillment)).scalars().all() == []
+        assert db.get(PlayerRollRequest, uuid.UUID(owner_req["id"])).status == "pending"
+    accepted = ctx["client"].post(
+        url.format(owner_req["id"]),
+        json={"source": "app", "raw_rolls": [14], "modifier": 3, "total": 17},
+        headers={"Idempotency-Key": "honest-total"},
+    )
+    assert accepted.status_code == 200, accepted.text
+
+
+def test_disadvantage_keeps_lower_die(roll_api):
+    ctx = roll_api
+    row = create_requests(ctx).json()["roll_requests"][0]
+    replacement = request_payload(ctx)["requests"][0] | {
+        "request_key": "owner-check-disadvantage", "advantage_state": "disadvantage",
+    }
+    changed = ctx["client"].post(
+        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{row["id"]}/cancel',
+        json={"replacement": replacement}, headers={"Idempotency-Key": "replace-disadvantage"},
+    )
+    assert changed.status_code == 200, changed.text
+    replacement_id = changed.json()["replacement"]["id"]
+    url = f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{replacement_id}/fulfill'
+    higher = ctx["client"].post(
+        url, json={"source": "app", "raw_rolls": [16, 4], "modifier": 2, "total": 18},
+        headers={"Idempotency-Key": "disadvantage-higher"},
+    )
+    assert higher.status_code == 422
+    lower = ctx["client"].post(
+        url, json={"source": "app", "raw_rolls": [16, 4], "modifier": 2, "total": 6},
+        headers={"Idempotency-Key": "disadvantage-lower"},
+    )
+    assert lower.status_code == 200, lower.text
+
+
 def test_snapshot_survives_reconnect_without_leaking_private_dc_or_result(roll_api):
     ctx = roll_api
     rows = create_requests(ctx, two=True).json()["roll_requests"]
@@ -236,7 +296,7 @@ def test_service_rejects_other_human_without_mutating_request(roll_api):
 
 def test_retry_endpoint_authorization_idempotency_and_post_commit_execution(roll_api, monkeypatch):
     ctx = roll_api
-    monkeypatch.setattr('app.dm.router.resolve_profile', lambda request, db: db.get(
+    monkeypatch.setattr('app.deps.auth.resolve_profile', lambda request, db: db.get(
         Profile, uuid.UUID(request.headers.get('X-Test-User', str(TEST_USER_ID)))))
     with ctx['factory']() as db:
         db.get(DmTurn, ctx['turn_id']).status = 'failed_visible'

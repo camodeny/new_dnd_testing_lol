@@ -44,8 +44,8 @@ from app.combat.service import (  # noqa: E402
 )
 from app.combat.turns import StaleTurnError, get_turn_state_row  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant  # noqa: E402

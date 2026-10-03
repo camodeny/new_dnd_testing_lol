@@ -52,8 +52,6 @@ def api(monkeypatch):
         return db.get(Profile, actor["id"])
 
     monkeypatch.setattr("app.deps.auth.resolve_profile", _as)
-    monkeypatch.setattr("app.runtime.router.resolve_profile", _as)
-    monkeypatch.setattr("app.realtime.router.resolve_profile", _as)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", _as)
     app.dependency_overrides[get_db] = override_db
     try:

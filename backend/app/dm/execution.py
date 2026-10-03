@@ -1,6 +1,6 @@
 """DM turn execution — how accepted player input becomes a committed turn.
 
-1. ``runtime.router`` accepts a submission; ``dm.turns.coordinate_turn``
+1. ``submissions.router`` accepts a submission; ``dm.turns.coordinate_turn``
    groups unresolved input into a turn with one prepared attempt.
 2. ``dm.recovery.execute_committed_attempt`` (post-response) or
    :func:`run_dm_execute_sweep` (``/api/cron/dm-execute``) calls
@@ -34,6 +34,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.observability.tracing import structured_log
 
 logger = logging.getLogger(__name__)
@@ -932,7 +933,7 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
     the replacement attempt either way.
     Returns the attempt to execute (possibly a fresh row).
     """
-    from app.dm.turns import _now, create_attempt
+    from app.dm.turns import create_attempt
     from models.campaigns import Campaign
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -963,7 +964,7 @@ def _refresh_backpressured_stale_attempt(db: Session, attempt):
             return attempt
         old.status = "superseded"
         old.invalidation_reason = "backpressure_revision_refresh"
-        old.invalidated_at = _now()
+        old.invalidated_at = utcnow()
         new_attempt = create_attempt(
             db, turn, source_revision=int(campaign.revision or 0), parent=old,
             submission_ids=old.submission_ids, input_set_revision=old.input_set_revision,

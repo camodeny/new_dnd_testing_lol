@@ -424,7 +424,7 @@ def test_world_tool_contract_validation():
 # ── AI review round 1 regressions ──────────────────────────────────────────
 
 def test_private_source_turn_thread_member_allowed_owner_denied():
-    from app.runtime.threads import create_private_thread
+    from app.threads.service import create_private_thread
 
     Fac, cid, owner, player, _ = _setup()
     db = Fac()

@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import argparse
 from database import SessionLocal
-from app.rules.embeddings import EMBEDDING_DIM, build_embeddings
+from app.rules_corpus.embeddings import EMBEDDING_DIM, build_embeddings
 
 def main():
     p = argparse.ArgumentParser()

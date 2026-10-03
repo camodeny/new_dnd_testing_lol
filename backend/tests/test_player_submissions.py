@@ -14,7 +14,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
-from app.runtime.submissions import SubmissionValidationError, parse_tagged_content  # noqa: E402
+from app.submissions.service import SubmissionValidationError, parse_tagged_content  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -50,7 +50,7 @@ def api(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -162,7 +162,7 @@ def test_non_member_cannot_submit(monkeypatch, api):
         db.add(Profile(id=outsider, email="second-outsider@example.com"))
         db.commit()
 
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda request, db: db.get(Profile, outsider))
+    monkeypatch.setattr("app.deps.auth.resolve_profile", lambda request, db: db.get(Profile, outsider))
     response = client.post(
         f"/api/campaigns/{campaign_id}/submissions",
         json={"content": "intrusion"},

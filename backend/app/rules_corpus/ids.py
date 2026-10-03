@@ -159,14 +159,14 @@ def check_collisions(records: list[dict], *, aliases: dict[str, str] | None = No
                 raise ValueError(
                     f"Collision: source_section_id {src!r} appears multiple times "
                     f"({seen_source[src]!r} vs {rid!r} title {title!r}). "
-                    f"Add explicit alias to backend/app/rules/aliases.json"
+                    f"Add explicit alias to backend/app/rules_corpus/aliases.json"
                 )
         if rid and rid in seen_rule:
             if not (aliases and rid in aliases):
                 raise ValueError(
                     f"Collision: rule_id {rid!r} appears multiple times "
                     f"({seen_rule[rid]!r} vs {src!r}). "
-                    f"Add explicit alias to backend/app/rules/aliases.json"
+                    f"Add explicit alias to backend/app/rules_corpus/aliases.json"
                 )
         # Also detect same source mapping to different rule (covers corpus version drift)
         if src in seen_source and seen_source[src] != rid:
@@ -174,14 +174,14 @@ def check_collisions(records: list[dict], *, aliases: dict[str, str] | None = No
                 raise ValueError(
                     f"Collision: source_section_id {src!r} maps to multiple rule_ids "
                     f"{seen_source[src]!r} vs {rid!r} (title {title!r}). "
-                    f"Add explicit alias to backend/app/rules/aliases.json"
+                    f"Add explicit alias to backend/app/rules_corpus/aliases.json"
                 )
         if rid in seen_rule and seen_rule[rid] != src:
             if not (aliases and rid in aliases):
                 raise ValueError(
                     f"Collision: rule_id {rid!r} maps to multiple source_section_ids "
                     f"{seen_rule[rid]!r} vs {src!r}. "
-                    f"Add explicit alias to backend/app/rules/aliases.json"
+                    f"Add explicit alias to backend/app/rules_corpus/aliases.json"
                 )
         if src:
             seen_source[src] = rid

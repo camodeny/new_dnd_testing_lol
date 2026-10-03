@@ -35,8 +35,8 @@ from app.post_turn.service import (  # noqa: E402
     get_checkpoint,
     run_post_turn_range,
 )
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
 from models.post_turn import PostTurnRun  # noqa: E402
 from models.profiles import Profile  # noqa: E402

@@ -364,7 +364,7 @@ def _thread_readable_for_viewer(
     private-audience records; shared-audience legacy ``"main"`` turns
     without a durable thread row never reach it.)
     """
-    from app.runtime.threads import can_read_thread, parse_thread_id
+    from app.threads.service import can_read_thread, parse_thread_id
 
     raw = "" if raw_thread_id is None else str(raw_thread_id)
     if not raw or raw == "main":

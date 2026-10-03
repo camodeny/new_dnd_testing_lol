@@ -36,8 +36,8 @@ from app.dm.context import (  # noqa: E402
     assemble_context_packet,
 )
 from app.dm.turns import coordinate_turn  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import create_private_thread, get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import create_private_thread, get_or_create_campaign_thread  # noqa: E402
 
 
 FIXTURES = json.loads(

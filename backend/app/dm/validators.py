@@ -21,17 +21,14 @@ import time
 import uuid
 from typing import Any, Callable, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.dm.context import ContextAudience, ForwardDmContextPacket, LaneName
 from app.dm.contract import Claim, ContractValidationError, DmTurnContractV1
 from app.observability.tracing import structured_log
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # ── Violation / result models ────────────────────────────────────────────────

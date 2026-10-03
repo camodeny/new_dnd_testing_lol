@@ -25,8 +25,8 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.runtime.submissions import MAX_CONTENT_LENGTH, accept_submission, list_submissions
-from app.runtime.threads import get_or_create_lobby_thread
+from app.submissions.service import MAX_CONTENT_LENGTH, accept_submission, list_submissions
+from app.threads.service import get_or_create_lobby_thread
 from app.campaigns.service import CampaignCommandError
 from models.campaigns import Campaign
 from models.threads import CampaignThread, PlayerSubmission, PlayerSubmissionSegment
@@ -146,7 +146,7 @@ def list_lobby_messages(
 
 
 def _thread_error(exc: Exception, *, campaign_id: uuid.UUID, user_id: uuid.UUID, action: str) -> CampaignCommandError:
-    from app.runtime.threads import ThreadNotFoundError
+    from app.threads.service import ThreadNotFoundError
 
     if isinstance(exc, ThreadNotFoundError):
         return CampaignCommandError("Thread not found", status_code=404)
@@ -161,7 +161,7 @@ def lobby_chat_snapshot(db: Session, campaign: Campaign, user_id: uuid.UUID) -> 
     dedicated backfill.
     """
     from app.realtime.channels import live_table_channel
-    from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread
+    from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread
 
     thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
     db.commit()
@@ -184,7 +184,7 @@ def lobby_chat_snapshot(db: Session, campaign: Campaign, user_id: uuid.UUID) -> 
 
 def writable_lobby_thread(db: Session, campaign: Campaign, user_id: uuid.UUID, payload: object) -> tuple[CampaignThread, str]:
     """Pre-start, write-authorized lobby thread plus the validated content."""
-    from app.runtime.threads import ThreadAuthorizationError, assert_can_write_thread
+    from app.threads.service import ThreadAuthorizationError, assert_can_write_thread
 
     require_lobby_chat_writable(campaign)
     thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
@@ -213,7 +213,7 @@ def post_lobby_chat(
     """
     from sqlalchemy import select
 
-    from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_write_thread
+    from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_write_thread
 
     locked = db.execute(
         select(Campaign)

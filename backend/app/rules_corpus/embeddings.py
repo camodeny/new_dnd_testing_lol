@@ -4,7 +4,7 @@ Vectors are derived, never canonical. Rebuilding with a new model/chunking
 must not change rule_id/citation.
 
 Default: deterministic hash-based stub for tests/offline. Plug real provider via env.
-Gemini Embeddings 2 (gemini-embedding-001) is supported via app.rules.gemini.
+Gemini Embeddings 2 (gemini-embedding-001) is supported via app.rules_corpus.gemini.
 """
 
 from __future__ import annotations
@@ -19,12 +19,12 @@ from sqlalchemy.orm import Session
 
 from models.rules import RulesSection
 from models.rules import RulesEmbedding
-from app.rules.gemini import EMBEDDING_DIM
+from app.rules_corpus.gemini import EMBEDDING_DIM
 
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"
 # Single production embedding dimension (issue #334) — must equal the
-# vector(N) width in the baseline migration and app.rules.gemini.EMBEDDING_DIM.
+# vector(N) width in the baseline migration and app.rules_corpus.gemini.EMBEDDING_DIM.
 DEFAULT_DIM = EMBEDDING_DIM
 assert DEFAULT_DIM == 1536, "indexed embedding dimension must be 1536"
 
@@ -73,7 +73,7 @@ def _resolve_provider(embedding_model: str, provider: Any | None):
     # Only auto-resolve for real embedding models; stub models fall through to stub
     if embedding_model.startswith("gemini") or embedding_model.startswith("text-embedding") or embedding_model.startswith("models/"):
         try:
-            from app.rules.gemini import make_gemini_provider
+            from app.rules_corpus.gemini import make_gemini_provider
 
             return make_gemini_provider(model=embedding_model)
         except Exception as exc:

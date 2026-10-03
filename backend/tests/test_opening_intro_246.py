@@ -86,10 +86,6 @@ def api(monkeypatch):
         "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
-    monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
-        lambda request, db: db.get(Profile, actor["id"]),
-    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, actor, owner_id, member_id

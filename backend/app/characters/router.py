@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.orm import Session
 
-from app.characters.service import character_with_sheet
+from app.characters.service import character_with_sheet, latest_sheet
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
@@ -43,11 +43,7 @@ def _launch_locking_campaign(
 
 
 def _update_sheet(db: Session, char: Character, owner_id, payload: dict):
-    existing = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == char.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    existing = latest_sheet(db, char.id)
     updated = Dnd5eCharacterSheet.from_frontend(payload, owner_id=owner_id)
     updated.character_id = char.id
     if existing:

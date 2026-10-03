@@ -19,9 +19,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from database import SessionLocal
-from app.rules.ingest import import_fixture_sections, import_markdown_text, parse_cantilux_json, compute_sha256
-from app.rules.metadata import CORPUS_ID, CORPUS_VERSION, OFFICIAL_SRD_URL
-from app.rules.embeddings import EMBEDDING_DIM, build_embeddings
+from app.rules_corpus.ingest import import_fixture_sections, import_markdown_text, parse_cantilux_json, compute_sha256
+from app.rules_corpus.metadata import CORPUS_ID, CORPUS_VERSION, OFFICIAL_SRD_URL
+from app.rules_corpus.embeddings import EMBEDDING_DIM, build_embeddings
 
 logger = logging.getLogger(__name__)
 

@@ -40,8 +40,8 @@ from app.combat.service import (  # noqa: E402
 from app.combat.turns import TurnError, cast_skip_vote, consume_resource, end_turn  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.post_turn.service import is_post_turn_relevant  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant, EncounterTurnState  # noqa: E402
@@ -843,7 +843,7 @@ def test_http_end_followups_owner_only(monkeypatch):
     def resolve_test_profile(request, db):
         return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
 
-    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)

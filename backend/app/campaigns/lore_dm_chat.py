@@ -21,6 +21,7 @@ import logging
 import uuid as uuid_lib
 
 from app.campaigns.service import CampaignCommandError
+from app.characters.service import latest_sheet
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +307,6 @@ def start_lore_chat_turn(db, *, campaign, character, user_id: uuid_lib.UUID, con
     from app.campaigns.party_lore import build_party_advice, build_party_composition, require_lore_writable
     from app.characters.chat.service import build_party_advisory_text
     from models.campaigns import CampaignLoreChatMessage
-    from models.characters import Dnd5eCharacterSheet
 
     require_lore_writable(campaign)
     user_message = CampaignLoreChatMessage(
@@ -327,11 +327,7 @@ def start_lore_chat_turn(db, *, campaign, character, user_id: uuid_lib.UUID, con
         .limit(12)
     ).scalars().all()
     history = [{"role": m.role, "content": m.content} for m in reversed(prior)]
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == character.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, character.id)
     composition = build_party_composition(db, campaign_members(db, campaign.id))
     context = build_lore_dm_context(
         campaign_name=campaign.name or "",

@@ -19,6 +19,7 @@ from typing import Callable, Any
 
 from sqlalchemy.orm import Session
 
+from app.characters.service import latest_sheet
 from app.visibility.policy import EFFECT_VISIBILITIES, record_to_effect_visibility
 from models.campaigns import Campaign
 from models.dm import DmTurn
@@ -678,7 +679,7 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
 
     if target_kind == "pc":
         from models.campaigns import CampaignMember
-        from models.characters import Character, Dnd5eCharacterSheet
+        from models.characters import Character
 
         character = db.get(Character, target_id)
         if character is None:
@@ -695,11 +696,7 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
         ).scalars().first()
         if roster is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
-        sheet = db.execute(
-            _select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == character.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, character.id)
         if sheet is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
         try:
@@ -848,7 +845,7 @@ def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) 
 
     if target_kind == "pc":
         from models.campaigns import CampaignMember
-        from models.characters import Character, Dnd5eCharacterSheet
+        from models.characters import Character
 
         character = db.get(Character, target_id)
         if character is None:
@@ -861,11 +858,7 @@ def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) 
         ).scalars().first()
         if roster is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
-        sheet = db.execute(
-            _select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == character.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, character.id)
         if sheet is None:
             raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
         return _StateTarget(kind="pc", row=sheet, campaign_id=campaign.id)

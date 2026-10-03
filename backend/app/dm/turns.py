@@ -44,6 +44,7 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
@@ -130,10 +131,6 @@ class AttemptSupersededError(Exception):
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def _collect_unresolved_submissions(
@@ -356,8 +353,8 @@ def coordinate_turn(
     # serialized race protection below.
     if active is None:
         sub_ids = [str(s.id) for s in unresolved]
-        window_start = min(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
-        window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
+        window_start = min(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else utcnow()
+        window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else utcnow()
         if window_start.tzinfo is None:
             window_start = window_start.replace(tzinfo=timezone.utc)
         if window_end.tzinfo is None:
@@ -500,8 +497,8 @@ def coordinate_turn(
     if cur_attempt is None:
         logger.warning("dm_turn pending_without_attempt campaign_id=%s thread_id=%s turn_id=%s", campaign_id, tid, active.id)
         new_rev = active.input_set_revision + 1
-        window_start = active.assembly_window_start or _now()
-        window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
+        window_start = active.assembly_window_start or utcnow()
+        window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else utcnow()
         if window_end and window_end.tzinfo is None:
             window_end = window_end.replace(tzinfo=timezone.utc)
         new_attempt = create_attempt(
@@ -563,10 +560,10 @@ def coordinate_turn(
 
     cur_attempt.status = ATTEMPT_SUPERSEDED
     cur_attempt.invalidation_reason = "new_eligible_submission_pre_stream"
-    cur_attempt.invalidated_at = _now()
+    cur_attempt.invalidated_at = utcnow()
 
-    window_start = active.assembly_window_start or cur_attempt.assembly_window_start or _now()
-    window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
+    window_start = active.assembly_window_start or cur_attempt.assembly_window_start or utcnow()
+    window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else utcnow()
     if window_end and window_end.tzinfo is None:
         window_end = window_end.replace(tzinfo=timezone.utc)
     if window_start and window_start.tzinfo is None:
@@ -797,7 +794,7 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
         raise AttemptSupersededError(attempt_id, "superseded_by_newer_attempt_pre_stream")
 
     # CAS: atomically verify still current and pending via conditional update
-    now = _now()
+    now = utcnow()
     # Use update with WHERE to ensure we haven't been superseded between read and write
     result = db.execute(
         update(DmTurn)
@@ -893,7 +890,7 @@ def mark_recovered_streaming(
     stream = db.get(DMStream, attempt.stream_id)
     if stream is None or stream.status != "completed":
         raise ValueError(f"Attempt {attempt_id} stream is not completed; cannot recover")
-    now = _now()
+    now = utcnow()
     attempt.status = ATTEMPT_STREAMING
     attempt.last_error = None
     attempt.error_class = None
@@ -922,7 +919,7 @@ def mark_recovered_streaming(
 
 def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid.UUID | None = None) -> DmTurnAttempt:
     """Mark attempt as running (worker claimed). Recoverable if worker crashes."""
-    now = _now()
+    now = utcnow()
     values = {"status": ATTEMPT_RUNNING, "started_at": now}
     if worker_job_id:
         values["worker_job_id"] = worker_job_id
@@ -959,7 +956,7 @@ def _lock_turn_and_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
 def _fail_commit_visible(db: Session, turn: DmTurn, attempt: DmTurnAttempt, *, error: str, error_class: str, commit: bool) -> None:
     attempt.last_error = error
     attempt.error_class = error_class
-    attempt.completed_at = _now()
+    attempt.completed_at = utcnow()
     attempt.status = ATTEMPT_FAILED_VISIBLE
     turn.status = TURN_FAILED_VISIBLE
     try:
@@ -1012,7 +1009,7 @@ def _replay_duplicate_commit(db: Session, turn: DmTurn, attempt: DmTurnAttempt, 
         "dm_turn duplicate_commit_hit_pre_mark campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
         turn.campaign_id, turn.id, attempt.id, operation_id, existing.id,
     )
-    now = _now()
+    now = utcnow()
     if attempt.status in (PRE_STREAM_ATTEMPT_STATUSES if silent else {ATTEMPT_STREAMING}):
         attempt.status = ATTEMPT_SUCCEEDED
         attempt.completed_at = now
@@ -1349,7 +1346,7 @@ def commit_turn(
             )
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
 
-    now = _now()
+    now = utcnow()
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
     if is_completion:
         finalize_turn_completion(
@@ -1421,7 +1418,7 @@ def discard_superseded_result(db: Session, attempt_id: uuid.UUID, reason: str = 
     attempt.status = ATTEMPT_DISCARDED
     attempt.last_error = f"Discarded obsolete attempt: {reason}"
     attempt.error_class = "superseded"
-    attempt.completed_at = _now()
+    attempt.completed_at = utcnow()
     try:
         db.flush()
         db.commit()
@@ -1447,7 +1444,7 @@ def mark_attempt_failed(
     turn = db.get(DmTurn, attempt.turn_id) if attempt.turn_id else None
     attempt.last_error = error[:2000] if error else None
     attempt.error_class = error_class
-    attempt.completed_at = _now()
+    attempt.completed_at = utcnow()
     if visible or attempt.status == ATTEMPT_STREAMING or (turn and turn.status == TURN_STREAMING):
         attempt.status = ATTEMPT_FAILED_VISIBLE
         if turn:
@@ -1477,7 +1474,7 @@ def recover_stuck_attempts(
 
     When ``campaign_id`` is given, only attempts for that campaign are recovered.
     """
-    cutoff = _now() - timedelta(seconds=lease_seconds)
+    cutoff = utcnow() - timedelta(seconds=lease_seconds)
     q = select(DmTurnAttempt).where(
         DmTurnAttempt.status == ATTEMPT_RUNNING,
         DmTurnAttempt.started_at < cutoff,

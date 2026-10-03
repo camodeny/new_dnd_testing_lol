@@ -46,8 +46,8 @@ from app.billing.resolution_guarantee import (  # noqa: E402
     require_new_ai_work,
 )
 from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started  # noqa: E402
-from app.runtime.submissions import accept_submission, list_submissions  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission, list_submissions  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 
 
 def _engine():
@@ -614,7 +614,7 @@ def paused_direct_api(monkeypatch):
     from fastapi.testclient import TestClient
 
     from app.auth.service import TEST_USER_ID
-    from app.runtime.threads import get_or_create_private_gameplay_thread
+    from app.threads.service import get_or_create_private_gameplay_thread
     from database import get_db
     from main import app
 
@@ -664,7 +664,7 @@ def paused_direct_api(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -701,7 +701,7 @@ def test_direct_thread_submission_usable_while_paused(paused_direct_api):
 # ── 18. private direct chat is never owed AI work and never leaks via hook ───
 
 def test_direct_thread_activity_not_owed_and_not_exposed():
-    from app.runtime.threads import get_or_create_private_gameplay_thread
+    from app.threads.service import get_or_create_private_gameplay_thread
 
     Fac, cid, owner, p2, _char, tid = _setup()
     p3 = uuid.uuid4()
@@ -778,7 +778,7 @@ def open_api(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
@@ -868,7 +868,7 @@ def test_paused_pending_turn_refuses_expansion():
 
 def test_pause_decision_scopes_owed_rolls_to_authorized_thread():
     from app.rolls.service import request_rolls
-    from app.runtime.threads import get_or_create_private_gameplay_thread
+    from app.threads.service import get_or_create_private_gameplay_thread
 
     Fac, cid, owner, p2, char, tid = _setup()
     db = Fac()

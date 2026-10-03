@@ -26,19 +26,23 @@ from __future__ import annotations
 import logging
 import re
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import ms_between, utcnow
 from app.combat.service import (
     TURN_ENDED_EVENT,
     TURN_SKIPPED_EVENT,
     TURN_STARTED_EVENT,
     EncounterError,
     get_turn_order,
+    is_campaign_owner,
     list_participants,
+    lock_encounter,
+    lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
 from app.visibility.access import is_campaign_participant
@@ -77,46 +81,6 @@ class StaleTurnError(TurnError):
         )
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _aware(value: datetime | None) -> datetime | None:
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
-
-
-def _ms_between(start: datetime | None, end: datetime | None) -> int:
-    start, end = _aware(start), _aware(end)
-    if start is None or end is None:
-        return 0
-    return max(0, int((end - start).total_seconds() * 1000))
-
-
-def _lock_encounter(db: Session, encounter_id: uuid.UUID) -> Encounter:
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise TurnError(f"Encounter {encounter_id} not found")
-    return encounter
-
-
-def _require_playable(db: Session, campaign_id: uuid.UUID) -> Campaign:
-    from app.campaigns.service import require_playable_campaign
-
-    campaign = db.execute(
-        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-    ).scalars().first()
-    if campaign is None:
-        raise TurnError(f"Campaign {campaign_id} not found")
-    require_playable_campaign(campaign)
-    return campaign
-
-
 def _active_or_raise(db: Session, encounter: Encounter) -> EncounterParticipant:
     if encounter.status == "ended":
         raise TurnError("encounter has ended; initiative is closed and turns are frozen")
@@ -128,11 +92,6 @@ def _active_or_raise(db: Session, encounter: Encounter) -> EncounterParticipant:
     return participant
 
 
-def _is_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
-    return campaign is not None and str(campaign.owner_id) == str(user_id)
-
-
 def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterParticipant, actor_id: uuid.UUID) -> None:
     """Only the controlling player may execute a PC's turn-bound actions."""
     if participant.kind == "pc":
@@ -142,7 +101,7 @@ def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterPa
         if character is None or str(character.owner_id) != str(actor_id):
             raise TurnAuthorizationError("Character control changed; turn action refused")
     else:
-        if not _is_owner(db, encounter.campaign_id, actor_id):
+        if not is_campaign_owner(db, encounter.campaign_id, actor_id):
             raise TurnAuthorizationError("Only the campaign owner may act for NPC/monster turns")
 
 
@@ -226,7 +185,7 @@ def list_turn_states(db: Session, encounter_id: uuid.UUID) -> list[EncounterTurn
 
 def init_turn_states(db: Session, encounter: Encounter, *, now: datetime | None = None) -> list[EncounterTurnState]:
     """Create full-budget turn resources for every participant (ready time)."""
-    now = now or _now()
+    now = now or utcnow()
     rows: list[EncounterTurnState] = []
     for participant in list_participants(db, encounter.id):
         existing = get_turn_state_row(db, encounter.id, participant.id)
@@ -267,7 +226,7 @@ def grant_extra_resource(
         raise TurnError("extra resource name must match [A-Za-z0-9_:-]+ (1-64 chars)")
     if not isinstance(maximum, int) or not 1 <= maximum <= 99:
         raise TurnError("extra resource maximum must be an integer between 1 and 99")
-    encounter = _lock_encounter(db, encounter_id)
+    encounter = lock_encounter(db, encounter_id, TurnError)
     if encounter.status != "active":
         raise TurnError("extra resources require an active encounter")
     state = get_turn_state_row(db, encounter.id, participant_id)
@@ -308,8 +267,8 @@ def consume_resource(
     consuming, so a delayed command from turn N can never spend the same
     participant's budget when they become active again in a later round.
     """
-    encounter = _lock_encounter(db, encounter_id)
-    _require_playable(db, encounter.campaign_id)
+    encounter = lock_encounter(db, encounter_id, TurnError)
+    lock_playable_campaign(db, encounter.campaign_id, TurnError)
     if encounter.status == "ended":
         raise TurnError("encounter has ended; turn resources are frozen")
     try:
@@ -472,9 +431,9 @@ def cast_skip_vote(
     from turn N can never count against the same PC when they block again
     in a later round.
     """
-    started = _now()
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
+    started = utcnow()
+    encounter = lock_encounter(db, encounter_id, TurnError)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, TurnError)
     try:
         expected_turn_sequence = int(expected_turn_sequence)
     except (TypeError, ValueError) as exc:
@@ -520,7 +479,7 @@ def cast_skip_vote(
         ))
         db.flush()
         if encounter.blocked_since is None:
-            encounter.blocked_since = _now()
+            encounter.blocked_since = utcnow()
             db.flush()
     tally = skip_tally(db, encounter, target.id)
 
@@ -540,7 +499,7 @@ def cast_skip_vote(
         # Vote recorded without executing: still needs a commit when this
         # call owns the transaction (direct service use).
         pass
-    latency_ms = _ms_between(started, _now())
+    latency_ms = ms_between(started, utcnow())
     structured_log(
         logger, logging.INFO, "encounter_skip_vote",
         encounter_id=str(encounter.id), target_participant_id=str(target.id),
@@ -575,9 +534,9 @@ def end_turn(
     state change and both domain events commit atomically.
     Returns (encounter, ended_event, started_event).
     """
-    started = _now()
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
+    started = utcnow()
+    encounter = lock_encounter(db, encounter_id, TurnError)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, TurnError)
     if encounter.status == "ended":
         raise TurnError("encounter has ended; initiative is closed and turns are frozen")
     if encounter.status != "active":
@@ -601,7 +560,7 @@ def end_turn(
         actor_id=actor_id, skipped=False,
         expected_revision=expected_revision,
         operation_id=operation_id or f"encounter:{encounter.id}:turn:{encounter.turn_sequence}:end",
-        end_turn_latency_ms=_ms_between(started, _now()),
+        end_turn_latency_ms=ms_between(started, utcnow()),
         commit=False,
     )
     duration_ms = int(encounter.last_turn_duration_ms or 0)
@@ -644,10 +603,10 @@ def _advance(
     except StopIteration as exc:
         raise TurnError("active participant is not in the authoritative turn order") from exc
 
-    now = _now()
+    now = utcnow()
     ended_participant = order[position]
     ended_state = get_turn_state_row(db, encounter.id, ended_participant.id)
-    turn_duration_ms = _ms_between(encounter.turn_started_at, now)
+    turn_duration_ms = ms_between(encounter.turn_started_at, now)
     if ended_state is not None:
         ended_state.turn_ended_at = now
         # A skipped PC generates no actions: their remaining budget is left

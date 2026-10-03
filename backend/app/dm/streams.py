@@ -15,12 +15,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from models.dm import DMStream
 from models.dm import DMStreamChunk
 
@@ -39,10 +39,6 @@ class DMStreamConflictError(ValueError):
 class DMStreamStateError(ValueError):
     """Invalid state transition (e.g. append after completion)."""
     pass
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def create_stream(
@@ -179,7 +175,7 @@ def append_chunk(
     )
     db.add(chunk)
     # Update stream observability metrics — only after persistence succeeds.
-    now = _now()
+    now = utcnow()
     if stream.first_chunk_at is None:
         stream.first_chunk_at = now
     stream.last_chunk_at = now
@@ -253,7 +249,7 @@ def complete_stream(
     final_text = "".join(c.text for c in chunks)
     stream.final_text = final_text
     stream.status = "completed"
-    stream.completed_at = _now()
+    stream.completed_at = utcnow()
     stream.completion_reason = completion_reason
     # Ensure observability metrics consistent even if chunks were zero
     if not chunks:
@@ -279,7 +275,7 @@ def fail_stream(
     if stream.status == "completed":
         raise DMStreamStateError("Cannot fail a completed stream")
     stream.status = "failed"
-    stream.abandoned_at = _now()
+    stream.abandoned_at = utcnow()
     stream.abandonment_reason = reason
     db.flush()
     logger.info(

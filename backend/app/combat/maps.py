@@ -34,7 +34,6 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from sqlalchemy import select
@@ -42,7 +41,6 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.combat.geometry import (
-    FEET_PER_SQUARE,
     GeometryError,
     cheapest_path,
     feet_to_squares,
@@ -54,11 +52,16 @@ from app.combat.geometry import (
     validate_rect,
     zone_cell_effect,
 )
-from app.combat.service import EncounterAuthorizationError, EncounterError, list_participants
+from app.combat.service import (
+    EncounterError,
+    is_campaign_owner,
+    list_participants,
+    lock_encounter,
+    lock_playable_campaign,
+)
 from app.observability.tracing import structured_log
 from models.campaigns import Campaign
 from models.combat import (
-    DIAGONAL_POLICIES,
     MOVEMENT_MODES,
     TERRAIN_KINDS,
     Encounter,
@@ -99,34 +102,8 @@ class MapAuthorizationError(PermissionError):
     pass
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _lock_encounter(db: Session, encounter_id: uuid.UUID) -> Encounter:
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise MapError(f"Encounter {encounter_id} not found", reason="no_map")
-    return encounter
-
-
-def _require_playable(db: Session, campaign_id: uuid.UUID) -> Campaign:
-    from app.campaigns.service import require_playable_campaign
-
-    campaign = db.execute(
-        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-    ).scalars().first()
-    if campaign is None:
-        raise MapError(f"Campaign {campaign_id} not found", reason="no_map")
-    require_playable_campaign(campaign)
-    return campaign
-
-
-def _is_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    campaign = db.get(Campaign, campaign_id)
-    return campaign is not None and str(campaign.owner_id) == str(user_id)
+def _no_map(message: str) -> MapError:
+    return MapError(message, reason="no_map")
 
 
 # ── Reads ────────────────────────────────────────────────────────────────────
@@ -517,9 +494,9 @@ def ensure_map(
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise MapError("operation_id is required (1-128 characters)")
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
-    if not _is_owner(db, encounter.campaign_id, actor_id):
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
+    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
         raise MapAuthorizationError("Only the campaign owner may define encounter map geometry")
     if encounter.status not in ("pending_initiative", "active"):
         raise MapError(f"maps require a pending or active encounter (status {encounter.status})")
@@ -681,9 +658,9 @@ def update_terrain(
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise MapError("operation_id is required (1-128 characters)")
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
-    if not _is_owner(db, encounter.campaign_id, actor_id):
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
+    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
         raise MapAuthorizationError("Only the campaign owner may change encounter terrain")
     encounter_map = get_map(db, encounter.id)
     if encounter_map is None:
@@ -1051,8 +1028,8 @@ def move_participant(
     except (TypeError, ValueError) as exc:
         raise MapError("expected_turn_sequence must be an integer", reason="stale_turn") from exc
 
-    encounter = _lock_encounter(db, encounter_id)
-    campaign = _require_playable(db, encounter.campaign_id)
+    encounter = lock_encounter(db, encounter_id, _no_map)
+    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
 
     # Idempotent replay first: a duplicate command returns the recorded
     # outcome without touching position or budget (duplicate_retry signal).
@@ -1118,7 +1095,7 @@ def move_participant(
     # Preview/commit consistency (same inputs, same occupancy) removes the
     # probing oracle where a reachable cell fails only because a hidden
     # token stands there. Owners keep the full authoritative collision set.
-    actor_is_owner = _is_owner(db, encounter.campaign_id, actor_id)
+    actor_is_owner = is_campaign_owner(db, encounter.campaign_id, actor_id)
     occupied = _occupied_cells(
         db, encounter.id, exclude_participant_id=participant.id,
         include_hidden=actor_is_owner,

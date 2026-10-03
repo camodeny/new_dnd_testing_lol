@@ -12,30 +12,33 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.campaigns.auth import authorized_campaign
-from app.deps.auth import resolve_profile
+from app.deps.campaign import campaign_for
+from app.deps.auth import current_profile
 from app.realtime.channels import live_table_channel, parse_live_table_channel
-from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
+from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 @router.get("/api/campaigns/{campaign_id}/realtime/channels")
-def list_realtime_channels(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+def list_realtime_channels(
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Return private realtime channels the caller is authorized to subscribe to.
 
     This is the audience-safe listing — private threads are hidden unless the
     caller is an explicit member. The returned channel names can be used with
     Supabase Realtime (`supabase.channel(name).subscribe()`).
     """
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-    from app.runtime.threads import list_threads_for_user
+    from app.threads.service import list_threads_for_user
 
     threads = list_threads_for_user(db, campaign.id, profile.id)
     channels = [
@@ -52,7 +55,12 @@ def list_realtime_channels(campaign_id: str, request: Request, db: Session = Dep
 
 
 @router.post("/api/campaigns/{campaign_id}/realtime/authorize")
-def authorize_realtime_channel(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+def authorize_realtime_channel(
+    payload: dict,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Authorize a specific realtime channel subscription.
 
     Payload: {"channel": "live-table:campaign:<cid>:thread:<tid>"}
@@ -61,9 +69,6 @@ def authorize_realtime_channel(campaign_id: str, payload: dict, request: Request
     Returns 200 if authorized, 403 if campaign member but not thread member,
     404 if campaign/thread not found or private thread hidden.
     """
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
-
     channel = payload.get("channel") if isinstance(payload, dict) else None
     thread_id_raw = payload.get("thread_id") if isinstance(payload, dict) else None
 

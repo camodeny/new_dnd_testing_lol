@@ -15,6 +15,7 @@ import uuid as uuid_lib
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.characters.service import latest_sheet
 from models.campaigns import Campaign, CampaignMember
 from models.threads import CampaignThread
 
@@ -218,6 +219,21 @@ class CampaignCommandError(Exception):
         self.headers = headers
 
 
+def lock_campaign_row(db: Session, campaign_id: uuid_lib.UUID) -> Campaign | None:
+    """Lock the campaign lifecycle row — issue #265.
+
+    Archive/restore serializes on this same row via commit_campaign_mutation,
+    so holding the lock until commit means a write that observed ``active``
+    cannot commit after archive has committed (and vice versa). Consistent
+    lock order everywhere is request/turn locks first, then the campaign row;
+    archive only ever takes the campaign row.
+    """
+    return db.execute(
+        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
+
+
 def require_playable_campaign(campaign) -> None:
     """Reject fictional writes while a campaign is archived.
 
@@ -270,7 +286,7 @@ def character_launch_validity(character, sheet) -> dict:
 
 def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
     """Server-side start eligibility from authoritative lobby/character state."""
-    from models.characters import Character, Dnd5eCharacterSheet
+    from models.characters import Character
     from models.profiles import Profile
 
     def member_label(m) -> str:
@@ -297,11 +313,7 @@ def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
         if char.status != "complete":
             blockers.append(f"{label} character is still a draft")
             continue
-        sheet = db.execute(
-            select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == char.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, char.id)
         validity = character_launch_validity(char, sheet)
         if not validity["is_valid"]:
             blockers.append(

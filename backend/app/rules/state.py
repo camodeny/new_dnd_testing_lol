@@ -42,10 +42,11 @@ import re
 import time
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.observability.tracing import structured_log
 from app.rules.mechanics import MECHANICS_VERSION, RULES_REVISION
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -69,10 +70,6 @@ class StateError(ValueError):
         self.code = code
         self.field = field
         self.details = details or {}
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 # ── Condition vocabulary (2024 launch play) ───────────────────────────────

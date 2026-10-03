@@ -34,7 +34,7 @@ import time
 import uuid
 from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.dm.context import (
     AuthorizationScope,
@@ -47,6 +47,7 @@ from app.dm.context import (
 )
 from app.dm.contract import DmTurnContractV1, EvidenceRequest, normalize_contract
 from app.observability.tracing import structured_log
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +68,6 @@ ALLOWED_TOOLS: frozenset[str] = frozenset(
 )
 
 # ── Strict base ──────────────────────────────────────────────────────────────
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
 
 # ── Evidence result ──────────────────────────────────────────────────────────
 
@@ -215,7 +212,7 @@ def _tool_registry() -> dict[str, Callable[..., Any]]:
     Imported lazily: the handler modules import this module's result types.
     """
     from app.dm.tools import handle_ask_character_sheet
-    from app.rules.evidence_tools import TOOL_HANDLERS as rules_handlers
+    from app.rules_corpus.evidence_tools import TOOL_HANDLERS as rules_handlers
     from app.world.retrieval import TOOL_HANDLERS as world_handlers
     from app.world.semantic import handle_search_campaign_memory
 

@@ -17,7 +17,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from app.rules.gemini import EMBEDDING_DIM
+from app.rules_corpus.gemini import EMBEDDING_DIM
 from models.rules import RulesSection
 from models.rules import RulesCorpus
 from models.rules import RulesEmbedding

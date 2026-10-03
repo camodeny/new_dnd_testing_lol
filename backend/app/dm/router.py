@@ -12,23 +12,30 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.campaigns.auth import authorized_campaign, require_owner
-from app.deps.auth import resolve_profile
-from app.runtime.threads import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
+from app.deps.campaign import campaign_for, require_owner, run_campaign_command
+from app.deps.auth import current_profile
+from app.threads.service import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
 from database import get_db
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry")
-def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: Request,
-                       response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+def retry_adjudication(
+    turn_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
+    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import retry_failed_adjudication, execute_committed_attempt
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
@@ -48,21 +55,27 @@ def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: R
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
-    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+    result = run_campaign_command(db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.retry", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
     background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
     return result
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry-narration")
-def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Request,
-                    response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def retry_narration(
+    turn_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    background_tasks: BackgroundTasks,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Narration-independent retry reusing the preserved structured result."""
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import retry_narration_only, execute_committed_attempt
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
@@ -82,15 +95,23 @@ def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Requ
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
-    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+    result = run_campaign_command(db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.retry_narration", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
     background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
     return result
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streams/{stream_id}/continue")
-def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dict, request: Request,
-                    response: Response, db: Session = Depends(get_db)):
+def continue_stream(
+    turn_id: str,
+    stream_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Recover a failed partial stream through the full turn state machine.
 
     Body: {"continued_text": "..."}. The stream is scoped to the authorized
@@ -107,11 +128,9 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     Realtime delivery happens after that commit returns (never before
     durability), via a best-effort post-commit status publish.
     """
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import recover_partial_stream
     from models.dm import DmTurn
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     try:
         tid, sid = uuid.UUID(turn_id), uuid.UUID(stream_id)
@@ -152,7 +171,7 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     # Full semantic identity: stream + complete text. Only the digest is
     # persisted, so nothing is truncated — requests differing anywhere
     # (even past character 4,000) are distinct commands.
-    result = execute_http_idempotent(
+    result = run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
         scope_id=tid, payload={"stream_id": str(sid), "continued_text": continued},
@@ -181,9 +200,12 @@ def _publish_recovery_status(db: Session, stream_id) -> None:
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
-def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def list_dm_turns(
+    request: Request,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     thread_raw = request.query_params.get("thread_id")
     from app.dm.turns import list_turns
 
@@ -200,7 +222,7 @@ def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_
             raise HTTPException(status_code=403, detail="Not authorized for this thread") from exc
     # No thread filter: return only turns for threads the user is authorized to see
     # (prevents private-turn metadata leakage)
-    from app.runtime.threads import list_threads_for_user
+    from app.threads.service import list_threads_for_user
 
     visible_threads = list_threads_for_user(db, campaign.id, profile.id)
     visible_ids = {str(t.id) for t in visible_threads}
@@ -210,9 +232,12 @@ def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns/{turn_id}")
-def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
+def get_dm_turn(
+    turn_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:

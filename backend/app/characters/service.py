@@ -7,12 +7,17 @@ from models.characters import Character
 from models.characters import Dnd5eCharacterSheet
 
 
-def character_with_sheet(db: Session, char: Character):
-    sheet = db.execute(
+def latest_sheet(db: Session, character_id) -> Dnd5eCharacterSheet | None:
+    """The character's current D&D 5e sheet (most recently updated row)."""
+    return db.execute(
         select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == char.id)
+        .where(Dnd5eCharacterSheet.character_id == character_id)
         .order_by(Dnd5eCharacterSheet.updated_at.desc())
     ).scalars().first()
+
+
+def character_with_sheet(db: Session, char: Character):
+    sheet = latest_sheet(db, char.id)
     data = char.to_dict()
     if sheet:
         sheet_data = sheet.to_dict()

@@ -50,7 +50,7 @@ def db(tmp_path):
 
 
 def _submit(s, camp_id, thread_id, text="I step into the torchlit hall."):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     accept_submission(s, campaign_id=camp_id, user_id=s.get(Campaign, camp_id).owner_id,

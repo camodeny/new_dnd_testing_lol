@@ -41,7 +41,7 @@ TIMEOUT_S = 30.0
 # Single production embedding dimension (issue #334). The rules_embeddings
 # column is vector(EMBEDDING_DIM) with a mandatory HNSW index — doc and query
 # embeddings must use exactly this dimension; nothing else is indexed.
-# Must stay <= 2000 (HNSW production cap) and equal app.rules.embeddings
+# Must stay <= 2000 (HNSW production cap) and equal app.rules_corpus.embeddings
 # DEFAULT_DIM / EMBEDDING_DIM.
 EMBEDDING_DIM = 1536
 

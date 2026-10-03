@@ -20,7 +20,7 @@ PINNED_MARKDOWN_COMMIT = "main"
 OPEN5E_REF = "main"
 
 # Trusted official WotC artifact checksums are versioned in
-# app/rules/official_manifest.json — the single source of truth for pinned
+# app/rules_corpus/official_manifest.json — the single source of truth for pinned
 # official artifact hashes (corpus_id -> corpus_version -> SHA-256).
 
 # Known 5.2.1 canary: must be present to prove 5.2.1 not stale 5.2

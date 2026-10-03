@@ -80,8 +80,8 @@ def db():
 
 
 def test_rules_search_degrades_to_lexical_when_embedding_fails(db, monkeypatch):
-    from app.rules import router as rules_router
-    from app.rules.ingest import import_fixture_sections
+    from app.rules_corpus import router as rules_router
+    from app.rules_corpus.ingest import import_fixture_sections
 
     sections = [
         {
@@ -113,7 +113,7 @@ def test_rules_search_degrades_to_lexical_when_embedding_fails(db, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("simulated provider failure")
 
-    monkeypatch.setattr("app.rules.gemini.gemini_embed_query", boom)
+    monkeypatch.setattr("app.rules_corpus.gemini.gemini_embed_query", boom)
 
     # Must degrade to lexical search without raising, and still return hits
     result = rules_router.search(q="attack", limit=5, corpus_id=None, db=db)
@@ -150,7 +150,7 @@ def api(monkeypatch):
 
     monkeypatch.setenv("NODE_ENV", "test")
     monkeypatch.setattr(
-        "app.runtime.router.resolve_profile",
+        "app.deps.auth.resolve_profile",
         lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db

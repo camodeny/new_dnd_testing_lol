@@ -7,10 +7,11 @@ from sqlalchemy.orm import Session
 
 from app.billing import stripe_funding as funding
 from app.billing.ledger import LedgerConflictError
-from app.campaigns.auth import authorized_campaign
-from app.deps.auth import resolve_profile
+from app.deps.campaign import campaign_for
+from app.deps.auth import current_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -87,8 +88,13 @@ def _public_operation(operation) -> dict:
 
 
 @router.post("/api/campaigns/{campaign_id}/funding/checkout")
-def start_funding_checkout(campaign_id: str, payload: dict, request: Request,
-                           db: Session = Depends(get_db)):
+def start_funding_checkout(
+    payload: dict,
+    request: Request,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Start a Stripe add-funds checkout — issue #256.
 
     Any campaign member may add funds (recorded as their contribution);
@@ -97,8 +103,6 @@ def start_funding_checkout(campaign_id: str, payload: dict, request: Request,
     URL without creating duplicate Stripe charges. Funding changes capacity
     only — never model quality or game outcomes.
     """
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     idempotency_key = require_idempotency_key(
         request, str(payload.get("operation_id") or "").strip() or None
     )
@@ -145,8 +149,12 @@ def start_funding_checkout(campaign_id: str, payload: dict, request: Request,
 
 
 @router.get("/api/campaigns/{campaign_id}/funding/operations/{operation_id}")
-def get_funding_operation(campaign_id: str, operation_id: str, request: Request,
-                          db: Session = Depends(get_db)):
+def get_funding_operation(
+    operation_id: str,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Funding-operation status with authoritative reconciliation — issue #256.
 
     Ambiguous pending state is reconciled against Stripe before responding,
@@ -157,8 +165,6 @@ def get_funding_operation(campaign_id: str, operation_id: str, request: Request,
     """
     from app.billing.ledger import public_capacity
 
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         operation_uuid = uuid_lib.UUID(str(operation_id))
     except ValueError as exc:
@@ -241,8 +247,14 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
 
 @router.post("/api/campaigns/{campaign_id}/recredits")
-def create_recredit(campaign_id: str, payload: dict, request: Request, response: Response,
-                    db: Session = Depends(get_db)):
+def create_recredit(
+    payload: dict,
+    request: Request,
+    response: Response,
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Explicit one-time re-credit for failed/abandoned counted work — issue #256.
 
     Owner-only accounting correction. Links the compensating entry to the
@@ -252,8 +264,6 @@ def create_recredit(campaign_id: str, payload: dict, request: Request, response:
     """
     from app.billing.ledger import get_capacity_summary
 
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     if campaign.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the campaign owner can issue re-credits")
     idempotency_key = require_idempotency_key(
@@ -304,14 +314,16 @@ def create_recredit(campaign_id: str, payload: dict, request: Request, response:
 
 
 @router.get("/api/campaigns/{campaign_id}/funding/operations")
-def list_funding_operations(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+def list_funding_operations(
+    profile=Depends(current_profile),
+    campaign: Campaign = Depends(campaign_for()),
+    db: Session = Depends(get_db),
+):
     """Owner-visible funding history (member-safe projection, no payment details)."""
     from sqlalchemy import select as _select
 
     from models.funding import CampaignFundingOperation as _Operation
 
-    profile = resolve_profile(request, db)
-    campaign = authorized_campaign(db, campaign_id, profile.id)
     # Member-safe projection for every row: status + amounts only, so any
     # campaign member may list. No Stripe identifiers or payment details.
     rows = db.scalars(

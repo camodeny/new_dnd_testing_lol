@@ -569,7 +569,7 @@ def _streaming_setup():
 
 
 def _coordinated_attempt(db, campaign, thread_id):
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
     user_id = uuid.uuid4()
     accept_submission(

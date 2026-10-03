@@ -36,6 +36,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import CampaignCommandError, require_playable_campaign
+from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
 from models.campaigns import Campaign, CampaignMember, CampaignPcLifecycle
 
@@ -207,7 +208,6 @@ def activate_replacement(
     the dead PC: the replacement starts fresh with no inherited knowledge.
     """
     from app.campaigns.service import character_launch_validity
-    from models.characters import Dnd5eCharacterSheet
 
     if str(getattr(campaign, "status", "lobby")) == "lobby":
         raise PcLifecycleError(
@@ -257,11 +257,7 @@ def activate_replacement(
             "A replacement was already activated; one active PC per member",
             status_code=409,
         )
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == new_character.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, new_character.id)
     validity = character_launch_validity(new_character, sheet)
     if not validity["is_valid"]:
         structured_log(
@@ -348,7 +344,7 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
     Never includes secret lore (backstory/notes/etc.) — same boundary as the
     lobby projection.
     """
-    from models.characters import Character, Dnd5eCharacterSheet
+    from models.characters import Character
 
     members = db.execute(
         select(CampaignMember).where(CampaignMember.campaign_id == campaign.id)
@@ -381,11 +377,7 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
         if char is None:
             continue
         row = lifecycles.get(m.selected_character_id)
-        sheet = db.execute(
-            select(Dnd5eCharacterSheet)
-            .where(Dnd5eCharacterSheet.character_id == char.id)
-            .order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, char.id)
         entry = {
             "character_id": str(char.id),
             "user_id": str(m.user_id),
@@ -413,13 +405,8 @@ def party_roster(db: Session, campaign: Campaign) -> dict:
 
 
 def _canon_entry(db: Session, row: CampaignPcLifecycle, char) -> dict:
-    from models.characters import Dnd5eCharacterSheet
 
-    sheet = db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == char.id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
+    sheet = latest_sheet(db, char.id)
     return {
         "character_id": str(char.id),
         "user_id": str(row.user_id),

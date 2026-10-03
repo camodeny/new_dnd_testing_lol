@@ -26,12 +26,13 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
+from app.visibility.access import is_campaign_participant
 from models.campaigns import Adventure, AdventureEpilogue, Campaign, CampaignMember
 
 logger = logging.getLogger(__name__)
@@ -63,10 +64,6 @@ class EpilogueDuplicateError(EpilogueError):
     """A second epilogue for the same PC, or a conflicting operation replay."""
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _get_adventure(db: Session, campaign_id: uuid.UUID, adventure_id: uuid.UUID) -> Adventure:
     adv = db.get(Adventure, adventure_id)
     if adv is None or str(adv.campaign_id) != str(campaign_id):
@@ -89,14 +86,6 @@ def _require_open_phase(adv: Adventure) -> None:
             f"Epilogue phase is {adv.epilogue_status!r} for adventure {adv.id}; "
             "submit/skip/roll require an open phase"
         )
-
-
-def _is_participant(db: Session, camp: Campaign, user_id: uuid.UUID) -> bool:
-    if camp.owner_id == user_id:
-        return True
-    return (
-        db.get(CampaignMember, {"campaign_id": camp.id, "user_id": user_id}) is not None
-    )
 
 
 def _validate_content(content: str) -> str:
@@ -189,7 +178,7 @@ def open_epilogues(
     if adv.epilogue_status == "open":
         return adv
     adv.epilogue_status = "open"
-    adv.epilogues_opened_at = _now()
+    adv.epilogues_opened_at = utcnow()
     db.flush()
     if commit:
         db.commit()
@@ -227,7 +216,7 @@ def close_epilogues(
         )
     if adv.epilogue_status != "closed":
         adv.epilogue_status = "closed"
-        adv.epilogues_closed_at = _now()
+        adv.epilogues_closed_at = utcnow()
         db.flush()
         if commit:
             db.commit()
@@ -286,7 +275,7 @@ def submit_epilogue(
             "Epilogues must be authored by the PC's owning player; "
             "the DM does not invent voluntary epilogue actions for human PCs"
         )
-    if not _is_participant(db, camp, user_id):
+    if not is_campaign_participant(db, camp, user_id):
         raise EpilogueAuthorizationError("Only campaign participants may submit epilogues")
 
     clean_content = _validate_content(content)
@@ -443,7 +432,7 @@ def _commit_epilogue_event(
     )
     row.source_event_id = event.id
     row.status = "resolved"
-    row.resolved_at = _now()
+    row.resolved_at = utcnow()
     row.last_error = None
     db.flush()
     if commit:

@@ -24,20 +24,13 @@ from app.campaigns.service import (
     is_launch_locked,
     parse_character_id,
 )
+from app.characters.service import latest_sheet
 from models.campaigns import Campaign, CampaignInvite, CampaignMember
-from models.characters import Character, Dnd5eCharacterSheet
+from models.characters import Character
 from models.profiles import Profile
 from models.threads import CampaignThread, CampaignThreadMember
 
 logger = logging.getLogger(__name__)
-
-
-def _latest_sheet(db: Session, character_id: uuid.UUID) -> Dnd5eCharacterSheet | None:
-    return db.execute(
-        select(Dnd5eCharacterSheet)
-        .where(Dnd5eCharacterSheet.character_id == character_id)
-        .order_by(Dnd5eCharacterSheet.updated_at.desc())
-    ).scalars().first()
 
 
 def campaign_members(db: Session, campaign_id: uuid.UUID) -> list[CampaignMember]:
@@ -66,7 +59,7 @@ def member_lobby_projection(db: Session, m: CampaignMember) -> dict:
     if m.selected_character_id:
         char = db.get(Character, m.selected_character_id)
         if char is not None and not char.is_deleted:
-            sheet = _latest_sheet(db, char.id)
+            sheet = latest_sheet(db, char.id)
             validity = character_launch_validity(char, sheet)
             projection.update({
                 "character_name": char.name,
@@ -87,7 +80,7 @@ def lobby_projection(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> d
     """Authoritative lobby projection — issue #241. Side-effect-free."""
     from app.campaigns.invites import invite_usability, lobby_invite_projection
     from app.campaigns.party_lore import build_party_composition
-    from app.runtime.threads import get_lobby_thread
+    from app.threads.service import get_lobby_thread
 
     members = campaign_members(db, campaign.id)
     viewer_is_owner = campaign.owner_id == viewer_id
@@ -139,7 +132,7 @@ def launch_roster(db: Session, campaign_id: uuid.UUID) -> list[dict]:
         char = db.get(Character, m.selected_character_id)
         if char is None or char.is_deleted:
             continue
-        sheet = _latest_sheet(db, char.id)
+        sheet = latest_sheet(db, char.id)
         roster.append({
             "character_id": str(char.id),
             "user_id": str(m.user_id),
@@ -267,7 +260,7 @@ def _require_ready_character(db: Session, member: CampaignMember, user_id: uuid.
     char = db.get(Character, char_id)
     if char is None or char.is_deleted or char.owner_id != user_id:
         raise CampaignCommandError(status_code=422, detail="Selected character is missing or not owned")
-    validity = character_launch_validity(char, _latest_sheet(db, char.id))
+    validity = character_launch_validity(char, latest_sheet(db, char.id))
     if not validity["is_valid"]:
         logger.warning(
             "readiness rejected campaign_id=%s actor_id=%s character_id=%s missing=%s",

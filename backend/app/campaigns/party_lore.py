@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import CampaignCommandError
+from app.characters.service import latest_sheet
 from models.campaigns import Campaign, CampaignCharacterLore, CampaignMember
 
 logger = logging.getLogger(__name__)
@@ -98,7 +99,7 @@ def build_party_composition(db: Session, members: list[CampaignMember]) -> dict:
     failure here must not fall back to private data — callers surface the
     error, never a secret-bearing payload.
     """
-    from models.characters import Character, Dnd5eCharacterSheet
+    from models.characters import Character
 
     entries: list[dict] = []
     for m in members:
@@ -115,11 +116,7 @@ def build_party_composition(db: Session, members: list[CampaignMember]) -> dict:
         if char_id is not None:
             char = db.get(Character, char_id)
             if char is not None:
-                sheet = db.execute(
-                    select(Dnd5eCharacterSheet)
-                    .where(Dnd5eCharacterSheet.character_id == char.id)
-                    .order_by(Dnd5eCharacterSheet.updated_at.desc())
-                ).scalars().first()
+                sheet = latest_sheet(db, char.id)
                 entry.update(_public_sheet_fields(char, sheet))
         entries.append(entry)
 

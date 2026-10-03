@@ -60,7 +60,7 @@ def db(tmp_path):
 
 def _submit(s, camp_id, thread_id, text="I step into the torchlit hall."):
     """Normal player submission acceptance (mirrors POST /submissions)."""
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
     from app.dm.turns import coordinate_turn
 
     accept_submission(

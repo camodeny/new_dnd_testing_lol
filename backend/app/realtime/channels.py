@@ -12,7 +12,7 @@ import uuid
 
 from sqlalchemy.orm import Session
 
-from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, assert_can_write_thread
+from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, assert_can_write_thread
 
 
 def live_table_channel(campaign_id: uuid.UUID | str, thread_id: uuid.UUID | str) -> str:
@@ -81,6 +81,6 @@ def assert_can_publish_channel(
 
 def is_channel_visible_to_user(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
     """Non-raising visibility check for projection filtering."""
-    from app.runtime.threads import can_read_thread
+    from app.threads.service import can_read_thread
 
     return can_read_thread(db, campaign_id, thread_id, user_id)

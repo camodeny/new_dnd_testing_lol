@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
-from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.service import lock_campaign_row, require_playable_campaign
+from app.clock import ms_between, utcnow
 from app.observability.tracing import structured_log
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
@@ -61,40 +62,28 @@ class EncounterAlreadyActiveError(EncounterError):
         )
 
 
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
+def lock_encounter(db: Session, encounter_id: uuid.UUID, error: Callable[[str], Exception]) -> Encounter:
+    encounter = db.execute(
+        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
+    ).scalars().first()
+    if encounter is None:
+        raise error(f"Encounter {encounter_id} not found")
+    return encounter
 
 
-def _aware(value: datetime | None) -> datetime | None:
-    """SQLite returns naive datetimes; treat them as UTC for arithmetic."""
-    if value is None:
-        return None
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value
+def lock_playable_campaign(db: Session, campaign_id: uuid.UUID, error: Callable[[str], Exception]) -> Campaign:
+    campaign = db.execute(
+        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+    ).scalars().first()
+    if campaign is None:
+        raise error(f"Campaign {campaign_id} not found")
+    require_playable_campaign(campaign)
+    return campaign
 
 
-def _ms_between(start: datetime | None, end: datetime | None) -> int:
-    start, end = _aware(start), _aware(end)
-    if start is None or end is None:
-        return 0
-    return max(0, int((end - start).total_seconds() * 1000))
-
-
-def _lock_campaign_row(db: Session, campaign_id: uuid.UUID) -> Campaign | None:
-    try:
-        return db.execute(
-            select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-            .execution_options(populate_existing=True)
-        ).scalars().first()
-    except Exception:
-        row = db.get(Campaign, campaign_id)
-        if row is not None:
-            try:
-                db.refresh(row)
-            except Exception:
-                pass
-        return row
+def is_campaign_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+    campaign = db.get(Campaign, campaign_id)
+    return campaign is not None and str(campaign.owner_id) == str(user_id)
 
 
 # ── Stat resolution (code-owned, never guessed) ─────────────────────────────
@@ -126,16 +115,15 @@ def _resolve_npc_stats(
 
     Precedence: explicit DM selection override > entity details
     (initiative_modifier, else dexterity score / dex_modifier + bonus) > 0.
-    Hidden-visibility entities stay DM-private.
+    NPC/monster stats are always DM-private.
     """
     entity = db.get(WorldEntity, entity_id)
     if entity is None or str(entity.campaign_id) != str(campaign_id):
         raise EncounterError(f"NPC entity {entity_id} not found in this campaign")
     if (entity.entity_type or "").strip().lower() not in ("npc", "monster"):
         raise EncounterError(f"Entity {entity_id} is not an NPC/monster and cannot join combat")
-    from models.combat import HIDDEN_ENTITY_VISIBILITIES
+    from app.rules.mechanics import ability_modifier
 
-    visibility = "dm_private" if str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES else "public"
     # NPC/monster combat stats are always DM-private per #230 security.
     visibility = "dm_private"
     details = entity.details or {}
@@ -150,7 +138,7 @@ def _resolve_npc_stats(
             raise EncounterError(f"NPC {entity_id} has a malformed dex_modifier") from exc
     elif details.get("dexterity") is not None:
         try:
-            dex_mod = (int(details["dexterity"]) - 10) // 2
+            dex_mod = ability_modifier(int(details["dexterity"]))
         except (TypeError, ValueError) as exc:
             raise EncounterError(f"NPC {entity_id} has a malformed dexterity score") from exc
     if override is not None:
@@ -525,7 +513,7 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
     central thread invariant: owner status alone never grants private
     access). Unparseable/missing threads fail closed.
     """
-    from app.runtime.threads import can_read_thread, parse_thread_id
+    from app.threads.service import can_read_thread, parse_thread_id
 
     try:
         thread_id = parse_thread_id(encounter.thread_id)
@@ -566,7 +554,7 @@ def encounter_event_visible_to(db: Session, event, viewer_id: uuid.UUID) -> bool
     thread_ref = payload.get("thread_id") if isinstance(payload, dict) else None
     if not thread_ref:
         return False
-    from app.runtime.threads import can_read_thread, parse_thread_id
+    from app.threads.service import can_read_thread, parse_thread_id
 
     try:
         thread_id = parse_thread_id(thread_ref)
@@ -619,7 +607,7 @@ def _build_encounter_rows(
     # read the encounter's source thread would receive an initiative request
     # they can never see, leaving combat permanently pending. Reject up
     # front instead of persisting an unfulfillable combatant.
-    from app.runtime.threads import can_read_thread, parse_thread_id
+    from app.threads.service import can_read_thread, parse_thread_id
 
     try:
         encounter_thread_id = parse_thread_id(turn.thread_id)
@@ -654,7 +642,7 @@ def _build_encounter_rows(
         source_attempt_id=attempt_id,
         operation_id=operation_id,
         participant_count=len(resolved),
-        initiated_at=_now(),
+        initiated_at=utcnow(),
     )
     db.add(encounter)
     db.flush()
@@ -730,7 +718,7 @@ def _roll_npc_inline(participant: EncounterParticipant, *, raw_d20: int | None) 
     participant.initiative_total = die + int(participant.initiative_modifier)
     participant.roll_source = "dm_runtime"
     participant.initiative_status = "fulfilled"
-    participant.fulfilled_at = _now()
+    participant.fulfilled_at = utcnow()
     return participant
 
 
@@ -747,8 +735,8 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
     for order, pid in enumerate(ordered_ids):
         member = db.get(EncounterParticipant, pid)
         member.sort_order = order
-    ready_at = _now()
-    wait_ms = _ms_between(encounter.initiated_at, ready_at)
+    ready_at = utcnow()
+    wait_ms = ms_between(encounter.initiated_at, ready_at)
     encounter.status = "active"
     encounter.round = 1
     encounter.active_index = 0
@@ -861,18 +849,16 @@ def start_encounter(
     if start_source not in ("dm_effect", "api"):
         raise EncounterError("start_source must be dm_effect or api")
 
-    campaign = _lock_campaign_row(db, campaign_id)
+    campaign = lock_campaign_row(db, campaign_id)
     if campaign is None:
         raise EncounterError(f"Campaign {campaign_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
     require_playable_campaign(campaign)
     turn, attempt = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
     if start_source == "api" and actor_id is not None:
         # Thread-scoped writes (#230): the actor must read the source
         # turn's thread, mirroring the encounter read boundary. Hidden as
         # not-found so private-thread existence never leaks.
-        from app.runtime.threads import ThreadNotFoundError, can_read_thread, parse_thread_id
+        from app.threads.service import ThreadNotFoundError, can_read_thread, parse_thread_id
 
         try:
             thread_ok = can_read_thread(
@@ -1027,9 +1013,7 @@ def roll_npc_initiative(
     ).scalars().first()
     if encounter is None:
         raise EncounterError(f"Encounter {encounter_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, encounter.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, encounter.campaign_id))
     if encounter.status == "active":
         raise EncounterError("initiative is already complete for this encounter")
     if encounter.status != "pending_initiative":
@@ -1049,7 +1033,7 @@ def roll_npc_initiative(
     db.flush()
     campaign = db.get(Campaign, encounter.campaign_id)
     event = _maybe_mark_ready(db, campaign, encounter, commit=False)
-    started = _now()
+    started = utcnow()
     if commit:
         db.commit()
         db.refresh(participant)
@@ -1059,7 +1043,7 @@ def roll_npc_initiative(
         encounter_id=str(encounter.id), participant_id=str(participant.id),
         roll_source="dm_runtime", raw_roll=participant.raw_roll,
         total=participant.initiative_total,
-        latency_ms=round((_now() - started).total_seconds() * 1000, 2),
+        latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
         from app.realtime.service import publish_encounter_ready
@@ -1083,15 +1067,13 @@ def fulfill_human_initiative(
     idempotent single fulfillment) but resumes the encounter instead of a DM
     turn: no turn-resume side effects.
     """
-    started = _now()
+    started = utcnow()
     encounter = db.execute(
         select(Encounter).where(Encounter.id == encounter_id).with_for_update()
     ).scalars().first()
     if encounter is None:
         raise EncounterError(f"Encounter {encounter_id} not found")
-    from app.campaigns.service import require_playable_campaign
-
-    require_playable_campaign(_lock_campaign_row(db, encounter.campaign_id))
+    require_playable_campaign(lock_campaign_row(db, encounter.campaign_id))
     if encounter.status != "pending_initiative":
         raise EncounterError(f"encounter cannot accept initiative from status {encounter.status}")
     participant = db.execute(
@@ -1153,12 +1135,12 @@ def fulfill_human_initiative(
     )
     db.add(fulfillment)
     request.status = "fulfilled"
-    request.fulfilled_at = _now()
+    request.fulfilled_at = utcnow()
     participant.raw_roll = int(raw_rolls[0])
     participant.initiative_total = total
     participant.roll_source = "human_app" if source == "app" else "human_physical"
     participant.initiative_status = "fulfilled"
-    participant.fulfilled_at = _now()
+    participant.fulfilled_at = utcnow()
     db.flush()
 
     campaign = db.get(Campaign, encounter.campaign_id)
@@ -1169,13 +1151,13 @@ def fulfill_human_initiative(
         db.refresh(fulfillment)
         db.refresh(participant)
         db.refresh(encounter)
-    wait_ms = _ms_between(encounter.initiated_at, _now())
+    wait_ms = ms_between(encounter.initiated_at, utcnow())
     structured_log(
         logger, logging.INFO, "encounter_initiative_fulfilled",
         encounter_id=str(encounter.id), participant_id=str(participant.id),
         roll_source=participant.roll_source, total=total,
         initiative_wait_ms=wait_ms,
-        latency_ms=round((_now() - started).total_seconds() * 1000, 2),
+        latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
         from app.realtime.service import publish_encounter_ready

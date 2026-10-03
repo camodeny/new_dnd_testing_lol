@@ -17,12 +17,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.clock import utcnow
 from app.adventures.summaries import finalize_adventure_derived
 from models.campaigns import Adventure, Campaign
 
@@ -77,10 +77,6 @@ class AdventureAlreadyCompletedError(ValueError):
             f"Adventure {adventure_id} is already completed"
             + (f" (outcome={outcome})" if outcome else "")
         )
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc)
 
 
 def validate_outcome(outcome: str) -> str:
@@ -343,7 +339,7 @@ def complete_adventure_inline(
     if operation_id:
         adventure.operation_id = operation_id
     adventure.closing_status = "pending"
-    adventure.completed_at = _now()
+    adventure.completed_at = utcnow()
     db.flush()
     return adventure
 
@@ -663,7 +659,7 @@ def _run_closing_followups(db: Session, adventure: Adventure) -> None:
     meta = dict(adventure.adventure_metadata or {})
     closing = dict(meta.get("closing") or {})
     started = adventure.started_at
-    completed = adventure.completed_at or _now()
+    completed = adventure.completed_at or utcnow()
     try:
         duration_s = max(0, int((completed - started).total_seconds())) if started else 0
     except Exception:
@@ -701,7 +697,7 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
         if rec is None or rec.status == "published":
             return
         rec.status = "published"
-        rec.published_at = _now()
+        rec.published_at = utcnow()
         rec.last_error = None
         db.commit()
 
@@ -711,10 +707,10 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
             return
         rec.status = "failed"
         rec.last_error = error[:2000] if error else None
-        rec.next_attempt_at = _now() + timedelta(seconds=60)
+        rec.next_attempt_at = utcnow() + timedelta(seconds=60)
         db.commit()
 
-    now = _now()
+    now = utcnow()
     candidates = list(
         db.execute(
             select(Outbox)

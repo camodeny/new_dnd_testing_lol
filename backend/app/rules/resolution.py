@@ -32,7 +32,7 @@ import secrets
 import time
 from typing import Any, Callable, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import Field
 
 from app.observability.tracing import structured_log
 from app.rules.mechanics import (
@@ -41,6 +41,7 @@ from app.rules.mechanics import (
     MechanicsError,
     get_character_mechanics_for_sheet,
 )
+from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
 
@@ -79,10 +80,6 @@ class ResolutionError(ValueError):
         self.details = details or {}
 
 
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-
 # ── Advantage ─────────────────────────────────────────────────────────────
 
 
@@ -103,9 +100,9 @@ def combine_advantage(sources: list[AdvantageSource]) -> AdvantageState:
     return "normal"
 
 
-def _validate_advantage_state(value: str) -> AdvantageState:
+def validate_advantage_state(value: str, *, error: type[ValueError] = ResolutionError) -> AdvantageState:
     if value not in ("normal", "advantage", "disadvantage"):
-        raise ResolutionError(
+        raise error(
             "invalid_advantage_state",
             f"advantage_state must be normal/advantage/disadvantage, got {value!r}",
             field="advantage_state",
@@ -161,25 +158,29 @@ class ModifierHook(Protocol):
     def bonus(self, context: HookContext) -> int: ...
 
 
-def _hook_bonus(hook: ModifierHook | Callable[[HookContext], int], context: HookContext, name: str) -> ModifierContribution:
+def call_modifier_hook(
+    hook: Any, context: Any, name: str, *, label: str = "modifier",
+    error: type[ValueError] = ResolutionError,
+) -> tuple[str, int]:
+    """Run a bonus hook (object with ``bonus`` or plain callable); return (name, value)."""
     try:
         if hasattr(hook, "bonus"):
-            value = hook.bonus(context)  # type: ignore[union-attr]
+            value = hook.bonus(context)
         else:
-            value = hook(context)  # type: ignore[operator]
-    except ResolutionError:
+            value = hook(context)
+    except error:
         raise
     except Exception as exc:
-        raise ResolutionError(
+        raise error(
             "hook_failed",
-            f"modifier hook {name!r} failed: {exc}",
+            f"{label} hook {name!r} failed: {exc}",
             field="hooks",
             details={"hook": name},
         ) from exc
     if type(value) is not int:
-        raise ResolutionError(
+        raise error(
             "hook_failed",
-            f"modifier hook {name!r} must return int, got {type(value).__name__}",
+            f"{label} hook {name!r} must return int, got {type(value).__name__}",
             field="hooks",
             details={"hook": name},
         )
@@ -190,7 +191,7 @@ def _hook_bonus(hook: ModifierHook | Callable[[HookContext], int], context: Hook
         resolved_name = type(getattr(hook, "__self__", hook)).__name__
     else:
         resolved_name = type_name
-    return ModifierContribution(name=resolved_name, value=value, source="hook")
+    return resolved_name, value
 
 
 class ResolvedModifier(StrictModel):
@@ -308,7 +309,8 @@ def resolve_modifier(
     )
     hook_contribs: list[ModifierContribution] = []
     for idx, hook in enumerate(hooks or []):
-        contrib = _hook_bonus(hook, hook_context, name=f"hook_{idx}")
+        hook_name, value = call_modifier_hook(hook, hook_context, name=f"hook_{idx}")
+        contrib = ModifierContribution(name=hook_name, value=value, source="hook")
         if contrib.value:
             hook_contribs.append(contrib)
 
@@ -346,15 +348,17 @@ def _norm_ability_or_raise(raw: str) -> str:
 # ── Runtime dice ──────────────────────────────────────────────────────────
 
 
-def runtime_d20(count: int, *, rng: Any | None = None) -> list[int]:
+def runtime_d20(
+    count: int, *, rng: Any | None = None, error: type[ValueError] = ResolutionError,
+) -> list[int]:
     """Generate NPC/hidden d20 results on the runtime path (never for PCs)."""
     if count not in (1, 2):
-        raise ResolutionError("invalid_dice_count", f"can generate 1 or 2 d20 results, got {count}", field="dice")
+        raise error("invalid_dice_count", f"can generate 1 or 2 d20 results, got {count}", field="dice")
     roller = rng if rng is not None else secrets.SystemRandom()
     try:
         return [int(roller.randint(1, 20)) for _ in range(count)]
     except Exception as exc:
-        raise ResolutionError("dice_generation_failed", f"runtime dice generation failed: {exc}", field="dice") from exc
+        raise error("dice_generation_failed", f"runtime dice generation failed: {exc}", field="dice") from exc
 
 
 # ── Result DTOs ───────────────────────────────────────────────────────────
@@ -487,7 +491,7 @@ def resolve_d20_roll(
         for source in sources:
             if source not in ("advantage", "disadvantage"):
                 raise ResolutionError("invalid_advantage_source", f"unknown advantage source {source!r}", field="advantage_sources")
-        state = combine_advantage(sources) if sources else _validate_advantage_state(advantage_state or "normal")
+        state = combine_advantage(sources) if sources else validate_advantage_state(advantage_state or "normal")
         logged_state = state
         target_dc = _validate_dc(dc)
 

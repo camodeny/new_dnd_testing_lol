@@ -20,8 +20,8 @@ from database import Base  # noqa: E402
 import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started  # noqa: E402
-from app.runtime.submissions import accept_submission  # noqa: E402
-from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+from app.submissions.service import accept_submission  # noqa: E402
+from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from app.world.facts import (  # noqa: E402
     EPISTEMIC_STATES,
     create_fact,

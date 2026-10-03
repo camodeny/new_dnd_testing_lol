@@ -86,6 +86,12 @@ def campaign_for(
     return dependency
 
 
+def require_owner(campaign: Campaign, user_id: uuid.UUID) -> None:
+    """Owner-only gate applied after participant authorization."""
+    if campaign.owner_id != user_id:
+        raise HTTPException(status_code=403, detail="Only the campaign owner can perform this DM lifecycle action")
+
+
 def require_expected_revision(payload: dict) -> int:
     if "expected_revision" not in payload:
         raise HTTPException(status_code=400, detail="expected_revision is required")

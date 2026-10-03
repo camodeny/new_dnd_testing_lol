@@ -53,7 +53,7 @@ def db(tmp_path):
 
 def _submit(s, camp_id, thread_id, text="..."):
     from app.dm.turns import coordinate_turn
-    from app.runtime.submissions import accept_submission
+    from app.submissions.service import accept_submission
 
     accept_submission(
         s,

@@ -86,7 +86,7 @@ def resolve_embedding_model(explicit_model: str | None = None) -> str:
     return DEFAULT_MODEL
 
 try:  # Single canonical indexed dimension (issue #334); safe local fallback.
-    from app.rules.gemini import EMBEDDING_DIM as _DIM  # type: ignore
+    from app.rules_corpus.gemini import EMBEDDING_DIM as _DIM  # type: ignore
 
     EMBEDDING_DIM = int(_DIM)
 except Exception:
@@ -162,7 +162,7 @@ def resolve_embedder(
         return provider
     if embedding_model.startswith(("gemini", "text-embedding", "models/")):
         try:
-            from app.rules.gemini import make_gemini_provider
+            from app.rules_corpus.gemini import make_gemini_provider
 
             return make_gemini_provider(model=embedding_model, task_type=task_type)
         except Exception as exc:

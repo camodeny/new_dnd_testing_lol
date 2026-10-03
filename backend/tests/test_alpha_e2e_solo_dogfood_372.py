@@ -432,9 +432,7 @@ def scn(monkeypatch, request):
     monkeypatch.setenv("NODE_ENV", "test")
     for module in (
         "app.deps.auth",
-        "app.runtime.router",
         "app.snapshot.router",
-        "app.dm.router",
         "app.characters.router",
     ):
         monkeypatch.setattr(

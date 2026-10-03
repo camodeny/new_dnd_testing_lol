@@ -12,8 +12,10 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/characters` | Character aggregate + sheet persistence |
 | `app/characters/chat` | Character-creator chat (SSE) — streams via provider abstraction |
 | `app/world` | World state written inside turn/post-turn commits: entities, current scene, facts/relations, knowledge, clocks, NPC state, retrieval + semantic index |
-| `app/runtime` | Turn/session orchestration stubs (live-table sessions) |
-| `app/rules` | Rules / combat pure domain (no I/O, no FastAPI) — placeholder for Epic 2 |
+| `app/submissions` | Live-table player submissions: validation, acceptance, DM turn coordination |
+| `app/threads` | Campaign threads: shared/private lifecycle, membership, read/write authorization |
+| `app/rules` | Deterministic 5e mechanics: sheet-derived stats, checks/saves, attacks/damage, spells, rules-state effects (no FastAPI; only DB read is loading the canonical sheet) |
+| `app/rules_corpus` | SRD rules-text corpus: ingest, embeddings, hybrid search, DM evidence tools, `/api/rules/*` |
 | `app/visibility` | Disclosure vocabulary/normalization/ordering (`policy`) and campaign participation, DM-authority, and per-record receive checks (`access`) |
 | `app/billing` | Billing / entitlement checks — placeholder |
 | `app/realtime` | Realtime projections / websocket fan-out — placeholder |

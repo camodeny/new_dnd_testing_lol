@@ -20,6 +20,7 @@ from typing import Any
 
 from sqlalchemy import select
 
+from app.characters.service import latest_sheet
 from app.dm.context import AuthorizationScope, ContextAudience, SourceRef
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import EvidenceResult
@@ -228,7 +229,6 @@ def handle_ask_character_sheet(
         )
 
     from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
-    from models.characters import Dnd5eCharacterSheet
 
     results_payload: list[dict[str, Any]] = []
     sources: list[SourceRef] = []
@@ -238,9 +238,7 @@ def handle_ask_character_sheet(
     has_success = False
 
     for cid in character_ids[:4]:
-        sheet = db.execute(
-            select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == cid).order_by(Dnd5eCharacterSheet.updated_at.desc())
-        ).scalars().first()
+        sheet = latest_sheet(db, cid)
         if sheet is None:
             continue
         try:
