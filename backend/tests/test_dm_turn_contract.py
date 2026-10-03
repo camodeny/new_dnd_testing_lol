@@ -226,10 +226,9 @@ def test_typed_staged_effects_ok():
         "staged_effects": [
             {"id": "effect_1", "effect_type": "record_world_event", "arguments": {"event_type": "clue_found", "summary": "Seal examined", "visibility": "public"}},
             {"id": "effect_2", "effect_type": "reveal_fact", "arguments": {"item_type": "fact", "item_id": "fact:seal_crack", "visibility": "public", "reason": "found"}},
-            {"id": "effect_3", "effect_type": "propose_sheet_update", "arguments": {"character_id": "char:1", "reason": "pay", "changes": [{"field": "gp", "operation": "subtract", "value": 1}]}},
         ],
     })
-    assert len(c.staged_effects) == 3
+    assert len(c.staged_effects) == 2
     # player trap: claim with invented id vs staged reveal — both typed, but contract validates shape
 
 

@@ -7,30 +7,26 @@ import pytest
 from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.decisions.errors import DecisionError
 from app.decisions.frames import (
-    CANDIDATE_SCHEMA_VERSION,
     CLARIFY_CANDIDATE_ID,
     DEFER_CANDIDATE_ID,
-    FRAME_SCHEMA_VERSION,
     OPEN_ENDED_DM_CANDIDATE_ID,
     CandidateRecord,
     assert_fresh,
     build_frame,
-    frame_trace,
-    is_stale,
-    rebuild_frame,
     resolve_candidate,
     revalidate_for_execution,
     to_decision_request,
 )
 from app.decisions.policy import (
-    POLICY_SCHEMA_VERSION,
     DecisionClassPolicy,
     evaluate_execution,
     get_policy,
-    policy_trace,
     register_policy,
 )
 from app.decisions.runtime import DecisionService
+from tests.support.decision_policies import register_example_policies
+
+register_example_policies()
 
 
 def _frame(**overrides):
@@ -153,8 +149,7 @@ def test_open_ended_dm_escape_defers_instead_of_executing():
 
 def test_stale_revision_rejected_before_execution():
     frame = _frame()
-    assert is_stale(frame, 7) is False
-    assert is_stale(frame, 8) is True
+    assert_fresh(frame, 7)
     with pytest.raises(DecisionError) as exc_info:
         assert_fresh(frame, 8)
     assert exc_info.value.kind == "stale"
@@ -163,52 +158,6 @@ def test_stale_revision_rejected_before_execution():
     with pytest.raises(DecisionError) as exc_info:
         revalidate_for_execution(frame, "flank", 8, still_legal=lambda c: True)
     assert exc_info.value.kind == "stale"
-
-
-def test_rebuild_after_revision_change_refreshes_frame():
-    from app.decisions.frames import CandidateRecord as _CR
-
-    frame = _frame()
-    # Revision 8 removes the archer: the caller re-enumerates fresh and the
-    # stale volley candidate must not survive the rebuild.
-    rebuilt = rebuild_frame(
-        frame,
-        state={"visible": ["goblin"], "turn": "fighter-1"},
-        state_revision=8,
-        candidates=(
-            _CR(
-                id="flank",
-                label="Flank the goblin",
-                source="rules:attack",
-                source_ref="state.visible[0]",
-                payload_ref="action:flank@goblin",
-                risk="low",
-                reversible=True,
-            ),
-        ),
-    )
-    assert rebuilt.state_revision == 8
-    assert rebuilt.frame_id != frame.frame_id
-    assert is_stale(rebuilt, 8) is False
-    assert is_stale(rebuilt, 7) is True
-    assert "volley" not in {c.id for c in rebuilt.candidates}
-    # Escapes survive the rebuild; stale frame still rejects the new revision.
-    assert OPEN_ENDED_DM_CANDIDATE_ID in {c.id for c in rebuilt.candidates}
-    with pytest.raises(DecisionError):
-        revalidate_for_execution(
-            frame, "flank", 8, still_legal=lambda c: True
-        )
-
-
-def test_rebuild_requires_fresh_candidates():
-    """Carrying old candidates into a new revision is a TypeError."""
-    frame = _frame()
-    with pytest.raises(TypeError):
-        rebuild_frame(
-            frame,
-            state={"visible": ["goblin"]},
-            state_revision=8,
-        )
 
 
 def test_near_tie_policy_defers_per_decision_class():
@@ -254,12 +203,7 @@ def test_aggressive_reversible_direct_execution():
         frame, "flank", _full("flank", 0.8, "volley", 0.1), 0.85, verified=True
     )
     assert verdict.directive == "direct_execute"
-    trace = policy_trace(frame, verdict)
-    assert trace["candidate_schema_version"] == CANDIDATE_SCHEMA_VERSION
-    assert trace["frame_schema_version"] == FRAME_SCHEMA_VERSION
-    assert trace["policy_schema_version"] == POLICY_SCHEMA_VERSION
-    assert trace["decision_class"] == "skirmish_action"
-    assert trace["directive"] == "direct_execute"
+    assert verdict.decision_class == "skirmish_action"
 
 
 def test_higher_risk_and_failed_verification_escalate():
@@ -384,21 +328,6 @@ def test_deterministic_revalidation_guards_execution():
     assert exc_info.value.kind == "malformed"
 
 
-def test_frame_trace_versions_candidate_schema_and_policy():
-    frame = _frame()
-    trace = frame_trace(frame, policy_version=POLICY_SCHEMA_VERSION)
-    assert trace["candidate_schema_version"] == CANDIDATE_SCHEMA_VERSION
-    assert trace["frame_schema_version"] == FRAME_SCHEMA_VERSION
-    assert trace["policy_schema_version"] == POLICY_SCHEMA_VERSION
-    assert set(trace["candidate_ids"]) >= {
-        "flank",
-        "volley",
-        OPEN_ENDED_DM_CANDIDATE_ID,
-        CLARIFY_CANDIDATE_ID,
-        DEFER_CANDIDATE_ID,
-    }
-
-
 def test_verification_outcome_is_required_not_assumed():
     """Omitting deterministic verification is a TypeError, never a pass."""
     frame = _frame()
@@ -447,7 +376,7 @@ def test_malformed_current_revision_fails_closed():
     frame = _frame()
     for bad in (7.0, True, False, "", "   ", None, 7.5, ["7"]):
         with pytest.raises(DecisionError) as exc_info:
-            is_stale(frame, bad)
+            assert_fresh(frame, bad)
         assert exc_info.value.kind == "malformed"
         with pytest.raises(DecisionError) as exc_info:
             revalidate_for_execution(

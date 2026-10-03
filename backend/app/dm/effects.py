@@ -1,7 +1,7 @@
 """Staged effect registry — issue #206.
 
 Typed, non-generic effect application. Effects remain attempt-local until
-atomic commit via commit_turn_with_effects; this registry is the extensible
+atomic commit via commit_turn; this registry is the extensible
 promotion point.
 
 Handlers are intentionally narrow: they receive (db, campaign, effect_dict, turn, attempt)
@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 # restricted unless the contract explicitly widens it (issue #210).
 _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "update_scene": "public",
-    "propose_sheet_update": "public",
     "assert_fact": "dm_private",
     "upsert_relation": "dm_private",
     # Encounter selection references canonical identities only; stat
@@ -410,12 +409,6 @@ def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str
         "effect transfer_knowledge effect_id=%s subject=%s target_kind=%s transfer=%s",
         effect.get("id"), args.get("subject_entity_id"), args.get("target_kind"), transfer_kind,
     )
-
-
-@register("propose_sheet_update")
-def _handle_propose_sheet_update(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
-    args = effect.get("arguments") or {}
-    logger.info("effect propose_sheet_update effect_id=%s character_id=%s changes=%s", effect.get("id"), args.get("character_id"), len(args.get("changes") or []))
 
 
 @register("complete_adventure")

@@ -462,7 +462,7 @@ def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch)
 
 
 def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
-    """A non-UndefinedTable DB error naming the scene table must not downgrade."""
+    """A DB error naming the scene table must not downgrade to no-scene."""
     from sqlalchemy.exc import ProgrammingError
 
     from app.world import service as world_service
@@ -495,19 +495,6 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
     assert calls == []
     fresh_attempt = s.get(DmTurnAttempt, attempt.id)
     assert fresh_attempt.status in ("failed", "failed_visible")
-
-
-def test_missing_scene_table_still_downgrades(db):
-    """Not-yet-migrated rollout: absent scene relation stays compatible."""
-    from sqlalchemy import text
-
-    s, camp_id, thread_id, _ = db
-    _, attempt = _submit(s, camp_id, thread_id)
-    s.execute(text("DROP TABLE campaign_current_scenes"))
-    result = execute_dm_attempt(
-        s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic"
-    )
-    assert result.attempt.status == "succeeded"
 
 
 def test_await_roll_creates_request_and_resumes_on_fulfill(db):

@@ -32,6 +32,7 @@ from app.decisions.policy import (
     POLICY_SCHEMA_VERSION,
     evaluate_execution,
 )
+from tests.support.decision_policies import register_example_policies
 from tests.support.diagnostics import (
     CATEGORY_STAGE,
     STAGES,
@@ -61,6 +62,8 @@ from test_alpha_e2e_solo_dogfood_372 import (  # noqa: E402
     start_production_play,
     submit_player_turn,
 )
+
+register_example_policies()
 
 __all__ = ["phase0_provider", "scn"]
 

@@ -387,7 +387,7 @@ def _turn_event(db, c, staged_effects, *, contract_snapshot=None, visibility="pu
                          contract_snapshot=contract_snapshot or {}))
     db.flush()
     _c, event = commit_campaign_mutation(
-        db, c.id, rev, event_type="dm.turn_committed",
+        db, c.id, rev, event_type="dm.turn_resolved",
         payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
                  "submission_ids": [], "mode": "respond"},
         visibility=visibility,
@@ -683,7 +683,7 @@ def test_compiler_entity_links_back_to_committed_turn():
                              "public_summary": "Missed by promotion."}]}))
     db.flush()
     _c, event = commit_campaign_mutation(
-        db, c.id, rev, event_type="dm.turn_committed",
+        db, c.id, rev, event_type="dm.turn_resolved",
         payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
                  "submission_ids": [], "mode": "respond"},
         operation_id=f"turn-{turn_id}",
@@ -946,7 +946,7 @@ def test_promoted_keep_distinct_proposal_is_recognized():
         idempotency_key=stable_jit_key(attempt_id, "tmp_npc_1")))
     db.flush()
     _c, event = commit_campaign_mutation(
-        db, c.id, rev, event_type="dm.turn_committed",
+        db, c.id, rev, event_type="dm.turn_resolved",
         payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
                  "submission_ids": [], "mode": "respond"},
         operation_id=f"turn-{turn_id}")
@@ -1030,7 +1030,7 @@ def test_reuse_first_later_keep_distinct_stays_two():
             "temp_id": "tmp_npc_1", "outcome": str(first.id)}]))
     db.flush()
     _c, event = commit_campaign_mutation(
-        db, c.id, rev, event_type="dm.turn_committed",
+        db, c.id, rev, event_type="dm.turn_resolved",
         payload={"turn_id": str(turn_id), "attempt_id": str(attempt_id),
                  "submission_ids": [], "mode": "respond"},
         operation_id=f"turn-{turn_id}")

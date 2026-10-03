@@ -218,9 +218,7 @@ def test_player_authored_declaration_preserved_with_attribution():
     }])
     text = render_deterministic_narration(build_narration_projection(c), c)
     assert "I will hold the bridge!" in text
-    assert validate_narration_fidelity(
-        text, c, pc_names={"char:elara": "Elara"}
-    ) == []
+    assert validate_narration_fidelity(text, c) == []
 
 
 def test_ordinary_narration_passes_fidelity():
@@ -235,15 +233,18 @@ def test_ordinary_narration_passes_fidelity():
 
 def test_secret_fact_leak_rejected_pre_commit_with_no_persistence(db):
     s, camp_id, thread_id = db
-    c = _respond([_narr_beat("The vault door stands shut.")])
     secret = "the vault code is moonfall"
+    c = _respond([{"id": "beat_1", "type": "narration", "claims": [
+        _claim("The vault door stands shut."),
+        _claim(secret, visibility="dm_private"),
+    ]}])
     bad = "The vault door stands shut. You recall the vault code is moonfall."
     with pytest.raises(NarrationFidelityError) as ei:
         stream_narration(
             s, campaign_id=camp_id, thread_id=thread_id,
             turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
             contract=c, narrator=lambda req: bad,
-            publish_realtime=False, extra_secrets={secret},
+            publish_realtime=False,
         )
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
     assert s.scalar(select(func.count()).select_from(DMStream)) == 0
@@ -265,9 +266,8 @@ def test_consequence_check_ignores_substring_inside_longer_word():
     assert validate_narration_fidelity(good, c) == []
 
 
-def test_pc_agency_violation_rejected(monkeypatch):
-    import app.dm.narration as narration_mod
-    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
+def test_invented_pc_action_is_not_a_narration_fidelity_failure():
+    """PC agency is guarded by the adjudication validators, not narration."""
     c = _respond([{
         "id": "beat_1", "type": "narration",
         "claims": [{
@@ -278,25 +278,7 @@ def test_pc_agency_violation_rejected(monkeypatch):
         }],
     }])
     bad = 'Elara declares, "I hold my ground." Elara charges the dragon and attacks.'
-    with pytest.raises(NarrationFidelityError) as ei:
-        check_narration_fidelity_or_raise(bad, c, pc_names={"char:elara": "Elara"})
-    assert any(v["category"] == "agency_violation" for v in ei.value.violations)
-    m = get_narration_metrics()
-    assert m["agency_rejections"] >= 1
-
-
-def test_pc_agency_gate_disabled_for_playtesting():
-    c = _respond([{
-        "id": "beat_1", "type": "narration",
-        "claims": [{
-            "text": 'Elara declares, "I hold my ground."',
-            "claim_kind": "player_declaration", "origin": "player_transcript",
-            "actor_ref": {"type": "character", "id": "char:elara"},
-            "evidence_refs": ["sub1"], "visibility": "public",
-        }],
-    }])
-    bad = 'Elara declares, "I hold my ground." Elara charges the dragon and attacks.'
-    assert validate_narration_fidelity(bad, c, pc_names={"char:elara": "Elara"}) == []
+    assert validate_narration_fidelity(bad, c) == []
 
 
 def test_contradiction_with_structured_result_rejected():
@@ -718,12 +700,13 @@ def test_incremental_gate_rejects_secret_midstream(db):
     from app.dm.streams import get_stream
 
     s, camp_id, thread_id = db
-    c = _respond([_narr_beat(
-        "Torchlight flickers on wet stone as the party descends the stair."
-    )])
+    secret = "the vault code is moonfall"
+    c = _respond([{"id": "beat_1", "type": "narration", "claims": [
+        _claim("Torchlight flickers on wet stone as the party descends the stair."),
+        _claim(secret, visibility="dm_private"),
+    ]}])
     delta1 = render_deterministic_narration(build_narration_projection(c), c)
     assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
-    secret = "the vault code is moonfall"
 
     def _leaky(req):
         yield delta1
@@ -734,7 +717,7 @@ def test_incremental_gate_rejects_secret_midstream(db):
             s, campaign_id=camp_id, thread_id=thread_id,
             turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
             contract=c, narrator=_leaky, chunk_size=48,
-            publish_realtime=False, extra_secrets={secret},
+            publish_realtime=False,
         )
     assert ei.value.persisted_chunks >= 1
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
@@ -743,42 +726,6 @@ def test_incremental_gate_rejects_secret_midstream(db):
     assert len(s.execute(
         select(DMStreamChunk).where(DMStreamChunk.stream_id == ei.value.stream_id)
     ).scalars().all()) >= 1
-
-
-def test_incremental_gate_rejects_agency_violation_midstream(db, monkeypatch):
-    from app.dm.streams import get_stream
-    import app.dm.narration as narration_mod
-    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
-    s, camp_id, thread_id = db
-    c = _respond([{
-        "id": "beat_1", "type": "narration",
-        "claims": [{
-            "text": 'Elara declares, "I hold my ground."',
-            "claim_kind": "player_declaration", "origin": "player_transcript",
-            "actor_ref": {"type": "character", "id": "char:elara"},
-            "evidence_refs": ["sub1"], "visibility": "public",
-        }],
-    }])
-    delta1 = (
-        'Elara declares, "I hold my ground." '
-        "The hall is quiet and the torches burn low."
-    )
-    assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
-
-    def _rogue(req):
-        yield delta1
-        yield " Elara charges the dragon and attacks."
-
-    with pytest.raises(NarrationStreamError) as ei:
-        stream_narration(
-            s, campaign_id=camp_id, thread_id=thread_id,
-            turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
-            contract=c, narrator=_rogue, chunk_size=48,
-            publish_realtime=False, pc_names={"char:elara": "Elara"},
-        )
-    assert ei.value.persisted_chunks >= 1
-    assert any(v["category"] == "agency_violation" for v in ei.value.violations)
-    assert get_stream(s, ei.value.stream_id).status == "failed"
 
 
 def test_full_validation_failure_after_partial_delivery_fails_stream(db):

@@ -19,19 +19,16 @@ instead of guessing.  This module mediates that state:
 * traces each request: tool type, latency, result count/source IDs, retries,
   evidence rounds, and TTFT contribution.
 
-Out of scope (deferred to #178/#180):
-* full graph / vector / rules corpus tool bodies;
-* direct mutation tools.
-
-The concrete tool bodies are injectable callables so fixtures can stub them
-without touching the orchestrator.  A minimal in-process default handles the
-three read-only tools as typed no-op stubs returning ``unknown`` so the
-contract validates even before the corpus tools land.
+Every allowed tool has a concrete read-only handler in one static registry
+(character sheet, rules corpus, world retrieval, semantic memory); callers may
+override individual handlers via ``tool_handlers``. Direct mutation tools are
+out of scope.
 """
 
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import logging
 import time
 import uuid
@@ -64,15 +61,10 @@ MAX_REQUESTS_PER_ROUND: int = 3
 MAX_TOTAL_REQUESTS: int = 9
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(
-    {"ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules",
+    {"ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules",
      "lookup_world_entity", "traverse_world_relations", "lookup_world_fact",
      "query_world_timeline", "lookup_source_turn", "query_character_knowledge"}
 )
-
-# For forward compatibility, also allow combat/rules hooks as stubs but keep
-# the contract allowlist strict — unknown tools are rejected before execution.
-# The typed stubs below default to unknown if a future tool name arrives.
-
 
 # ── Strict base ──────────────────────────────────────────────────────────────
 
@@ -167,7 +159,6 @@ def _compact(value: Any, depth: int = 0) -> Any:
 def _tool_to_source_type(tool: str) -> str:
     mapping = {
         "ask_character_sheet": "dnd5e_character_sheet",
-        "get_current_scene": "scene",
         "search_campaign_memory": "campaign_memory",
         "lookup_rule": "dnd_srd_rule",
         "search_rules": "dnd_srd_rule",
@@ -215,57 +206,25 @@ def validate_evidence_requests(
     return normalized
 
 
-# ── Tool stubs / registry ────────────────────────────────────────────────────
+# ── Tool registry ────────────────────────────────────────────────────────────
 
-def _default_tool_handler(
-    request: EvidenceRequest,
-    audience: ContextAudience,
-    *,
-    db: Any | None = None,
-) -> EvidenceResult:
-    """Minimal typed stub for the three read-only tools.
+@functools.cache
+def _tool_registry() -> dict[str, Callable[..., Any]]:
+    """Static handler registry for every allowed evidence tool.
 
-    Real implementations from #178/#180 inject via ``tool_handlers``.  This
-    stub returns ``unknown`` with no sources so the loop still exercises
-    bounded retries and the ``unknown`` → uncertainty path.
+    Imported lazily: the handler modules import this module's result types.
     """
-    auth = AuthorizationScope(
-        campaign_id=audience.campaign_id,
-        thread_ids=[audience.thread_id],
-        user_ids=list(audience.user_ids) if request.tool == "ask_character_sheet" else [],
-    )
-    # Private source simulation: if include_private without audience authorization,
-    # the stub marks unauthorized.
-    if request.tool == "ask_character_sheet":
-        if request.include_private and audience.audience != "private":
-            return EvidenceResult(
-                request_id=request.id,
-                tool=request.tool,
-                status="unauthorized",
-                sources=[],
-                visibility="private",
-                authorization=auth,
-                payload=None,
-                error="private sheet data not authorized for this audience",
-            )
-    return EvidenceResult(
-        request_id=request.id,
-        tool=request.tool,
-        status="unknown",
-        sources=[
-            SourceRef(
-                source_type=_tool_to_source_type(request.tool),
-                source_id=request.id,
-                source_version="stub_v1",
-                campaign_revision=None,
-                provenance={"tool": request.tool, "stub": True},
-            )
-        ],
-        visibility="campaign",
-        authorization=auth,
-        payload={"note": "stub: no authoritative source available", "request_id": request.id},
-        result_count=0,
-    )
+    from app.dm.tools import handle_ask_character_sheet
+    from app.rules.evidence_tools import TOOL_HANDLERS as rules_handlers
+    from app.world.retrieval import TOOL_HANDLERS as world_handlers
+    from app.world.semantic import handle_search_campaign_memory
+
+    return {
+        "ask_character_sheet": handle_ask_character_sheet,
+        "search_campaign_memory": handle_search_campaign_memory,
+        **rules_handlers,
+        **world_handlers,
+    }
 
 
 def _classify_tool_error(exc: BaseException) -> str:
@@ -452,30 +411,11 @@ def execute_evidence_round(
     source_ids: list[str] = []
     tool_types: list[str] = []
 
-    handlers = dict(tool_handlers or {})
-    # Auto-register rules corpus handlers if available (issue #223)
-    if "lookup_rule" not in handlers or "search_rules" not in handlers:
-        try:
-            from app.rules.evidence_tools import TOOL_HANDLERS as _rules_handlers
-
-            for k, v in _rules_handlers.items():
-                handlers.setdefault(k, v)
-        except Exception:
-            pass
-    # Auto-register authoritative world retrieval handlers (issue #212)
-    try:
-        from app.world.retrieval import TOOL_HANDLERS as _world_handlers
-        from app.world.semantic import handle_search_campaign_memory
-
-        for k, v in _world_handlers.items():
-            handlers.setdefault(k, v)
-        handlers.setdefault("search_campaign_memory", handle_search_campaign_memory)
-    except Exception:
-        pass
+    handlers = {**_tool_registry(), **(tool_handlers or {})}
 
     for req in requests:
         tool_types.append(req.tool)
-        handler = handlers.get(req.tool, _default_tool_handler)
+        handler = handlers[req.tool]
         retries = 0
         last_exc: BaseException | None = None
         result: EvidenceResult | None = None

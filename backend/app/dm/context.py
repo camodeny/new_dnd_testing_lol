@@ -6,7 +6,7 @@ an authorization scope, a use boundary, and deterministic budget behavior.
 
 Current production tables provide turn identity, exact IC/OOC inputs, protected
 PC ownership/state, ruleset identity, and recent committed domain events.  Other
-authoritative readers (scene, combat, canon, clocks, policy) can add
+authoritative readers (scene, canon, knowledge, evidence) can add
 ``ContextRecord`` objects without changing this contract.
 """
 
@@ -55,10 +55,8 @@ class LaneName(str, Enum):
     PROTECTED_PCS = "protected_pcs"
     CURRENT_SCENE = "current_scene"
     CHARACTER_STATE = "character_state"
-    COMBAT_HOOKS = "combat_hooks"
     RELEVANT_CANON = "relevant_canon_relations"
     KNOWLEDGE_VISIBILITY = "knowledge_visibility"
-    CLOCKS_PRESSURES = "clocks_pressures"
     RECENT_HISTORY = "recent_unprocessed_history"
     REPAIR_DIRECTIVES = "repair_directives"
     CONTENT_BOUNDARIES = "content_boundaries"
@@ -807,47 +805,6 @@ def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
     return base
 
 
-def is_missing_current_scene_table_error(exc: BaseException) -> bool:
-    """Strict rollout predicate: the ``campaign_current_scenes`` relation itself is absent.
-
-    Only two exact cases qualify:
-    - SQLite: ``no such table: campaign_current_scenes``.
-    - PostgreSQL: SQLSTATE 42P01 (UndefinedTable) mentioning the relation.
-    Every other DB error (permission denied, missing column, malformed data,
-    etc.) must stay fail-closed even when the statement text names the table.
-    """
-    from sqlalchemy.exc import SQLAlchemyError
-
-    if not isinstance(exc, SQLAlchemyError):
-        return False
-    msg = str(exc).lower()
-    if "campaign_current_scenes" not in msg:
-        return False
-    if "no such table: campaign_current_scenes" in msg:
-        return True
-    chain: list[BaseException] = []
-    seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        chain.append(current)
-        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
-        if isinstance(cause, BaseException):
-            current = cause
-        else:
-            current = None
-    orig = getattr(exc, "orig", None)
-    if isinstance(orig, BaseException) and id(orig) not in seen:
-        chain.append(orig)
-    for err in chain:
-        sqlstate = getattr(err, "sqlstate", None) or getattr(err, "pgcode", None)
-        if sqlstate == "42P01":
-            return True
-        if type(err).__name__ == "UndefinedTable":
-            return True
-    return False
-
-
 def assemble_attempt_context(
     db: Session,
     attempt_id: uuid.UUID,
@@ -1232,29 +1189,11 @@ def assemble_attempt_context(
     # location/time/present actors without parsing chat history. Absent
     # scene rows leave the lane empty so #202 fail-closed rules apply.
     lane_started = time.monotonic()
-    try:
-        from app.world.service import build_current_scene_context_record
+    from app.world.service import build_current_scene_context_record
 
-        scene_value = build_current_scene_context_record(db, campaign)
-    except (ImportError, AttributeError) as exc:
-        # Missing scene reader/wiring: lane stays empty so the caller can
-        # decide (explicit not_applicable vs fail-closed). Never fabricate.
-        logger.warning("current_scene reader unavailable: %s", exc)
-        scene_value = None
-    except Exception as exc:
-        # Source failure (malformed row, reader regression, DB error):
-        # fail closed — never silently convert to "no scene established".
-        # The only tolerated case is a not-yet-migrated deployment where
-        # the scene table itself does not exist.
-        if is_missing_current_scene_table_error(exc):
-            logger.warning("current_scene table missing, treating lane as empty: %s", exc)
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            scene_value = None
-        else:
-            raise
+    # Source failure (malformed row, reader regression, DB error) raises:
+    # fail closed — never silently convert to "no scene established".
+    scene_value = build_current_scene_context_record(db, campaign)
     if scene_value is not None:
         scene_visibility = scene_value.get("visibility") or "campaign"
         if scene_visibility not in {"public", "campaign", "private", "dm_only"}:
@@ -1366,16 +1305,12 @@ def assemble_attempt_context(
                     scene_npc_ids.append(eid)
             if len(scene_npc_ids) >= 32:
                 break
-    try:
-        from app.world.knowledge import build_knowledge_visibility_values
+    from app.world.knowledge import build_knowledge_visibility_values
 
-        knowledge_values = build_knowledge_visibility_values(
-            db, campaign, sorted(character_ids, key=str),
-            npc_entity_ids=scene_npc_ids,
-        )
-    except (ImportError, AttributeError) as exc:
-        logger.warning("knowledge_visibility reader unavailable: %s", exc)
-        knowledge_values = []
+    knowledge_values = build_knowledge_visibility_values(
+        db, campaign, sorted(character_ids, key=str),
+        npc_entity_ids=scene_npc_ids,
+    )
     for index, value in enumerate(knowledge_values):
         subject_ref = (
             value.get("character_id")
@@ -1675,3 +1610,133 @@ def _template_sources(knowledge_records: list[ContextRecord]) -> list[SourceRef]
             if source.source_type == "dm_turn_attempt":
                 return [source]
     return []
+
+
+#: Bounds for the identity-deferral retry advisory: explicit-retry ancestry
+#: walked, and deferral memos surfaced in one advisory.
+_DEFERRAL_MAX_LEVELS = 5
+_DEFERRAL_MAX_RECORDS = 3
+IDENTITY_DEFERRAL_RECORD_ID = "identity-deferral:advisory"
+
+
+def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
+    """Advisory note from abandoned-parent identity deferrals, or ``None``.
+
+    Walks the explicit-retry parent chain (abandoned ``explicit_retry``
+    attempts) collecting ``via == "deferred"`` identity-resolution memos left
+    by :func:`app.world.identity.resolve_new_entity_identities_pre_narration`.
+    Without this, deterministic adjudication would replay the identical frame
+    into the same DEFER. Never raises: unreadable ancestry means no advisory,
+    never a blocked turn. Memo content is DM-prompt-safe by construction
+    (public proposal fields + canonical candidate labels only).
+    """
+    try:
+        memos: list[dict[str, Any]] = []
+        current = attempt
+        for _ in range(_DEFERRAL_MAX_LEVELS):
+            parent_id = getattr(current, "parent_attempt_id", None)
+            if not parent_id:
+                break
+            parent = db.get(DmTurnAttempt, parent_id)
+            if parent is None:
+                break
+            for item in getattr(parent, "identity_resolutions", None) or []:
+                if (
+                    isinstance(item, dict)
+                    and item.get("outcome") == "DEFER"
+                    and item.get("via") == "deferred"
+                ):
+                    memos.append(item)
+            if not (
+                getattr(parent, "status", None) == "abandoned"
+                and (getattr(parent, "abandonment_reason", None) or "") == "explicit_retry"
+            ):
+                break
+            current = parent
+    except Exception:
+        return None
+    # Dedupe repeat deferrals of the same proposal across the chain.
+    unique: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for memo in memos:
+        proposal = memo.get("proposal") if isinstance(memo.get("proposal"), dict) else {}
+        key = f"{memo.get('temp_id')}|{proposal.get('public_name')}|{proposal.get('kind')}"
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        unique.append(memo)
+        if len(unique) >= _DEFERRAL_MAX_RECORDS:
+            break
+    if not unique:
+        return None
+    parts: list[str] = []
+    for memo in unique:
+        proposal = memo.get("proposal") if isinstance(memo.get("proposal"), dict) else {}
+        name = str(proposal.get("public_name") or memo.get("temp_id") or "the figure")[:120]
+        kind = str(proposal.get("kind") or "entity")[:40]
+        labels = [str(label)[:120] for label in (memo.get("candidate_labels") or [])][:5]
+        parts.append(
+            f"'{name}' ({kind})"
+            + (f" resembled existing: {', '.join(labels)}" if labels else "")
+        )
+    note = (
+        "A previous attempt could not determine whether "
+        + "; ".join(parts)
+        + " is an already-established entity or someone new, so the turn could not "
+        "proceed. If it is an established canonical entity, reference it by exact "
+        "canonical name or alias in entity references instead of proposing a new "
+        "entity. If it is genuinely new, describe it with distinguishing detail "
+        "(appearance, role, location, group affiliation) so it cannot be confused "
+        "with an existing entity."
+    )
+    return note[:2000]
+
+
+def attach_retry_deferral_advisory(
+    packet: ForwardDmContextPacket, note: str
+) -> ForwardDmContextPacket:
+    """Return a copy of ``packet`` with the identity-deferral advisory attached.
+
+    One ``adjudication_only`` record in the player-inputs lane (idempotent by
+    record ID), so it never reaches narration. It inherits the packet
+    audience: on a private turn it stays thread-scoped and private.
+    """
+    audience = packet.audience
+    lanes = list(packet.lanes)
+    lane_index = next(
+        i for i, lane in enumerate(lanes) if lane.name == LaneName.PLAYER_INPUTS
+    )
+    if any(r.record_id == IDENTITY_DEFERRAL_RECORD_ID for r in lanes[lane_index].records):
+        return packet
+    private = str(audience.audience or "campaign") == "private"
+    record = ContextRecord(
+        record_id=IDENTITY_DEFERRAL_RECORD_ID,
+        value={
+            "label": "A previous attempt deferred an entity identity — disambiguate",
+            "note": note,
+            "authority": (
+                "advisory only: the adjudicator weighs this prior against "
+                "the full authoritative context and is not bound by it"
+            ),
+        },
+        sources=[
+            SourceRef(
+                source_type="identity_deferral",
+                source_id="identity-deferral",
+                source_version="1",
+                campaign_revision=None,
+            )
+        ],
+        authorization=AuthorizationScope(
+            campaign_id=str(audience.campaign_id),
+            thread_ids=[str(audience.thread_id)],
+            user_ids=[],
+        ),
+        visibility="private" if private else "campaign",  # type: ignore[arg-type]
+        use="adjudication_only",
+        required=False,
+        priority=5,
+    )
+    primed = packet.model_copy(deep=True)
+    primed.lanes[lane_index].records.append(record)
+    return primed

@@ -152,7 +152,7 @@ def test_world_seed_solo_happy_path(api):
         assert clock.status == "active"
         assert clock.threshold >= 1
         assert clock.advancement_criteria["kind"] == "deterministic"
-        assert "dm.turn_committed" in clock.advancement_criteria["event_types"]
+        assert "dm.turn_resolved" in clock.advancement_criteria["event_types"]
 
 
 def test_world_seed_multiplayer_covers_party(api):

@@ -1291,7 +1291,7 @@ def test_private_attempt_promotes_start_encounter():
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
     from app.runtime.threads import create_private_thread
 
@@ -1351,7 +1351,7 @@ def test_private_attempt_promotes_start_encounter():
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
         # Previously rejected: public-defaulted effect broadening a private attempt.
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
         encounter = get_active_encounter(db, ctx["campaign_id"])
         assert encounter is not None
         assert encounter.thread_id == str(thread.id)

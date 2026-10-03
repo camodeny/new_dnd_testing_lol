@@ -85,8 +85,6 @@ def _stub_status():
     return {
         LaneName.CURRENT_SCENE: "not_applicable",
         LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
-        LaneName.CLOCKS_PRESSURES: "not_applicable",
-        LaneName.COMBAT_HOOKS: "not_applicable",
         LaneName.RELEVANT_CANON: "not_applicable",
         LaneName.REPAIR_DIRECTIVES: "not_applicable",
     }

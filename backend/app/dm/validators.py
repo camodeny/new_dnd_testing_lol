@@ -93,10 +93,6 @@ class Validator(Protocol):
         self,
         contract: DmTurnContractV1,
         packet: ForwardDmContextPacket | None,
-        *,
-        known_entity_ids: set[str] | None = None,
-        canon_facts: dict[str, Any] | None = None,
-        private_fact_texts: set[str] | None = None,
     ) -> ValidatorResult: ...
 
 
@@ -215,7 +211,7 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                         out[norm_full] = "character"
         elif lane.name in (
             LaneName.RELEVANT_CANON, LaneName.CURRENT_SCENE,
-            LaneName.COMBAT_HOOKS, LaneName.REPAIR_DIRECTIVES,
+            LaneName.REPAIR_DIRECTIVES,
         ):
             for rec in lane.records:
                 v = rec.value
@@ -286,7 +282,7 @@ class AgencyValidator:
             return True
         return False
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         for bi, ci, claim in _all_claims(contract):
@@ -321,7 +317,7 @@ class OwnershipValidator:
     name = "ownership_validator"
     category = "ownership"
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         pc_owner = _extract_pc_ownership(packet)
@@ -428,28 +424,11 @@ class EntityValidator:
             return "character:" + s[5:]
         return s
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
 
-        # Typed allowlist: full_id_lower -> expected_type (None for bare)
-        # Only genuinely bare caller ids become wildcard; typed ids stay typed.
         known_map: dict[str, str | None] = {}
-        if known_entity_ids is not None:
-            for entry in set(known_entity_ids):
-                e = str(entry).strip()
-                if not e:
-                    continue
-                low = e.strip().lower()
-                norm_low = self._normalize_full_id(low)
-                if ":" in low:
-                    prefix = low.split(":", 1)[0].strip().lower()
-                    if prefix in ("character", "char", "npc", "location", "object", "entity"):
-                        known_map[norm_low] = self._normalize_type(prefix)
-                    else:
-                        known_map[norm_low] = None
-                else:
-                    known_map[norm_low] = None
         # packet-derived typed entities (never includes submission/event IDs)
         known_map.update({self._normalize_full_id(k): v for k, v in _known_entities_map_from_packet(packet).items()})
 
@@ -477,14 +456,6 @@ class EntityValidator:
                     refs.append((f"beat[{bi}].claim[{ci}].target_refs[{idx}]", r))
                 for idx, r in enumerate(claim.topic_refs):
                     refs.append((f"beat[{bi}].claim[{ci}].topic_refs[{idx}]", r))
-        for eff in contract.staged_effects:
-            args = eff.arguments or {}
-            # reveal_fact item_id is entity-like
-            if eff.effect_type == "reveal_fact" and args.get("item_id"):
-                # only check if it looks like an entity ref
-                pass
-            if eff.effect_type == "propose_sheet_update" and args.get("character_id"):
-                refs.append((f"effect[{eff.id}].character_id", _fake_ref(args.get("character_id"))))
         for ne in contract.new_entities:
             if ne.location_ref:
                 refs.append((f"new_entity[{ne.temp_id}].location_ref", ne.location_ref))
@@ -551,32 +522,8 @@ class EntityValidator:
                         )
                     )
 
-        # Check that new entity public names don't duplicate existing entity names (hook)
-        # naive: if known_entity_ids contains a name that matches new_entity public_name, flag
-        # caller can supply names via canon_facts mapping
-        if canon_facts:
-            known_names = {str(v).lower() for v in canon_facts.values() if isinstance(v, str)}
-            for ne in contract.new_entities:
-                if ne.public_name.lower() in known_names:
-                    violations.append(
-                        ValidationViolation(
-                            validator=self.name, category=self.category, code="duplicate_identity_name",
-                            message=f"New entity {ne.temp_id!r} name {ne.public_name!r} duplicates known canonical name",
-                            details={"temp_id": ne.temp_id, "name": ne.public_name}, entity_ref=ne.temp_id
-                        )
-                    )
-
         latency = (time.monotonic() - t0) * 1000
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
-
-
-def _fake_ref(char_id: Any):
-    """Wrap a bare id into a minimal EntityRef-like dict for uniform handling."""
-    class _R:
-        def __init__(self, id_val):
-            self.id = id_val
-            self.type = "character"
-    return _R(char_id)
 
 
 class ProvenanceValidator:
@@ -585,7 +532,7 @@ class ProvenanceValidator:
     name = "provenance_validator"
     category = "provenance"
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         # Build known source ids from packet (submission ids, event ids, evidence ids)
@@ -658,7 +605,7 @@ class EpistemicValidator:
     name = "epistemic_validator"
     category = "epistemics"
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         # Collect player_declaration and npc_utterance texts
@@ -704,11 +651,6 @@ class EpistemicValidator:
                             details={"beat": bi, "claim": ci, "origin": claim.origin}, claim_index=(bi, ci)
                         )
                     )
-                # Observation without evidence but claiming knowledge of hidden truth
-                # For now, require that observations about hidden canon have evidence_refs
-                if claim.claim_kind == "observation" and "hidden" in low and not claim.evidence_refs:
-                    # heuristic — only if canon_facts supplied and claim contradicts? skip heavy
-                    pass
 
         # NPC beats with truthful but no supporting evidence are okay; deception already validated via contract
 
@@ -722,7 +664,7 @@ class VisibilityValidator:
     name = "visibility_validator"
     category = "visibility"
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         audience = packet.audience if packet is not None else None
@@ -739,25 +681,6 @@ class VisibilityValidator:
                         claim_index=(bi, ci),
                     )
                 )
-            # Also check semantic private leak: claim text matches known private fact texts
-            if is_shared and private_fact_texts and claim.text.strip() in private_fact_texts:
-                violations.append(
-                    ValidationViolation(
-                        validator=self.name, category=self.category, code="private_semantic_leak",
-                        message="Shared-audience output contains private-only fact text",
-                        details={"beat": bi, "claim": ci, "text": claim.text}, claim_index=(bi, ci)
-                    )
-                )
-
-        # Check staged effects visibility: shared audience must not have dm_private events leaked via narration? But effects are internal — skip
-        # Check packet-aware: private records must not be in campaign audience packet — already enforced by context assembly, but validator double-checks
-        if is_shared and private_fact_texts:
-            for beat in contract.beats:
-                for claim in beat.claims:
-                    if claim.text.strip() in private_fact_texts:
-                        # already handled above; dedup
-                        pass
-
         latency = (time.monotonic() - t0) * 1000
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
@@ -856,7 +779,7 @@ class KnowledgeValidator:
                 out.setdefault(subject, set()).update(targets)
         return out
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         perspectives = self._perspectives(packet)
@@ -931,12 +854,8 @@ class KnowledgeValidator:
 class CanonValidator:
     """Basic current-canon contradiction checks against authoritative context.
 
-    Supports two typed inputs:
-    * packet-derived canon: all records in RELEVANT_CANON / CURRENT_SCENE / RECENT_HISTORY
-      are treated as authoritative. Contradiction is detected via shared subject + antonym pairs.
-    * caller-supplied canon_facts: dict where each value is either a string, or a dict
-      {\"value\": str, \"forbids\": [str, ...]} . A claim that contains a forbids phrase
-      (or an antonym of the value) without evidence_refs is a contradiction.
+    All records in RELEVANT_CANON / CURRENT_SCENE / RECENT_HISTORY are treated
+    as authoritative. Contradiction is detected via shared subject + antonym pairs.
     """
 
     # Deterministic antonym pairs for packet-derived checks
@@ -956,34 +875,9 @@ class CanonValidator:
     name = "canon_validator"
     category = "canon"
 
-    def _extract_canon_entries(self, packet, canon_facts) -> list[tuple[str, list[str]]]:
+    def _extract_canon_entries(self, packet) -> list[tuple[str, list[str]]]:
         """Return list of (canonical_text, forbids_phrases)."""
         entries: list[tuple[str, list[str]]] = []
-        if canon_facts:
-            for k, v in canon_facts.items():
-                if k.startswith("contradicts:") and isinstance(v, str):
-                    # legacy explicit forbid
-                    entries.append((k, [v.strip().lower()]))
-                elif isinstance(v, str):
-                    # derive forbids via antonym lookup
-                    low = v.strip().lower()
-                    forbids: list[str] = []
-                    for a, b in self._ANTONYMS:
-                        if a in low:
-                            forbids.append(b)
-                        if b in low:
-                            forbids.append(a)
-                    entries.append((low, forbids))
-                elif isinstance(v, dict):
-                    canon_val = str(v.get("value") or v.get("canonical") or "").strip().lower()
-                    forbids = [str(x).strip().lower() for x in v.get("forbids") or v.get("forbids_contains") or [] if str(x).strip()]
-                    # also augment with antonym expansion
-                    for a, b in self._ANTONYMS:
-                        if canon_val and a in canon_val and b not in forbids:
-                            forbids.append(b)
-                        if canon_val and b in canon_val and a not in forbids:
-                            forbids.append(a)
-                    entries.append((canon_val, forbids))
         if packet is not None:
             for lane_name in (LaneName.RELEVANT_CANON, LaneName.CURRENT_SCENE, LaneName.RECENT_HISTORY):
                 lane = next((lane for lane in packet.lanes if lane.name == lane_name), None)
@@ -1015,10 +909,10 @@ class CanonValidator:
                             entries.append((t, forbids))
         return entries
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
-        canon_entries = self._extract_canon_entries(packet, canon_facts)
+        canon_entries = self._extract_canon_entries(packet)
 
         for bi, ci, claim in _all_claims(contract):
             if claim.claim_kind not in ("world_fact", "observation"):
@@ -1052,20 +946,6 @@ class CanonValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
-# ── Extension hook ───────────────────────────────────────────────────────────
-
-class ContentBoundaryValidator:
-    """Hook for content-boundary policy — supplied via lane, fails closed on disallowed content."""
-    name = "content_boundary_validator"
-    category = "content"
-
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
-        # No-op stub: real policy adapter will supply disallowed patterns via supplemental records
-        t0 = time.monotonic()
-        latency = (time.monotonic() - t0) * 1000
-        return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=latency)
-
-
 class RulesValidator:
     """Deterministic 2024 rules validation (#180; first enforced rule #226).
 
@@ -1086,7 +966,7 @@ class RulesValidator:
     name = "rules_validator"
     category = "mechanics"
 
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
+    def validate(self, contract, packet) -> ValidatorResult:
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         for eff in getattr(contract, "staged_effects", None) or []:
@@ -1125,17 +1005,6 @@ class RulesValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
-class RepairValidator:
-    """Hook for post-visible repair directives (#179) — in pre-narration pipeline it's a no-op."""
-    name = "repair_validator"
-    category = "repair"
-
-    def validate(self, contract, packet, *, known_entity_ids=None, canon_facts=None, private_fact_texts=None) -> ValidatorResult:
-        t0 = time.monotonic()
-        latency = (time.monotonic() - t0) * 1000
-        return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=latency)
-
-
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 DEFAULT_VALIDATORS: list[Validator] = [
@@ -1147,9 +1016,7 @@ DEFAULT_VALIDATORS: list[Validator] = [
     VisibilityValidator(),
     KnowledgeValidator(),
     CanonValidator(),
-    ContentBoundaryValidator(),
     RulesValidator(),
-    RepairValidator(),
 ]
 
 # category ordering is the validator list order above
@@ -1179,9 +1046,6 @@ class ValidatorPipeline:
         contract: DmTurnContractV1,
         packet: ForwardDmContextPacket | None = None,
         *,
-        known_entity_ids: set[str] | None = None,
-        canon_facts: dict[str, Any] | None = None,
-        private_fact_texts: set[str] | None = None,
         correlation_id: str | None = None,
         regeneration_index: int = 0,
     ) -> ValidationReport:
@@ -1193,13 +1057,7 @@ class ValidatorPipeline:
         for validator in self.validators:
             v_t0 = time.monotonic()
             try:
-                result = validator.validate(
-                    contract,
-                    packet,
-                    known_entity_ids=known_entity_ids,
-                    canon_facts=canon_facts,
-                    private_fact_texts=private_fact_texts,
-                )
+                result = validator.validate(contract, packet)
                 # ensure latency is set (validator may have already)
                 if result.latency_ms == 0:
                     result.latency_ms = (time.monotonic() - v_t0) * 1000
@@ -1242,16 +1100,11 @@ class ValidatorPipeline:
         contract: DmTurnContractV1,
         packet: ForwardDmContextPacket | None = None,
         *,
-        known_entity_ids: set[str] | None = None,
-        canon_facts: dict[str, Any] | None = None,
-        private_fact_texts: set[str] | None = None,
         correlation_id: str | None = None,
         regeneration_index: int = 0,
     ) -> ValidationReport:
         report = self.validate(
             contract, packet,
-            known_entity_ids=known_entity_ids, canon_facts=canon_facts,
-            private_fact_texts=private_fact_texts,
             correlation_id=correlation_id, regeneration_index=regeneration_index,
         )
         if not report.passed:
@@ -1267,19 +1120,12 @@ def validate_contract(
     contract: DmTurnContractV1,
     packet: ForwardDmContextPacket | None = None,
     *,
-    known_entity_ids: set[str] | None = None,
-    canon_facts: dict[str, Any] | None = None,
-    private_fact_texts: set[str] | None = None,
     correlation_id: str | None = None,
     regeneration_index: int = 0,
-    pipeline: ValidatorPipeline | None = None,
 ) -> ValidationReport:
     """Convenience: validate before first visible chunk using default pipeline."""
-    pipe = pipeline or default_pipeline
-    return pipe.validate(
+    return default_pipeline.validate(
         contract, packet,
-        known_entity_ids=known_entity_ids, canon_facts=canon_facts,
-        private_fact_texts=private_fact_texts,
         correlation_id=correlation_id, regeneration_index=regeneration_index,
     )
 
@@ -1288,18 +1134,11 @@ def validate_contract_or_raise(
     contract: DmTurnContractV1,
     packet: ForwardDmContextPacket | None = None,
     *,
-    known_entity_ids: set[str] | None = None,
-    canon_facts: dict[str, Any] | None = None,
-    private_fact_texts: set[str] | None = None,
     correlation_id: str | None = None,
     regeneration_index: int = 0,
-    pipeline: ValidatorPipeline | None = None,
 ) -> ValidationReport:
-    pipe = pipeline or default_pipeline
-    return pipe.validate_or_raise(
+    return default_pipeline.validate_or_raise(
         contract, packet,
-        known_entity_ids=known_entity_ids, canon_facts=canon_facts,
-        private_fact_texts=private_fact_texts,
         correlation_id=correlation_id, regeneration_index=regeneration_index,
     )
 
@@ -1345,66 +1184,16 @@ def _augment_packet_with_feedback(
         return packet
 
 
-def _call_adjudicate(adjudicate: Callable[..., Any], packet: ForwardDmContextPacket | None, feedback: str | None):
-    """Explicit signature dispatch — does not use trial invocation.
-
-    Supported adjudicate forms:
-    * ``() -> contract``
-    * ``(packet) -> contract``
-    * ``(feedback) -> contract`` (name contains feedback/rejection)
-    * ``(packet, feedback) -> contract``
-    Any TypeError raised *inside* the adjudicate is not treated as a
-    signature mismatch and propagates.
-    """
-    import inspect
-
-    sig = inspect.signature(adjudicate)
-    params = [p for p in sig.parameters.values() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
-    has_var = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in sig.parameters.values())
-
-    if has_var:
-        return adjudicate(packet, feedback)  # type: ignore[call-arg]
-
-    if len(params) == 0:
-        return adjudicate()  # type: ignore[call-arg]
-
-    if len(params) == 1:
-        name = params[0].name.lower()
-        if "packet" in name:
-            return adjudicate(packet)  # type: ignore[call-arg]
-        if "feedback" in name or "rejection" in name:
-            return adjudicate(feedback)  # type: ignore[call-arg]
-        # ambiguous single-arg: treat as packet-only (explicit contract prefers
-        # 2-arg (packet, feedback)); packet will already be augmented with
-        # repair_directives on retry so feedback is still visible.
-        return adjudicate(packet)  # type: ignore[call-arg]
-
-    # 2+ positional args — assume (packet, feedback) order, but respect names
-    names = [p.name.lower() for p in params[:2]]
-    if "packet" in names[0] and ("feedback" in names[1] or "rejection" in names[1]):
-        return adjudicate(packet, feedback)  # type: ignore[call-arg]
-    if ("feedback" in names[0] or "rejection" in names[0]) and "packet" in names[1]:
-        return adjudicate(feedback, packet)  # type: ignore[call-arg]
-    # default: (packet, feedback)
-    return adjudicate(packet, feedback)  # type: ignore[call-arg]
-
-
 def run_with_bounded_regeneration(
     adjudicate: Callable[..., DmTurnContractV1 | dict[str, Any]],
     packet: ForwardDmContextPacket | None = None,
     *,
-    known_entity_ids: set[str] | None = None,
-    canon_facts: dict[str, Any] | None = None,
-    private_fact_texts: set[str] | None = None,
     max_regenerations: int = 3,
-    pipeline: ValidatorPipeline | None = None,
-    normalize_fn: Callable[[Any], DmTurnContractV1] | None = None,
     packet_repair: Callable[[ValidationReport, ForwardDmContextPacket | None], ForwardDmContextPacket | None] | None = None,
 ) -> tuple[DmTurnContractV1, ValidationReport]:
     """Bounded retry: adjudicate → validate → on rejection, adjudicate again with feedback.
 
-    ``adjudicate`` may be ``() -> contract``, ``(feedback: str|None) -> contract``,
-    ``(packet) -> contract`` or ``(packet, feedback) -> contract``.  On retry,
+    ``adjudicate`` is called as ``adjudicate(packet, feedback)``. On retry,
     ``feedback`` is the structured string from ``format_rejection_for_retry`` and
     ``packet`` is augmented with a ``repair_directives`` record so packet-only
     adjudicators still see the rejection. Failures after the bound surface a
@@ -1425,10 +1214,9 @@ def run_with_bounded_regeneration(
     requests is never silenced — it spends a normal model retry, and fails
     visibly once the budget is exhausted.
     """
-    from app.dm.contract import normalize_contract as _normalize
+    from app.dm.contract import normalize_contract
 
-    norm = normalize_fn or _normalize
-    pipe = pipeline or default_pipeline
+    pipe = default_pipeline
     last_report: ValidationReport | None = None
     current_packet = packet
     repair_attempted = False
@@ -1442,11 +1230,9 @@ def run_with_bounded_regeneration(
             # perspective lane survives re-augmentation.
             if attempt > 0 and feedback is not None:
                 current_packet = _augment_packet_with_feedback(current_packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
-                raw = _call_adjudicate(adjudicate, current_packet, feedback)
-            else:
-                raw = _call_adjudicate(adjudicate, current_packet, feedback)
+            raw = adjudicate(current_packet, feedback)
             if isinstance(raw, dict):
-                contract = norm(raw)
+                contract = normalize_contract(raw)
             elif isinstance(raw, DmTurnContractV1):
                 contract = raw
             else:
@@ -1482,8 +1268,6 @@ def run_with_bounded_regeneration(
 
         report = pipe.validate(
             contract, current_packet,
-            known_entity_ids=known_entity_ids, canon_facts=canon_facts,
-            private_fact_texts=private_fact_texts,
             regeneration_index=attempt,
         )
         if report.passed:
@@ -1529,8 +1313,6 @@ def run_with_bounded_regeneration(
             for candidate in [c for c in candidates if c is not None]:
                 repair_report = pipe.validate(
                     candidate, current_packet,
-                    known_entity_ids=known_entity_ids, canon_facts=canon_facts,
-                    private_fact_texts=private_fact_texts,
                     regeneration_index=attempt + 1,
                 )
                 if repair_report.passed:

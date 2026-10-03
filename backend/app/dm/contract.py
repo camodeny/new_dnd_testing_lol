@@ -277,7 +277,6 @@ STAGED_EFFECT_TYPES = (
     "record_world_event",
     "update_scene",
     "reveal_fact",
-    "propose_sheet_update",
     "assert_fact",
     "upsert_relation",
     "complete_adventure",
@@ -338,23 +337,6 @@ class UpsertRelationArgs(StrictModel):
     supersedes_relation_id: str | None = Field(default=None, max_length=160)
     clear_object: bool = False
     idempotency_key: str | None = Field(default=None, max_length=128)
-
-class ProposeSheetUpdateArgs(StrictModel):
-    character_id: str | int = Field(description="Durable character id; proposal remains pending")
-    reason: str = Field(min_length=1, max_length=400)
-    changes: list[dict[str, Any]] = Field(min_length=1, max_length=8)
-
-    @field_validator("changes")
-    @classmethod
-    def _validate_changes(cls, v: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        for ch in v:
-            if not isinstance(ch, dict):
-                raise ValueError("changes entries must be objects")
-            if "field" not in ch or "operation" not in ch or "value" not in ch:
-                raise ValueError("each change requires field, operation, value")
-            if ch["operation"] not in ("add", "subtract", "set"):
-                raise ValueError("operation must be add|subtract|set")
-        return v
 
 class CompleteAdventureArgs(StrictModel):
     """DM-declared adventure/arc completion — issue #260.
@@ -713,13 +695,13 @@ class TransferKnowledgeArgs(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -757,8 +739,6 @@ class StagedEffect(StrictModel):
                 UpdateSceneArgs.model_validate(args)
             elif t == "reveal_fact":
                 RevealFactArgs.model_validate(args)
-            elif t == "propose_sheet_update":
-                ProposeSheetUpdateArgs.model_validate(args)
             elif t == "assert_fact":
                 AssertFactArgs.model_validate(args)
             elif t == "upsert_relation":
@@ -799,7 +779,7 @@ class StagedEffect(StrictModel):
 
 class EvidenceRequest(StrictModel):
     id: str = Field(min_length=1, max_length=48)
-    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
+    tool: Literal["ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
     question: str | None = Field(default=None, max_length=600)
     scope: Literal["current_player", "party", "character_id"] | None = None
     character_id: str | int | None = None

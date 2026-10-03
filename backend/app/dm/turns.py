@@ -60,6 +60,10 @@ TURN_SUCCEEDED = "succeeded"
 TURN_FAILED_VISIBLE = "failed_visible"
 TURN_ABANDONED = "abandoned"
 
+#: Canonical domain event for a committed DM turn (promoted to
+#: ``adventure.completed`` when the turn closes an adventure).
+DM_TURN_RESOLVED = "dm.turn_resolved"
+
 ATTEMPT_PREPARED = "prepared"
 ATTEMPT_RUNNING = "running"
 ATTEMPT_AWAITING_ROLL = "awaiting_roll"
@@ -854,7 +858,7 @@ def mark_recovered_streaming(
     current failed-visible attempt with a completed stream and a preserved
     valid ``contract_snapshot``. New input can never enter through here
     (input set stays locked); the only exit is the normal
-    ``commit_turn_with_effects``. Raises ``ValueError`` otherwise.
+    ``commit_turn``. Raises ``ValueError`` otherwise.
     """
     try:
         turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
@@ -940,8 +944,6 @@ def commit_turn(
     turn_id: uuid.UUID,
     attempt_id: uuid.UUID,
     expected_revision: int | None = None,
-    mutate: Any | None = None,
-    event_type: str = "dm.turn_resolved",
     payload: dict | None = None,
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
@@ -1121,6 +1123,7 @@ def commit_turn(
     # Include staged effect ids/types in payload for observability
     staged_list = attempt.staged_effects or []
     adventure_completion_args: dict | None = None
+    event_type = DM_TURN_RESOLVED
     if staged_list:
         base_payload = dict(base_payload)
         base_payload["staged_effect_ids"] = [e.get("id") for e in staged_list]
@@ -1129,14 +1132,12 @@ def commit_turn(
             base_payload["stream_id"] = str(attempt.stream_id)
         # A staged adventure completion promotes the turn commit to the
         # adventure.completed domain event (issue #260): the turn IS the
-        # authoritative provenance for the DM's completion decision. Only
-        # the default turn event type is promoted — explicit callers keep
-        # their event type.
+        # authoritative provenance for the DM's completion decision.
         adventure_completion_args = next(
             (e.get("arguments") or {} for e in staged_list if e.get("effect_type") == "complete_adventure"),
             None,
         )
-        if adventure_completion_args is not None and event_type == "dm.turn_resolved":
+        if adventure_completion_args is not None:
             event_type = "adventure.completed"
             # Player-readable lifecycle data only — the DM's completion
             # reason stays on the owner-visible adventure row, never in the
@@ -1150,7 +1151,6 @@ def commit_turn(
             base_payload["public_summary"] = adventure_completion_args.get("public_summary")
             base_payload["source_turn_id"] = str(turn.id)
 
-    # Wrap mutate to also apply staged effects atomically inside same revision bump
     # Resolved adventure identity closed by this turn (issue #260): populated
     # inside the mutation, consumed by the post-mutate payload builder so the
     # authoritative completion event carries the actual adventure id even when
@@ -1164,9 +1164,6 @@ def commit_turn(
     identity_telemetry_outbox: list = []
 
     def _mutate_with_effects(campaign):
-        # Apply caller-provided mutate first
-        if mutate is not None:
-            mutate(campaign)
         # Apply staged effects via registry (fail-closed)
         if staged_list:
             from app.dm.effects import apply_staged_effects
@@ -1585,105 +1582,6 @@ def commit_turn(
     return turn, attempt, event
 
 
-def commit_turn_with_effects(
-    db: Session,
-    turn_id: uuid.UUID,
-    attempt_id: uuid.UUID,
-    expected_revision: int | None = None,
-    event_type: str = "dm.turn_resolved",
-    payload: dict | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    commit: bool = True,
-) -> tuple[DmTurn, DmTurnAttempt, Any]:
-    """Thin wrapper for staged-effects commit (issue #206). Delegates to commit_turn."""
-    return commit_turn(db, turn_id, attempt_id, expected_revision=expected_revision, mutate=None, event_type=event_type, payload=payload, operation_id=operation_id, actor_id=actor_id, commit=commit)
-
-
-def abandon_visible_attempt(
-    db: Session,
-    turn_id: uuid.UUID,
-    attempt_id: uuid.UUID,
-    reason: str = "explicit_retry",
-    actor_id: uuid.UUID | None = None,
-) -> tuple[DmTurn, DmTurnAttempt]:
-    """Abandon a visible partial attempt without mutating authoritative state (explicit Retry).
-
-    Only streaming/failed_visible attempts can be abandoned. Staged effects remain
-    for audit but are never promoted. The stream is marked abandoned/non-canonical.
-    After abandon, the blocking turn no longer prevents next turn advancement.
-    Idempotent.
-    """
-    try:
-        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-    except Exception:
-        turn = db.get(DmTurn, turn_id)
-        attempt = db.get(DmTurnAttempt, attempt_id)
-    if turn is None or attempt is None:
-        raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
-    if str(attempt.turn_id) != str(turn.id):
-        raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
-    if str(turn.current_attempt_id) != str(attempt_id):
-        raise ValueError(f"Attempt {attempt_id} is not current for turn {turn_id}")
-
-    if attempt.status == ATTEMPT_ABANDONED and turn.status == TURN_ABANDONED:
-        return turn, attempt
-
-    # Only visible attempts can be abandoned
-    if attempt.status not in (ATTEMPT_STREAMING, ATTEMPT_FAILED_VISIBLE) or turn.status not in (TURN_STREAMING, TURN_FAILED_VISIBLE):
-        raise ValueError(f"Cannot abandon attempt {attempt_id} with status {attempt.status} / turn {turn_id} status {turn.status}; must be streaming/failed_visible")
-
-    now = _now()
-    # Compute visible-but-incomplete duration for observability
-    visible_ms = None
-    if attempt.streaming_started_at:
-        try:
-            visible_ms = int((now - attempt.streaming_started_at).total_seconds() * 1000)
-        except Exception:
-            visible_ms = None
-    elif turn.streaming_started_at:
-        try:
-            visible_ms = int((now - turn.streaming_started_at).total_seconds() * 1000)
-        except Exception:
-            visible_ms = None
-
-    attempt.status = ATTEMPT_ABANDONED
-    attempt.abandoned_at = now
-    attempt.abandonment_reason = reason[:64] if reason else "explicit_retry"
-    attempt.completed_at = now
-    attempt.last_error = f"Abandoned visible attempt: {reason}"
-    attempt.error_class = "abandoned"
-
-    turn.status = TURN_ABANDONED
-    turn.abandoned_at = now
-    turn.abandonment_reason = reason[:64] if reason else "explicit_retry"
-
-    # Mark stream abandoned
-    if attempt.stream_id:
-        try:
-            from models.dm import DMStream
-
-            stream = db.get(DMStream, attempt.stream_id)
-            if stream:
-                stream.status = "abandoned"
-                stream.abandoned_at = now
-                stream.abandonment_reason = reason[:64] if reason else "explicit_retry"
-        except Exception as e:
-            logger.warning("abandon failed to mark stream abandoned turn_id=%s stream_id=%s error=%s", turn_id, attempt.stream_id, e)
-
-    db.flush()
-    db.commit()
-    db.refresh(turn)
-    db.refresh(attempt)
-
-    logger.info(
-        "dm_turn abandoned campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s reason=%s staged_effect_count=%s time_visible_but_incomplete_ms=%s",
-        turn.campaign_id, turn.thread_id, turn.id, attempt.id, reason, len(attempt.staged_effects or []), visible_ms,
-    )
-    return turn, attempt
-
-
 def discard_superseded_result(db: Session, attempt_id: uuid.UUID, reason: str = "superseded") -> DmTurnAttempt | None:
     """Handle an obsolete attempt that finished model execution after supersession."""
     attempt = db.get(DmTurnAttempt, attempt_id)
@@ -1752,8 +1650,7 @@ def recover_stuck_attempts(
 ) -> int:
     """Recover attempts left in running without completion (worker crash).
 
-    When ``campaign_id`` is given, only attempts for that campaign are recovered
-    (prevents cross-campaign reset from a path-scoped recover endpoint).
+    When ``campaign_id`` is given, only attempts for that campaign are recovered.
     """
     cutoff = _now() - timedelta(seconds=lease_seconds)
     q = select(DmTurnAttempt).where(

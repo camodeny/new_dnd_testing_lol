@@ -775,7 +775,7 @@ def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
         def _fail(*a, **k):
             raise RuntimeError("crash during effect/event staging")
 
-        monkeypatch.setattr(turns_mod, "commit_turn_with_effects", _fail)
+        monkeypatch.setattr(turns_mod, "commit_turn", _fail)
 
     with pytest.raises(RuntimeError, match="crash"):
         recover_partial_stream(s, camp_id, turn.id, stream_id, LONG_TEXT,

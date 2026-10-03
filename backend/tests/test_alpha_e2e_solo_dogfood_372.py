@@ -943,9 +943,8 @@ def run_phase0_solo_scenario(
 ) -> None:
     """Run the one Phase 0 scenario flow for fake and opt-in real AI.
 
-    Deterministic and generative modes require narration for every turn.
-    Experimental decision mode may additionally accept a succeeded, persisted
-    ``silent`` contract without inventing a stream; all other structural,
+    Narration is required for every turn unless ``allow_silent`` accepts a
+    succeeded, persisted ``silent`` contract without inventing a stream; all other structural,
     reconnect, and continuation assertions remain shared.
     """
     # Setup: synthetic fixtures + authoritative select/ready.

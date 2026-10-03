@@ -16,7 +16,6 @@ import uuid
 from typing import Any
 
 from app.decisions.adapters.base import DecisionAdapter
-from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.decisions.adapters.jev import JevAdapter
 from app.decisions.config import (
     MAX_DECISION_ATTEMPTS,
@@ -35,18 +34,6 @@ from app.decisions.errors import DecisionError
 
 DECISION_ROLE = "decision"
 DECISION_LOGICAL_OPERATION = "bounded_decision"
-
-
-def create_adapter(name: str | None = None, **kwargs: Any) -> DecisionAdapter:
-    """Build an adapter by name. Branching lives here, not in gameplay code."""
-    resolved = (name or "jev").strip().lower()
-    if resolved == "jev":
-        return JevAdapter()
-    if resolved in {"fake", "fake-decision"}:
-        return FakeDecisionAdapter(**kwargs)
-    raise DecisionError(
-        f"unknown decision adapter: {name!r}", kind="unsupported_feature"
-    )
 
 
 def validate_request(request: DecisionRequest) -> None:

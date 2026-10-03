@@ -27,6 +27,8 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from app.dm.turns import DM_TURN_RESOLVED
+
 logger = logging.getLogger(__name__)
 
 #: Marker for production seed state — the #355 scaffold tag must NOT appear
@@ -346,14 +348,14 @@ def validate_seed_spec(spec: dict, *, required_pc_ids: list[str]) -> None:
     threshold = int(pressure["threshold"])
     validate_advancement_criteria({
         "kind": "deterministic",
-        "event_types": ["dm.turn_committed"],
+        "event_types": [DM_TURN_RESOLVED],
         "required_count": 2,
         "max_advance": 1,
     })
     validate_completion_criteria({
         "kind": "semantic",
         "description": f"Decisively end {pressure['name']} through play",
-        "event_types": ["dm.turn_committed"],
+        "event_types": [DM_TURN_RESOLVED],
     })
     validate_stages(
         [{"at": max(1, threshold - 1), "label": f"{pressure['name']} escalates"}],
@@ -597,7 +599,7 @@ def run_world_seed(
             db, locked, name=spec["pressure"]["name"], threshold=threshold,
             advancement_criteria={
                 "kind": "deterministic",
-                "event_types": ["dm.turn_committed"],
+                "event_types": [DM_TURN_RESOLVED],
                 "required_count": 2,
                 "max_advance": 1,
             },
@@ -606,7 +608,7 @@ def run_world_seed(
             completion_criteria={
                 "kind": "semantic",
                 "description": f"Decisively end {spec['pressure']['name']} through play",
-                "event_types": ["dm.turn_committed"],
+                "event_types": [DM_TURN_RESOLVED],
             },
             visibility="campaign", provenance=prov,
             operation_id=f"{operation_id}:clock", idempotency_key=ck("clock"),

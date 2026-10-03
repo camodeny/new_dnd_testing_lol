@@ -35,8 +35,8 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.decisions.errors import DecisionError
-from app.decisions.frames import CANDIDATE_SCHEMA_VERSION, FRAME_SCHEMA_VERSION, frame_trace
-from app.decisions.policy import POLICY_SCHEMA_VERSION, policy_trace
+from app.decisions.frames import CANDIDATE_SCHEMA_VERSION, FRAME_SCHEMA_VERSION
+from app.decisions.policy import POLICY_SCHEMA_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -181,17 +181,25 @@ def frame_metadata(
 ) -> dict[str, Any]:
     """IDs/versions/counts for a decision frame — never state or text.
 
-    Built on :func:`frame_trace` (candidate IDs only) plus caller-supplied
-    routing metadata. Raw frame ``state``, candidate labels/hints, provenance
+    Candidate IDs and schema versions plus caller-supplied routing metadata. Raw frame ``state``, candidate labels/hints, provenance
     refs, and payload refs are never included.
     """
+    trace: dict[str, Any] = {
+        "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
+        "frame_schema_version": FRAME_SCHEMA_VERSION,
+    }
     try:
-        trace = dict(frame_trace(frame, policy_version=policy_version))
+        trace.update({
+            "decision_class": frame.decision_class,
+            "frame_id": frame.frame_id,
+            "question_id": frame.question_id,
+            "state_revision": frame.state_revision,
+            "candidate_ids": [c.id for c in frame.candidates],
+        })
     except Exception:
-        trace = {
-            "candidate_schema_version": CANDIDATE_SCHEMA_VERSION,
-            "frame_schema_version": FRAME_SCHEMA_VERSION,
-        }
+        pass
+    if policy_version is not None:
+        trace["policy_schema_version"] = policy_version
     trace["candidate_count"] = len(trace.get("candidate_ids", []))
     if role is not None:
         trace["decision_role"] = role
@@ -206,13 +214,17 @@ def frame_metadata(
 
 def verdict_metadata(frame: Any, verdict: Any) -> dict[str, Any]:
     """Policy outcome for a calibrated selection (direct/primer/escalate)."""
-    try:
-        return dict(policy_trace(frame, verdict))
-    except Exception:
-        return {
-            "directive": getattr(verdict, "directive", None),
-            "policy_schema_version": POLICY_SCHEMA_VERSION,
-        }
+    trace = frame_metadata(frame, policy_version=POLICY_SCHEMA_VERSION)
+    trace.pop("candidate_count", None)
+    trace.update({
+        "directive": getattr(verdict, "directive", None),
+        "reason": getattr(verdict, "reason", None),
+        "selected_id": getattr(verdict, "selected_id", None),
+        "probability": getattr(verdict, "probability", None),
+        "confidence": getattr(verdict, "confidence", None),
+        "margin": getattr(verdict, "margin", None),
+    })
+    return trace
 
 
 def _infer_category(error: BaseException) -> str:

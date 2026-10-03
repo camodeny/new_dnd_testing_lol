@@ -31,8 +31,6 @@ Entry points:
   execution of the attempt coordinated by a new submission, campaign start,
   retry, or roll fulfillment, so prepared work does not wait for the sweep
   (disable with ``DM_EXECUTE_DISPATCH=0``).
-- ``dm.turn.execute`` queue handler — same orchestrator behind the worker
-  envelope path for when a queue trigger is registered (#208 hardening).
 """
 from __future__ import annotations
 
@@ -57,89 +55,41 @@ def retry_backoff_seconds(retry_count: int) -> int:
     return min(30 * (2 ** (count - 1)), 600)
 
 
-def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool:
-    """True only when positively identified: no scene row established.
+def _assemble_production_context(db: Session, attempt_id: uuid.UUID):
+    """Assemble the attempt context, scoping out a not-yet-established scene.
 
-    Any source failure (reader error, DB error) returns False so the caller
-    stays fail-closed. Only the exact not-yet-migrated case (missing
-    ``campaign_current_scenes`` relation) is treated as absent, using the
-    same strict predicate as context assembly.
-    """
-    try:
-        from models.dm import DmTurnAttempt
-        from models.world import CampaignCurrentScene
-
-        attempt = db.get(DmTurnAttempt, attempt_id)
-        if attempt is None:
-            return False
-        scene = db.get(CampaignCurrentScene, attempt.campaign_id)
-        return scene is None
-    except Exception as exc:
-        from app.dm.context import is_missing_current_scene_table_error
-
-        if is_missing_current_scene_table_error(exc):
-            logger.warning("dm_execute scene-absence check missing table: %s", exc)
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            return True
-        return False
-
-
-def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, supplemental_status=None):
-    """Assemble the attempt context with explicit first-slice lane scoping.
-
-    Strict assembly first (fail-closed). When the ONLY missing authority is
-    a lane with no usable source for this attempt — no scene row established
-    yet (``current_scene``) — retry with just that lane explicitly declared
-    ``not_applicable`` and the downgrade recorded as source errors.
-    Any other missing lane still fails closed. Once a scene row exists,
-    strict assembly succeeds and no downgrade applies. The
-    ``knowledge_visibility`` lane has a wired #211 reader (#251) and always
-    emits at least one record, so it never downgrades.
+    Strict assembly first (fail-closed). When it fails only because the
+    campaign has no current-scene row yet, retry once with that lane
+    explicitly declared ``not_applicable`` and the downgrade recorded as a
+    source error. Any other missing authority — or a scene row that exists
+    but could not be read — still fails closed.
     """
     from app.dm.context import (
         LaneName,
         MissingAuthoritativeContextError,
         assemble_attempt_context,
     )
+    from models.dm import DmTurnAttempt
+    from models.world import CampaignCurrentScene
 
-    extra = dict(supplemental_status or {})
-    errors: dict = {}
-    for _ in range(4):
-        try:
-            return assemble_attempt_context(
-                db, attempt_id,
-                supplemental_status=extra or None,
-                supplemental_errors=errors or None,
-            )
-        except MissingAuthoritativeContextError as exc:
-            msg = str(exc)
-            downgraded: dict = {}
-            # current_scene: only downgrade on positively identified absence.
-            # A reader/source failure raises through assemble_attempt_context
-            # directly (fail-closed) or leaves a row present here — both must
-            # NOT become not_applicable.
-            if LaneName.CURRENT_SCENE.value in msg and LaneName.CURRENT_SCENE not in extra \
-                    and LaneName.CURRENT_SCENE.value not in extra:
-                if _current_scene_explicitly_absent(db, attempt_id):
-                    extra[LaneName.CURRENT_SCENE] = "not_applicable"
-                    downgraded[LaneName.CURRENT_SCENE] = [f"declared not_applicable: {msg}"[:500]]
-                else:
-                    raise
-            if not downgraded:
-                raise
-            errors.update(downgraded)
-            logger.warning(
-                "dm_execute context lane scoped attempt_id=%s lanes=%s",
-                attempt_id, sorted(str(k) for k in downgraded),
-            )
-    return assemble_attempt_context(
-        db, attempt_id,
-        supplemental_status=extra or None,
-        supplemental_errors=errors or None,
-    )
+    try:
+        return assemble_attempt_context(db, attempt_id)
+    except MissingAuthoritativeContextError as exc:
+        msg = str(exc)
+        if LaneName.CURRENT_SCENE.value not in msg:
+            raise
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None or db.get(CampaignCurrentScene, attempt.campaign_id) is not None:
+            raise
+        logger.warning(
+            "dm_execute context lane scoped attempt_id=%s lanes=%s",
+            attempt_id, [LaneName.CURRENT_SCENE.value],
+        )
+        return assemble_attempt_context(
+            db, attempt_id,
+            supplemental_status={LaneName.CURRENT_SCENE: "not_applicable"},
+            supplemental_errors={LaneName.CURRENT_SCENE: [f"declared not_applicable: {msg}"[:500]]},
+        )
 
 
 def _with_identity_repair(packet, conflict):
@@ -395,7 +345,7 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
     from sqlalchemy import select
 
     from app.campaigns.events import commit_campaign_mutation
-    from app.dm.turns import stage_validated_attempt
+    from app.dm.turns import DM_TURN_RESOLVED, stage_validated_attempt
     from models.threads import PlayerSubmission
 
     staged = stage_validated_attempt(db, attempt.id, contract)
@@ -431,7 +381,7 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
         db,
         turn.campaign_id,
         expected,
-        event_type="dm.turn_resolved",
+        event_type=DM_TURN_RESOLVED,
         payload=base_payload,
         operation_id=duplicate_op,
         mutate=_silent_playable_guard,
@@ -656,8 +606,6 @@ def _execute_owned_attempt(
     provider_name: str | None = None,
     timeout_seconds: float = 90,
     trace_id: str | None = None,
-    supplemental_status=None,
-    decision_service=None,
 ):
     """Claim and execute one prepared DM attempt end-to-end (idempotent).
 
@@ -672,7 +620,6 @@ def _execute_owned_attempt(
         mark_attempt_running,
     )
     from app.dm.evidence import run_bounded_evidence_loop
-    from app.dm.tools import handle_ask_character_sheet
     from app.dm.validators import default_pipeline
     from app.dm.narration import (
         NarrationStreamError,
@@ -766,8 +713,8 @@ def _execute_owned_attempt(
             if error_class == RETRIABLE and not crossed:
                 # Pre-visibility transient: keep retryable work but requeue it
                 # BEHIND ready work. Reset the claim to prepared with a future
-                # eligibility time (error preserved) so the next cron sweep or
-                # queue redelivery retries without manual repair — without
+                # eligibility time (error preserved) so the next cron sweep
+                # retries without manual repair — without
                 # letting one failing attempt starve newer prepared attempts.
                 if fresh_attempt is not None:
                     from datetime import datetime, timezone
@@ -857,9 +804,7 @@ def _execute_owned_attempt(
         return isinstance(exc, CampaignArchivedError)
 
     try:
-        packet = _assemble_production_context(
-            db, attempt.id, supplemental_status=supplemental_status
-        )
+        packet = _assemble_production_context(db, attempt.id)
     except Exception as exc:
         db.rollback()
         _fail_closed(exc)
@@ -953,92 +898,31 @@ def _execute_owned_attempt(
             _snapshot_contract = None
             _reuse_snapshot = False
 
-    # Issue #382 — decision-first routing probe. Runs after packet assembly
-    # and only for fresh attempts (narration retries reuse their snapshot).
-    # DIRECT outcomes still pass deterministic validation below; PRIMER
-    # outcomes attach the advisory prior to the adjudication packet while
-    # the generative path stays authoritative; anything else proceeds down
-    # the ordinary generative path with the trace recording which path was
-    # taken.
-    _direct_contract = None
-    _route_trace: dict = {}
-    _route_primer: dict | None = None
-    if _snapshot_contract is None:
-        try:
-            from app.dm import decision_routing as _routing
-
-            _outcome = _routing.route_attempt(
-                db, attempt=attempt, turn=turn, trace_id=tid,
-                decision_service=decision_service,
-            )
-            _route_trace = _outcome.trace
-            path_info.update(_routing.path_info_fields(_outcome))
-            if _outcome.primer is not None:
-                _route_primer = dict(_outcome.primer)
-                structured_log(
-                    logger, logging.INFO, "dm_execute_decision_primer",
-                    turn_id=str(turn.id), attempt_id=str(attempt.id),
-                    selected=str(_outcome.selected_id),
-                    primer=_outcome.primer, trace_id=tid,
-                )
-            if (
-                _outcome.directive == "direct_execute"
-                and _outcome.contract is not None
-            ):
-                _direct_contract = _outcome.contract
-            structured_log(
-                logger, logging.INFO, "dm_execute_decision_route",
-                turn_id=str(turn.id), attempt_id=str(attempt.id),
-                decision_path=_route_trace.get("decision_path"),
-                directive=_outcome.directive,
-                selected=str(_outcome.selected_id),
-                decision_skipped=_outcome.decision_skipped,
-                decision_latency_ms=_route_trace.get("latency_ms"),
-                trace_id=tid,
-            )
-        except Exception as exc:
-            logger.warning("dm_execute decision routing failed: %s", exc)
-            _direct_contract = None
-            _route_primer = None
-            _route_trace = {
-                "decision_path": "open_ended_generative",
-                "directive": "escalate",
-                "reason": f"router error: {exc}",
-            }
-
     # Identity-deferral retry feedback: when an abandoned explicit-retry
     # parent deferred a new-entity identity (deterministic adjudication
     # would otherwise replay the identical frame into the same DEFER),
     # advise re-adjudication to disambiguate. Advisory only — the
     # generative DM stays authoritative. Fail-soft: no advisory on error.
-    _deferral_primer: dict | None = None
     if _snapshot_contract is None:
-        try:
-            from app.dm import decision_routing as _deferral_routing
+        from app.dm.context import (
+            attach_retry_deferral_advisory,
+            build_retry_deferral_advisory,
+        )
 
-            _deferral_primer = _deferral_routing.build_retry_deferral_primer(db, attempt)
-            if _deferral_primer is not None:
-                structured_log(
-                    logger, logging.INFO, "dm_execute_deferral_primer",
-                    turn_id=str(turn.id), attempt_id=str(attempt.id),
-                    trace_id=tid,
+        _deferral_note = build_retry_deferral_advisory(db, attempt)
+        if _deferral_note is not None:
+            structured_log(
+                logger, logging.INFO, "dm_execute_deferral_advisory",
+                turn_id=str(turn.id), attempt_id=str(attempt.id),
+                trace_id=tid,
+            )
+            _base_adjudicate = adjudicate
+
+            def adjudicate(packet, feedback=None):  # type: ignore[misc]
+                return _base_adjudicate(
+                    attach_retry_deferral_advisory(packet, _deferral_note),
+                    feedback=feedback,
                 )
-        except Exception as exc:
-            logger.warning("dm_execute deferral primer failed: %s", exc)
-            _deferral_primer = None
-
-    _primers = [p for p in (_route_primer, _deferral_primer) if p is not None]
-    if _primers and adjudicate is not None:
-        _base_adjudicate = adjudicate
-
-        def adjudicate(packet, feedback=None):  # type: ignore[misc]
-            primed_packet = packet
-            for _primer_item in _primers:
-                try:
-                    primed_packet = _routing.attach_primer(primed_packet, _primer_item)
-                except Exception as exc:
-                    logger.warning("dm_execute primer attach failed: %s", exc)
-            return _base_adjudicate(primed_packet, feedback=feedback)
 
     def _adjudicate_and_validate(start_packet):
         """Run the normal evidence and validation path for an initial or repaired packet."""
@@ -1101,7 +985,6 @@ def _execute_owned_attempt(
 
         final_contract, _bundle = run_bounded_evidence_loop(
             initial_packet=start_packet, adjudicate=evidence_adjudicate, db=db,
-            tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
         )
         report = default_pipeline.validate(final_contract, validation_packet)
         if report.passed:
@@ -1111,25 +994,7 @@ def _execute_owned_attempt(
     try:
         if _snapshot_contract is not None:
             contract = _snapshot_contract
-        elif _direct_contract is not None:
-            _direct_report = default_pipeline.validate(_direct_contract, packet)
-            if _direct_report.passed:
-                contract = _direct_contract
-                structured_log(
-                    logger, logging.INFO, "dm_execute_decision_direct",
-                    turn_id=str(turn.id), attempt_id=str(attempt.id),
-                    mode=str(contract.mode),
-                    selected=str(_route_trace.get("selected_id")),
-                    trace_id=tid,
-                )
-            else:
-                # Deterministic validators rejected the direct contract:
-                # escalate to the generative path with input intact.
-                _route_trace["validator_rejection"] = True
-                contract = None
         else:
-            contract = None
-        if contract is None:
             contract, packet = _adjudicate_and_validate(packet)
     except Exception as exc:
         db.rollback()
@@ -1237,25 +1102,6 @@ def _execute_owned_attempt(
         # call): same production stream/commit path, used by tests.
         narrator = None
 
-    # Issue #384 — shadow-first semantic judges over narration fidelity.
-    # Reuses the existing decision-service path (same object the router
-    # uses, defaulting to a service like the router does) and an
-    # independent telemetry session factory. Shadow verdicts are
-    # calibration-only: deterministic failures stay final and a judge
-    # failure never breaks narration.
-    try:
-        from app.decisions.runtime import DecisionService as _JudgeService
-
-        _judge_service = decision_service if decision_service is not None else _JudgeService()
-    except Exception:
-        _judge_service = decision_service
-    try:
-        from database import SessionLocal as _JudgeSessionLocal
-
-        _judge_factory = _JudgeSessionLocal
-    except Exception:
-        _judge_factory = None
-
     try:
         for identity_repair_index in range(2):
             try:
@@ -1268,8 +1114,6 @@ def _execute_owned_attempt(
                     provider=pname or "dm-provider",
                     publish_realtime=True,
                     trace_id=tid,
-                    judge_service=_judge_service,
-                    judge_session_factory=_judge_factory,
                 )
                 break
             except IdentityReuseRequiresReadjudication as conflict:
@@ -1354,8 +1198,6 @@ def _execute_owned_attempt(
         model=path_info.get("model") or model,
         failover_reasons=path_info.get("failover_reasons") or [],
         ttft_added_ms=path_info.get("ttft_added_ms") or 0.0,
-        decision_path=path_info.get("decision_path") or "open_ended_generative",
-        decision_selected=path_info.get("decision_selected"),
         trace_id=tid,
     )
     return result

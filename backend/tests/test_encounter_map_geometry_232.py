@@ -866,7 +866,7 @@ def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DMStream, DMStreamChunk
 
     fac, ctx = _fixture()
@@ -921,7 +921,7 @@ def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision
         stream.chunk_count = 1
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
 
         encounter_map = get_map(db, encounter.id)
         assert encounter_map.revision == 2
@@ -936,7 +936,7 @@ def test_staged_placement_effect_promotes_through_turn_pipeline_and_bumps_revisi
     from datetime import datetime, timezone
 
     from app.dm.contract import normalize_contract
-    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
     from models.dm import DMStream, DMStreamChunk
 
     fac, ctx = _fixture()
@@ -993,7 +993,7 @@ def test_staged_placement_effect_promotes_through_turn_pipeline_and_bumps_revisi
         stream.chunk_count = 1
         db.flush()
         mark_streaming_started(db, turn.id, attempt.id, stream.id)
-        commit_turn_with_effects(db, turn.id, attempt.id)
+        commit_turn(db, turn.id, attempt.id)
 
         assert get_map(db, encounter.id).revision == 2
         placed = get_placement(db, encounter.id, participant.id)

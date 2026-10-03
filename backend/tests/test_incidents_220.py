@@ -93,7 +93,7 @@ def _scripted(answer):
 def _aria_dead(db, c):
     """Canon: Aria visibly dead, backed by a member-visible committed event."""
     e1 = _commit(db, c, payload={"outcome": "Aria falls in the crypt"},
-                 etype="dm.turn_committed", visibility="campaign")
+                 etype="dm.turn_resolved", visibility="campaign")
     ent, _ = create_entity(
         db, db.get(Campaign, c.id), entity_type="npc", name="Aria",
         status="dead", visibility="campaign", idempotency_key="aria-220",

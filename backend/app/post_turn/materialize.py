@@ -50,6 +50,7 @@ from app.decisions import (
     register_policy,
     to_decision_request,
 )
+from app.dm.turns import DM_TURN_RESOLVED
 from app.observability.tracing import structured_log
 from app.visibility.policy import (
     disclosure_rank,
@@ -82,7 +83,7 @@ WRITE_CATEGORIES = (
 # turn commit to that event type when it closes an adventure); its
 # payload carries the same turn/attempt fields.
 TURN_EVENT_TYPES = frozenset({
-    "dm.turn_committed", "dm.turn_resolved", "adventure.completed",
+    DM_TURN_RESOLVED, "adventure.completed",
 })
 
 # Staged effects already applied durably at turn commit: recompiling them
@@ -312,7 +313,7 @@ def compile_committed_candidates(
 ) -> tuple[list[CandidateAssertion], dict[tuple[str, str], int], dict[str, int]]:
     """Compile candidates from committed turn structures (default source).
 
-    Loads each dm.turn_committed/dm.turn_resolved event's durable attempt
+    Loads each dm.turn_resolved event's durable attempt
     and translates staged effects the turn commit left unpersisted:
 
     - record_world_event -> confirmed-history fact (the commit handler

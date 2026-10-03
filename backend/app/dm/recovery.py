@@ -189,7 +189,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
 
     Single orchestration helper for partial-stream recovery (HTTP route +
     any future trigger): scope-check → fidelity-gated continuation →
-    recovered-streaming transition → ``commit_turn_with_effects`` (staged
+    recovered-streaming transition → ``commit_turn`` (staged
     effects promoted exactly once with the normal idempotency/revision
     guards). Caller-supplied text ALWAYS goes through the contract fidelity
     gate; there is no ungated resume path for untrusted input.
@@ -209,7 +209,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     from app.dm.turns import (
         StaleRevisionError,
         TurnConflictError,
-        commit_turn_with_effects,
+        commit_turn,
         mark_recovered_streaming,
     )
     from app.dm.streams import (
@@ -281,7 +281,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         "recovery": "partial_stream_continuation",
     }
     try:
-        final_turn, final_attempt, event = commit_turn_with_effects(
+        final_turn, final_attempt, event = commit_turn(
             db, turn.id, old.id,
             payload=payload,
             operation_id=old.commit_operation_id or str(old.id),

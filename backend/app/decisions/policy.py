@@ -29,7 +29,6 @@ from app.decisions.frames import (
     RISK_ORDER,
     CandidateRecord,
     DecisionFrame,
-    frame_trace,
     is_escape_id,
     resolve_candidate,
 )
@@ -142,44 +141,6 @@ def get_policy(decision_class: str) -> DecisionClassPolicy:
             f"{decision_class!r}",
             kind="malformed",
         ) from error
-
-
-def _seed_builtin_policies() -> None:
-    register_policy(
-        DecisionClassPolicy(
-            decision_class="skirmish_action",
-            # Aggressive posture for low-stakes reversible tactics: modest
-            # confidence + a clear margin executes directly.
-            min_probability_direct=0.55,
-            min_confidence_direct=0.5,
-            min_margin_direct=0.10,
-            near_tie_margin=0.10,
-            near_tie_behavior=PRIMER_ADVISORY,
-            allow_direct_when_irreversible=False,
-            max_risk_for_direct="standard",
-            min_probability_primer=0.35,
-            min_confidence_primer=0.3,
-        )
-    )
-    register_policy(
-        DecisionClassPolicy(
-            decision_class="campaign_consequence",
-            # Conservative posture for story-consequential calls: high bar for
-            # direct execution, near-ties escalate to the open-ended AI DM.
-            min_probability_direct=0.85,
-            min_confidence_direct=0.8,
-            min_margin_direct=0.25,
-            near_tie_margin=0.25,
-            near_tie_behavior=ESCALATE,
-            allow_direct_when_irreversible=False,
-            max_risk_for_direct="low",
-            min_probability_primer=0.5,
-            min_confidence_primer=0.45,
-        )
-    )
-
-
-_seed_builtin_policies()
 
 
 def _checked_unit(value: float | None, *, what: str) -> float:
@@ -379,19 +340,3 @@ def evaluate_execution(
         confidence=confidence_value,
         margin=margin,
     )
-
-
-def policy_trace(frame: DecisionFrame, verdict: PolicyVerdict) -> dict[str, object]:
-    """Trace metadata stamping candidate + frame + policy schema versions."""
-    trace = frame_trace(frame, policy_version=POLICY_SCHEMA_VERSION)
-    trace.update(
-        {
-            "directive": verdict.directive,
-            "reason": verdict.reason,
-            "selected_id": verdict.selected_id,
-            "probability": verdict.probability,
-            "confidence": verdict.confidence,
-            "margin": verdict.margin,
-        }
-    )
-    return trace
