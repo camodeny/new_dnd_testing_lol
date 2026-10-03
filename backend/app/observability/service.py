@@ -90,8 +90,7 @@ def trace_summary(record: OperationTrace) -> dict:
 def start_ai_run(session_factory, *, logical_operation: str, role: str, provider: str, model: str,
                  attempt: int = 1, classification: str = "primary", billable: bool | None = None,
                  trace_id: str | None = None, operation_id: str | None = None,
-                 parent_run_id=None, content_metadata: dict | None = None,
-                 credential_id=None) -> AIRun:
+                 parent_run_id=None, content_metadata: dict | None = None) -> AIRun:
     if classification not in {"primary", "recovery"}:
         raise ValueError("classification must be primary or recovery")
     if attempt < 1:
@@ -104,10 +103,7 @@ def start_ai_run(session_factory, *, logical_operation: str, role: str, provider
                 parent_run_id=parent_run_id, logical_operation=logical_operation, role=role,
                 provider=provider, model=model, attempt=attempt, classification=classification,
                 billable=(classification == "primary") if billable is None else billable,
-                status="running", started_at=utcnow(), content_metadata=content_metadata,
-                # BYOK credential selection trace (#257): ID only, never key
-                # material; NULL for platform-funded runs.
-                credential_id=credential_id)
+                status="running", started_at=utcnow(), content_metadata=content_metadata)
     return _telemetry_write(session_factory, lambda db: (db.add(run), run)[1])
 
 
@@ -178,7 +174,6 @@ def get_trace(db: Session, trace_id: str) -> dict | None:
     return {**trace_summary(record), "ai_runs": [{"id": str(run.id), "attempt": run.attempt,
         "classification": run.classification, "billable": run.billable, "status": run.status,
         "provider": run.provider, "model": run.model,
-        "credential_id": str(run.credential_id) if run.credential_id else None,
         "input_tokens": run.input_tokens,
         "output_tokens": run.output_tokens, "cost_usd": run.cost_usd} for run in runs]}
 

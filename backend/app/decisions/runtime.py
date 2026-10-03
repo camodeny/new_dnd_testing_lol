@@ -202,60 +202,12 @@ class DecisionService:
     def decide(
         self,
         request: DecisionRequest,
-        *,
-        byok=None,
-        decision_role: str | None = None,
-        mode: str = "primer",
     ) -> DecisionResponse:
-        """Execute one bounded decision request.
-
-        Issue #257 — ``byok`` (``app.byok.accounting.ByokExecution``) runs
-        the request through the user's credential when its adapter/model is
-        approved for ``decision_role`` in ``mode`` (see
-        ``app.byok.routing.resolve_decision_route``). Production callers
-        must build ``byok`` via
-        ``app.byok.service.resolve_decision_execution`` (the campaign
-        authorization boundary); caller-constructed contexts are test-only.
-        ``decision_role`` is
-        required with ``byok``; unapproved provider/model/role/mode
-        combinations raise clearly instead of executing, and possession of
-        a decision-provider key is never treated as approval. BYOK runs
-        are non-billable with a credential-ID trace plus a zero-amount
-        ``byok_marker``; an invalid/expired credential escalates through
-        the normal decision error path (the caller falls back to the
-        generative DM) without exposing secret details.
-        """
+        """Execute one bounded decision request through the configured adapter."""
         from app.observability import tracing as tracing_module
 
         validate_request(request)
         adapter = self._adapter
-        credential_id = None
-        byok_campaign_id = None
-        if byok is not None:
-            from app.byok.adapters import wrap_decision_adapter
-            from app.byok.routing import resolve_decision_route
-
-            if not decision_role:
-                from app.byok.errors import ByokError
-
-                raise ByokError(
-                    "decision_role is required for decision-role BYOK execution",
-                    kind="malformed",
-                )
-            candidate_model = request.model or adapter.default_model()
-            route = resolve_decision_route(
-                decision_role,
-                provider=byok.provider,
-                model=candidate_model,
-                mode=mode,
-            )
-            adapter = wrap_decision_adapter(route.provider, byok.secret)
-            credential_id = byok.credential_id
-            byok_campaign_id = byok.campaign_id
-            # Approval resolved the effective model; keep telemetry honest.
-            request_model_override = route.model
-        else:
-            request_model_override = None
         capabilities = adapter.capabilities() or {}
         unsupported = sorted(
             {question.kind for question in request.questions}
@@ -267,7 +219,7 @@ class DecisionService:
                 provider=adapter.name,
                 kind="unsupported_feature",
             )
-        model = request_model_override or request.model or adapter.default_model()
+        model = request.model or adapter.default_model()
         timeout = request.timeout_seconds or default_timeout_seconds()
         attempt_limit = max(
             1, int(request.max_attempts or default_max_attempts())
@@ -286,13 +238,9 @@ class DecisionService:
             # One AI run per real provider attempt, linked by parent_run_id,
             # so retries keep failed/succeeded attempt history like the
             # forward-DM failover path instead of collapsing into one row.
-            # BYOK runs are user-funded: non-billable with a credential-ID
-            # trace, never platform cost.
             run_id = self._start_run(
                 adapter, model, trace_id, operation_id,
                 attempt=attempt, parent_run_id=parent_run_id,
-                billable=False if credential_id is not None else None,
-                credential_id=credential_id,
             )
             if parent_run_id is None:
                 parent_run_id = self._run_uuid(run_id)
@@ -301,17 +249,6 @@ class DecisionService:
                 results, answered_model, usage = adapter.parse_response(data, request)
                 latency_ms = max(0, int((time.monotonic() - started) * 1000))
                 self._finish_run(run_id, status="succeeded", usage=usage)
-                if credential_id is not None:
-                    from app.byok.accounting import mark_byok_run_fail_soft
-
-                    mark_byok_run_fail_soft(
-                        self._session_factory, campaign_id=byok_campaign_id,
-                        ai_run_id=self._run_uuid(run_id),
-                        credential_id=credential_id,
-                        execution_class="decision",
-                        role=decision_role or DECISION_ROLE,
-                        provider=adapter.name, model=answered_model or model,
-                    )
                 return DecisionResponse(
                     results=results,
                     provider=adapter.name,
@@ -331,23 +268,6 @@ class DecisionService:
                 self._finish_run(
                     run_id, status="failed", error_type=classified.kind
                 )
-                if credential_id is not None:
-                    # An invalid/expired BYOK credential escalates through
-                    # the normal decision error path (callers fall back to
-                    # the generative DM) instead of burning bounded retries
-                    # against a dead key. Secret details never surface.
-                    from app.byok.accounting import is_auth_failure
-
-                    if is_auth_failure(classified) or is_auth_failure(error):
-                        from app.byok.service import flag_invalid_credential
-
-                        try:
-                            flag_invalid_credential(
-                                self._session_factory, credential_id
-                            )
-                        except Exception:
-                            pass
-                        raise classified from error
                 if attempt < attempt_limit and classified.retryable:
                     time.sleep(retry_delay_seconds(attempt))
                     continue
@@ -362,7 +282,6 @@ class DecisionService:
     def _start_run(
         self, adapter: DecisionAdapter, model: str, trace_id: str, operation_id: str,
         *, attempt: int = 1, parent_run_id: Any = None,
-        billable: bool | None = None, credential_id: Any = None,
     ) -> Any:
         if self._session_factory is None:
             return None
@@ -379,10 +298,7 @@ class DecisionService:
                     attempt=attempt,
                     # First attempt is the billable primary; retries are
                     # recovery, matching the forward-DM failover convention.
-                    # BYOK runs are user-funded: explicitly non-billable.
                     classification="primary" if attempt == 1 else "recovery",
-                    **({"billable": billable} if billable is not None else {}),
-                    credential_id=credential_id,
                     parent_run_id=parent_run_id,
                     trace_id=trace_id,
                     operation_id=operation_id,

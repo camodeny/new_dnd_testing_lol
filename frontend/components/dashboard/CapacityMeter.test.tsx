@@ -50,14 +50,13 @@ describe('CapacityMeterView', () => {
     expect(container.textContent).toContain('may briefly pause')
   })
 
-  it('pauses with a neutral multiplayer notice plus add-funds/BYOK hooks', async () => {
+  it('pauses with a neutral multiplayer notice plus add-funds controls', async () => {
     await renderView({ view: { state: 'paused', percent: 100 }, loading: false, error: null, hasProjection: true, onRetry: noop })
     const text = container.textContent ?? ''
     expect(text).toContain('New AI narration is paused for the campaign until shared capacity returns.')
     expect(text).toContain('History, character sheets, and player chat stay available.')
     expect(text).toContain('nothing needs to be redone')
     expect(text).toContain('added funds')
-    expect(text).toContain('BYOK')
   })
 
   it('never invents a percentage while loading and stays neutral on failure', async () => {
@@ -106,7 +105,7 @@ describe('CapacityMeter container', () => {
     expect(events).toContainEqual({ type: 'paused_view' })
   })
 
-  it('resyncs to normal play after funding/BYOK restores capacity', async () => {
+  it('resyncs to normal play after funding restores capacity', async () => {
     vi.useFakeTimers()
     try {
       vi.mocked(apiFetch)

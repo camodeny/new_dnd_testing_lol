@@ -6,9 +6,7 @@
  * A simple shared-campaign percentage with a low-key notice as capacity gets
  * low or pauses. Campaign-level language only: no blame toward any
  * participant, no upsell interruption, no raw cost/token/provider details.
- * Add-funds/BYOK restoration hooks are text-only until those flows land
- * (#256, out of scope); funding/BYOK restoration resyncs through the same
- * authoritative projection with no special recovery flow.
+ * Funding restoration resyncs through the authoritative projection.
  */
 
 import { useCampaignCapacity } from '@/hooks/useCampaignCapacity'
@@ -166,7 +164,7 @@ export function CapacityMeterView({ view, loading, error, hasProjection, onRetry
           </p>
           <p style={{ margin: '6px 0 0' }}>
             Play picks up on its own when capacity returns — nothing needs to be redone. Capacity
-            can return through added funds or a BYOK key.
+            can return through added funds.
           </p>
           {funding && <AddFundsRow controls={funding} />}
         </div>

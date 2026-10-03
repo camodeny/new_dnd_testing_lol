@@ -8,7 +8,7 @@
  * `@/lib/capacity`. A projection failure never invents a percentage: the
  * view falls back to `unavailable` with a neutral retry. Callers invoke
  * `refresh()` to resync from the authoritative projection after a 409
- * pause signal or funding/BYOK changes restore capacity.
+ * pause signal or funding changes restore capacity.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -89,7 +89,7 @@ export function useCampaignCapacity({
       eventRef.current?.({ type: 'paused_view' })
     }
     if (view.state !== 'paused') {
-      // Capacity restored (funding/BYOK re-credit resyncs through the same
+      // Capacity restored (funding re-credit resyncs through the same
       // authoritative projection) — re-arm the paused-view signal without a
       // special recovery flow.
       pausedNotifiedRef.current = false

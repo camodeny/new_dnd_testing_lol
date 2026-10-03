@@ -126,44 +126,6 @@ def _ensure_route_policy() -> DecisionClassPolicy:
 _ensure_route_policy()
 
 
-def _ensure_route_byok_approval() -> None:
-    """Register the BYOK execution approval for the route decision class.
-
-    Issue #257 — the route class may direct-execute (``route_silent``) or
-    advise (primer) from the same bounded call, so the approval covers
-    shadow, primer, and direct modes against the calibrated policy above.
-    Registration lives with the class owner (this router), never in
-    gameplay code; without it ``resolve_decision_execution`` fails closed
-    to None and production routing stays on the platform adapter.
-    """
-    from app.byok.routing import (
-        MODE_DIRECT,
-        MODE_PRIMER,
-        MODE_SHADOW,
-        DecisionRoleApproval,
-        register_decision_approval,
-    )
-    from app.decisions.config import default_model
-    from app.decisions.frames import CANDIDATE_SCHEMA_VERSION
-    from app.decisions.policy import POLICY_SCHEMA_VERSION
-
-    register_decision_approval(
-        DecisionRoleApproval(
-            decision_class=FORWARD_DM_ROUTE_CLASS,
-            adapter="jev",
-            model=default_model(),
-            policy_version=POLICY_SCHEMA_VERSION,
-            candidate_schema_version=CANDIDATE_SCHEMA_VERSION,
-            allowed_modes=(MODE_SHADOW, MODE_PRIMER, MODE_DIRECT),
-            byok_eligible=True,
-            evaluation_ref="forward-dm-route-policy-v1",
-        )
-    )
-
-
-_ensure_route_byok_approval()
-
-
 @dataclass(frozen=True)
 class RouteSignals:
     """Authoritative code-owned signals a route frame is built from.
@@ -1025,35 +987,6 @@ def _record_superseded_telemetry(
     )
 
 
-def _resolve_route_byok(db: Any, attempt: Any, *, shadow: bool) -> Any | None:
-    """Authorized BYOK context for the route decision call, or None.
-
-    Issue #257 — production routing resolves the campaign's
-    owner-authorized credential server-side (never caller-supplied) and
-    only for the exact ``forward_dm_route`` class in the current mode
-    (shadow evaluations stay shadow; live calls may direct-execute, so
-    they require the direct mode approval). Any failure — no policy,
-    unapproved combination, decryption error — returns None and the
-    funded/provider path proceeds unchanged. A BYOK failure must never
-    break, stall, or bill the platform for a turn.
-    """
-    campaign_id = getattr(attempt, "campaign_id", None)
-    if campaign_id is None:
-        return None
-    try:
-        from app.byok.routing import MODE_DIRECT, MODE_SHADOW
-        from app.byok.service import resolve_decision_execution
-
-        return resolve_decision_execution(
-            db,
-            campaign_id,
-            decision_class=FORWARD_DM_ROUTE_CLASS,
-            mode=MODE_SHADOW if shadow else MODE_DIRECT,
-        )
-    except Exception:
-        return None
-
-
 def route_attempt(
     db: Any,
     *,
@@ -1118,26 +1051,8 @@ def route_attempt(
     except DecisionError as exc:
         return _escalate(f"frame build failed: {exc}")
     service = decision_service or DecisionService()
-    # Issue #257 — resolve the campaign-authorized decision credential for
-    # the default production service only. An explicitly injected service
-    # owns its adapter choice (tests, judges); production calls carry the
-    # authorized BYOK context when the exact class/mode is approved, else
-    # None preserves the funded/provider path with no behavior change.
-    route_byok = None
-    if decision_service is None:
-        route_byok = _resolve_route_byok(db, attempt, shadow=shadow)
     try:
-        if route_byok is not None:
-            from app.byok.routing import MODE_DIRECT, MODE_SHADOW
-
-            response = service.decide(
-                to_decision_request(frame),
-                byok=route_byok,
-                decision_role=FORWARD_DM_ROUTE_CLASS,
-                mode=MODE_SHADOW if shadow else MODE_DIRECT,
-            )
-        else:
-            response = service.decide(to_decision_request(frame))
+        response = service.decide(to_decision_request(frame))
     except DecisionError as exc:
         trace_extra: dict[str, Any] = {
             "frame_id": frame.frame_id,
@@ -1216,10 +1131,6 @@ def route_attempt(
     trace = outcome.trace
     trace.setdefault("provider", response.provider)
     trace.setdefault("model", response.model)
-    if route_byok is not None:
-        # Issue #257 — credential-ID-only trace for authorized BYOK runs
-        # (never key material); platform runs carry no credential trace.
-        trace.setdefault("credential_id", str(route_byok.credential_id))
     trace.setdefault("latency_ms", response.latency_ms)
     effective_trace_id = trace_id or getattr(response, "trace_id", None)
     if effective_trace_id is not None:
@@ -1272,8 +1183,6 @@ def path_info_fields(outcome: RoutingOutcome) -> dict[str, Any]:
     for key in ("provider", "model", "latency_ms"):
         if outcome.trace.get(key) is not None:
             fields[f"decision_{key}"] = outcome.trace[key]
-    if outcome.trace.get("credential_id") is not None:
-        fields["decision_credential_id"] = outcome.trace["credential_id"]
     if outcome.primer is not None:
         fields["decision_primer"] = outcome.primer
     return fields

@@ -4,7 +4,7 @@ Append-only, auditable usage/capacity accounting for one campaign's shared
 pool. One canonical schema (pre-alpha: no legacy shims).
 
 Money is integer cents. Funding entries are positive, AI-spend entries are
-negative, BYOK markers are exactly zero. Corrections never mutate history:
+negative. Corrections never mutate history:
 post a compensating entry (refund / re-credit / admin adjustment).
 
 Each primary billable AI run from #192 maps to exactly one ``ai_spend``
@@ -34,7 +34,6 @@ ENTRY_TYPE_GRACE = "grace"  # bounded grace grant (policy lives elsewhere)
 ENTRY_TYPE_AI_SPEND = "ai_spend"  # primary billable AI run cost
 ENTRY_TYPE_REFUND = "refund"  # compensating credit for returned funds
 ENTRY_TYPE_RECREDIT = "recredit"  # compensating credit (idempotent re-credit, #256)
-ENTRY_TYPE_BYOK_MARKER = "byok_marker"  # non-platform spend marker, amount == 0
 ENTRY_TYPE_ADMIN_ADJUSTMENT = "admin_adjustment"  # signed operator correction
 
 ENTRY_TYPES = frozenset({
@@ -45,7 +44,6 @@ ENTRY_TYPES = frozenset({
     ENTRY_TYPE_AI_SPEND,
     ENTRY_TYPE_REFUND,
     ENTRY_TYPE_RECREDIT,
-    ENTRY_TYPE_BYOK_MARKER,
     ENTRY_TYPE_ADMIN_ADJUSTMENT,
 })
 
@@ -69,7 +67,7 @@ class CampaignUsageEntry(Base):
         UniqueConstraint("ai_run_id", name="uq_usage_entries_ai_run"),
         CheckConstraint(
             "entry_type IN ('allocation','contribution','added_funds','grace','ai_spend',"
-            "'refund','recredit','byok_marker','admin_adjustment')",
+            "'refund','recredit','admin_adjustment')",
             name="ck_usage_entries_entry_type",
         ),
         Index("ix_usage_entries_campaign", "campaign_id"),
@@ -82,7 +80,7 @@ class CampaignUsageEntry(Base):
         UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
     )
     entry_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    # Signed cents: funding > 0, ai_spend < 0, byok_marker == 0, admin any sign != 0? (zero allowed but pointless)
+    # Signed cents: funding > 0, ai_spend < 0, admin adjustment != 0.
     amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
     # Exactly one ai_spend entry per primary billable AI run; NULL otherwise.
     ai_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, unique=True)
