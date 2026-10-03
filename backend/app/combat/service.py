@@ -827,7 +827,7 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
     # same transaction, next campaign revision — so turn duration tracking
     # and reconnect reads never observe an active encounter without a turn.
     first_turn_operation_id = f"encounter:{encounter.id}:turn:1:started"
-    _, first_turn_event = commit_campaign_mutation(
+    commit_campaign_mutation(
         db,
         campaign.id,
         expected_revision=int(campaign.revision or 0),
@@ -854,7 +854,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         outbox_operation_id=first_turn_operation_id,
         commit=commit,
     )
-    event.payload = dict(event.payload or {}) | {"first_turn_event_id": str(first_turn_event.id)}
     return event
 
 
