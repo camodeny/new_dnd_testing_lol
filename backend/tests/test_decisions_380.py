@@ -858,6 +858,29 @@ def test_fake_adapter_telemetry_uses_fake_model_identity():
     assert runs[0].model == "fake-decision-model-v1"
 
 
+def test_recovery_decision_is_non_billable_from_first_call():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    from database import Base
+    from models.reliability import AIRun
+
+    SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    DecisionService(FakeDecisionAdapter(answers={"ok": 0.7}),
+                    session_factory=factory, is_recovery=True).decide(
+        DecisionRequest(questions=(NoulQuestion(question_id="ok", instructions="yes?"),), state="test")
+    )
+    with factory() as db:
+        runs = db.query(AIRun).all()
+    assert len(runs) == 1
+    assert runs[0].classification == "recovery"
+    assert runs[0].billable is False
+
+
 def test_request_validation_rejects_bad_shapes():
     service = DecisionService(FakeDecisionAdapter(answers={}))
     with pytest.raises(DecisionError):

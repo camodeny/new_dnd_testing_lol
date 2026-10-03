@@ -106,6 +106,126 @@ def _fake_adjudicate(text="Torchlight gutters as something stirs beyond the arch
     return _adj
 
 
+def test_rules_guidance_precedes_adjudication_and_contradiction_is_advisory(db, monkeypatch):
+    from app.dm import rules_guidance
+    from app.dm.context import AuthorizationScope, ContextRecord, LaneName, SourceRef
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id, "I attack with my sword.")
+    order = []
+
+    def enrich(db_session, packet, **kwargs):
+        assert db_session is s
+        order.append("retrieve")
+        return packet.with_records(
+            {LaneName.EVIDENCE_RESULTS: [ContextRecord(
+                record_id="rules-guidance:test",
+                value={"rules_guidance": True, "rule_id": "srd521.attack", "body": "Attack reference"},
+                sources=[SourceRef(source_type="dnd_srd_rule", source_id="srd521.attack", source_version="5.2.1")],
+                authorization=AuthorizationScope(campaign_id=str(camp_id)),
+                visibility="public", use="adjudication_only",
+            )]},
+            dependency="rules_guidance",
+        )
+
+    fake = _fake_adjudicate()
+
+    def adjudicate(packet, feedback=None):
+        order.append("adjudicate")
+        assert "Attack reference" in packet.serialize_for_adjudication()
+        assert "Attack reference" not in packet.serialize_for_narration()
+        return fake(packet, feedback)
+
+    def check(packet, contract, **kwargs):
+        order.append("check")
+        assert contract.mode == "respond"
+        return {"status": "evaluated", "outcome": "CONTRADICTED", "rule_ids": ["srd521.attack"]}
+
+    monkeypatch.setattr(rules_guidance, "enrich_rules_context", enrich)
+    monkeypatch.setattr(rules_guidance, "check_rules_advisory", check)
+    execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert order == ["retrieve", "adjudicate", "check"]
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+
+
+def test_rules_guidance_reused_after_validation_regeneration(db, monkeypatch):
+    from app.dm import rules_guidance
+    from app.dm.context import LaneName
+
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+    retrieved = []
+    checked = []
+    calls = []
+    fake = _fake_adjudicate()
+
+    def enrich(db_session, packet, **kwargs):
+        retrieved.append(packet)
+        return packet.with_records({LaneName.EVIDENCE_RESULTS: []}, dependency="rules_guidance")
+
+    def adjudicate(packet, feedback=None):
+        calls.append(packet)
+        assert "rules_guidance" in packet.observability.retrieval_dependencies
+        if len(calls) == 1:
+            raise ContractValidationError("malformed", "retry this contract")
+        return fake(packet, feedback)
+
+    monkeypatch.setattr(rules_guidance, "enrich_rules_context", enrich)
+    monkeypatch.setattr(rules_guidance, "check_rules_advisory", lambda packet, contract, **kwargs: checked.append(contract) or {"status": "skipped"})
+    execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert len(retrieved) == 1
+    assert len(calls) == 2
+    assert len(checked) == 1
+
+
+def test_optional_rules_database_failure_does_not_break_commit(db, monkeypatch):
+    from sqlalchemy import text
+    from app.dm import rules_guidance
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    def broken_search(req, audience, db=None, **kwargs):
+        db.execute(text("SELECT * FROM nonexistent_rules_table"))
+
+    def broken_judge(*args, **kwargs):
+        raise RuntimeError("optional evaluator unavailable")
+
+    monkeypatch.setattr(rules_guidance, "search_bm25_rules", broken_search)
+    monkeypatch.setattr(rules_guidance, "check_rules_advisory", broken_judge)
+    execute_dm_attempt(s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic")
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+
+
+def test_imported_srd_passage_reaches_live_turn_adjudication(db):
+    from app.rules_corpus.ingest import import_fixture_sections
+    from app.dm.context import LaneName
+
+    s, camp_id, thread_id, _ = db
+    _, records = import_fixture_sections(s, [{
+        "document": "playing-the-game", "heading_path": ["Combat", "Attack Rolls"],
+        "title": "Attack Rolls", "body": "When you make an attack, roll a d20 and add modifiers.",
+    }], source_artifact_hash="8974902d109d6e63672d7c490bde9ccf052410503d9cfa768237154fbc5e3d87", validate_canaries=False)
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id, "Attack Rolls")
+    fake = _fake_adjudicate()
+    seen = []
+
+    def adjudicate(packet, feedback=None):
+        evidence = next(l.records for l in packet.lanes if l.name == LaneName.EVIDENCE_RESULTS)
+        passage = next(r for r in evidence if r.record_id.startswith("rules-guidance:") and r.value.get("rule_id"))
+        assert passage.value["rule_id"] == records[0].rule_id
+        assert passage.value["body"] == records[0].body
+        assert passage.value["citation"]["license"] == "CC BY 4.0"
+        assert passage.value["ranking"] == "unranked"
+        seen.append(passage)
+        return fake(packet, feedback)
+
+    execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert len(seen) == 1
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+
+
 def test_submission_autonomously_executes_to_persisted_dm_reply(db):
     s, camp_id, thread_id, factory = db
     turn, attempt = _submit(s, camp_id, thread_id)

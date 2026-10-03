@@ -9,7 +9,7 @@ repo-root ``.env`` when no ``backend/.env`` exists — and that file sets
 ``gemini-embedding-2`` and breaking stub-assuming tests (e.g. #213 suite).
 
 So test results must not depend on which ``.env`` files happen to exist or
-what the shell exports. This strips the four provider-selection vars:
+what the shell exports. This strips embedding selection and Jev key vars:
 
 - at import time (before test modules import ``database`` and trigger
   ``load_dotenv()``), so import-time readers see the offline baseline;
@@ -34,6 +34,9 @@ _PROVIDER_ENV_VARS = (
     "GOOGLE_API_KEY",
     "GOOGLE_GENAI_API_KEY",
     "GEMINI_EMBEDDING_MODEL",
+    # Automatic rules guidance must not call Jev with a developer's live key.
+    # Tests of the adapter use explicit fakes or monkeypatch this themselves.
+    "TYPESAFE_API_KEY",
 )
 
 

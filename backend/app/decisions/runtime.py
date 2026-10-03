@@ -179,10 +179,12 @@ class DecisionService:
         *,
         session_factory: Any = None,
         logical_operation: str = DECISION_LOGICAL_OPERATION,
+        is_recovery: bool = False,
     ) -> None:
         self._adapter = adapter or JevAdapter()
         self._session_factory = session_factory
         self._logical_operation = logical_operation
+        self._is_recovery = is_recovery
 
     @property
     def adapter(self) -> DecisionAdapter:
@@ -283,7 +285,7 @@ class DecisionService:
                     attempt=attempt,
                     # First attempt is the billable primary; retries are
                     # recovery, matching the forward-DM failover convention.
-                    classification="primary" if attempt == 1 else "recovery",
+                    classification="primary" if attempt == 1 and not self._is_recovery else "recovery",
                     parent_run_id=parent_run_id,
                     trace_id=trace_id,
                     operation_id=operation_id,

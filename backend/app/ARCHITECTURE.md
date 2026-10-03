@@ -53,7 +53,12 @@ The authoritative walkthrough is the module docstring of `dm/execution.py`. In s
 2. The response schedules `dm.recovery.execute_committed_attempt` as a FastAPI
    `BackgroundTasks` task. Campaign start, roll fulfillment and `/retry` do the same.
 3. `dm.execution.execute_dm_attempt` claims the attempt and assembles context (`dm.context`).
+   `dm.rules_guidance` retrieves public SRD candidates with cached BM25 postings,
+   rehydrates them in one canonical database read, and filters/reranks relevance through
+   Jev when configured, and attaches bounded, source-backed adjudication context.
    It adjudicates with failover inside the bounded evidence loop, then validates.
+   A Jev rules assessment of the validated proposal is recorded in advisory mode;
+   it never changes the contract, overrides validators, or blocks commit.
    Next it dispatches on the contract mode: `await_roll` goes to `rolls.service`, `silent` commits.
 4. For `respond`, `dm.narration.execute_validated_turn` streams durable narration chunks.
    It then calls `dm.turns.commit_turn`, which applies `dm.effects` inside

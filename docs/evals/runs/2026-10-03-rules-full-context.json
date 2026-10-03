@@ -1,0 +1,2544 @@
+{
+  "core_sections": 261,
+  "core_chars": 109012,
+  "samples": [
+    {
+      "method": "full_core_bm25",
+      "case": "oa-disengage-avoids",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 548.7186670070514,
+      "calls": [
+        {
+          "ms": 539.021083037369,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30798,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123790
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "oa-disengage-avoids",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 232.58999997051433,
+      "calls": [
+        {
+          "ms": 229.72104197833687,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 992,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2011
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "oa-teleport-misty-step",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 837.1881250059232,
+      "calls": [
+        {
+          "ms": 817.0373750035651,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30692,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123170
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "oa-teleport-misty-step",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 346.8325830181129,
+      "calls": [
+        {
+          "ms": 337.5443330151029,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1004,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2089
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "prone-ranged-melee",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 734.0620830073021,
+      "calls": [
+        {
+          "ms": 720.967874978669,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32276,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 129091
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "prone-ranged-melee",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 206.71745797153562,
+      "calls": [
+        {
+          "ms": 205.339832988102,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 787,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1252
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "concentration-incapacitated",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 626.8561250180937,
+      "calls": [
+        {
+          "ms": 616.594624996651,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31107,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125100
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "concentration-incapacitated",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 230.58783303713426,
+      "calls": [
+        {
+          "ms": 216.03591699386016,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1072,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2364
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "blinded-vs-invisible",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 499.96179196750745,
+      "calls": [
+        {
+          "ms": 476.6401670058258,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30962,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123970
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "blinded-vs-invisible",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 199.53737501055002,
+      "calls": [
+        {
+          "ms": 192.90891604032367,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 950,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1893
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "grapple-drag-cost",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 624.5235829846933,
+      "calls": [
+        {
+          "ms": 618.7949579907581,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30767,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123692
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "grapple-drag-cost",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 220.8622909965925,
+      "calls": [
+        {
+          "ms": 219.3569170194678,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 767,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1164
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "unconscious-autocrit",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 447.839250031393,
+      "calls": [
+        {
+          "ms": 439.71895799040794,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30630,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123336
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "unconscious-autocrit",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 264.1866250196472,
+      "calls": [
+        {
+          "ms": 261.72266696812585,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1018,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2066
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "paralyzed-hold-person",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 610.260916990228,
+      "calls": [
+        {
+          "ms": 588.7331660487689,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31889,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127945
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "paralyzed-hold-person",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 258.17308301338926,
+      "calls": [
+        {
+          "ms": 251.9325000466779,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1194,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2606
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "dodge-incapacitated",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 783.3785419934429,
+      "calls": [
+        {
+          "ms": 767.2961250063963,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31101,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124864
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "dodge-incapacitated",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 338.25933397747576,
+      "calls": [
+        {
+          "ms": 330.0821249722503,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 949,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1714
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "hide-requires-cover",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 716.9936660211533,
+      "calls": [
+        {
+          "ms": 702.4297079769894,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31642,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126687
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "hide-requires-cover",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 229.71079201670364,
+      "calls": [
+        {
+          "ms": 209.37549998052418,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 843,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1478
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "cover-degrees",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 626.4153749798425,
+      "calls": [
+        {
+          "ms": 575.3004580037668,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30720,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124159
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "cover-degrees",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 301.8488750094548,
+      "calls": [
+        {
+          "ms": 293.96904102759436,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 805,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1390
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "resistance-stacking",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 516.1545830196701,
+      "calls": [
+        {
+          "ms": 501.03691598633304,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30843,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124372
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "resistance-stacking",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 235.21145799895748,
+      "calls": [
+        {
+          "ms": 232.6595410122536,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 707,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 965
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "fireball-dex-half",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 660.8594590215944,
+      "calls": [
+        {
+          "ms": 630.1065419684164,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32073,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 128077
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "fireball-dex-half",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 253.03891603834927,
+      "calls": [
+        {
+          "ms": 240.7942499849014,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 838,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1368
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "shield-magic-missile",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 818.6121250037104,
+      "calls": [
+        {
+          "ms": 802.2039159550332,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31312,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125750
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "shield-magic-missile",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 219.21854198444635,
+      "calls": [
+        {
+          "ms": 211.9175000116229,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 755,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1108
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "counterspell-see-caster",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 848.8053340115584,
+      "calls": [
+        {
+          "ms": 840.102374961134,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32473,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 130602
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "counterspell-see-caster",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 234.35008304659277,
+      "calls": [
+        {
+          "ms": 231.77837498951703,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 813,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1299
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "darkness-darkvision",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 641.6449589887634,
+      "calls": [
+        {
+          "ms": 608.2427499932237,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31755,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127383
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "darkness-darkvision",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 296.1914580082521,
+      "calls": [
+        {
+          "ms": 287.9919169936329,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 854,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1473
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "bless-concentration",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 486.55212501762435,
+      "calls": [
+        {
+          "ms": 476.1657909839414,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31180,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125369
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "bless-concentration",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 220.25224997196347,
+      "calls": [
+        {
+          "ms": 217.70679199835286,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1089,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2385
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "cure-wounds-range",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 659.5940410043113,
+      "calls": [
+        {
+          "ms": 638.242665969301,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31398,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125577
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "cure-wounds-range",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 213.49920897046104,
+      "calls": [
+        {
+          "ms": 203.21962499292567,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 770,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1047
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "healing-word-bonus",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 593.2877500308678,
+      "calls": [
+        {
+          "ms": 583.7963329977356,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30939,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124260
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "healing-word-bonus",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 235.30979204224423,
+      "calls": [
+        {
+          "ms": 224.46199995465577,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 762,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1054
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "death-save-dc",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 537.484000029508,
+      "calls": [
+        {
+          "ms": 502.64712498756126,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30868,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124129
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "death-save-dc",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 293.6413330025971,
+      "calls": [
+        {
+          "ms": 291.48179199546576,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 972,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1947
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "stabilize-help",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 566.827333997935,
+      "calls": [
+        {
+          "ms": 547.1279170014895,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30742,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123730
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "stabilize-help",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 281.3521249918267,
+      "calls": [
+        {
+          "ms": 279.9798749620095,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 817,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1327
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "critical-hit-dice",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 479.21891597798094,
+      "calls": [
+        {
+          "ms": 460.5916250147857,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30915,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123916
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "critical-hit-dice",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 219.22112500760704,
+      "calls": [
+        {
+          "ms": 215.6684580259025,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 774,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1220
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "ranged-close-disadvantage",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 552.7276250068098,
+      "calls": [
+        {
+          "ms": 536.2786250188947,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31641,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127042
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "ranged-close-disadvantage",
+      "repeat": 0,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 207.79312495142221,
+      "calls": [
+        {
+          "ms": 204.65445902664214,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 792,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1174
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "feather-fall-trigger",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 535.9373749815859,
+      "calls": [
+        {
+          "ms": 513.8130419654772,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31375,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126258
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "feather-fall-trigger",
+      "repeat": 0,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 239.87333301920444,
+      "calls": [
+        {
+          "ms": 236.61341704428196,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 801,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1267
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-tavern-greeting",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 751.0855000000447,
+      "calls": [
+        {
+          "ms": 746.1957079940476,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31482,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126830
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-tavern-greeting",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 221.62700002081692,
+      "calls": [
+        {
+          "ms": 218.33174995845184,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 566,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 444
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-character-name",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 514.017709007021,
+      "calls": [
+        {
+          "ms": 495.29954098397866,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31974,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 129109
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-character-name",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 319.94745903648436,
+      "calls": [
+        {
+          "ms": 317.8386670188047,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 574,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 465
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-recap-story",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 756.2975830514915,
+      "calls": [
+        {
+          "ms": 735.053583048284,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31447,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126571
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-recap-story",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 258.7492499733344,
+      "calls": [
+        {
+          "ms": 256.4079579897225,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 569,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 465
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-snack-break",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 718.9432079903781,
+      "calls": [
+        {
+          "ms": 711.2289170036092,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30817,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124022
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-snack-break",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 211.46208397112787,
+      "calls": [
+        {
+          "ms": 209.41862504696473,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 563,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 435
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-scary-description",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 624.8188749887049,
+      "calls": [
+        {
+          "ms": 621.578959049657,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30350,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 122409
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-scary-description",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 237.32079099863768,
+      "calls": [
+        {
+          "ms": 234.13404205348343,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 563,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 460
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-next-session",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 474.30579096544534,
+      "calls": [
+        {
+          "ms": 467.03920798609033,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30650,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123562
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-next-session",
+      "repeat": 0,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 231.87750001670793,
+      "calls": [
+        {
+          "ms": 224.80537497904152,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 566,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 439
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "oa-disengage-avoids",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 623.1872500502504,
+      "calls": [
+        {
+          "ms": 606.2854580231942,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30798,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123790
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "oa-disengage-avoids",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 238.05983300553635,
+      "calls": [
+        {
+          "ms": 236.32424999959767,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 992,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2011
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "oa-teleport-misty-step",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 491.6373749729246,
+      "calls": [
+        {
+          "ms": 473.2625419856049,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30692,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123170
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "oa-teleport-misty-step",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 299.2512499913573,
+      "calls": [
+        {
+          "ms": 294.89729198394343,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1004,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2089
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "prone-ranged-melee",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 509.76712501142174,
+      "calls": [
+        {
+          "ms": 500.02762500662357,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32276,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 129091
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "prone-ranged-melee",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 252.1743749966845,
+      "calls": [
+        {
+          "ms": 247.89041600888595,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 787,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1252
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "concentration-incapacitated",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 467.50416699796915,
+      "calls": [
+        {
+          "ms": 459.1819579945877,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31107,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125100
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "concentration-incapacitated",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 218.35829102201387,
+      "calls": [
+        {
+          "ms": 215.15000000363216,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1072,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2364
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "blinded-vs-invisible",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 798.5670839552768,
+      "calls": [
+        {
+          "ms": 781.165249994956,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30962,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123970
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "blinded-vs-invisible",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 232.7419999637641,
+      "calls": [
+        {
+          "ms": 226.70762497000396,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 950,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1893
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "grapple-drag-cost",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 622.6280410191976,
+      "calls": [
+        {
+          "ms": 618.2469589984976,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30767,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123692
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "grapple-drag-cost",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 262.77050003409386,
+      "calls": [
+        {
+          "ms": 259.49316698824987,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 767,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1164
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "unconscious-autocrit",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 464.39454099163413,
+      "calls": [
+        {
+          "ms": 448.58345796819776,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30630,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123336
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "unconscious-autocrit",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 309.16579195763916,
+      "calls": [
+        {
+          "ms": 305.3260419983417,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1018,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2066
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "paralyzed-hold-person",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 506.82529201731086,
+      "calls": [
+        {
+          "ms": 487.51766700297594,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31889,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127945
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "paralyzed-hold-person",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 250.16412499826401,
+      "calls": [
+        {
+          "ms": 247.44620901765302,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1194,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2606
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "dodge-incapacitated",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 503.2873749732971,
+      "calls": [
+        {
+          "ms": 486.8484580074437,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31101,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124864
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "dodge-incapacitated",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 293.7932919594459,
+      "calls": [
+        {
+          "ms": 291.71379195759073,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 949,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1714
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "hide-requires-cover",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": false,
+      "ms": 783.585375000257,
+      "calls": [
+        {
+          "ms": 776.4187920256518,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31642,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126687
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "hide-requires-cover",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 265.158333000727,
+      "calls": [
+        {
+          "ms": 262.5524590257555,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 843,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1478
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "cover-degrees",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 877.5695409858599,
+      "calls": [
+        {
+          "ms": 861.7791670258157,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30720,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124159
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "cover-degrees",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 437.78112495783716,
+      "calls": [
+        {
+          "ms": 430.6532079936005,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 805,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1390
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "resistance-stacking",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 698.0975409969687,
+      "calls": [
+        {
+          "ms": 657.9381249612197,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30843,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124372
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "resistance-stacking",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 352.6831670315005,
+      "calls": [
+        {
+          "ms": 344.3527089548297,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 707,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 965
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "fireball-dex-half",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 672.1439159591682,
+      "calls": [
+        {
+          "ms": 639.4289589952677,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32073,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 128077
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "fireball-dex-half",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 291.2835829774849,
+      "calls": [
+        {
+          "ms": 286.86041705077514,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 838,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1368
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "shield-magic-missile",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 732.0548329735175,
+      "calls": [
+        {
+          "ms": 636.6630410193466,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31312,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125750
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "shield-magic-missile",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 260.96641598269343,
+      "calls": [
+        {
+          "ms": 256.5210419707,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 755,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1108
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "counterspell-see-caster",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 848.9637079765089,
+      "calls": [
+        {
+          "ms": 828.2033750438131,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 32473,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 130602
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "counterspell-see-caster",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 326.2537500122562,
+      "calls": [
+        {
+          "ms": 307.0153340231627,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 813,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1299
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "darkness-darkvision",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 618.6454580165446,
+      "calls": [
+        {
+          "ms": 601.7956670257263,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31755,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127383
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "darkness-darkvision",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 372.2986250068061,
+      "calls": [
+        {
+          "ms": 368.32666699774563,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 854,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1473
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "bless-concentration",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 934.4462919980288,
+      "calls": [
+        {
+          "ms": 914.8242499795742,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31180,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125369
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "bless-concentration",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 372.33300000661984,
+      "calls": [
+        {
+          "ms": 297.68904199590907,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 1089,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 2385
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "cure-wounds-range",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 1049.651959037874,
+      "calls": [
+        {
+          "ms": 1023.799583024811,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31398,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 125577
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "cure-wounds-range",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 448.9110839786008,
+      "calls": [
+        {
+          "ms": 404.036832973361,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 770,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1047
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "healing-word-bonus",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 931.4427499775775,
+      "calls": [
+        {
+          "ms": 913.1116250064224,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30939,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124260
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "healing-word-bonus",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 243.71025001164526,
+      "calls": [
+        {
+          "ms": 241.2147920113057,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 762,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1054
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "death-save-dc",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 852.1989170112647,
+      "calls": [
+        {
+          "ms": 842.1824589604512,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30868,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124129
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "death-save-dc",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 225.13620799873024,
+      "calls": [
+        {
+          "ms": 221.09270899090916,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 972,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1947
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "stabilize-help",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 678.4224580042064,
+      "calls": [
+        {
+          "ms": 660.9327499754727,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30742,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123730
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "stabilize-help",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 260.2770419907756,
+      "calls": [
+        {
+          "ms": 237.81158297788352,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 817,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1327
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "critical-hit-dice",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 635.035915998742,
+      "calls": [
+        {
+          "ms": 617.893666960299,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30915,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123916
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "critical-hit-dice",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 281.40612499555573,
+      "calls": [
+        {
+          "ms": 277.2777919890359,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 774,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1220
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "ranged-close-disadvantage",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 495.39574998198077,
+      "calls": [
+        {
+          "ms": 479.16524996981025,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31641,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 127042
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "ranged-close-disadvantage",
+      "repeat": 1,
+      "outcome": "SUPPORTED",
+      "correct": true,
+      "ms": 243.34149999776855,
+      "calls": [
+        {
+          "ms": 233.99875004542992,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 792,
+            "output_tokens": 65
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1174
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "feather-fall-trigger",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 639.9517920217477,
+      "calls": [
+        {
+          "ms": 625.1842500059865,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31375,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126258
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "feather-fall-trigger",
+      "repeat": 1,
+      "outcome": "CONTRADICTED",
+      "correct": true,
+      "ms": 217.3769579967484,
+      "calls": [
+        {
+          "ms": 213.6680840048939,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 801,
+            "output_tokens": 67
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 1267
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-tavern-greeting",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 538.8776250183582,
+      "calls": [
+        {
+          "ms": 531.4254169934429,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31482,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126830
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-tavern-greeting",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 276.92845900310203,
+      "calls": [
+        {
+          "ms": 272.62316702399403,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 566,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 444
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-character-name",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 510.71066700387746,
+      "calls": [
+        {
+          "ms": 490.7291250419803,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31974,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 129109
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-character-name",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 233.54079195996746,
+      "calls": [
+        {
+          "ms": 227.48204099480063,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 574,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 465
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-recap-story",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 674.6369590400718,
+      "calls": [
+        {
+          "ms": 660.8996249851771,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 31447,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 126571
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-recap-story",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 304.76129200542346,
+      "calls": [
+        {
+          "ms": 299.35529199428856,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 569,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 465
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-snack-break",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 476.18229198269546,
+      "calls": [
+        {
+          "ms": 467.6741670118645,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30817,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 124022
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-snack-break",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 346.1267499951646,
+      "calls": [
+        {
+          "ms": 344.2133329808712,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 563,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 435
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-scary-description",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 498.58941696584225,
+      "calls": [
+        {
+          "ms": 494.00375003460795,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30350,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 122409
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-scary-description",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 226.51558299548924,
+      "calls": [
+        {
+          "ms": 223.40754105243832,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 563,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 460
+    },
+    {
+      "method": "full_core_bm25",
+      "case": "chat-next-session",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 494.9335000128485,
+      "calls": [
+        {
+          "ms": 470.63933400204405,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 30650,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 123562
+    },
+    {
+      "method": "oracle_evidence",
+      "case": "chat-next-session",
+      "repeat": 1,
+      "outcome": "NOT_MECHANICAL",
+      "correct": true,
+      "ms": 203.77299998654053,
+      "calls": [
+        {
+          "ms": 201.28154195845127,
+          "model": "jev-1.13.0",
+          "usage": {
+            "input_tokens": 566,
+            "output_tokens": 66
+          },
+          "questions": 1
+        }
+      ],
+      "error": null,
+      "state_chars": 439
+    }
+  ],
+  "repeats": 2,
+  "corpus_sha256": "fc38dbda247dd5bc94cb28fb05a966a8dd2a5fc1957d1769bf87798387af6d12",
+  "fixture_sha256": "6b6b3a585a594b553c89af75804516fd7ac9024a871e9def848a7227e5718fdf",
+  "summary": {
+    "full_core_bm25": {
+      "accuracy": 0.9166666666666666,
+      "errors": 0,
+      "p50_ms": 624.6712289866991,
+      "p95_ms": 877.5695409858599
+    },
+    "oracle_evidence": {
+      "accuracy": 0.9833333333333333,
+      "errors": 0,
+      "p50_ms": 251.16924999747425,
+      "p95_ms": 372.2986250068061
+    }
+  },
+  "corpus_content_sha256": "b2c10081e56628b53a5de3d568aab934bb955a4765625b8d914d8072353c8d9e"
+}

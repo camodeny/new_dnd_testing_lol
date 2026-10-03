@@ -1,0 +1,255 @@
+{
+  "samples": [
+    {
+      "pair": 0,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 326.774834014941,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 0,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 191.9919999781996,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 1,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 137.7108339802362,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 1,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 209.39350000116974,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 2,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 246.67345895431936,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 2,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 265.87262499378994,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 3,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 149.69170902622864,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 3,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 227.37291699741036,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 4,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 299.16691698599607,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 4,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 142.28912501130253,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 5,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 222.60216594440863,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 5,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 218.61749998060986,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 6,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 204.6609169919975,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 6,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 239.1372499987483,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 7,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 155.4137910134159,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 7,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 240.28254201402888,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 8,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 225.46287503791973,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 8,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 142.69175002118573,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 9,
+      "transport": "pooled",
+      "outcome": "SUPPORTED",
+      "ms": 150.24129097582772,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    },
+    {
+      "pair": 9,
+      "transport": "fresh",
+      "outcome": "SUPPORTED",
+      "ms": 200.60737495077774,
+      "model": "jev-1.13.0",
+      "usage": {
+        "input_tokens": 969,
+        "output_tokens": 65
+      },
+      "questions": 1
+    }
+  ],
+  "summary": {
+    "fresh": {
+      "p50_ms": 226.41789601766504,
+      "p95_ms": 326.774834014941
+    },
+    "pooled": {
+      "p50_ms": 152.8275409946218,
+      "p95_ms": 265.87262499378994
+    }
+  },
+  "corpus_content_sha256": "b2c10081e56628b53a5de3d568aab934bb955a4765625b8d914d8072353c8d9e"
+}

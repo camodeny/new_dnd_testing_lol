@@ -20,6 +20,40 @@
 
 **Evidence tools:** `app/dm/tools/rules.py` → `lookup_rule` / `search_rules` via `app/dm/evidence.py#203` (`ALLOWED_TOOLS`). Bounded output, `missing`/`tool_failure` never hallucinated.
 
+**Automatic turn guidance:** `app/dm/rules_guidance.py` uses local BM25 before each
+fresh adjudication attempt using player input and current location. It
+reuses those references during evidence rounds and regeneration within that
+attempt. Retrieval considers at most 8 sections; one Jev call filters relevance
+and reranks them, retaining at most 3 passages (4,000 characters each). Unknown
+rule IDs are dropped after canonical lookup. An empty relevant set, incomplete
+evidence, and unavailable retrieval remain explicit outcomes. References and
+their canonical citations are adjudication-only context, excluded from automatic
+narration projection.
+
+The corpus must be imported first. `app/rules_corpus/bm25.py` shares the benchmarked
+BM25 algorithm with the evaluation harness. `bm25_store.py` caches derived public
+SRD postings per database engine for one hour, using an independent read-only
+transaction so uncommitted turn data never enters the cache. Only the canonical
+SRD corpus/version from `metadata.py` is indexed. Candidate IDs are rehydrated
+in one fresh bounded database read; deleted or foreign sources are dropped. New
+source text can take up to an hour to affect candidate ranking, while retained
+passages always come from canonical storage. Automatic guidance does not use
+embeddings or make Gemini calls; explicit `search_rules` retains its hybrid
+search behavior. `TYPESAFE_API_KEY` enables Jev relevance
+ranking and advisory assessment; without it, retrieved references are marked
+unranked. Each Jev request uses a 2-second timeout and one attempt. Failures
+preserve unranked retrieval or report insufficient evidence without blocking play.
+
+After deterministic validation, mechanical proposals (including ordinary
+`respond` rulings with retrieved rules) receive an advisory Jev assessment:
+`SUPPORTED`, `CONTRADICTED`, `INSUFFICIENT_EVIDENCE`, or `NOT_MECHANICAL`.
+The judge receives the actual proposed beats, roll request, and staged effects,
+plus source-backed passages, including later explicit rule lookups. Its verdict
+does not trigger regeneration or alter state. Content-safe `dm_rules_advisory`
+logs record turn/attempt IDs, outcome, evidence IDs, and failure kind for evaluation;
+the existing AI-run ledger records provider calls, with recovery calls non-billable.
+These judgments must be evaluated against known rulings before any enforcement.
+
 **Embeddings:** `app/rules_corpus/embeddings.py` + `scripts/build_rule_embeddings.py` — section_with_heading_context, versioned `model/version/build_id`; rebuild does not mutate `rule_id`.
 - Default: `stub-hash-v1` (1536 dims, deterministic, offline/test).
 - **Gemini Embeddings 2:** `gemini-embedding-2` (default, 3072 dims, multimodal, 8192 tokens, falls back to `gemini-embedding-001` if 2 not yet GA) or `gemini-embedding-001` (2048 tokens) / `text-embedding-004` (768 dims). Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) and run:
