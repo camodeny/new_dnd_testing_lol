@@ -386,7 +386,34 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     """
     from app.dm.contract import ContractValidationError
     from app.dm.evidence import run_bounded_evidence_loop
+    from app.dm.rules_guidance import enrich_rules_context, check_rules_advisory
     from app.dm.validators import default_pipeline, run_with_bounded_regeneration
+    from app.observability.tracing import trace_context
+
+    # Retrieve once for this attempt. Evidence rounds, validation regeneration,
+    # and identity readjudication reuse the same bounded rules references.
+    if "rules_guidance" not in start_packet.observability.retrieval_dependencies:
+        with trace_context(run.trace_id, f"dm_rules:{run.attempt_id}"):
+            start_packet = enrich_rules_context(run.db, start_packet, is_recovery=run.is_recovery)
+
+    def checked(contract, packet):
+        # Shadow evaluation only: a semantic judgment never changes the
+        # contract or bypasses the deterministic validation/commit pipeline.
+        with trace_context(run.trace_id, f"dm_rules:{run.attempt_id}"):
+            try:
+                advisory = check_rules_advisory(packet, contract, is_recovery=run.is_recovery)
+            except Exception as exc:
+                # Optional evaluation must never interrupt a validated turn.
+                advisory = {"status": "unavailable", "outcome": "INSUFFICIENT_EVIDENCE",
+                            "provider_error": type(exc).__name__}
+            structured_log(
+                logger, logging.INFO, "dm_rules_advisory",
+                turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+                status=advisory.get("status"), outcome=advisory.get("outcome"),
+                rule_ids=advisory.get("citations", []),
+                error_kind=advisory.get("provider_error"),
+            )
+        return contract, packet
 
     def repair_missing_perspectives(report, pkt):
         """Deterministic resolve-then-retry; None falls back to scope-narrowing."""
@@ -433,8 +460,9 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
         initial_packet=start_packet, adjudicate=evidence_adjudicate, db=run.db,
     )
     if default_pipeline.validate(final_contract, validation_packet).passed:
-        return final_contract, validation_packet
-    return regenerate(validation_packet)
+        return checked(final_contract, validation_packet)
+    regenerated, repaired_packet = regenerate(validation_packet)
+    return checked(regenerated, repaired_packet)
 
 
 def _build_narrator(run: _Run, narrator):

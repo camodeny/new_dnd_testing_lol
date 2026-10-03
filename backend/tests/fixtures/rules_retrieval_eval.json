@@ -1,0 +1,850 @@
+{
+  "cases": [
+    {
+      "category": "opportunity-attacks",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.disengage-action"
+        ],
+        [
+          "dndsrd521.playing-the-game.playing-the-game.combat.melee-attacks.opportunity-attacks"
+        ]
+      ],
+      "id": "oa-disengage-avoids",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Using the Disengage action means your movement does not provoke Opportunity Attacks for the rest of the turn."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks whether Disengage lets them run past a guard without provoking."
+      },
+      "query": "If I take the Disengage action, can I move past an enemy without provoking an Opportunity Attack?",
+      "rationale": "Grounded: Disengage body 'your movement doesn't provoke Opportunity Attacks for the rest of the current turn'; OA body 'You can avoid provoking an Opportunity Attack by taking the Disengage action.'"
+    },
+    {
+      "category": "opportunity-attacks",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.swim-speed.teleportation"
+        ],
+        [
+          "dndsrd521.spells.spells.spell-descriptions.misty-step"
+        ]
+      ],
+      "id": "oa-teleport-misty-step",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "When the wizard casts Misty Step to leave a threatened square, the adjacent enemy gets an Opportunity Attack against her."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests teleport exception: proposed ruling claims teleport provokes, contradicting the rule."
+      },
+      "query": "An enemy is next to me and I cast Misty Step to teleport 30 feet away. Does that provoke an Opportunity Attack?",
+      "rationale": "Grounded: Teleportation body 'teleportation never provokes Opportunity Attacks'; Misty Step body 'you teleport up to 30 feet to an unoccupied space you can see.' Proposal contradicts both."
+    },
+    {
+      "category": "conditions",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.prone-condition"
+        ]
+      ],
+      "id": "prone-ranged-melee",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Attacks against the prone goblin have Advantage if made from within 5 feet, and Disadvantage if made from farther away."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks how range interacts with attacking a prone target."
+      },
+      "query": "The goblin is Prone. Do I get Advantage shooting it from 30 feet away with my bow?",
+      "rationale": "Grounded: Prone body 'An attack roll against you has Advantage if the attacker is within 5 feet of you. Otherwise, that attack roll has Disadvantage.' Ranged-close body confirms adjacent-ranged Disadvantage interplay."
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.concentration"
+        ],
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.incapacitated-condition"
+        ]
+      ],
+      "id": "concentration-incapacitated",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Even though the cleric is Incapacitated, her Bless spell stays active because she already made the casting roll."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests concentration exception: proposed ruling keeps concentration through Incapacitated, contradicting the rule."
+      },
+      "query": "The cleric concentrating on Bless gets stunned and gains the Incapacitated condition. Does Bless stay up?",
+      "rationale": "Grounded: Concentration body 'Your Concentration ends if you have the Incapacitated condition'; Incapacitated body 'No Concentration. Your Concentration is broken.' Proposal contradicts both."
+    },
+    {
+      "category": "conditions",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.blinded-condition"
+        ],
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.invisible-condition"
+        ]
+      ],
+      "id": "blinded-vs-invisible",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "The blinded fighter attacks with Disadvantage, and attacks against her have Advantage. The invisible enemy is a target of attacks with Disadvantage."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks how Blinded interacts with an unseen attacker."
+      },
+      "query": "I have the Blinded condition and I am swinging at an Invisible stalker. What happens to the attack rolls?",
+      "rationale": "Grounded: Blinded body 'Attack rolls against you have Advantage, and your attack rolls have Disadvantage'; Invisible body 'Attack rolls against you have Disadvantage, and your attack rolls have Advantage. If a creature can somehow see you, you don't gain this benefit.'"
+    },
+    {
+      "category": "conditions",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.grappled-condition"
+        ]
+      ],
+      "id": "grapple-drag-cost",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Dragging the grappled prisoner costs no extra movement as long as you are the same size as them."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests grapple movement exception: proposed ruling denies the extra-foot cost."
+      },
+      "query": "I have a human prisoner Grappled and I drag them while we move. Does it cost extra movement?",
+      "rationale": "Grounded: Grappled body 'The grappler can drag or carry you when it moves, but every foot of movement costs it 1 extra foot unless you are Tiny or two or more sizes smaller than it.' Same-size drag costs extra; proposal contradicts it."
+    },
+    {
+      "category": "conditions",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.swim-speed.unconscious-condition"
+        ],
+        [
+          "dndsrd521.playing-the-game.playing-the-game.damage-and-healing.critical-hits"
+        ]
+      ],
+      "id": "unconscious-autocrit",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Any attack that hits the unconscious paladin from within 5 feet is a Critical Hit, rolling damage dice twice."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks whether hitting an unconscious ally-turned-target crits."
+      },
+      "query": "The paladin is Unconscious on the ground. My fighter stands over her and hits with a sword. Is it a Critical Hit?",
+      "rationale": "Grounded: Unconscious body 'Any attack roll that hits you is a Critical Hit if the attacker is within 5 feet of you'; Critical Hits body 'Roll the attack's damage dice twice, add them together, and add any relevant modifiers.'"
+    },
+    {
+      "category": "conditions",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.paralyzed-condition"
+        ],
+        [
+          "dndsrd521.spells.spells.spell-descriptions.hold-person"
+        ],
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.incapacitated-condition"
+        ]
+      ],
+      "id": "paralyzed-hold-person",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "The target held by Hold Person has the Paralyzed condition but can still use its Reaction to cast Shield."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests paralysis exception: proposed ruling grants actions to a Paralyzed target."
+      },
+      "query": "Hold Person worked and the target has the Paralyzed condition. Can it still take Reactions on other turns?",
+      "rationale": "Grounded: Paralyzed body 'Incapacitated. You have the Incapacitated condition' and Incapacitated body 'You can't take any action, Bonus Action, or Reaction'; Hold Person body imposes 'the Paralyzed condition'. Proposal contradicts this."
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.dodge-action"
+        ],
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.incapacitated-condition"
+        ]
+      ],
+      "id": "dodge-incapacitated",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Dodge imposes Disadvantage on attacks against you while you can see the attacker, but you lose that benefit if you gain the Incapacitated condition or your Speed drops to 0."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks what Dodge does and what turns it off."
+      },
+      "query": "I take the Dodge action. What does it do, and does it still work if I get stunned?",
+      "rationale": "Grounded: Dodge body 'any attack roll made against you has Disadvantage if you can see the attacker' and 'You lose these benefits if you have the Incapacitated condition or if your Speed is 0.'"
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.hide-action"
+        ]
+      ],
+      "id": "hide-requires-cover",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "You can take the Hide action standing in open Bright Light with enemies watching, and a success still gives you the Invisible condition."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests Hide exception: proposed ruling ignores the obscurement and line-of-sight requirements."
+      },
+      "query": "Can I Hide in the middle of a lit empty room while the guards stare at me?",
+      "rationale": "Grounded: Hide body requires 'DC 15 Dexterity (Stealth) check while you're Heavily Obscured or behind Three-Quarters Cover or Total Cover, and you must be out of any enemy's line of sight'; only 'On a successful check, you have the Invisible condition while hidden.' Proposal contradicts the requirements."
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.playing-the-game.playing-the-game.combat.cover"
+        ]
+      ],
+      "id": "cover-degrees",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "A low wall giving Half Cover adds +2 to AC and Dexterity saves, and a target behind several sources uses only the most protective degree."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks what Half Cover grants when two obstacles overlap."
+      },
+      "query": "My ranger shoots from behind a low wall and a crate. What bonus does Half Cover give, and do the two stack?",
+      "rationale": "Grounded: Cover body 'Half Cover (+2 bonus to AC and Dexterity saving throws)' and 'If a target is behind multiple sources of cover, only the most protective degree of cover applies.'"
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.resistance"
+        ]
+      ],
+      "id": "resistance-stacking",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Because the dwarf has fire resistance from two different sources, incoming Fire damage is quartered (halved twice)."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests resistance exception: proposed ruling stacks resistance twice."
+      },
+      "query": "My dwarf has Fire Resistance from the spell and from armor. Is Fire damage halved twice?",
+      "rationale": "Grounded: Resistance body 'damage of that type is halved against you (round down)' and glossary 'Resistance is applied only once to an instance of damage.' Double-halving contradicts this."
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.fireball"
+        ]
+      ],
+      "id": "fireball-dex-half",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Each creature in the 20-foot-radius sphere makes a Dexterity save, taking 8d6 Fire damage on failure or half as much on success."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks how Fireball damage resolves on a successful save."
+      },
+      "query": "I cast Fireball at 3rd level. What happens to creatures that succeed on the Dexterity save?",
+      "rationale": "Grounded: Fireball body 'Each creature in a 20-foot-radius Sphere ... makes a Dexterity saving throw, taking 8d6 Fire damage on a failed save or half as much damage on a successful one.'"
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.shield"
+        ]
+      ],
+      "id": "shield-magic-missile",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Shield gives +5 AC but does nothing against Magic Missile, so the darts still hit."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests Shield exception: proposed ruling denies the Magic Missile immunity."
+      },
+      "query": "I cast Shield when hit by an attack, then the enemy follows up with Magic Missile. Does Shield stop it?",
+      "rationale": "Grounded: Shield body 'you have a +5 bonus to AC ... and you take no damage from Magic Missile.' Claiming Magic Missile still hits contradicts this."
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.counterspell"
+        ]
+      ],
+      "id": "counterspell-see-caster",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Counterspell is a Reaction you take when you see a creature within 60 feet casting a spell, forcing a Constitution save or the spell dissipates."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks when Counterspell can be cast."
+      },
+      "query": "An enemy wizard starts chanting 40 feet away where I can see him. Can I Counterspell?",
+      "rationale": "Grounded: Counterspell body 'Reaction, which you take when you see a creature within 60 feet of yourself casting a spell'; 'On a failed save, the spell dissipates with no effect.'"
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.darkness"
+        ]
+      ],
+      "id": "darkness-darkvision",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Darkvision lets you see through the magical Darkness created by the Darkness spell as if it were Dim Light."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests Darkness exception: proposed ruling lets Darkvision pierce the spell."
+      },
+      "query": "Our scout has Darkvision. Can she see through the 15-foot sphere of the Darkness spell?",
+      "rationale": "Grounded: Darkness body 'Darkvision can't see through it, and nonmagical light can't illuminate it.' Proposal contradicts this directly."
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.bless"
+        ],
+        [
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.concentration"
+        ]
+      ],
+      "id": "bless-concentration",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Bless requires Concentration up to 1 minute, adds 1d4 to attack rolls and saves, and ends if you start concentrating on another Concentration spell."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks whether Bless needs concentration and what it adds."
+      },
+      "query": "I am concentrating on Bless and want to cast another concentration spell. What happens to Bless?",
+      "rationale": "Grounded: Bless body 'Duration: Concentration, up to 1 minute' and 'adds 1d4 to the attack roll or save'; Concentration body 'You lose Concentration on an effect the moment you start casting a spell that requires Concentration.'"
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.cure-wounds"
+        ]
+      ],
+      "id": "cure-wounds-range",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Cure Wounds has a range of 60 feet and a casting time of a Bonus Action, healing 2d8 plus modifier."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests Cure Wounds basics: proposed ruling swaps in Healing Word's range and action."
+      },
+      "query": "Can I cast Cure Wounds on an ally 60 feet away as a Bonus Action?",
+      "rationale": "Grounded: Cure Wounds body 'Casting Time: Action. Range: Touch' healing '2d8 plus your spellcasting ability modifier.' A 60-foot Bonus Action contradicts both fields."
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.healing-word"
+        ]
+      ],
+      "id": "healing-word-bonus",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Healing Word is a Bonus Action with 60-foot range that heals 2d4 plus your spellcasting modifier to a creature you can see."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks how Healing Word differs from Cure Wounds."
+      },
+      "query": "How fast can I get Healing Word off, and how far does it reach?",
+      "rationale": "Grounded: Healing Word body 'Casting Time: Bonus Action. Range: 60 feet' healing '2d4 plus your spellcasting ability modifier' to a creature 'you can see within range.'"
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.playing-the-game.playing-the-game.damage-and-healing.dropping-to-0-hit-points.death-saving-throws"
+        ]
+      ],
+      "id": "death-save-dc",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "A Death Saving Throw succeeds on a roll of 15 or higher, and it takes five successes before you stabilize."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests death-save exception: proposed ruling invents a wrong DC and count."
+      },
+      "query": "What do I need to roll on a Death Saving Throw, and how many successes stabilize me?",
+      "rationale": "Grounded: Death saves body 'If the roll is 10 or higher, you succeed' and 'On your third success, you become Stable.' DC 15 / five successes contradicts both."
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.playing-the-game.playing-the-game.damage-and-healing.dropping-to-0-hit-points.stabilizing-a-character"
+        ]
+      ],
+      "id": "stabilize-help",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "You can use the Help action to stabilize a creature at 0 Hit Points with a DC 10 Wisdom (Medicine) check; a Stable creature keeps the Unconscious condition but stops making Death Saves."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks how to stabilize a dying ally."
+      },
+      "query": "My friend is dying at 0 Hit Points. How do I stabilize them with the Help action?",
+      "rationale": "Grounded: Stabilizing body 'You can take the Help action to try to stabilize a creature with 0 Hit Points, which requires a successful DC 10 Wisdom (Medicine) check' and 'A Stable creature doesn't make Death Saving Throws ... but it still has the Unconscious condition.'"
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.playing-the-game.playing-the-game.damage-and-healing.critical-hits",
+          "dndsrd521.rules-glossary.rules-glossary.rules-definitions.critical-hit"
+        ]
+      ],
+      "id": "critical-hit-dice",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "On a Critical Hit you reroll the attack to confirm, then add double your ability modifier while rolling damage dice only once."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests critical-hit exception: proposed ruling invents confirmation and doubles modifiers instead of dice."
+      },
+      "query": "I rolled a 20 on my attack with a dagger. How do I compute Critical Hit damage?",
+      "rationale": "Grounded: Critical body 'Roll all of the attack's damage dice twice and add them together. Then add any relevant modifiers' (glossary) / 'roll 2d4 for the damage rather than 1d4, and add your relevant ability modifier' (playing). Proposal contradicts both."
+    },
+    {
+      "category": "combat",
+      "expected_advisory": "SUPPORTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.playing-the-game.playing-the-game.combat.ranged-attacks.ranged-attacks-in-close-combat"
+        ]
+      ],
+      "id": "ranged-close-disadvantage",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "The bow attack has Disadvantage because a hostile creature who can see you and is not Incapacitated is within 5 feet."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Player asks whether shooting a bow next to an enemy is penalized."
+      },
+      "query": "I shoot my bow while a hostile goblin who can see me and is not Incapacitated is within 5 feet. Do I attack with Disadvantage?",
+      "rationale": "Grounded: Ranged-close body 'you have Disadvantage on the roll if you are within 5 feet of an enemy who can see you and doesn't have the Incapacitated condition.'"
+    },
+    {
+      "category": "spells",
+      "expected_advisory": "CONTRADICTED",
+      "expected_rule_groups": [
+        [
+          "dndsrd521.spells.spells.spell-descriptions.feather-fall"
+        ]
+      ],
+      "id": "feather-fall-trigger",
+      "no_rules": false,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Feather Fall takes an Action to cast on your own turn and only affects you, so it cannot save allies who are already falling."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Tests Feather Fall exception: proposed ruling narrows casting time and targets."
+      },
+      "query": "The bridge collapses and three allies are falling within 60 feet. Can I cast Feather Fall right now?",
+      "rationale": "Grounded: Feather Fall body 'Casting Time: Reaction, which you take when you or a creature you can see within 60 feet of you falls' and 'Choose up to five falling creatures within range.' Proposal contradicts both."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-tavern-greeting",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "The tavern keeper wipes a mug, smiles warmly, and asks what brings the party to town today."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Pure roleplay greeting with no rules claim to verify."
+      },
+      "query": "We walk into the tavern and say hello. What happens?",
+      "rationale": "No mechanics invoked; ordinary dialogue needs no SRD section. Control case for false-positive retrieval."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-character-name",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "That is a fine name for a wanderer; the folk here will remember it, and I note it in the party's story."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Naming discussion with no rules content."
+      },
+      "query": "I want my character to be called Thorn the Wanderer. Does that sound good?",
+      "rationale": "Flavor preference only; no attack, save, condition, or spell involved. Control case."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-recap-story",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Last time, the party crossed the river, befriended the miller, and agreed to investigate the old chapel at dawn."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Story recap request with no ruling to check."
+      },
+      "query": "Can you recap what our party did last session in plain words?",
+      "rationale": "Narrative summary only; no D20 Test, condition, or spell adjudication. Control case."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-snack-break",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Sounds good, take ten minutes and stretch; I will keep the campfire scene warm until everyone is back."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Logistics chat with no game mechanics."
+      },
+      "query": "Can we pause for a snack break for ten minutes?",
+      "rationale": "Table logistics only; nothing to support or contradict in the SRD. Control case."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-scary-description",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "The chapel door groans open onto dust and cold air, and somewhere below, something scrapes slowly across stone."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Atmosphere description with no mechanical ruling."
+      },
+      "query": "Describe the creepy chapel entrance to set the mood.",
+      "rationale": "Flavor narration only; no cover, light, or condition ruling is made. Control case."
+    },
+    {
+      "category": "conversation",
+      "expected_advisory": "NOT_MECHANICAL",
+      "expected_rule_groups": [],
+      "id": "chat-next-session",
+      "no_rules": true,
+      "proposal": {
+        "beats": [
+          {
+            "claims": [
+              {
+                "claim_kind": "observation",
+                "origin": "dm_adjudication",
+                "text": "Same time next week works for me; I will have the chapel interior and the miller's errand ready to continue."
+              }
+            ]
+          }
+        ],
+        "mode": "respond",
+        "reason": "Scheduling chat with no rules content."
+      },
+      "query": "Can we play again at the same time next week?",
+      "rationale": "Scheduling only; no SRD section could support or contradict it. Control case."
+    }
+  ],
+  "version": 1,
+  "gold_review": "Main-agent source review corrected irrelevant required passages and duplicate alternatives before live evaluation."
+}

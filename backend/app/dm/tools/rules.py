@@ -103,6 +103,7 @@ def handle_lookup_rule(request: EvidenceRequest, audience: ContextAudience, *, d
                 "source_section_id": row.source_section_id,
                 "excerpt": row.body[:800] if row.body else "",
                 "body": row.body[:2000] if row.body else "",
+                "truncated": len(row.body or "") > 2000,
                 "citation": citation,
                 "citation_text": f"{citation['title']} — {citation['corpus_id']} {citation['corpus_version']} [{citation['source_locator']}]",
                 "license": citation.get("license"),
@@ -187,10 +188,10 @@ def handle_search_rules(request: EvidenceRequest, audience: ContextAudience, *, 
                 except Exception as exc:
                     # semantic is optional — fall back to lexical only
                     query_embedding = None
-                    logger.warning("rules evidence search embedding degraded reason=%s error=%s", type(exc).__name__, exc)
+                    logger.warning("rules evidence search embedding degraded reason=%s", type(exc).__name__)
     except Exception as exc:
         query_embedding = None
-        logger.warning("rules evidence search embedding degraded reason=%s error=%s", type(exc).__name__, exc)
+        logger.warning("rules evidence search embedding degraded reason=%s", type(exc).__name__)
 
     try:
         hits = hybrid_search(db_sess, query, limit=limit, query_embedding=query_embedding, embedding_model=embedding_model)
