@@ -194,6 +194,7 @@ def _get_active_turn_for_update(db: Session, campaign_id: uuid.UUID, thread_id: 
             .order_by(DmTurn.created_at.desc())
             .limit(1)
             .with_for_update()
+            .execution_options(populate_existing=True)
         ).scalars().first()
     except Exception:
         # SQLite or any dialect that rejects FOR UPDATE in this context
@@ -517,7 +518,8 @@ def coordinate_turn(
     if active.current_attempt_id:
         try:
             cur_attempt = db.execute(
-                select(DmTurnAttempt).where(DmTurnAttempt.id == active.current_attempt_id).with_for_update()
+                select(DmTurnAttempt).where(DmTurnAttempt.id == active.current_attempt_id)
+                .with_for_update().execution_options(populate_existing=True)
             ).scalars().first()
         except Exception:
             cur_attempt = db.get(DmTurnAttempt, active.current_attempt_id)
@@ -736,12 +738,7 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     Uses FOR UPDATE + CAS to ensure only the current attempt can become streaming.
     """
     # Lock both rows for CAS
-    try:
-        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-    except Exception:
-        turn = db.get(DmTurn, turn_id)
-        attempt = db.get(DmTurnAttempt, attempt_id)
+    turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
@@ -889,12 +886,7 @@ def mark_recovered_streaming(
     (input set stays locked); the only exit is the normal
     ``commit_turn``. Raises ``ValueError`` otherwise.
     """
-    try:
-        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-    except Exception:
-        turn = db.get(DmTurn, turn_id)
-        attempt = db.get(DmTurnAttempt, attempt_id)
+    turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
@@ -968,13 +960,20 @@ def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid
 # ── Commit / stale-revision guard ───────────────────────────────────────────
 
 
-def _lock_turn_and_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn | None, DmTurnAttempt | None]:
-    try:
-        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
-    except Exception:
-        turn = db.get(DmTurn, turn_id)
-        attempt = db.get(DmTurnAttempt, attempt_id)
+def lock_turn_and_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn | None, DmTurnAttempt | None]:
+    """Row-lock a turn and attempt and reload them, so CAS checks see committed state.
+
+    ``populate_existing`` matters: a session that already loaded these rows
+    (e.g. the executor that is about to narrate or request rolls) would
+    otherwise get its stale identity-map copies back from the locked query
+    and miss a concurrent supersession.
+    """
+    turn = db.execute(
+        select(DmTurn).where(DmTurn.id == turn_id).with_for_update().execution_options(populate_existing=True)
+    ).scalars().first()
+    attempt = db.execute(
+        select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update().execution_options(populate_existing=True)
+    ).scalars().first()
     return turn, attempt
 
 
@@ -1173,7 +1172,7 @@ def commit_turn(
         turn_completion_args,
         turn_completion_payload,
     )
-    turn, attempt = _lock_turn_and_attempt(db, turn_id, attempt_id)
+    turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
@@ -1350,7 +1349,7 @@ def commit_turn(
             turn.campaign_id, turn.thread_id, turn.id, attempt.id, exc.expected_revision, exc.actual_revision,
         )
         db.rollback()
-        turn, attempt = _lock_turn_and_attempt(db, turn_id, attempt_id)
+        turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
         if attempt and turn:
             _fail_commit_visible(
                 db, turn, attempt, error=str(exc), error_class="revision_conflict", commit=commit,

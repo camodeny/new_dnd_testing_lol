@@ -17,7 +17,7 @@ from sqlalchemy.orm import Session
 from app.campaigns.service import lock_campaign_row, require_playable_campaign
 from app.clock import utcnow
 from app.combat.service import EncounterAuthorizationError, EncounterError, fulfill_human_initiative
-from app.dm.turns import create_attempt
+from app.dm.turns import create_attempt, lock_turn_and_attempt
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
 from models.characters import Character
@@ -56,8 +56,7 @@ def _uuid(payload: dict, name: str) -> uuid.UUID:
 
 
 def _lock_turn_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn, DmTurnAttempt]:
-    turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
-    attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None or attempt.turn_id != turn.id:
         raise RollLifecycleError("Turn or attempt not found")
     if turn.current_attempt_id != attempt.id:
