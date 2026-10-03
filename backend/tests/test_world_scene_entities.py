@@ -17,18 +17,17 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import RevisionConflictError, commit_campaign_mutation, list_campaign_events  # noqa: E402
 from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
 from app.world.service import (  # noqa: E402
     build_current_scene_context_record,
-    create_entity_authoritative,
-    create_entity_inline,
+    create_entity,
     get_current_scene,
-    get_current_scene_dict,
     list_entities,
-    set_scene_authoritative,
+    apply_scene_update,
 )
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.dm import DMStream, DMStreamChunk  # noqa: E402
@@ -81,13 +80,13 @@ def _stream(db, turn, attempt, text="Narration begins."):
 def test_canonical_npc_and_location_creation_have_stable_ids():
     Fac, cid, _owner = _setup()
     db = Fac()
-    npc, evt1 = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mira the Guide",
+    npc, evt1 = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Mira the Guide",
         summary="A hooded guide.", operation_id="op-npc-1",
     )
     assert evt1.sequence == 1
-    loc, evt2 = create_entity_authoritative(
-        db, cid, 1, entity_type="location", name="Ember Gate",
+    loc, evt2 = commit_world_write(
+        db, cid, 1, create_entity, entity_type="location", name="Ember Gate",
         operation_id="op-loc-1",
     )
     assert evt2.sequence == 2
@@ -103,8 +102,8 @@ def test_entity_types_cover_faction_object_landmark_and_custom():
     db = Fac()
     rev = 0
     for etype in ("faction", "organization", "object", "item", "landmark", "custom_beast"):
-        ent, _evt = create_entity_authoritative(
-            db, cid, rev, entity_type=etype, name=f"Test {etype}",
+        ent, _evt = commit_world_write(
+            db, cid, rev, create_entity, entity_type=etype, name=f"Test {etype}",
             operation_id=f"op-{etype}",
         )
         assert ent.entity_type == etype
@@ -116,21 +115,21 @@ def test_entity_types_cover_faction_object_landmark_and_custom():
 def test_idempotent_jit_creation_duplicate_retry_creates_nothing():
     Fac, cid, _owner = _setup()
     db = Fac()
-    first, evt = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mira",
+    campaign = db.get(Campaign, cid)
+    first, created = create_entity(
+        db, campaign, entity_type="npc", name="Mira",
         operation_id="op-dup-1", idempotency_key="jit:attempt-1:tmp_npc_1",
     )
-    assert evt is not None
-    # Duplicate retry with same key at the new revision returns existing, no event
-    second, evt2 = create_entity_authoritative(
-        db, cid, 1, entity_type="npc", name="Mira (retry)",
+    assert created is True
+    # Duplicate retry with the same key returns the existing row.
+    second, created_again = create_entity(
+        db, campaign, entity_type="npc", name="Mira (retry)",
         operation_id="op-dup-1", idempotency_key="jit:attempt-1:tmp_npc_1",
     )
     assert str(second.id) == str(first.id)
-    assert evt2 is None
+    assert created_again is False
     assert second.name == "Mira"  # original preserved
     assert len(list_entities(db, cid)) == 1
-    assert db.get(Campaign, cid).revision == 1  # no extra revision bump
 
 
 # ── scene / fictional time ──────────────────────────────────────────────────
@@ -138,11 +137,11 @@ def test_idempotent_jit_creation_duplicate_retry_creates_nothing():
 def test_scene_location_transition_and_fictional_time_update():
     Fac, cid, _owner = _setup()
     db = Fac()
-    loc, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="location", name="Ember Gate", operation_id="op-loc",
+    loc, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Ember Gate", operation_id="op-loc",
     )
-    scene, evt = set_scene_authoritative(
-        db, cid, 1, location_entity_id=loc.id, location_name="Ember Gate",
+    scene, evt = commit_world_write(
+        db, cid, 1, apply_scene_update, location_entity_id=loc.id, location_name="Ember Gate",
         fictional_time="Day 3, dusk",
         present_actors=[{"entity_id": "pc-1", "name": "Aria"}],
         environment={"weather": "ashfall"}, operation_id="op-scene-1",
@@ -152,8 +151,8 @@ def test_scene_location_transition_and_fictional_time_update():
     assert scene.fictional_time == "Day 3, dusk"
     assert scene.present_actors[0]["name"] == "Aria"
 
-    scene2, evt2 = set_scene_authoritative(
-        db, cid, 2, location_name="Sunken Archive", fictional_time="Day 4, dawn",
+    scene2, evt2 = commit_world_write(
+        db, cid, 2, apply_scene_update, location_name="Sunken Archive", fictional_time="Day 4, dawn",
         present_actors=["Aria", "Bram"], operation_id="op-scene-2",
     )
     assert evt2.sequence == 3
@@ -167,9 +166,9 @@ def test_scene_location_transition_and_fictional_time_update():
 def test_stale_revision_scene_update_fails_safely():
     Fac, cid, _owner = _setup()
     db = Fac()
-    set_scene_authoritative(db, cid, 0, location_name="A", operation_id="op-a")
+    commit_world_write(db, cid, 0, apply_scene_update, location_name="A", operation_id="op-a")
     with pytest.raises(RevisionConflictError):
-        set_scene_authoritative(db, cid, 0, location_name="STALE", operation_id="op-stale")
+        commit_world_write(db, cid, 0, apply_scene_update, location_name="STALE", operation_id="op-stale")
     scene = get_current_scene(db, cid)
     assert scene.location_name == "A"
     assert db.get(Campaign, cid).revision == 1
@@ -179,13 +178,13 @@ def test_stale_revision_scene_update_fails_safely():
 def test_current_scene_retrieval_without_parsing_history():
     Fac, cid, _owner = _setup()
     db = Fac()
-    assert get_current_scene_dict(db, cid) is None
-    set_scene_authoritative(
-        db, cid, 0, location_name="Ember Gate", fictional_time="Day 3",
+    assert get_current_scene(db, cid) is None
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Ember Gate", fictional_time="Day 3",
         present_actors=[{"name": "Aria"}, {"name": "Bram"}],
         environment={"light": "torchlight"}, operation_id="op-s",
     )
-    current = get_current_scene_dict(db, cid)
+    current = get_current_scene(db, cid).to_dict()
     assert current["location_name"] == "Ember Gate"
     assert current["fictional_time"] == "Day 3"
     assert [a["name"] for a in current["present_actors"]] == ["Aria", "Bram"]
@@ -200,15 +199,15 @@ def test_current_scene_retrieval_without_parsing_history():
 def test_transient_scene_change_preserves_entity_history_and_visibility_hook():
     Fac, cid, _owner = _setup()
     db = Fac()
-    npc, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Secret Informant",
+    npc, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Secret Informant",
         visibility="dm_only", operation_id="op-secret",
     )
     assert npc.visibility == "dm_only"
-    set_scene_authoritative(
-        db, cid, 1, location_name="Tavern", visibility="dm_only", operation_id="op-h",
+    commit_world_write(
+        db, cid, 1, apply_scene_update, location_name="Tavern", visibility="dm_only", operation_id="op-h",
     )
-    set_scene_authoritative(db, cid, 2, location_name="Docks", operation_id="op-d")
+    commit_world_write(db, cid, 2, apply_scene_update, location_name="Docks", operation_id="op-d")
     assert db.get(WorldEntity, npc.id).visibility == "dm_only"
     assert get_current_scene(db, cid).location_name == "Docks"
     assert get_current_scene(db, cid).visibility == "dm_only"
@@ -260,7 +259,7 @@ def test_failed_entity_commit_leaves_no_half_created_authority():
     db = Fac()
 
     def bad_mutate(campaign):
-        create_entity_inline(
+        create_entity(
             db, campaign, entity_type="npc", name="Half-Made",
             idempotency_key="half-1",
         )
@@ -274,43 +273,6 @@ def test_failed_entity_commit_leaves_no_half_created_authority():
     assert list_entities(db, cid) == []
     assert db.get(Campaign, cid).revision == 0
     assert list_campaign_events(db, cid) == []
-
-
-# ── reviewer HOLD findings (PR #348) ─────────────────────────────────────────
-
-def test_authoritative_entity_event_carries_real_entity_id():
-    Fac, cid, _owner = _setup()
-    db = Fac()
-    npc, evt = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mira the Guide",
-        operation_id="op-evt-1",
-    )
-    assert evt.payload["entity_id"] == str(npc.id)
-    assert evt.targets["entity_id"] == str(npc.id)
-    assert evt.payload["entity_id"] != ""
-    # Persisted history (re-read from DB) agrees
-    persisted = list_campaign_events(db, cid)[0]
-    assert persisted.payload["entity_id"] == str(npc.id)
-    assert persisted.targets["entity_id"] == str(npc.id)
-
-
-def test_authoritative_scene_event_carries_real_scene_snapshot():
-    Fac, cid, _owner = _setup()
-    db = Fac()
-    scene, evt = set_scene_authoritative(
-        db, cid, 0, location_name="Ember Gate", fictional_time="Day 3, dusk",
-        present_actors=[{"name": "Aria"}], environment={"weather": "ashfall"},
-        operation_id="op-scene-evt",
-    )
-    snap = evt.payload["scene"]
-    assert snap != {}
-    assert snap["location_name"] == "Ember Gate"
-    assert snap["fictional_time"] == "Day 3, dusk"
-    assert snap["present_actors"] == [{"name": "Aria"}]
-    assert snap["environment"] == {"weather": "ashfall"}
-    assert snap == scene.to_dict()
-    persisted = list_campaign_events(db, cid)[0]
-    assert persisted.payload["scene"]["location_name"] == "Ember Gate"
 
 
 def _commit_scene_patch_turn(db, cid, owner, tid, patch):
@@ -336,8 +298,8 @@ def _commit_scene_patch_turn(db, cid, owner, tid, patch):
 def test_staged_update_scene_empty_values_clear_state():
     Fac, cid, owner = _setup()
     db = Fac()
-    set_scene_authoritative(
-        db, cid, 0, location_name="Ember Gate",
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Ember Gate",
         present_actors=[{"name": "Aria"}, {"name": "Bram"}],
         environment={"weather": "ashfall"}, operation_id="op-seed",
     )
@@ -358,8 +320,8 @@ def test_staged_update_scene_empty_values_clear_state():
 def test_staged_update_scene_empty_alias_values_clear_state():
     Fac, cid, owner = _setup()
     db = Fac()
-    set_scene_authoritative(
-        db, cid, 0, location_name="Ember Gate",
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Ember Gate",
         present_actors=[{"name": "Aria"}],
         environment={"light": "torchlight"}, operation_id="op-seed-alias",
     )
@@ -384,7 +346,7 @@ def test_create_entity_inline_idempotency_race_returns_winner():
     Fac, cid, _owner = _setup()
     db = Fac()
     campaign = db.get(Campaign, cid)
-    winner, created = create_entity_inline(
+    winner, created = create_entity(
         db, campaign, entity_type="npc", name="Winner",
         idempotency_key="race-1",
     )
@@ -405,7 +367,7 @@ def test_create_entity_inline_idempotency_race_returns_winner():
 
     with mock.patch.object(world_service, "_find_by_idempotency", side_effect=flaky_find):
         campaign2 = db.get(Campaign, cid)
-        loser, created2 = create_entity_inline(
+        loser, created2 = create_entity(
             db, campaign2, entity_type="npc", name="Loser",
             idempotency_key="race-1",
         )
@@ -460,17 +422,17 @@ def test_location_reference_explicit_null_clears():
 
     Fac, cid, _owner = _setup()
     db = Fac()
-    loc, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="location", name="Ember Gate", operation_id="op-loc",
+    loc, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Ember Gate", operation_id="op-loc",
     )
-    set_scene_authoritative(
-        db, cid, 1, location_entity_id=loc.id, location_name="Ember Gate",
+    commit_world_write(
+        db, cid, 1, apply_scene_update, location_entity_id=loc.id, location_name="Ember Gate",
         operation_id="op-s1",
     )
     assert get_current_scene(db, cid).location_entity_id == loc.id
     # Explicit null clears the canonical reference (not omission).
-    scene, _ = set_scene_authoritative(
-        db, cid, 2, location_entity_id=None, operation_id="op-clear",
+    scene, _ = commit_world_write(
+        db, cid, 2, apply_scene_update, location_entity_id=None, operation_id="op-clear",
     )
     assert scene.location_entity_id is None
     # Omission is a distinct state from explicit null.
@@ -480,17 +442,17 @@ def test_location_reference_explicit_null_clears():
 def test_location_reference_omission_preserves_despite_name_change():
     Fac, cid, _owner = _setup()
     db = Fac()
-    loc, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="location", name="Ember Gate", operation_id="op-loc",
+    loc, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Ember Gate", operation_id="op-loc",
     )
-    set_scene_authoritative(
-        db, cid, 1, location_entity_id=loc.id, location_name="Ember Gate",
+    commit_world_write(
+        db, cid, 1, apply_scene_update, location_entity_id=loc.id, location_name="Ember Gate",
         operation_id="op-s1",
     )
     # location_name changes WITHOUT the location_entity_id key: the canonical
     # reference must be preserved, not silently retained-or-cleared.
-    scene, _ = set_scene_authoritative(
-        db, cid, 2, location_name="Ember Gate Annex", operation_id="op-s2",
+    scene, _ = commit_world_write(
+        db, cid, 2, apply_scene_update, location_name="Ember Gate Annex", operation_id="op-s2",
     )
     assert scene.location_entity_id == loc.id
     assert scene.location_name == "Ember Gate Annex"
@@ -499,11 +461,11 @@ def test_location_reference_omission_preserves_despite_name_change():
 def test_staged_patch_explicit_null_location_clears_reference():
     Fac, cid, owner = _setup()
     db = Fac()
-    loc, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="location", name="Ember Gate", operation_id="op-loc",
+    loc, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Ember Gate", operation_id="op-loc",
     )
-    set_scene_authoritative(
-        db, cid, 1, location_entity_id=loc.id, location_name="Ember Gate",
+    commit_world_write(
+        db, cid, 1, apply_scene_update, location_entity_id=loc.id, location_name="Ember Gate",
         operation_id="op-s1",
     )
     thread = get_or_create_campaign_thread(db, cid, created_by=owner)
@@ -521,51 +483,13 @@ def test_staged_patch_explicit_null_location_clears_reference():
     assert db.get(WorldEntity, loc.id) is not None
 
 
-def test_restricted_entities_filtered_for_ordinary_member():
-    from app.world.service import (
-        entity_visible_to_viewer,
-        filter_entities_for_viewer,
-        is_world_authority,
-    )
-
-    Fac, cid, owner = _setup()
-    db = Fac()
-    member = uuid.uuid4()
-    db.add(Profile(id=member, email="member@example.com"))
-    db.add(CampaignMember(campaign_id=cid, user_id=member, role="player"))
-    db.commit()
-    campaign = db.get(Campaign, cid)
-    assert is_world_authority(campaign, owner) is True
-    assert is_world_authority(campaign, member) is False
-    create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Open Ally",
-        details={"secret": "none"}, operation_id="op-open",
-    )
-    hidden, _ = create_entity_authoritative(
-        db, cid, 1, entity_type="npc", name="Hidden Blade",
-        visibility="dm_only", details={"secret": "assassin"},
-        operation_id="op-hidden",
-    )
-    quiet, _ = create_entity_authoritative(
-        db, cid, 2, entity_type="npc", name="Quiet Contact",
-        visibility="private", operation_id="op-private",
-    )
-    assert entity_visible_to_viewer(hidden, True) is True
-    assert entity_visible_to_viewer(hidden, False) is False
-    assert entity_visible_to_viewer(quiet, False) is False
-    all_entities = list_entities(db, cid)
-    assert len(filter_entities_for_viewer(all_entities, True)) == 3
-    visible = filter_entities_for_viewer(all_entities, False)
-    assert [e.name for e in visible] == ["Open Ally"]
-
-
 def test_restricted_scene_hidden_from_ordinary_member():
     from app.world.service import scene_visible_to_viewer
 
     Fac, cid, _owner = _setup()
     db = Fac()
-    set_scene_authoritative(
-        db, cid, 0, location_name="Secret Lair", visibility="dm_only",
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Secret Lair", visibility="dm_only",
         operation_id="op-s",
     )
     scene = get_current_scene(db, cid)
@@ -578,8 +502,8 @@ def test_dm_only_scene_excluded_from_player_narration_projection():
 
     Fac, cid, owner = _setup()
     db = Fac()
-    set_scene_authoritative(
-        db, cid, 0, location_name="Secret Lair", visibility="dm_only",
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Secret Lair", visibility="dm_only",
         operation_id="op-s",
     )
     thread = get_or_create_campaign_thread(db, cid, created_by=owner)
@@ -613,161 +537,13 @@ def test_dm_only_scene_excluded_from_player_narration_projection():
     assert proj_lane["records"] == []
 
 
-@pytest.fixture
-def world_api(monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from app.auth.service import TEST_USER_ID
-    from database import get_db
-    from main import app
-
-    eng = _engine()
-    Fac = sessionmaker(bind=eng, expire_on_commit=False)
-    owner = TEST_USER_ID
-    member = uuid.uuid4()
-    cid = uuid.uuid4()
-    db = Fac()
-    db.add(Profile(id=owner, email="owner@example.com"))
-    db.add(Profile(id=member, email="member@example.com"))
-    db.add(Campaign(id=cid, owner_id=owner, name="World campaign", revision=0))
-    db.flush()
-    db.add(CampaignMember(campaign_id=cid, user_id=owner, role="owner"))
-    db.add(CampaignMember(campaign_id=cid, user_id=member, role="player"))
-    db.commit()
-    db.close()
-
-    def override_db():
-        session = Fac()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, TEST_USER_ID),
-    )
-    app.dependency_overrides[get_db] = override_db
-    try:
-        yield TestClient(app), cid, owner, member
-    finally:
-        app.dependency_overrides.clear()
-
-
-def _act_as(monkeypatch, profile_id):
-    # Bypass header/mock auth (broken under TestClient in this env — see
-    # pre-existing test_thread_audience.py 401s) by patching the world
-    # router's resolve_profile directly.
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, profile_id),
-    )
-
-
-def test_world_reads_are_viewer_aware_over_http(world_api, monkeypatch):
-    client, cid, owner, member = world_api
-    _act_as(monkeypatch, owner)
-    base = f"/api/campaigns/{cid}/world"
-    # Owner (default mock auth) creates public + restricted entities.
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 0, "entity_type": "npc", "name": "Open Ally",
-        "details": {"note": "hello"}, "operation_id": "op-open",
-    }, headers={"Idempotency-Key": "op-open"})
-    assert r.status_code == 200, r.text
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 1, "entity_type": "npc", "name": "Hidden Blade",
-        "visibility": "dm_only", "details": {"secret": "assassin"},
-        "operation_id": "op-hidden",
-    }, headers={"Idempotency-Key": "op-hidden"})
-    assert r.status_code == 200, r.text
-    hidden_id = r.json()["entity"]["id"]
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 2, "entity_type": "npc", "name": "Quiet Contact",
-        "visibility": "private", "operation_id": "op-private",
-    }, headers={"Idempotency-Key": "op-private"})
-    assert r.status_code == 200, r.text
-    # Owner sets a dm_only scene.
-    r = client.put(f"{base}/current-scene", json={
-        "expected_revision": 3, "location_name": "Secret Lair",
-        "visibility": "dm_only", "operation_id": "op-scene",
-    }, headers={"Idempotency-Key": "op-scene"})
-    assert r.status_code == 200, r.text
-    # Owner sees everything, including arbitrary restricted details.
-    assert len(client.get(f"{base}/entities").json()["entities"]) == 3
-    assert client.get(f"{base}/entities/{hidden_id}").status_code == 200
-    assert client.get(f"{base}/entities/{hidden_id}").json()["entity"]["details"] == {"secret": "assassin"}
-    assert client.get(f"{base}/current-scene").json()["scene"]["location_name"] == "Secret Lair"
-    # Ordinary member: restricted entities filtered, never leaked verbatim.
-    _act_as(monkeypatch, member)
-    names = [e["name"] for e in client.get(f"{base}/entities").json()["entities"]]
-    assert names == ["Open Ally"]
-    assert client.get(f"{base}/entities/{hidden_id}").status_code == 404
-    assert client.get(f"{base}/current-scene").status_code == 404
-
-
-def test_legacy_world_aggregate_and_encounter_stub_removed(world_api):
-    client, cid, _owner, _member = world_api
-    assert client.get(f"/api/campaigns/{cid}/world").status_code == 404
-    assert client.get(f"/api/campaigns/{cid}/encounter-maps/current").status_code == 404
-
-
-def _act_as_all(monkeypatch, profile_id):
-    # World + campaign-events endpoints resolve auth in separate routers.
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, profile_id),
-    )
-    monkeypatch.setattr(
-        "app.campaigns.router.resolve_profile",
-        lambda req, db: db.get(Profile, profile_id),
-    )
-
-
-def test_restricted_world_events_hidden_from_non_owner_over_http(world_api, monkeypatch):
-    client, cid, owner, member = world_api
-    _act_as_all(monkeypatch, owner)
-    base = f"/api/campaigns/{cid}/world"
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 0, "entity_type": "npc", "name": "Hidden Blade",
-        "visibility": "dm_only", "details": {"secret": "assassin"},
-        "operation_id": "op-hidden",
-    }, headers={"Idempotency-Key": "op-hidden"})
-    assert r.status_code == 200, r.text
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 1, "entity_type": "npc", "name": "Quiet Contact",
-        "visibility": "private", "operation_id": "op-private",
-    }, headers={"Idempotency-Key": "op-private"})
-    assert r.status_code == 200, r.text
-    r = client.put(f"{base}/current-scene", json={
-        "expected_revision": 2, "location_name": "Secret Lair",
-        "visibility": "dm_only", "operation_id": "op-scene",
-    }, headers={"Idempotency-Key": "op-scene"})
-    assert r.status_code == 200, r.text
-    # Owner/DM still sees the restricted world events with full payloads.
-    events = client.get(f"/api/campaigns/{cid}/events").json()["events"]
-    world_events = [e for e in events if e["event_type"].startswith("world.")]
-    assert len(world_events) == 3
-    assert {e["visibility"] for e in world_events} == {"dm_only", "private"}
-    blob = str([e["payload"] for e in world_events])
-    assert "Hidden Blade" in blob and "Secret Lair" in blob
-    # Ordinary member: no restricted world data leaks via campaign events.
-    _act_as_all(monkeypatch, member)
-    member_events = client.get(f"/api/campaigns/{cid}/events").json()["events"]
-    assert member_events == []
-    member_blob = str(member_events)
-    assert "Hidden Blade" not in member_blob
-    assert "Quiet Contact" not in member_blob
-    assert "Secret Lair" not in member_blob
-    assert "assassin" not in member_blob
-
-
 def test_private_scene_context_assembly_stays_hidden():
     from app.dm.context import LaneName, assemble_attempt_context
 
     Fac, cid, owner = _setup()
     db = Fac()
-    set_scene_authoritative(
-        db, cid, 0, location_name="Hidden Sanctum", visibility="private",
+    commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Hidden Sanctum", visibility="private",
         operation_id="op-s",
     )
     thread = get_or_create_campaign_thread(db, cid, created_by=owner)
@@ -802,60 +578,3 @@ def test_private_scene_context_assembly_stays_hidden():
     assert proj_lane["records"] == []
 
 
-def test_campaign_visible_world_events_reach_non_owner_over_http(world_api, monkeypatch):
-    # Re-review HOLD (round 4): campaign-visible world records must have
-    # campaign-visible history — a non-owner member reads the record AND its
-    # domain event, while private/dm_only stay invisible in both.
-    client, cid, owner, member = world_api
-    _act_as_all(monkeypatch, owner)
-    base = f"/api/campaigns/{cid}/world"
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 0, "entity_type": "npc", "name": "Open Ally",
-        "operation_id": "op-open",
-    }, headers={"Idempotency-Key": "op-open"})
-    assert r.status_code == 200, r.text
-    open_id = r.json()["entity"]["id"]
-    r = client.put(f"{base}/current-scene", json={
-        "expected_revision": 1, "location_name": "Ember Gate",
-        "operation_id": "op-scene",
-    }, headers={"Idempotency-Key": "op-scene"})
-    assert r.status_code == 200, r.text
-    # Member-visible world levels map onto the event system's public value.
-    owner_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
-                    if e["event_type"].startswith("world.")]
-    assert len(owner_events) == 2
-    assert {e["visibility"] for e in owner_events} == {"public"}
-    # Non-owner member: world reads succeed AND history events are visible.
-    _act_as_all(monkeypatch, member)
-    assert [e["name"] for e in client.get(f"{base}/entities").json()["entities"]] == ["Open Ally"]
-    assert client.get(f"{base}/entities/{open_id}").status_code == 200
-    assert client.get(f"{base}/current-scene").json()["scene"]["location_name"] == "Ember Gate"
-    member_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
-                     if e["event_type"].startswith("world.")]
-    assert len(member_events) == 2
-    blob = str([e["payload"] for e in member_events])
-    assert "Open Ally" in blob and "Ember Gate" in blob
-    # Restricted records stay invisible in both reads and events.
-    _act_as_all(monkeypatch, owner)
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 2, "entity_type": "npc", "name": "Hidden Blade",
-        "visibility": "dm_only", "details": {"secret": "assassin"},
-        "operation_id": "op-hidden",
-    }, headers={"Idempotency-Key": "op-hidden"})
-    assert r.status_code == 200, r.text
-    hidden_id = r.json()["entity"]["id"]
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 3, "entity_type": "npc", "name": "Quiet Contact",
-        "visibility": "private", "operation_id": "op-private",
-    }, headers={"Idempotency-Key": "op-private"})
-    assert r.status_code == 200, r.text
-    _act_as_all(monkeypatch, member)
-    assert [e["name"] for e in client.get(f"{base}/entities").json()["entities"]] == ["Open Ally"]
-    assert client.get(f"{base}/entities/{hidden_id}").status_code == 404
-    member_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
-                     if e["event_type"].startswith("world.")]
-    assert len(member_events) == 2
-    member_blob = str(member_events)
-    assert "Hidden Blade" not in member_blob
-    assert "Quiet Contact" not in member_blob
-    assert "assassin" not in member_blob

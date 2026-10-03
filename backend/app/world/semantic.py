@@ -10,11 +10,10 @@ never a source of truth:
 - Bounded semantic search resolves every candidate back to its authoritative
   record (version-checked) and returns typed evidence references through the
   same #212 authorization gates. Campaign scoping + visibility filtering
-  happen BEFORE any player-visible path or decision-reranker exposure.
+  happen BEFORE any player-visible path.
 - Weak candidate sets return ``no_match``/``defer`` instead of forcing the
-  top vector hit. Optional #380/#381 reranking may only reorder/select from
-  the already-authorized candidates (via :func:`apply_rerank`).
-- Embedding/search/reranker failure degrades to direct authoritative
+  top vector hit.
+- Embedding/search failure degrades to direct authoritative
   retrieval — it never mutates canon and never blocks direct reads.
 - Storage mirrors the ``rules_embeddings`` branch pattern: ``vector(1536)``
   + HNSW on Postgres with pgvector, portable JSON text otherwise, with
@@ -127,7 +126,7 @@ class SemanticOutcome:
     """Envelope for one bounded semantic search.
 
     ``packets`` are authorized #212 evidence packets in similarity order with
-    ``retrieval_score`` set to cosine similarity; vector/rerank values travel
+    ``retrieval_score`` set to cosine similarity; vector values travel
     only as derived provenance metadata. ``fallback_to_direct`` is True when
     the vector path was unusable and callers should use direct retrieval.
     """
@@ -147,7 +146,6 @@ class SemanticOutcome:
     truncated: bool = False
     vector_backend: str = "python"
     fallback_to_direct: bool = False
-    rerank: dict[str, Any] | None = None
     latency_ms: float = 0.0
     error: str | None = None
 
@@ -168,7 +166,6 @@ class SemanticOutcome:
             "truncated": self.truncated,
             "vector_backend": self.vector_backend,
             "fallback_to_direct": self.fallback_to_direct,
-            "rerank": dict(self.rerank) if self.rerank else None,
             "latency_ms": self.latency_ms,
             "error": self.error,
         }
@@ -397,13 +394,6 @@ def _authoritative_source_version(record: Any, source_type: str) -> str:
 
 _PGVECTOR_STATUS: bool | None = None
 _PGVECTOR_COLUMN_VECTOR: bool | None = None
-
-
-def reset_pgvector_cache() -> None:
-    """Test hook: clear cached pgvector detection."""
-    global _PGVECTOR_STATUS, _PGVECTOR_COLUMN_VECTOR
-    _PGVECTOR_STATUS = None
-    _PGVECTOR_COLUMN_VECTOR = None
 
 
 def _dialect_name(db: Session) -> str:
@@ -673,49 +663,6 @@ def mark_superseded(
     return len(rows)
 
 
-def get_semantic_stats(
-    db: Session, campaign_id: Any, *, embedding_model: str | None = None,
-    embedding_version: str = DEFAULT_VERSION,
-) -> dict[str, Any]:
-    """Indexing observability: counts by status + oldest-stale lag."""
-    from sqlalchemy import func as _func
-
-    embedding_model = resolve_embedding_model(embedding_model)
-    campaign = retrieval_mod._resolve_campaign(db, campaign_id)
-    rows = db.execute(
-        select(WorldEmbedding.status, _func.count()).where(
-            WorldEmbedding.campaign_id == campaign.id,
-            WorldEmbedding.embedding_model == embedding_model,
-            WorldEmbedding.embedding_version == embedding_version,
-        ).group_by(WorldEmbedding.status)
-    ).all()
-    by_status = {k: int(v) for k, v in rows}
-    oldest = db.execute(
-        select(_func.min(WorldEmbedding.updated_at)).where(
-            WorldEmbedding.campaign_id == campaign.id,
-            WorldEmbedding.status.in_(("stale", "failed")),
-        )
-    ).scalar()
-    lag_s = 0.0
-    if oldest is not None:
-        from datetime import datetime, timezone
-
-        ts = oldest if oldest.tzinfo else oldest.replace(tzinfo=timezone.utc)
-        lag_s = max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
-    return {
-        "campaign_id": str(campaign.id),
-        "embedding_model": embedding_model,
-        "embedding_version": embedding_version,
-        "by_status": by_status,
-        "total": sum(by_status.values()),
-        "active": by_status.get("active", 0),
-        "stale": by_status.get("stale", 0),
-        "superseded": by_status.get("superseded", 0),
-        "failed": by_status.get("failed", 0),
-        "oldest_unindexed_lag_seconds": lag_s,
-    }
-
-
 # ── Async indexing (placeholder rows + cron sweep) ──────────────────────────
 
 def _read_source_version(
@@ -851,9 +798,8 @@ def note_turn_committed(
     """Post-commit hook for staged DM-turn writes (issue #213 review round 1).
 
     Staged ``assert_fact`` / ``upsert_relation`` effects (plus JIT-promoted
-    entities) write via the ``*_inline`` knowledge writers inside the turn
-    transaction, bypassing the ``*_authoritative`` hooks — so a committed
-    turn's records would never become searchable without this. Call once,
+    entities) write inside the turn transaction, so a committed turn's
+    records would never become searchable without this. Call once,
     AFTER the turn commit, with the committed session: it collects the
     turn's facts/relations/entities (attempt-scoped, falling back to the
     turn) and routes creates through :func:`note_authoritative_write` and
@@ -1378,44 +1324,6 @@ def _log_search(campaign: Campaign, outcome: SemanticOutcome, *, dm_internal: bo
         latency_ms=round(outcome.latency_ms, 3),
         error=outcome.error,
     )
-
-
-# ── Optional second-stage rerank (#380/#381, never blocking) ─────────────────
-
-def apply_semantic_rerank(
-    outcome: SemanticOutcome,
-    *,
-    order: list[str] | None = None,
-    defer: bool = False,
-    reranker: Callable[[list[dict[str, str]]], Any] | None = None,
-    reranker_model: str | None = None,
-    reranker_policy: str | None = None,
-) -> SemanticOutcome:
-    """Reorder/select only from the already-authorized candidate packets.
-
-    Reranker failure falls back to similarity order (``rerank.fallback``) —
-    authoritative evidence is never lost. Vector + rerank scores stay derived
-    metadata on provenance.
-    """
-    reranked = retrieval_mod.apply_rerank(
-        list(outcome.packets), order=order, defer=defer, reranker=reranker,
-        reranker_model=reranker_model, reranker_policy=reranker_policy,
-    )
-    outcome.packets = list(reranked.packets)
-    if reranked.status in {retrieval_mod.STATUS_DEFER, retrieval_mod.STATUS_NO_MATCH}:
-        outcome.status = STATUS_NO_MATCH if outcome.packets else STATUS_DEFER
-        if not outcome.packets:
-            outcome.status = STATUS_DEFER
-    outcome.rerank = {
-        "reranked": reranked.reranked,
-        "fallback": reranked.fallback,
-        "presented_ids": list(reranked.presented_ids),
-        "reordered_ids": list(reranked.reordered_ids),
-        "model": reranked.reranker_model,
-        "policy": reranked.reranker_policy,
-        "error": reranked.error,
-    }
-    return outcome
 
 
 # ── #203 evidence-mediation tool (search_campaign_memory) ────────────────────

@@ -561,7 +561,7 @@ def run_post_turn_range(
             # deterministic + semantic contradictions against committed canon
             # become explicit incidents instead of silent normalization. A
             # required unresolved incident fails the run (checkpoint stays
-            # put; #221 repair resolves, then a cumulative retry converges).
+            # put for cumulative retry).
             # Custom consolidate_fn callers own their content and opt out.
             from app.post_turn.incidents import ConsistencyBlocked, verify_post_turn_consistency
 
@@ -580,7 +580,7 @@ def run_post_turn_range(
                 # Incidents persist on an independent transaction: the
                 # ConsistencyBlocked raise below fails the run (whose
                 # handler rolls back this range's materialization/clock
-                # writes), while incidents stay durable for #221 repair.
+                # writes), while incidents stay durable.
                 # The worker session is flush-only here; the checkpoint
                 # commit below persists a successful range atomically.
                 durable_session_factory=incident_factory,
@@ -655,12 +655,8 @@ def run_post_turn_range(
             db.commit()
         logger.info("post_turn consolidated campaign=%s %s-%s run=%s",
                     campaign_id, from_sequence, to_sequence, run.id if run else "-")
-        _best_effort_running_summary(
-            db, campaign_id, to_sequence,
-            decision_service=clock_decision_service,
-            session_factory=clock_telemetry_factory,
-            commit=commit,
-        )
+        if commit:
+            _request_range_semantic_index(db, campaign_id, events)
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
     except Exception as exc:
@@ -796,51 +792,37 @@ def mark_post_turn_skipped(
     return run
 
 
-# ── Observability ──────────────────────────────────────────────────────────
-
-
-def _best_effort_running_summary(
-    db: Session,
-    campaign_id: uuid.UUID,
-    to_sequence: int,
-    *,
-    decision_service=None,
-    session_factory=None,
-    commit: bool = True,
+def _request_range_semantic_index(
+    db: Session, campaign_id: uuid.UUID, events: list[CampaignDomainEvent],
 ) -> None:
-    """Issue #219 — refresh the running summary over the processed prefix.
+    """Stage #213 semantic indexing for a consolidated range.
 
-    Independently retryable derived work: any failure is swallowed (with a
-    rollback of the summary-only transaction) so it never threatens the
-    already-committed checkpoint advancement or authoritative state above.
-
-    Verification runs on the runtime decision service by default (same
-    pattern as #217 materialize / #218 clocks), so normal post-turn
-    processing can actually produce a context-eligible ``current`` summary.
-    A down/unconfigured verifier fails closed to ``deferred`` — retryable,
-    never silently canon — rather than permanent ``pending``.
+    Materialization writes facts/relations after the turn commit, so the
+    turn-commit hook (``note_turn_committed``) never sees them. Stages the
+    range's domain events plus facts/relations citing them; the semantic
+    sweep embeds them later. Best-effort: never raises past the already
+    committed checkpoint.
     """
     try:
-        from app.decisions import DecisionService
-        from app.world import summaries as _summaries
+        from app.world import semantic as _semantic
+        from models.world import WorldFact, WorldRelation
 
-        campaign = db.get(Campaign, campaign_id)
-        if campaign is None:
-            return
-        _summaries.consolidate_summary_for_range(
-            db, campaign, 1, int(to_sequence),
-            decision_service=decision_service or DecisionService(),
-            session_factory=session_factory,
-            operation_id=f"post-turn-summary:1-{to_sequence}",
-            commit=commit,
-        )
-    except Exception as exc:
-        try:
-            db.rollback()
-        except Exception:
-            pass
-        logger.warning("post_turn running summary failed campaign=%s error=%s",
+        event_ids = [e.id for e in events]
+        entries: list[tuple[str, uuid.UUID]] = []
+        for source_type, model in (("world_fact", WorldFact), ("world_relation", WorldRelation)):
+            ids = db.execute(select(model.id).where(
+                model.campaign_id == campaign_id,
+                model.source_event_id.in_(event_ids),
+            )).scalars().all()
+            entries.extend((source_type, row_id) for row_id in ids)
+        entries.extend(("domain_event", event_id) for event_id in event_ids)
+        _semantic.note_authoritative_write(db, campaign_id, entries)
+    except Exception as exc:  # noqa: BLE001 — derived index work never fails the run
+        logger.warning("post_turn semantic index staging failed campaign=%s error=%s",
                        campaign_id, exc)
+
+
+# ── Observability ──────────────────────────────────────────────────────────
 
 
 def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:

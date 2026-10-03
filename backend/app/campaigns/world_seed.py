@@ -384,10 +384,10 @@ def run_world_seed(
     from app.campaigns.service import (
         CampaignArchivedError, compute_start_eligibility, require_playable_campaign,
     )
-    from app.world.clocks import create_clock_inline
-    from app.world.epistemics import assert_knowledge_inline
-    from app.world.knowledge import create_fact_inline, create_relation_inline
-    from app.world.service import apply_scene_update_inline, create_entity_inline
+    from app.world.clocks import create_clock
+    from app.world.epistemics import assert_knowledge
+    from app.world.knowledge import create_fact, create_relation
+    from app.world.service import apply_scene_update, create_entity
     from models.campaigns import Campaign, CampaignMember
     from models.world import CampaignCurrentScene
 
@@ -471,13 +471,13 @@ def run_world_seed(
         prov = _provenance()
         ck = lambda slot: f"{WORLD_SEED_TAG}:{slot}:{locked.id}"
 
-        location, _ = create_entity_inline(
+        location, _ = create_entity(
             db, locked, entity_type="location", name=spec["location"]["name"],
             summary=spec["location"]["summary"], status="active", visibility="campaign",
             details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
             operation_id=f"{operation_id}:location", idempotency_key=ck("location"),
         )
-        faction, _ = create_entity_inline(
+        faction, _ = create_entity(
             db, locked, entity_type="faction", name=spec["faction"]["name"],
             summary=spec["faction"]["summary"], status="active", visibility="campaign",
             details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
@@ -485,20 +485,20 @@ def run_world_seed(
         )
         npc_rows = []
         for idx, npc in enumerate(spec["npcs"]):
-            row, _ = create_entity_inline(
+            row, _ = create_entity(
                 db, locked, entity_type="npc", name=npc["name"],
                 summary=npc["summary"], status="active", visibility="campaign",
                 details={"seed": WORLD_SEED_TAG, "contract_version": WORLD_SEED_CONTRACT_VERSION},
                 operation_id=f"{operation_id}:npc:{idx}", idempotency_key=ck(f"npc:{idx}"),
             )
             npc_rows.append(row)
-            create_relation_inline(
+            create_relation(
                 db, locked, subject_entity_id=row.id, relation_type="member_of",
                 object_entity_id=faction.id, epistemic_state="confirmed", visibility="campaign",
                 provenance=prov, operation_id=f"{operation_id}:rel:{idx}",
                 idempotency_key=ck(f"rel:{idx}"),
             )
-            create_relation_inline(
+            create_relation(
                 db, locked, subject_entity_id=row.id, relation_type="present_at",
                 object_entity_id=location.id, epistemic_state="confirmed", visibility="campaign",
                 provenance=prov, operation_id=f"{operation_id}:at:{idx}",
@@ -506,7 +506,7 @@ def run_world_seed(
             )
         char_rows = []
         for pc in spec["pcs"]:
-            row, _ = create_entity_inline(
+            row, _ = create_entity(
                 db, locked, entity_type="character", name=pc["character_name"],
                 summary=f"Player character adventuring from {spec['location']['name']}.",
                 status="active", visibility="campaign",
@@ -516,12 +516,12 @@ def run_world_seed(
             )
             char_rows.append(row)
 
-        situation_fact, _ = create_fact_inline(
+        situation_fact, _ = create_fact(
             db, locked, content=spec["situation"], entity_refs=[location.id],
             epistemic_state="confirmed", visibility="campaign", provenance=prov,
             operation_id=f"{operation_id}:situation", idempotency_key=ck("situation"),
         )
-        secret_fact, _ = create_fact_inline(
+        secret_fact, _ = create_fact(
             db, locked,
             content=f"Hidden scheme behind {spec['pressure']['name']}: {spec['pressure']['description']}",
             entity_refs=[location.id], epistemic_state="confirmed", visibility="dm_only",
@@ -548,7 +548,7 @@ def run_world_seed(
             ):
                 suppressed_hooks += 1
                 continue
-            hook_fact, _ = create_fact_inline(
+            hook_fact, _ = create_fact(
                 db, locked, content=hook_text,
                 epistemic_state="confirmed", visibility="dm_only", provenance=prov,
                 operation_id=f"{operation_id}:hook:{idx}", idempotency_key=ck(f"hook:{idx}"),
@@ -564,7 +564,7 @@ def run_world_seed(
         # Party knowledge: every seeded PC knows the starting situation;
         # each hooked PC holds its own unrevealed hook (DM-restricted record).
         for row in char_rows:
-            assert_knowledge_inline(
+            assert_knowledge(
                 db, locked, subject_kind="character", subject_entity_id=row.id,
                 target_kind="fact", target_fact_id=situation_fact.id,
                 knowledge_state="knows", acquisition_source="world_seed",
@@ -583,7 +583,7 @@ def run_world_seed(
                 continue
             if row is None:
                 raise WorldSeedError("World seed hook does not resolve to a seeded character")
-            assert_knowledge_inline(
+            assert_knowledge(
                 db, locked, subject_kind="character", subject_entity_id=row.id,
                 target_kind="fact", target_fact_id=hook_fact_id,
                 knowledge_state="knows", acquisition_source="private_lore",
@@ -593,7 +593,7 @@ def run_world_seed(
             )
 
         threshold = int(spec["pressure"]["threshold"])
-        clock, _ = create_clock_inline(
+        clock, _ = create_clock(
             db, locked, name=spec["pressure"]["name"], threshold=threshold,
             advancement_criteria={
                 "kind": "deterministic",
@@ -611,7 +611,7 @@ def run_world_seed(
             visibility="campaign", provenance=prov,
             operation_id=f"{operation_id}:clock", idempotency_key=ck("clock"),
         )
-        scene = apply_scene_update_inline(
+        scene = apply_scene_update(
             db, locked, new_revision=prior + 1, location_entity_id=location.id,
             location_name=spec["location"]["name"], fictional_time=spec["fictional_time"],
             present_actors=[{"name": p["character_name"], "kind": "pc"} for p in spec["pcs"]],

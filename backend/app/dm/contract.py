@@ -667,7 +667,7 @@ class TransferKnowledgeArgs(StrictModel):
     Tell/show/reveal writes what one subject fictionally holds toward one
     truth record. It never mutates truth tables and never grants human
     visibility — those stay separate explicit acts. Promotion-time
-    references resolve fail-closed inside ``assert_knowledge_inline``.
+    references resolve fail-closed inside ``assert_knowledge``.
     """
     subject_kind: Literal["character", "npc", "party", "group"] = Field(description="Kind of knowing subject")
     subject_entity_id: str = Field(min_length=1, max_length=160, description="WorldEntity subject UUID")

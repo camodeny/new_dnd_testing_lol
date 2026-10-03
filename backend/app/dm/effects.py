@@ -248,7 +248,7 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     commit leaves no half-applied scene. ``new_revision`` is the resulting
     campaign revision (prior + 1), keeping scene changes in revision order.
     """
-    from app.world.service import UNSET, apply_scene_update_inline
+    from app.world.service import UNSET, apply_scene_update
 
     args = effect.get("arguments") or {}
     patch = args.get("scene_patch") or {}
@@ -277,7 +277,7 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
         environment = patch["state"]
     else:
         environment = None
-    apply_scene_update_inline(
+    apply_scene_update(
         db, campaign, new_revision=prior + 1,
         # Key-presence: explicit null clears the canonical location reference
         # while omission preserves it (same as actors/environment above).
@@ -308,14 +308,14 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
     commits roll back both the version insert and any prior lifecycle flip,
     so failed updates never partially supersede prior active truth.
     """
-    from app.world.knowledge import create_fact_inline, supersede_fact_inline
+    from app.world.knowledge import create_fact, supersede_fact
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
     idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_fact_id")
     if supersedes:
-        supersede_fact_inline(
+        supersede_fact(
             db, campaign, supersedes,
             content=args.get("content"),
             entity_refs=args.get("entity_refs"),
@@ -326,7 +326,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
             operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
-        create_fact_inline(
+        create_fact(
             db, campaign, content=args.get("content") or "",
             entity_refs=args.get("entity_refs"),
             epistemic_state=args.get("epistemic_state") or "claimed",
@@ -341,7 +341,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
 @register("upsert_relation")
 def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Create or supersede one durable world relation inside the turn-commit txn."""
-    from app.world.knowledge import create_relation_inline, supersede_relation_inline
+    from app.world.knowledge import create_relation, supersede_relation
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
@@ -351,7 +351,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
         # Key-presence: absent object keys inherit the prior reference;
         # explicit null clears it (clear_object clears both sides at once).
         from app.world.service import UNSET as _UNSET
-        supersede_relation_inline(
+        supersede_relation(
             db, campaign, supersedes,
             subject_entity_id=args.get("subject_entity_id"),
             relation_type=args.get("relation_type"),
@@ -365,7 +365,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
             operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
-        create_relation_inline(
+        create_relation(
             db, campaign,
             subject_entity_id=args.get("subject_entity_id"),
             relation_type=args.get("relation_type") or "",
@@ -385,19 +385,19 @@ def _handle_transfer_knowledge(db: Session, campaign: Campaign, effect: dict[str
     """Record explicit in-fiction disclosure as a knowledge stance (#251).
 
     Tell/show/reveal writes what one subject fictionally holds toward one
-    truth record via ``assert_knowledge_inline`` — it never mutates truth
+    truth record via ``assert_knowledge`` — it never mutates truth
     tables and never grants human visibility. Runs inside the outer
     ``commit_campaign_mutation`` so a failed turn commit rolls the stance
     back with everything else. Duplicate retries keyed by the resolved
     effect key return the existing row without re-mutating.
     """
-    from app.world.epistemics import assert_knowledge_inline
+    from app.world.epistemics import assert_knowledge
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
     idempotency_key = _resolve_effect_key(attempt, effect)
     transfer_kind = str(args.get("transfer_kind") or "explicit_disclosure").strip().lower() or "explicit_disclosure"
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign,
         subject_kind=args.get("subject_kind"),
         subject_entity_id=args.get("subject_entity_id"),

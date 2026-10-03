@@ -40,7 +40,6 @@ def create_app() -> FastAPI:
     from app.runtime.router import router as runtime_router
     from app.snapshot.router import router as snapshot_router
     from app.observability.router import router as observability_router
-    from app.world.router import router as world_router
     from app.realtime.router import router as realtime_router
     from app.dm.router import router as dm_router
     from app.rolls.router import router as rolls_router
@@ -56,7 +55,6 @@ def create_app() -> FastAPI:
     app.include_router(campaigns_router)
     app.include_router(combat_router)
     app.include_router(adventures_router)
-    app.include_router(world_router)
     app.include_router(runtime_router)
     app.include_router(snapshot_router)
     app.include_router(observability_router)

@@ -465,9 +465,11 @@ def execute_evidence_round(
     # Auto-register authoritative world retrieval handlers (issue #212)
     try:
         from app.world.retrieval import TOOL_HANDLERS as _world_handlers
+        from app.world.semantic import handle_search_campaign_memory
 
         for k, v in _world_handlers.items():
             handlers.setdefault(k, v)
+        handlers.setdefault("search_campaign_memory", handle_search_campaign_memory)
     except Exception:
         pass
 

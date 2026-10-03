@@ -11,11 +11,10 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/campaigns` | Campaign aggregate: creation, membership, invites, validation |
 | `app/characters` | Character aggregate + sheet persistence |
 | `app/characters/chat` | Character-creator chat (SSE) — streams via provider abstraction |
-| `app/world` | World aggregate: canonical entities + authoritative current scene (viewer-aware reads) |
+| `app/world` | World state written inside turn/post-turn commits: entities, current scene, facts/relations, knowledge, clocks, NPC state, retrieval + semantic index |
 | `app/runtime` | Turn/session orchestration stubs (live-table sessions) |
 | `app/rules` | Rules / combat pure domain (no I/O, no FastAPI) — placeholder for Epic 2 |
 | `app/visibility` | Fog / visibility calculations — placeholder |
-| `app/repair` | Consistency / repair workflows — placeholder |
 | `app/billing` | Billing / entitlement checks — placeholder |
 | `app/realtime` | Realtime projections / websocket fan-out — placeholder |
 | `app/providers` | LLM provider adapters — re-exports `llm_providers` without workflow branching |

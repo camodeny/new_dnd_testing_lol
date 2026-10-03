@@ -15,7 +15,7 @@ Contract shared by both:
 - A bare claim (player/NPC utterance) stores as ``claimed``/``suspected``/
   etc. and never becomes ``confirmed`` truth unless superseded explicitly.
 - Duplicate retries keyed by idempotency_key return the existing row with
-  no new version and (authoritative path) no revision bump.
+  no new version.
 - Failed updates raise before mutating the prior row's lifecycle, so the
   prior active truth survives intact (the outer revision transaction rolls
   back on any error).
@@ -32,7 +32,7 @@ import re
 import uuid
 from typing import Any
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -40,9 +40,7 @@ from app.observability.tracing import structured_log
 from app.world.service import (
     RESTRICTED_VISIBILITIES,
     UNSET,
-    is_world_authority,
     normalize_visibility,
-    world_event_visibility,
 )
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.dm import DmTurn, DmTurnAttempt
@@ -66,34 +64,19 @@ __all__ = [
     "validate_new_version_status",
     "validate_object_label",
     "validate_fact_content",
-    "relation_visible_to_viewer",
-    "fact_visible_to_viewer",
-    "filter_relations_for_viewer",
-    "filter_facts_for_viewer",
     "get_relation_strict",
     "get_fact_strict",
     "list_relations",
     "list_facts",
-    "list_relations_for_entity",
     "list_records_for_source_turn",
-    "list_records_for_source_event",
-    "create_relation_inline",
-    "supersede_relation_inline",
-    "create_fact_inline",
-    "supersede_fact_inline",
-    "create_relation_authoritative",
-    "supersede_relation_authoritative",
-    "create_fact_authoritative",
-    "supersede_fact_authoritative",
-    "count_active_relations",
-    "count_active_facts",
+    "create_relation",
+    "supersede_relation",
+    "create_fact",
+    "supersede_fact",
 ]
 
 _RELATION_TYPE_RE = re.compile(r"^[a-z0-9_]{2,64}$")
 _MAX_FACT_ENTITY_REFS = 24
-
-# Re-exported for router convenience (single import surface).
-_IsAuthority = is_world_authority
 
 
 # ── Validation ──────────────────────────────────────────────────────────────
@@ -176,76 +159,6 @@ def _normalize_idempotency_key(value: Any) -> str | None:
     if key and len(key) > 128:
         raise ValueError("idempotency_key must be 128 characters or fewer")
     return key
-
-
-def _note_semantic_write(
-    db: Session,
-    campaign_id: Any,
-    entries: list[tuple[str, Any]],
-    *,
-    prior: tuple[str, Any] | None = None,
-    event_id: Any | None = None,
-) -> None:
-    """Best-effort #213 async-index hook for authoritative relation/fact writes.
-
-    Lazy import avoids the semantic→knowledge import cycle; never raises so
-    derived index work cannot break canon commits. The committing domain
-    event is a declared semantic source too, so it is enqueued alongside
-    the record when the caller passes its id.
-    """
-    try:
-        from app.world import semantic as _semantic
-
-        if prior is not None:
-            replacement = entries[0] if entries else None
-            _semantic.note_supersession(db, campaign_id, prior, replacement)
-        else:
-            _semantic.note_authoritative_write(db, campaign_id, entries)
-        if event_id is not None:
-            _semantic.note_authoritative_write(
-                db, campaign_id, [("domain_event", event_id)])
-    except Exception:
-        pass
-
-
-def _note_summary_repair(
-    db: Session,
-    campaign_id: Any,
-    prior: Any,
-    *,
-    reason: str,
-) -> None:
-    """Best-effort #219 hook: a supersede/repair invalidates affected summaries.
-
-    Lazy import avoids a knowledge→summaries import cycle at module load;
-    never raises so derived invalidation cannot break canon commits. When
-    the prior row cites a committed source sequence, only overlapping
-    summaries go stale; otherwise the campaign's live summaries all go
-    stale (fail-closed direction: never leave a summary over repaired
-    sources marked current).
-    """
-    try:
-        from app.world import summaries as _summaries
-
-        lo = hi = None
-        seq = (prior.provenance or {}).get("source_sequence") if isinstance(
-            getattr(prior, "provenance", None), dict) else None
-        event_id = getattr(prior, "source_event_id", None)
-        if event_id is not None:
-            try:
-                from models.campaigns import CampaignDomainEvent as _Event
-
-                event = db.get(_Event, event_id)
-                if event is not None and event.campaign_id == campaign_id:
-                    seq = int(event.sequence)
-            except Exception:
-                pass
-        if isinstance(seq, int):
-            lo = hi = seq
-        _summaries.note_source_repair(
-            db, campaign_id, from_sequence=lo, to_sequence=hi, reason=reason)
-    except Exception:
-        pass
 
 
 def _normalize_grants(value: Any) -> dict:
@@ -359,30 +272,6 @@ def _resolve_source_turn_refs(
 
 # ── Viewer-aware reads ──────────────────────────────────────────────────────
 
-def relation_visible_to_viewer(relation: WorldRelation, is_authority: bool) -> bool:
-    return bool(is_authority) or relation.visibility not in RESTRICTED_VISIBILITIES
-
-
-def fact_visible_to_viewer(fact: WorldFact, is_authority: bool) -> bool:
-    return bool(is_authority) or fact.visibility not in RESTRICTED_VISIBILITIES
-
-
-def filter_relations_for_viewer(
-    relations: list[WorldRelation], is_authority: bool
-) -> list[WorldRelation]:
-    if is_authority:
-        return list(relations)
-    return [r for r in relations if r.visibility not in RESTRICTED_VISIBILITIES]
-
-
-def filter_facts_for_viewer(
-    facts: list[WorldFact], is_authority: bool
-) -> list[WorldFact]:
-    if is_authority:
-        return list(facts)
-    return [f for f in facts if f.visibility not in RESTRICTED_VISIBILITIES]
-
-
 # ── Typed reads (active truth by default; no history replay) ────────────────
 
 def get_relation_strict(db: Session, campaign_id: uuid.UUID, relation_id: uuid.UUID) -> WorldRelation:
@@ -440,12 +329,6 @@ def list_relations(
     return list(db.execute(q).scalars().all())
 
 
-def list_relations_for_entity(
-    db: Session, campaign_id: uuid.UUID, entity_id: Any, *, include_history: bool = False, limit: int = 100
-) -> list[WorldRelation]:
-    return list_relations(db, campaign_id, entity_id=entity_id, include_history=include_history, limit=limit)
-
-
 def list_facts(
     db: Session,
     campaign_id: uuid.UUID,
@@ -498,43 +381,6 @@ def list_records_for_source_turn(
         ).scalars().all()
     )
     return {"relations": relations, "facts": facts}
-
-
-def list_records_for_source_event(
-    db: Session, campaign_id: uuid.UUID, source_event_id: Any
-) -> dict[str, list]:
-    eid = _coerce_uuid(source_event_id, field="source_event_id")
-    relations = list(
-        db.execute(
-            select(WorldRelation).where(
-                WorldRelation.campaign_id == campaign_id, WorldRelation.source_event_id == eid
-            ).order_by(WorldRelation.created_at.asc())
-        ).scalars().all()
-    )
-    facts = list(
-        db.execute(
-            select(WorldFact).where(
-                WorldFact.campaign_id == campaign_id, WorldFact.source_event_id == eid
-            ).order_by(WorldFact.created_at.asc())
-        ).scalars().all()
-    )
-    return {"relations": relations, "facts": facts}
-
-
-def count_active_relations(db: Session, campaign_id: uuid.UUID) -> int:
-    return int(db.scalar(
-        select(func.count()).select_from(WorldRelation).where(
-            WorldRelation.campaign_id == campaign_id, WorldRelation.status == "active"
-        )
-    ) or 0)
-
-
-def count_active_facts(db: Session, campaign_id: uuid.UUID) -> int:
-    return int(db.scalar(
-        select(func.count()).select_from(WorldFact).where(
-            WorldFact.campaign_id == campaign_id, WorldFact.status == "active"
-        )
-    ) or 0)
 
 
 # ── Internal writers (no revision bump; caller owns the transaction) ────────
@@ -747,7 +593,7 @@ def _sync_fact_refs(
     db.flush()
 
 
-def create_relation_inline(
+def create_relation(
     db: Session,
     campaign: Campaign,
     *,
@@ -817,7 +663,7 @@ def create_relation_inline(
     return row, created
 
 
-def supersede_relation_inline(
+def supersede_relation(
     db: Session,
     campaign: Campaign,
     prior_relation_id: Any,
@@ -959,14 +805,10 @@ def supersede_relation_inline(
             campaign_id=str(campaign.id), relation_id=str(row.id),
             prior=prior.epistemic_state, current=epistemic,
         )
-    _note_summary_repair(
-        db, campaign.id, prior,
-        reason=f"source_superseded:relation:{prior.id}",
-    )
     return row, True
 
 
-def create_fact_inline(
+def create_fact(
     db: Session,
     campaign: Campaign,
     *,
@@ -1102,7 +944,7 @@ def create_fact_inline(
     return row, True
 
 
-def supersede_fact_inline(
+def supersede_fact(
     db: Session,
     campaign: Campaign,
     prior_fact_id: Any,
@@ -1155,7 +997,7 @@ def supersede_fact_inline(
     else:
         resolved_refs = _resolve_fact_entity_refs(db, campaign.id, list(prior.entity_refs or []))
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    # Effective pair first (see supersede_relation_inline): re-pointing one
+    # Effective pair first (see supersede_relation): re-pointing one
     # half of the turn/attempt provenance requires re-pointing both.
     turn_id, attempt_id = _resolve_source_turn_refs(
         db, campaign.id,
@@ -1237,317 +1079,4 @@ def supersede_fact_inline(
             campaign_id=str(campaign.id), fact_id=str(row.id),
             prior=prior.epistemic_state, current=epistemic,
         )
-    _note_summary_repair(
-        db, campaign.id, prior,
-        reason=f"source_superseded:fact:{prior.id}",
-    )
     return row, True
-
-
-# ── Authoritative writers (bump campaign revision + emit domain event) ───────
-
-def create_relation_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    *,
-    subject_entity_id: Any,
-    relation_type: str,
-    object_entity_id: Any | None = None,
-    object_label: str | None = None,
-    epistemic_state: str = "claimed",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
-) -> tuple[WorldRelation, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_relation_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign_id), relation_id=str(existing.id),
-                idempotency_key=key, path="authoritative_precheck",
-            )
-            return existing, None
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = create_relation_inline(
-            db, campaign, subject_entity_id=subject_entity_id, relation_type=relation_type,
-            object_entity_id=object_entity_id, object_label=object_label,
-            epistemic_state=epistemic_state, visibility=visibility, grants=grants,
-            provenance=provenance, details=details,
-            source_turn_id=source_turn_id, source_attempt_id=source_attempt_id,
-            source_event_id=source_event_id, operation_id=operation_id,
-            idempotency_key=key,
-        )
-        holder["relation_id"] = row.id
-
-    validated_type = validate_relation_type(relation_type)
-    validated_epistemic = validate_epistemic_state(epistemic_state)
-
-    def _payload() -> dict[str, Any]:
-        return {
-            "relation_id": str(holder["relation_id"]),
-            "relation_type": validated_type,
-            "epistemic_state": validated_epistemic,
-            "idempotency_key": key,
-        }
-
-    def _targets() -> dict[str, Any]:
-        return {"relation_id": str(holder["relation_id"])}
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.relation_created",
-        payload_builder=_payload,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=_targets,
-        visibility=world_event_visibility(visibility or "dm_only"),
-        provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
-        mutate=_mutate,
-    )
-    _note_semantic_write(db, campaign_id, [("world_relation", holder["relation_id"])],
-                         event_id=getattr(event, "id", None))
-    return db.get(WorldRelation, holder["relation_id"]), event
-
-
-def supersede_relation_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    prior_relation_id: Any,
-    *,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
-    **kwargs: Any,
-) -> tuple[WorldRelation, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_relation_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            _verify_supersede_dup(
-                existing.supersedes_id,
-                _coerce_uuid(prior_relation_id, field="prior_relation_id"),
-                key, kind="relation",
-            )
-            structured_log(
-                logger, logging.INFO, "world_relation_duplicate_conflict",
-                campaign_id=str(campaign_id), relation_id=str(existing.id),
-                idempotency_key=key, path="authoritative_precheck",
-            )
-            return existing, None
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = supersede_relation_inline(
-            db, campaign, prior_relation_id,
-            operation_id=operation_id, idempotency_key=key, **kwargs,
-        )
-        holder["relation_id"] = row.id
-        holder["visibility"] = row.visibility
-
-    def _payload() -> dict[str, Any]:
-        return {
-            "relation_id": str(holder["relation_id"]),
-            "supersedes_id": str(prior_relation_id),
-            "idempotency_key": key,
-        }
-
-    def _targets() -> dict[str, Any]:
-        return {"relation_id": str(holder["relation_id"])}
-
-    def _visibility() -> str:
-        return world_event_visibility(holder.get("visibility") or "dm_only")
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.relation_superseded",
-        payload_builder=_payload,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=_targets,
-        visibility="public",
-        visibility_builder=_visibility,
-        provenance={"source": "world_api", "idempotency_key": key},
-        mutate=_mutate,
-    )
-    _note_semantic_write(
-        db, campaign_id, [("world_relation", holder["relation_id"])],
-        prior=("world_relation", prior_relation_id),
-        event_id=getattr(event, "id", None),
-    )
-    return db.get(WorldRelation, holder["relation_id"]), event
-
-
-def create_fact_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    *,
-    content: str,
-    entity_refs: list | None = None,
-    epistemic_state: str = "claimed",
-    visibility: str | None = None,
-    grants: dict | None = None,
-    provenance: dict | None = None,
-    details: dict | None = None,
-    source_turn_id: Any | None = None,
-    source_attempt_id: Any | None = None,
-    source_event_id: Any | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
-) -> tuple[WorldFact, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_fact_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            structured_log(
-                logger, logging.INFO, "world_fact_duplicate_conflict",
-                campaign_id=str(campaign_id), fact_id=str(existing.id),
-                idempotency_key=key, path="authoritative_precheck",
-            )
-            return existing, None
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = create_fact_inline(
-            db, campaign, content=content, entity_refs=entity_refs,
-            epistemic_state=epistemic_state, visibility=visibility, grants=grants,
-            provenance=provenance, details=details,
-            source_turn_id=source_turn_id, source_attempt_id=source_attempt_id,
-            source_event_id=source_event_id, operation_id=operation_id,
-            idempotency_key=key,
-        )
-        holder["fact_id"] = row.id
-
-    validated_epistemic = validate_epistemic_state(epistemic_state)
-
-    def _payload() -> dict[str, Any]:
-        return {
-            "fact_id": str(holder["fact_id"]),
-            "epistemic_state": validated_epistemic,
-            "idempotency_key": key,
-        }
-
-    def _targets() -> dict[str, Any]:
-        return {"fact_id": str(holder["fact_id"])}
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.fact_asserted",
-        payload_builder=_payload,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=_targets,
-        visibility=world_event_visibility(visibility or "dm_only"),
-        provenance={"source": "world_api", "idempotency_key": key, **_normalize_provenance(provenance)},
-        mutate=_mutate,
-    )
-    _note_semantic_write(db, campaign_id, [("world_fact", holder["fact_id"])],
-                         event_id=getattr(event, "id", None))
-    return db.get(WorldFact, holder["fact_id"]), event
-
-
-def supersede_fact_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    prior_fact_id: Any,
-    *,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
-    **kwargs: Any,
-) -> tuple[WorldFact, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_fact_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            _verify_supersede_dup(
-                existing.supersedes_id,
-                _coerce_uuid(prior_fact_id, field="prior_fact_id"),
-                key, kind="fact",
-            )
-            structured_log(
-                logger, logging.INFO, "world_fact_duplicate_conflict",
-                campaign_id=str(campaign_id), fact_id=str(existing.id),
-                idempotency_key=key, path="authoritative_precheck",
-            )
-            return existing, None
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = supersede_fact_inline(
-            db, campaign, prior_fact_id,
-            operation_id=operation_id, idempotency_key=key, **kwargs,
-        )
-        holder["fact_id"] = row.id
-        holder["visibility"] = row.visibility
-
-    def _payload() -> dict[str, Any]:
-        return {
-            "fact_id": str(holder["fact_id"]),
-            "supersedes_id": str(prior_fact_id),
-            "idempotency_key": key,
-        }
-
-    def _targets() -> dict[str, Any]:
-        return {"fact_id": str(holder["fact_id"])}
-
-    def _visibility() -> str:
-        return world_event_visibility(holder.get("visibility") or "dm_only")
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.fact_superseded",
-        payload_builder=_payload,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=_targets,
-        visibility="public",
-        visibility_builder=_visibility,
-        provenance={"source": "world_api", "idempotency_key": key},
-        mutate=_mutate,
-    )
-    _note_semantic_write(
-        db, campaign_id, [("world_fact", holder["fact_id"])],
-        prior=("world_fact", prior_fact_id),
-        event_id=getattr(event, "id", None),
-    )
-    return db.get(WorldFact, holder["fact_id"]), event

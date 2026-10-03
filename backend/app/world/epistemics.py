@@ -23,8 +23,8 @@ non-membership, and revoked/missing grants all deny with a reason code.
 Access is never inferred from a related shared record — the subject entity,
 the knowledge row, and its truth target are authorized independently.
 
-Observability: acquisition_source on every knowledge row; grant/revoke emit
-domain events + structured logs; denials return reason codes; projections
+Observability: acquisition_source on every knowledge row; grants emit
+structured logs; denials return reason codes; projections
 return filter counts without leaking hidden content (denied rows contribute
 only counts, never ids/content).
 """
@@ -33,10 +33,9 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import is_campaign_member
@@ -73,16 +72,10 @@ __all__ = [
     "validate_grant_target_kind",
     "validate_acquisition_source",
     "normalize_record_visibility",
-    "assert_knowledge_inline",
-    "assert_knowledge_authoritative",
-    "get_knowledge_strict",
+    "assert_knowledge",
     "list_knowledge_for_subject",
     "list_knowledge_for_target",
-    "grant_visibility_inline",
-    "grant_visibility_authoritative",
-    "revoke_visibility_inline",
-    "revoke_visibility_authoritative",
-    "list_active_grants",
+    "grant_visibility",
     "has_active_grant",
     "may_user_receive",
     "what_does_subject_know",
@@ -283,7 +276,7 @@ def _find_current_knowledge(
     return db.execute(q.order_by(WorldKnowledge.created_at.asc())).scalars().first()
 
 
-def assert_knowledge_inline(
+def assert_knowledge(
     db: Session,
     campaign: Campaign,
     *,
@@ -409,13 +402,6 @@ def _coerce_optional_uuid(value: Any) -> uuid.UUID | None:
     return _coerce_uuid(value, field="source_ref")
 
 
-def get_knowledge_strict(db: Session, campaign_id: uuid.UUID, knowledge_id: Any) -> WorldKnowledge:
-    row = db.get(WorldKnowledge, _coerce_uuid(knowledge_id, field="knowledge_id"))
-    if row is None or row.campaign_id != campaign_id:
-        raise ValueError(f"World knowledge {knowledge_id} not found in campaign {campaign_id}")
-    return row
-
-
 def list_knowledge_for_subject(
     db: Session, campaign_id: uuid.UUID, subject_entity_id: Any, *,
     knowledge_state: str | None = None, limit: int = 100,
@@ -451,47 +437,6 @@ def list_knowledge_for_target(
         q = q.where(WorldKnowledge.knowledge_state == validate_knowledge_state(knowledge_state))
     q = q.order_by(WorldKnowledge.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
     return list(db.execute(q).scalars().all())
-
-
-def assert_knowledge_authoritative(
-    db: Session, campaign_id: uuid.UUID, expected_revision: int, *,
-    operation_id: str | None = None, actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None, **kwargs: Any,
-) -> tuple[WorldKnowledge, Any]:
-    """Revision-ordered knowledge assertion with a durable domain event."""
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_knowledge_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            return existing, None
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = assert_knowledge_inline(
-            db, campaign, operation_id=operation_id, idempotency_key=key, **kwargs
-        )
-        holder["knowledge_id"] = row.id
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.knowledge_asserted",
-        payload_builder=lambda: {
-            "knowledge_id": str(holder["knowledge_id"]),
-            "idempotency_key": key,
-        },
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=lambda: {"knowledge_id": str(holder["knowledge_id"])},
-        visibility="dm_only",
-        provenance={"source": "world_api", "idempotency_key": key},
-        mutate=_mutate,
-    )
-    return db.get(WorldKnowledge, holder["knowledge_id"]), event
 
 
 # ── Visibility grants (arbitrary authorized subsets) ────────────────────────
@@ -535,21 +480,6 @@ def _resolve_grantee(db: Session, campaign: Campaign, grantee_user_id: Any) -> u
     return gid
 
 
-def list_active_grants(
-    db: Session, campaign_id: uuid.UUID, target_kind: str, target_id: Any,
-) -> list[WorldVisibilityGrant]:
-    kind = validate_grant_target_kind(target_kind)
-    tid = _coerce_uuid(target_id, field="target_id")
-    return list(db.execute(
-        select(WorldVisibilityGrant).where(
-            WorldVisibilityGrant.campaign_id == campaign_id,
-            WorldVisibilityGrant.target_kind == kind,
-            WorldVisibilityGrant.target_id == tid,
-            WorldVisibilityGrant.revoked_at.is_(None),
-        ).order_by(WorldVisibilityGrant.created_at.asc())
-    ).scalars().all())
-
-
 def has_active_grant(
     db: Session, campaign_id: uuid.UUID, target_kind: str,
     target_id: uuid.UUID, user_id: uuid.UUID,
@@ -565,7 +495,7 @@ def has_active_grant(
     ).scalar_one() > 0
 
 
-def grant_visibility_inline(
+def grant_visibility(
     db: Session, campaign: Campaign, *, target_kind: str, target_id: Any,
     grantee_user_id: Any, granted_by: Any | None = None,
     operation_id: str | None = None, idempotency_key: str | None = None,
@@ -608,149 +538,6 @@ def grant_visibility_inline(
         operation_id=str(operation_id) if operation_id else None,
     )
     return row, True
-
-
-def revoke_visibility_inline(
-    db: Session, campaign: Campaign, *, target_kind: str, target_id: Any,
-    grantee_user_id: Any, operation_id: str | None = None,
-) -> bool:
-    """Revoke one active grant (soft: sets revoked_at, history preserved).
-
-    Returns True when an active grant was revoked; False when none existed
-    (still fail-closed for future reads). Never deletes rows.
-    """
-    kind = validate_grant_target_kind(target_kind)
-    tid = _coerce_uuid(target_id, field="target_id")
-    gid = _coerce_uuid(grantee_user_id, field="grantee_user_id")
-    row = db.execute(
-        select(WorldVisibilityGrant).where(
-            WorldVisibilityGrant.campaign_id == campaign.id,
-            WorldVisibilityGrant.target_kind == kind,
-            WorldVisibilityGrant.target_id == tid,
-            WorldVisibilityGrant.grantee_user_id == gid,
-            WorldVisibilityGrant.revoked_at.is_(None),
-        )
-    ).scalars().first()
-    if row is None:
-        structured_log(
-            logger, logging.INFO, "world_visibility_revoke_noop",
-            campaign_id=str(campaign.id), target_kind=kind,
-            grantee_user_id=str(gid),
-        )
-        return False
-    row.revoked_at = datetime.now(timezone.utc)
-    db.flush()
-    structured_log(
-        logger, logging.INFO, "world_visibility_revoked",
-        campaign_id=str(campaign.id), target_kind=kind,
-        grantee_user_id=str(gid),
-        operation_id=str(operation_id) if operation_id else None,
-    )
-    return True
-
-
-def grant_visibility_authoritative(
-    db: Session, campaign_id: uuid.UUID, expected_revision: int, *,
-    operation_id: str | None = None, actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None, target_kind: str = "",
-    target_id: Any = None, grantee_user_id: Any = None,
-) -> tuple[WorldVisibilityGrant, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = _normalize_idempotency_key(idempotency_key or operation_id)
-    if key:
-        existing = _find_grant_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            return existing, None
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        row, _ = grant_visibility_inline(
-            db, campaign, target_kind=target_kind, target_id=target_id,
-            grantee_user_id=grantee_user_id, granted_by=actor_id,
-            operation_id=operation_id, idempotency_key=key,
-        )
-        holder["grant_id"] = row.id
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.visibility_granted",
-        payload_builder=lambda: {
-            "grant_id": str(holder["grant_id"]),
-            "target_kind": validate_grant_target_kind(target_kind),
-            "idempotency_key": key,
-        },
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=lambda: {"grant_id": str(holder["grant_id"])},
-        visibility="dm_only",
-        provenance={"source": "world_api", "idempotency_key": key},
-        mutate=_mutate,
-    )
-    row = db.get(WorldVisibilityGrant, holder["grant_id"])
-    # Issue #250: a committed grant expands someone's projection — publish
-    # the audience-neutral invalidation post-commit so clients reload. Best
-    # effort: never breaks the authoritative commit.
-    try:
-        from app.realtime.service import publish_projection_invalidated_for_grantee
-
-        publish_projection_invalidated_for_grantee(
-            db, campaign_after, grantee_user_id=grantee_user_id,
-        )
-    except Exception:
-        pass
-    return row, event
-
-
-def revoke_visibility_authoritative(
-    db: Session, campaign_id: uuid.UUID, expected_revision: int, *,
-    operation_id: str | None = None, actor_id: uuid.UUID | None = None,
-    target_kind: str = "", target_id: Any = None,
-    grantee_user_id: Any = None,
-) -> tuple[bool, Any]:
-    from app.campaigns.events import commit_campaign_mutation
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        holder["revoked"] = revoke_visibility_inline(
-            db, campaign, target_kind=target_kind, target_id=target_id,
-            grantee_user_id=grantee_user_id, operation_id=operation_id,
-        )
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.visibility_revoked",
-        payload={
-            "target_kind": validate_grant_target_kind(target_kind),
-            "target_id": str(target_id),
-            "grantee_user_id": str(grantee_user_id),
-        },
-        operation_id=operation_id,
-        actor_id=actor_id,
-        visibility="dm_only",
-        provenance={"source": "world_api"},
-        mutate=_mutate,
-    )
-    revoked = bool(holder.get("revoked"))
-    if revoked:
-        # Issue #250: a committed revoke contracts someone's projection —
-        # publish the audience-neutral invalidation post-commit. Best effort.
-        try:
-            from app.realtime.service import publish_projection_invalidated_for_grantee
-
-            publish_projection_invalidated_for_grantee(
-                db, campaign_after, grantee_user_id=grantee_user_id,
-            )
-        except Exception:
-            pass
-    return revoked, event
 
 
 # ── Authorization + projection (server-side, RLS-compatible) ────────────────

@@ -31,7 +31,6 @@ from app.world import service as _world  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
-from models.world import WorldVisibilityGrant  # noqa: E402
 
 
 def _engine():
@@ -81,19 +80,19 @@ def _seed_private_fact(ctx, content="the vault sigil is a moth"):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        decoy, _ = _knowledge.create_fact_inline(
+        decoy, _ = _knowledge.create_fact(
             db, camp, content="the tavern serves stew",
             visibility="campaign", operation_id="op-decoy-250",
         )
-        secret, _ = _knowledge.create_fact_inline(
+        secret, _ = _knowledge.create_fact(
             db, camp, content=content,
             visibility="private", operation_id="op-secret-250",
         )
-        dm_only, _ = _knowledge.create_fact_inline(
+        dm_only, _ = _knowledge.create_fact(
             db, camp, content="the DM tracks a hidden omen",
             visibility="dm_only", operation_id="op-omen-250",
         )
-        _epistemics.grant_visibility_inline(
+        _epistemics.grant_visibility(
             db, camp, target_kind="fact", target_id=secret.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-250",
@@ -149,7 +148,7 @@ def test_visible_record_fields_survive_member_sanitization(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        _world.create_entity_inline(
+        _world.create_entity(
             db, camp, entity_type="item", name="Visible Rope",
             visibility="campaign",
             details={"total": 5, "length_ft": 50, "denied": "no entry here"},
@@ -181,15 +180,15 @@ def test_hidden_records_do_not_change_unauthorized_serialized_view(ctx):
             build_surfaces_for_viewer(db, camp, ctx["bob"]), sort_keys=True, default=str,
         )
         # Add more secrets Bob cannot see: private fact, private item, secret clock.
-        secret, _ = _knowledge.create_fact_inline(
+        secret, _ = _knowledge.create_fact(
             db, camp, content="a second moth sigil",
             visibility="private", operation_id="op-secret2-250",
         )
-        dagger, _ = _world.create_entity_inline(
+        dagger, _ = _world.create_entity(
             db, camp, entity_type="item", name="Hidden Dagger",
             visibility="private", operation_id="op-dagger2-250",
         )
-        _clocks.create_clock_inline(
+        _clocks.create_clock(
             db, camp, name="Hidden Doom", threshold=8,
             advancement_criteria={"kind": "deterministic"}, visibility="dm_only",
             provenance={"source": "test-250"},
@@ -214,7 +213,7 @@ def test_reveal_expands_projection(ctx):
         secret = [f for f in secret if f.visibility == "private"][0]
         before = build_surfaces_for_viewer(db, camp, ctx["bob"])
         assert all(r["id"] != str(secret.id) for r in before["clues"]["records"])
-        _epistemics.grant_visibility_inline(
+        _epistemics.grant_visibility(
             db, camp, target_kind="fact", target_id=secret.id,
             grantee_user_id=ctx["bob"], granted_by=ctx["owner"],
             operation_id="op-reveal-250",
@@ -222,28 +221,6 @@ def test_reveal_expands_projection(ctx):
         db.commit()
         after = build_surfaces_for_viewer(db, camp, ctx["bob"])
         assert any(r["id"] == str(secret.id) for r in after["clues"]["records"])
-    finally:
-        db.close()
-
-
-def test_revoke_removes_future_access_preserves_audit(ctx):
-    _seed_private_fact(ctx)
-    db = _db(ctx)
-    try:
-        camp = db.get(Campaign, ctx["campaign_id"])
-        secret = [f for f in _knowledge.list_facts(db, camp.id, limit=200)
-                  if f.visibility == "private"][0]
-        assert _epistemics.revoke_visibility_inline(
-            db, camp, target_kind="fact", target_id=secret.id,
-            grantee_user_id=ctx["alice"], operation_id="op-revoke-250",
-        ) is True
-        db.commit()
-        view = build_surfaces_for_viewer(db, camp, ctx["alice"])
-        assert all(r["id"] != str(secret.id) for r in view["clues"]["records"])
-        # Audit history preserved: soft-revoked row still exists.
-        rows = db.query(WorldVisibilityGrant).filter_by(
-            campaign_id=camp.id, grantee_user_id=ctx["alice"]).all()
-        assert rows and all(r.revoked_at is not None for r in rows)
     finally:
         db.close()
 
@@ -257,7 +234,7 @@ def test_shared_appearance_differs_from_hidden_reality(ctx):
             "resources": [{"name": "signal whistle", "uses": 1}],
             "rules_state_visibility": {"resources": "dm_private"},
         }
-        row, _ = _world.create_entity_inline(
+        row, _ = _world.create_entity(
             db, camp, entity_type="npc", name="Vex",
             visibility="campaign", details=details, operation_id="op-vex-250",
         )
@@ -283,20 +260,20 @@ def test_hidden_item_and_shop_only_for_grantee(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        dagger, _ = _world.create_entity_inline(
+        dagger, _ = _world.create_entity(
             db, camp, entity_type="item", name="Moon Dagger",
             visibility="private", operation_id="op-dagger-250",
         )
-        shop, _ = _world.create_entity_inline(
+        shop, _ = _world.create_entity(
             db, camp, entity_type="shop", name="Night Market",
             visibility="private", operation_id="op-shop-250",
         )
-        _epistemics.grant_visibility_inline(
+        _epistemics.grant_visibility(
             db, camp, target_kind="entity", target_id=dagger.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-dagger-250",
         )
-        _epistemics.grant_visibility_inline(
+        _epistemics.grant_visibility(
             db, camp, target_kind="entity", target_id=shop.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-shop-250",
@@ -349,14 +326,14 @@ def test_clocks_member_vs_owner(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        _clocks.create_clock_inline(
+        _clocks.create_clock(
             db, camp, name="City Alarm", threshold=4,
             advancement_criteria={"kind": "deterministic"}, visibility="campaign",
             completion_effect={"effect": "guards arrive"},
             provenance={"source": "test-250"},
             operation_id="op-clock-open-250",
         )
-        _clocks.create_clock_inline(
+        _clocks.create_clock(
             db, camp, name="Secret Ritual", threshold=6,
             advancement_criteria={"kind": "deterministic"}, visibility="dm_only",
             provenance={"source": "test-250"},
@@ -446,62 +423,6 @@ def test_invalidation_fanout_targets_grantee_threads(ctx):
         db.close()
 
 
-def test_authoritative_grant_and_revoke_publish_invalidation(ctx):
-    """Review #418: real grant/revoke commits must emit the invalidation event."""
-    db = _db(ctx)
-    try:
-        camp = db.get(Campaign, ctx["campaign_id"])
-        secret, _ = _knowledge.create_fact_inline(
-            db, camp, content="the vault sigil is a moth",
-            visibility="private", operation_id="op-secret-auth-250",
-        )
-        db.commit()
-        mem = InMemoryRealtimePublisher()
-        set_realtime_publisher(mem)
-        try:
-            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-            row, _ = _epistemics.grant_visibility_authoritative(
-                db, ctx["campaign_id"], rev,
-                operation_id="op-auth-grant-250", actor_id=ctx["owner"],
-                target_kind="fact", target_id=secret.id,
-                grantee_user_id=ctx["bob"],
-            )
-            assert row is not None
-            grants = [r for r in mem.published
-                      if r["payload"]["type"] == "projection.invalidated"]
-            assert len(grants) == 1
-            # Audience-neutral: no grantee, kind, or direction on the wire.
-            assert str(ctx["bob"]) not in str(grants[0]["payload"])
-            assert "moth" not in str(grants[0]["payload"])
-
-            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-            revoked, _ = _epistemics.revoke_visibility_authoritative(
-                db, ctx["campaign_id"], rev,
-                operation_id="op-auth-revoke-250", actor_id=ctx["owner"],
-                target_kind="fact", target_id=secret.id,
-                grantee_user_id=ctx["bob"],
-            )
-            assert revoked is True
-            assert len([r for r in mem.published
-                        if r["payload"]["type"] == "projection.invalidated"]) == 2
-
-            # No-op revoke (nothing active) changes nothing and stays silent.
-            before = len(mem.published)
-            rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-            revoked_again, _ = _epistemics.revoke_visibility_authoritative(
-                db, ctx["campaign_id"], rev,
-                operation_id="op-auth-revoke-noop-250", actor_id=ctx["owner"],
-                target_kind="fact", target_id=secret.id,
-                grantee_user_id=ctx["bob"],
-            )
-            assert revoked_again is False
-            assert len(mem.published) == before
-        finally:
-            set_realtime_publisher(None)
-    finally:
-        db.close()
-
-
 def test_dm_only_map_zones_absent_for_non_owner(ctx):
     """Review #418 round 3: hidden trap geometry (kind/rect/label) must be
     absent from unauthorized payloads — in surfaces AND the full snapshot."""
@@ -559,11 +480,11 @@ def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
-        shade, _ = _world.create_entity_inline(
+        shade, _ = _world.create_entity(
             db, camp, entity_type="npc", name="Veil Shade",
             visibility="private", operation_id="op-shade-250",
         )
-        _epistemics.grant_visibility_inline(
+        _epistemics.grant_visibility(
             db, camp, target_kind="entity", target_id=shade.id,
             grantee_user_id=ctx["alice"], granted_by=ctx["owner"],
             operation_id="op-grant-shade-250",

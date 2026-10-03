@@ -16,37 +16,29 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import ContextAudience  # noqa: E402
 from app.dm.contract import EvidenceRequest  # noqa: E402
 from app.dm.evidence import execute_evidence_round, validate_evidence_requests  # noqa: E402
-from app.world.epistemics import assert_knowledge_inline  # noqa: E402
+from app.world.epistemics import assert_knowledge  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
-    create_fact_authoritative,
-    create_relation_authoritative,
+    create_fact,
+    create_relation,
 )
 from app.world.retrieval import (  # noqa: E402
     RETRIEVAL_MAX_DEPTH,
-    STATUS_DEFER,
     STATUS_NOT_FOUND,
     STATUS_OK,
-    apply_rerank,
-    build_rerank_candidates,
-    decision_service_reranker,
     fact_source_evidence,
-    facts_for_entity,
     lookup_fact,
     lookup_source_turn,
-    lookup_submission,
     query_character_knowledge,
     query_timeline,
-    query_who_knows,
-    retrieve_current_scene,
     retrieve_entity,
     traverse_relations,
 )
 from app.world.service import (  # noqa: E402
-    create_entity_authoritative,
-    set_scene_authoritative,
+    create_entity,
 )
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.dm import DmTurn  # noqa: E402
@@ -82,28 +74,33 @@ def _setup():
 
 def _seed_graph(db, cid, rev=0):
     """A --knows--> B --located_at--> C plus a dm_only secret fact on A."""
-    a, _ = create_entity_authoritative(
-        db, cid, rev, entity_type="npc", name="Asha",
+    a, _ = commit_world_write(
+        db, cid, rev, create_entity, event_type="world.entity_created",
+        event_visibility="public", entity_type="npc", name="Asha",
         visibility="campaign", operation_id="op-ent-a")
-    b, _ = create_entity_authoritative(
-        db, cid, rev + 1, entity_type="npc", name="Bram",
+    b, _ = commit_world_write(
+        db, cid, rev + 1, create_entity, event_type="world.entity_created",
+        event_visibility="public", entity_type="npc", name="Bram",
         visibility="campaign", operation_id="op-ent-b")
-    c, _ = create_entity_authoritative(
-        db, cid, rev + 2, entity_type="location", name="Cinder Keep",
+    c, _ = commit_world_write(
+        db, cid, rev + 2, create_entity, event_type="world.entity_created",
+        event_visibility="public", entity_type="location", name="Cinder Keep",
         visibility="campaign", operation_id="op-ent-c")
     rev += 3
-    rel_ab, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=a.id, relation_type="knows",
+    rel_ab, _ = commit_world_write(
+        db, cid, rev, create_relation, event_type="world.relation_created",
+        event_visibility="public", subject_entity_id=a.id, relation_type="knows",
         object_entity_id=b.id, epistemic_state="confirmed",
         visibility="campaign", operation_id="op-rel-ab")
     rev += 1
-    rel_bc, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=b.id, relation_type="located_at",
+    rel_bc, _ = commit_world_write(
+        db, cid, rev, create_relation, event_type="world.relation_created",
+        event_visibility="public", subject_entity_id=b.id, relation_type="located_at",
         object_entity_id=c.id, epistemic_state="believed",
         visibility="campaign", operation_id="op-rel-bc")
     rev += 1
-    secret, _ = create_fact_authoritative(
-        db, cid, rev, content="Asha hides the key.",
+    secret, _ = commit_world_write(
+        db, cid, rev, create_fact, event_type="world.fact_asserted", content="Asha hides the key.",
         entity_refs=[a.id], epistemic_state="confirmed",
         visibility="dm_only", operation_id="op-fact-secret")
     rev += 1
@@ -204,8 +201,8 @@ def test_fact_source_evidence_follows_provenance_links():
     db = Fac()
     seed = _seed_graph(db, cid)
     turn, _submission = _seed_turn(db, cid, player)
-    fact, _ = create_fact_authoritative(
-        db, cid, seed["rev"], content="The gate fell at dusk.",
+    fact, _ = commit_world_write(
+        db, cid, seed["rev"], create_fact, content="The gate fell at dusk.",
         entity_refs=[seed["c"].id], epistemic_state="confirmed",
         visibility="campaign",
         source_turn_id=turn.id,
@@ -220,15 +217,6 @@ def test_fact_source_evidence_follows_provenance_links():
     assert fact_packet.provenance["source_turn_id"] == str(turn.id)
     turn_packet = next(p for p in outcome.packets if p.source_type == "source_turn")
     assert turn_packet.content["established_records"]["fact_ids"] == [str(fact.id)]
-
-
-def test_facts_for_entity_lists_referencing_facts():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = facts_for_entity(db, cid, seed["a"].id, owner, dm_internal=True)
-    assert outcome.status == STATUS_OK
-    assert {p.source_id for p in outcome.packets} == {str(seed["secret"].id)}
 
 
 def test_lookup_fact_not_found():
@@ -285,8 +273,8 @@ def test_source_turn_retrieval_with_submissions_and_records():
     db = Fac()
     seed = _seed_graph(db, cid)
     turn, submission = _seed_turn(db, cid, player)
-    rel, _ = create_relation_authoritative(
-        db, cid, seed["rev"], subject_entity_id=seed["a"].id,
+    rel, _ = commit_world_write(
+        db, cid, seed["rev"], create_relation, subject_entity_id=seed["a"].id,
         relation_type="owes", object_entity_id=seed["b"].id,
         epistemic_state="claimed", visibility="campaign",
         source_turn_id=turn.id, operation_id="op-rel-turn")
@@ -299,45 +287,11 @@ def test_source_turn_retrieval_with_submissions_and_records():
     assert packet.provenance["thread_id"] == "main"
 
 
-def test_source_turn_not_found_and_submission_lookup():
+def test_source_turn_not_found():
     Fac, cid, owner, player, _ = _setup()
     db = Fac()
     outcome = lookup_source_turn(db, cid, uuid.uuid4(), player)
     assert outcome.status == STATUS_NOT_FOUND
-    _turn, submission = _seed_turn(db, cid, player)
-    sub_outcome = lookup_submission(db, cid, submission.id, player)
-    assert sub_outcome.status == STATUS_OK
-    assert sub_outcome.packets[0].source_type == "submission"
-    assert lookup_submission(db, cid, uuid.uuid4(), player).status == STATUS_NOT_FOUND
-
-
-def test_private_submission_hidden_from_other_members():
-    from app.runtime.threads import create_private_thread
-
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    other = uuid.uuid4()
-    db.add(Profile(id=other, email="other@example.com"))
-    db.add(CampaignMember(campaign_id=cid, user_id=other, role="player"))
-    db.commit()
-    _turn, _sub = _seed_turn(db, cid, player)
-    # Private evidence lives on a private thread: only explicit thread
-    # members may read it (owner status alone never grants access).
-    private_thread = create_private_thread(
-        db, campaign_id=cid, created_by=player, member_ids=[player])
-    db.commit()
-    private_sub = PlayerSubmission(
-        id=uuid.uuid4(), campaign_id=cid, user_id=player,
-        thread_id=str(private_thread.id), audience="private", sequence=2,
-        raw_content="secret whisper")
-    db.add(private_sub)
-    db.commit()
-    denied = lookup_submission(db, cid, private_sub.id, other)
-    assert denied.packets == []
-    assert denied.denied == 1
-    assert denied.denied_reasons.get("submission_not_visible") == 1
-    author = lookup_submission(db, cid, private_sub.id, player)
-    assert author.status == STATUS_OK
 
 
 # ── character knowledge ──────────────────────────────────────────────────────
@@ -347,7 +301,7 @@ def test_character_knowledge_query_returns_target_snapshot():
     db = Fac()
     seed = _seed_graph(db, cid)
     campaign = db.get(Campaign, cid)
-    row, _ = assert_knowledge_inline(
+    row, _ = assert_knowledge(
         db, campaign, subject_kind="character",
         subject_entity_id=seed["a"].id, target_kind="fact",
         target_fact_id=seed["secret"].id, knowledge_state="knows",
@@ -370,7 +324,7 @@ def test_character_knowledge_hidden_target_counts_denial_without_leak():
     seed = _seed_graph(db, cid)
     campaign = db.get(Campaign, cid)
     # Knowledge row itself is campaign-visible but the truth target is dm_only.
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign, subject_kind="character",
         subject_entity_id=seed["a"].id, target_kind="fact",
         target_fact_id=seed["secret"].id, knowledge_state="believes",
@@ -381,27 +335,6 @@ def test_character_knowledge_hidden_target_counts_denial_without_leak():
     assert outcome.packets == []  # target hidden: no ids/content leak
     assert outcome.denied == 1
     assert outcome.denied_reasons.get("target_not_visible") == 1
-
-
-def test_who_knows_projection():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    # Public fact so a member viewer passes the target gate.
-    fact, _ = create_fact_authoritative(
-        db, cid, seed["rev"], content="The well is dry.",
-        entity_refs=[seed["c"].id], epistemic_state="believed",
-        visibility="public", operation_id="op-fact-well")
-    campaign = db.get(Campaign, cid)
-    assert_knowledge_inline(
-        db, campaign, subject_kind="character",
-        subject_entity_id=seed["a"].id, target_kind="fact",
-        target_fact_id=fact.id, knowledge_state="knows",
-        visibility="public")
-    db.commit()
-    outcome = query_who_knows(db, cid, "fact", fact.id, player)
-    assert outcome.visible == 1
-    assert outcome.packets[0].content["subject_entity_id"] == str(seed["a"].id)
 
 
 # ── hidden evidence handling ─────────────────────────────────────────────────
@@ -428,126 +361,7 @@ def test_hidden_evidence_denied_player_facing_preserved_dm_internal():
     assert internal.packets[0].revealable is None
 
 
-def test_current_scene_retrieval_and_hidden_scene():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    missing = retrieve_current_scene(db, cid, player)
-    assert missing.status == STATUS_NOT_FOUND
-    scene, _ = set_scene_authoritative(
-        db, cid, 0, location_name="Cinder Keep",
-        fictional_time="dusk", visibility="campaign",
-        operation_id="op-scene-1")
-    visible = retrieve_current_scene(db, cid, player)
-    assert visible.status == STATUS_OK
-    assert visible.packets[0].content["location_name"] == "Cinder Keep"
-    assert visible.packets[0].source_version == f"r{scene.revision}"
-    assert visible.packets[0].visibility == "campaign"
-
-
 # ── optional reranking ───────────────────────────────────────────────────────
-
-def test_authorized_reranking_preserves_provenance_and_order_metadata():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    packets = outcome.packets
-    before = [(p.source_type, p.source_id, p.source_version,
-               p.retrieval_rank, dict(p.provenance)) for p in packets]
-    ids = [f"{p.source_type}:{p.source_id}" for p in packets]
-    reranked = apply_rerank(packets, order=list(reversed(ids)),
-                            reranker_model="fake", reranker_policy="test")
-    assert reranked.reranked is True
-    assert reranked.presented_ids == list(reversed(ids))
-    # Original retrieval order/score/source/provenance untouched.
-    for packet, snapshot in zip(reranked.packets, reversed(before)):
-        assert (packet.source_type, packet.source_id, packet.source_version,
-                packet.retrieval_rank, dict(packet.provenance)) == snapshot
-    assert [p.presentation_rank for p in reranked.packets] == list(range(len(packets)))
-
-
-def test_rerank_no_match_defer_keeps_authoritative_set_for_audit():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    reranked = apply_rerank(outcome.packets, reranker=lambda _c: "DEFER")
-    assert reranked.status == STATUS_DEFER
-    assert reranked.presented_ids == []
-    assert reranked.reranked is False
-    # Authoritative packets retained for audit, retrieval order intact.
-    assert [p.retrieval_rank for p in reranked.packets] == list(range(len(outcome.packets)))
-    dict_form = apply_rerank(outcome.packets, reranker=lambda _c: {"no_match": True})
-    assert dict_form.status == STATUS_DEFER
-
-
-def test_rerank_failure_falls_back_to_deterministic_order():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    expected = [f"{p.source_type}:{p.source_id}" for p in outcome.packets]
-
-    def _boom(_candidates):
-        raise RuntimeError("model exploded")
-
-    reranked = apply_rerank(outcome.packets, reranker=_boom)
-    assert reranked.fallback is True
-    assert reranked.reranked is False
-    assert [f"{p.source_type}:{p.source_id}" for p in reranked.packets] == expected
-    assert reranked.error
-
-
-def test_rerank_rejects_invented_candidate_ids():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    expected = [f"{p.source_type}:{p.source_id}" for p in outcome.packets]
-    reranked = apply_rerank(
-        outcome.packets, order=["world_fact:00000000-0000-0000-0000-000000000000"])
-    assert reranked.fallback is True
-    assert [f"{p.source_type}:{p.source_id}" for p in reranked.packets] == expected
-    # The invented ID never becomes a packet.
-    assert all("00000000" not in p.source_id for p in reranked.packets)
-
-
-def test_rerank_candidates_are_bounded_authorized_ids_only():
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    candidates = build_rerank_candidates(outcome.packets)
-    assert {c["id"] for c in candidates} == {
-        f"{p.source_type}:{p.source_id}" for p in outcome.packets}
-    assert all("description" in c for c in candidates)
-
-
-def test_decision_service_reranker_selects_only_supplied_ids():
-    from app.decisions.adapters.fake import FakeDecisionAdapter
-    from app.decisions.runtime import DecisionService
-
-    Fac, cid, owner, player, _ = _setup()
-    db = Fac()
-    seed = _seed_graph(db, cid)
-    outcome = traverse_relations(db, cid, seed["a"].id, player, depth=1)
-    candidates = build_rerank_candidates(outcome.packets)
-    target = candidates[-1]["id"]
-    service = DecisionService(FakeDecisionAdapter(
-        answers={"world_evidence_rank": target}))
-    reranked = apply_rerank(
-        outcome.packets,
-        reranker=decision_service_reranker(service, policy="test-policy"))
-    assert reranked.reranked is True
-    assert reranked.presented_ids[0] == target
-    assert reranked.reranker_policy == "test-policy"
-    # DEFER escape maps to the defer outcome.
-    defer_service = DecisionService(FakeDecisionAdapter(
-        answers={"world_evidence_rank": "DEFER"}))
-    deferred = apply_rerank(
-        outcome.packets, reranker=decision_service_reranker(defer_service))
-    assert deferred.status == STATUS_DEFER
-
 
 # ── #203 mediation integration ──────────────────────────────────────────────
 
@@ -648,12 +462,12 @@ def test_private_knowledge_internal_preserves_visibility_player_filters():
     Fac, cid, owner, player, _ = _setup()
     db = Fac()
     seed = _seed_graph(db, cid)
-    fact, _ = create_fact_authoritative(
-        db, cid, seed["rev"], content="The well is dry.",
+    fact, _ = commit_world_write(
+        db, cid, seed["rev"], create_fact, content="The well is dry.",
         entity_refs=[seed["c"].id], epistemic_state="believed",
         visibility="public", operation_id="op-fact-well-private-k")
     campaign = db.get(Campaign, cid)
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign, subject_kind="character",
         subject_entity_id=seed["a"].id, target_kind="fact",
         target_fact_id=fact.id, knowledge_state="knows",
@@ -682,7 +496,7 @@ def test_campaign_knowledge_of_hidden_target_stays_restricted_in_mediation():
     seed = _seed_graph(db, cid)  # seed["secret"] is a dm_only fact
     campaign = db.get(Campaign, cid)
     # Campaign-visible knowledge row pointing at a dm_only truth target.
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign, subject_kind="character",
         subject_entity_id=seed["a"].id, target_kind="fact",
         target_fact_id=seed["secret"].id, knowledge_state="knows",
@@ -718,7 +532,7 @@ def test_private_knowledge_of_dm_only_target_stays_dm_only():
     # Private knowledge row pointing at a dm_only truth target: dm_only
     # dominates private (adjudication-only always beats audience-scoped
     # private), so the composed packet must stay dm_only.
-    assert_knowledge_inline(
+    assert_knowledge(
         db, campaign, subject_kind="character",
         subject_entity_id=seed["a"].id, target_kind="fact",
         target_fact_id=seed["secret"].id, knowledge_state="knows",

@@ -18,31 +18,22 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.turns import commit_turn, coordinate_turn, mark_streaming_started  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
     EPISTEMIC_STATES,
-    create_fact_authoritative,
-    create_fact_inline,
-    create_relation_authoritative,
-    create_relation_inline,
-    fact_visible_to_viewer,
-    filter_facts_for_viewer,
-    filter_relations_for_viewer,
+    create_fact,
+    create_relation,
     get_relation_strict,
     list_facts,
-    list_records_for_source_event,
     list_records_for_source_turn,
     list_relations,
-    list_relations_for_entity,
-    relation_visible_to_viewer,
-    supersede_fact_authoritative,
-    supersede_fact_inline,
-    supersede_relation_authoritative,
-    supersede_relation_inline,
+    supersede_fact,
+    supersede_relation,
 )
-from app.world.service import create_entity_authoritative, is_world_authority  # noqa: E402
+from app.world.service import create_entity, is_world_authority  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.dm import DMStream, DMStreamChunk  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -70,12 +61,12 @@ def _setup():
 
 
 def _entities(db, cid, rev):
-    mara, _ = create_entity_authoritative(
-        db, cid, rev, entity_type="npc", name="Mara",
+    mara, _ = commit_world_write(
+        db, cid, rev, create_entity, entity_type="npc", name="Mara",
         operation_id=f"op-mara-{rev}",
     )
-    guild, _ = create_entity_authoritative(
-        db, cid, rev + 1, entity_type="faction", name="Guild",
+    guild, _ = commit_world_write(
+        db, cid, rev + 1, create_entity, entity_type="faction", name="Guild",
         operation_id=f"op-guild-{rev}",
     )
     return mara, guild, rev + 2
@@ -110,8 +101,8 @@ def test_confirmed_fact_carries_epistemic_state_and_provenance():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, _, rev = _entities(db, cid, 0)
-    fact, evt = create_fact_authoritative(
-        db, cid, rev, content="The bridge collapsed.",
+    fact, evt = commit_world_write(
+        db, cid, rev, create_fact, content="The bridge collapsed.",
         entity_refs=[mara.id], epistemic_state="confirmed",
         visibility="campaign",
         provenance={"source": "dm_adjudication", "origin": "established_state"},
@@ -121,16 +112,14 @@ def test_confirmed_fact_carries_epistemic_state_and_provenance():
     assert fact.status == "active"
     assert fact.provenance["source"] == "dm_adjudication"
     assert fact.entity_refs == [str(mara.id)]
-    assert evt.event_type == "world.fact_asserted"
-    assert evt.payload["fact_id"] == str(fact.id)
 
 
 def test_unsupported_player_claim_stays_claim_not_truth():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, _, rev = _entities(db, cid, 0)
-    claim, _ = create_fact_authoritative(
-        db, cid, rev, content="Mara says the vault is unguarded.",
+    claim, _ = commit_world_write(
+        db, cid, rev, create_fact, content="Mara says the vault is unguarded.",
         entity_refs=[mara.id],
         provenance={"source": "player_transcript", "claim_kind": "player_declaration"},
         operation_id="op-claim-1",
@@ -145,8 +134,8 @@ def test_deceptive_npc_statement_stored_as_evidence_not_objective_truth():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, _, rev = _entities(db, cid, 0)
-    lie, _ = create_fact_authoritative(
-        db, cid, rev, content="Mara claims the Guild guards the bridge.",
+    lie, _ = commit_world_write(
+        db, cid, rev, create_fact, content="Mara claims the Guild guards the bridge.",
         entity_refs=[mara.id], epistemic_state="false",
         visibility="dm_only",
         provenance={
@@ -171,29 +160,27 @@ def test_relationship_lifecycle_preserves_historical_evidence():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rival, _ = create_entity_authoritative(
-        db, cid, rev, entity_type="faction", name="Rival Guild",
+    rival, _ = commit_world_write(
+        db, cid, rev, create_entity, entity_type="faction", name="Rival Guild",
         operation_id="op-rival",
     )
     rev += 1
-    rel, evt1 = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, evt1 = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign",
         provenance={"source": "dm_adjudication"},
         operation_id="op-rel-1",
     )
-    assert evt1.event_type == "world.relation_created"
     assert rel.version == 1
     assert rel.status == "active"
 
-    rel2, evt2 = supersede_relation_authoritative(
-        db, cid, rev + 1, rel.id,
+    rel2, evt2 = commit_world_write(
+        db, cid, rev + 1, supersede_relation, rel.id,
         object_entity_id=rival.id, epistemic_state="confirmed",
         provenance={"source": "dm_adjudication", "reason": "Mara defected"},
         operation_id="op-rel-2",
     )
-    assert evt2.event_type == "world.relation_superseded"
     assert rel2.version == 2
     assert rel2.status == "active"
     assert str(rel2.supersedes_id) == str(rel.id)
@@ -212,13 +199,13 @@ def test_false_to_retconned_supersession():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="false",
         visibility="campaign", operation_id="op-rel-false",
     )
-    fixed, _ = supersede_relation_authoritative(
-        db, cid, rev + 1, rel.id, epistemic_state="retconned",
+    fixed, _ = commit_world_write(
+        db, cid, rev + 1, supersede_relation, rel.id, epistemic_state="retconned",
         new_status="retracted",
         provenance={"source": "dm_adjudication", "reason": "continuity fix"},
         operation_id="op-rel-retcon",
@@ -228,13 +215,13 @@ def test_false_to_retconned_supersession():
     assert get_relation_strict(db, cid, rel.id).status == "superseded"
     assert list_relations(db, cid) == []
 
-    fact, _ = create_fact_authoritative(
-        db, cid, rev + 2, content="The bridge stands.",
+    fact, _ = commit_world_write(
+        db, cid, rev + 2, create_fact, content="The bridge stands.",
         epistemic_state="false", visibility="campaign",
         operation_id="op-fact-false",
     )
-    fixed_fact, _ = supersede_fact_authoritative(
-        db, cid, rev + 3, fact.id, epistemic_state="retconned",
+    fixed_fact, _ = commit_world_write(
+        db, cid, rev + 3, supersede_fact, fact.id, epistemic_state="retconned",
         new_status="retracted", operation_id="op-fact-retcon",
     )
     assert fixed_fact.epistemic_state == "retconned"
@@ -247,53 +234,53 @@ def test_false_to_retconned_supersession():
 def test_duplicate_retry_creates_no_duplicate_versions():
     Fac, cid, _owner = _setup()
     db = Fac()
-    mara, guild, rev = _entities(db, cid, 0)
-    rel, evt = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    mara, guild, _rev = _entities(db, cid, 0)
+    campaign = db.get(Campaign, cid)
+    rel, created = create_relation(
+        db, campaign, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="believed",
         visibility="campaign",
         operation_id="op-rel-dup", idempotency_key="rel-op-1",
     )
-    assert evt is not None
-    dup, evt2 = create_relation_authoritative(
-        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="works_for",
+    assert created is True
+    dup, created_again = create_relation(
+        db, campaign, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign",
         operation_id="op-rel-dup", idempotency_key="rel-op-1",
     )
     assert str(dup.id) == str(rel.id)
     assert dup.epistemic_state == "believed"  # original preserved
-    assert evt2 is None
+    assert created_again is False
     assert len(list_relations(db, cid, include_history=True)) == 1
-    assert db.get(Campaign, cid).revision == rev + 1  # no extra bump
 
-    fact, fevt = create_fact_authoritative(
-        db, cid, rev + 1, content="The vault is sealed.",
+    fact, created = create_fact(
+        db, campaign, content="The vault is sealed.",
         epistemic_state="suspected", visibility="campaign",
         operation_id="op-fact-dup", idempotency_key="fact-op-1",
     )
-    assert fevt is not None
-    fact_dup, fevt2 = create_fact_authoritative(
-        db, cid, rev + 2, content="The vault is sealed (retry).",
+    assert created is True
+    fact_dup, created_again = create_fact(
+        db, campaign, content="The vault is sealed (retry).",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-fact-dup", idempotency_key="fact-op-1",
     )
     assert str(fact_dup.id) == str(fact.id)
-    assert fevt2 is None
+    assert created_again is False
     assert len(list_facts(db, cid, include_history=True)) == 1
 
     # Duplicate supersede retry is equally safe.
-    rel2, sevt = supersede_relation_authoritative(
-        db, cid, rev + 2, rel.id, epistemic_state="confirmed",
+    rel2, created = supersede_relation(
+        db, campaign, rel.id, epistemic_state="confirmed",
         operation_id="op-rel-sup", idempotency_key="rel-sup-1",
     )
-    assert sevt is not None
-    rel2_dup, sevt2 = supersede_relation_authoritative(
-        db, cid, rev + 3, rel.id, epistemic_state="suspected",
+    assert created is True
+    rel2_dup, created_again = supersede_relation(
+        db, campaign, rel.id, epistemic_state="suspected",
         operation_id="op-rel-sup", idempotency_key="rel-sup-1",
     )
     assert str(rel2_dup.id) == str(rel2.id)
-    assert sevt2 is None
+    assert created_again is False
     assert len(list_relations(db, cid, include_history=True)) == 2
 
 
@@ -303,15 +290,15 @@ def test_failed_supersede_leaves_prior_active_truth_intact():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign", operation_id="op-rel-ok",
     )
     bogus = uuid.uuid4()
     with pytest.raises(ValueError):
-        supersede_relation_authoritative(
-            db, cid, rev + 1, rel.id, object_entity_id=bogus,
+        commit_world_write(
+            db, cid, rev + 1, supersede_relation, rel.id, object_entity_id=bogus,
             operation_id="op-rel-bad",
         )
     db.rollback()
@@ -330,19 +317,19 @@ def test_conflicting_identity_reference_fails_closed():
     other_camp = Campaign(id=uuid.uuid4(), owner_id=owner, name="Other", revision=0)
     db.add(other_camp)
     db.flush()
-    outsider, _ = create_entity_authoritative(
-        db, other_camp.id, 0, entity_type="npc", name="Outsider",
+    outsider, _ = commit_world_write(
+        db, other_camp.id, 0, create_entity, entity_type="npc", name="Outsider",
         operation_id="op-outsider",
     )
     with pytest.raises(ValueError):
-        create_relation_inline(
+        create_relation(
             db, db.get(Campaign, cid),
             subject_entity_id=mara.id, relation_type="works_for",
             object_entity_id=outsider.id, operation_id="op-bad-ref",
         )
     db.rollback()
     with pytest.raises(ValueError):
-        create_fact_inline(
+        create_fact(
             db, db.get(Campaign, cid), content="Outsider did it.",
             entity_refs=[outsider.id], operation_id="op-bad-fact-ref",
         )
@@ -355,17 +342,17 @@ def test_superseding_non_active_record_fails():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, operation_id="op-r1",
     )
-    supersede_relation_inline(
+    supersede_relation(
         db, db.get(Campaign, cid), rel.id, epistemic_state="suspected",
         operation_id="op-r2",
     )
     db.commit()
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel.id, epistemic_state="confirmed",
             operation_id="op-r3",
         )
@@ -377,28 +364,22 @@ def test_lookup_by_canonical_entity_and_source_refs():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, rel_evt = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, rel_evt = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, epistemic_state="confirmed",
         visibility="campaign", operation_id="op-rel-src",
     )
-    fact, fact_evt = create_fact_authoritative(
-        db, cid, rev + 1, content="Mara serves the Guild.",
+    fact, fact_evt = commit_world_write(
+        db, cid, rev + 1, create_fact, content="Mara serves the Guild.",
         entity_refs=[mara.id, guild.id], epistemic_state="confirmed",
         visibility="campaign",
         source_event_id=rel_evt.id,
         operation_id="op-fact-src",
     )
     assert fact.source_event_id == rel_evt.id
-    # By canonical entity, either side of a relation.
-    assert [str(r.id) for r in list_relations_for_entity(db, cid, mara.id)] == [str(rel.id)]
-    assert [str(r.id) for r in list_relations_for_entity(db, cid, guild.id)] == [str(rel.id)]
     assert [str(r.id) for r in list_relations(db, cid, subject_entity_id=mara.id)] == [str(rel.id)]
     # Facts referencing an entity resolve through the join table.
     assert [str(f.id) for f in list_facts(db, cid, entity_id=guild.id)] == [str(fact.id)]
-    # By source domain event.
-    by_event = list_records_for_source_event(db, cid, rel_evt.id)
-    assert [str(f.id) for f in by_event["facts"]] == [str(fact.id)]
     # Facts/relations record their source turn/attempt (real rows).
     thread = get_or_create_campaign_thread(db, cid, created_by=_owner)
     db.commit()
@@ -409,8 +390,8 @@ def test_lookup_by_canonical_entity_and_source_refs():
     )
     db.commit()
     src_turn, src_attempt = coordinate_turn(db, cid, src_tid)
-    fact2, _ = create_fact_authoritative(
-        db, cid, rev + 2, content="Turn-sourced rumor.",
+    fact2, _ = commit_world_write(
+        db, cid, rev + 2, create_fact, content="Turn-sourced rumor.",
         source_turn_id=src_turn.id, source_attempt_id=src_attempt.id,
         operation_id="op-fact-turn",
     )
@@ -418,8 +399,8 @@ def test_lookup_by_canonical_entity_and_source_refs():
     assert [str(f.id) for f in by_turn["facts"]] == [str(fact2.id)]
     # Unknown source event fails closed.
     with pytest.raises(ValueError):
-        create_fact_authoritative(
-            db, cid, rev + 3, content="Bogus provenance.",
+        commit_world_write(
+            db, cid, rev + 3, create_fact, content="Bogus provenance.",
             source_event_id=uuid.uuid4(), operation_id="op-fact-bogus",
         )
     db.rollback()
@@ -472,28 +453,28 @@ def test_source_turn_attempt_refs_fail_closed():
 
     # Nonexistent turn fails closed.
     with pytest.raises(ValueError):
-        create_fact_inline(
+        create_fact(
             db, campaign, content="Ghost source.",
             source_turn_id=uuid.uuid4(), operation_id="op-ghost-turn",
         )
     db.rollback()
     # Cross-campaign turn fails closed.
     with pytest.raises(ValueError):
-        create_fact_inline(
+        create_fact(
             db, db.get(Campaign, cid), content="Foreign source.",
             source_turn_id=foreign_turn.id, operation_id="op-foreign-turn",
         )
     db.rollback()
     # Mismatched attempt/turn pair fails closed.
     with pytest.raises(ValueError):
-        create_fact_inline(
+        create_fact(
             db, db.get(Campaign, cid), content="Mismatched source.",
             source_turn_id=turn1.id, source_attempt_id=attempt2.id,
             operation_id="op-mismatch",
         )
     db.rollback()
     # Matched pair succeeds.
-    fact, created = create_fact_inline(
+    fact, created = create_fact(
         db, db.get(Campaign, cid), content="Sourced rumor.",
         source_turn_id=turn1.id, source_attempt_id=attempt1.id,
         operation_id="op-matched",
@@ -506,18 +487,18 @@ def test_source_turn_attempt_refs_fail_closed():
     # Supersession validates the post-inheritance pair: re-pointing only the
     # turn inherits the old attempt (and vice versa) — both fail closed.
     with pytest.raises(ValueError):
-        supersede_fact_inline(
+        supersede_fact(
             db, db.get(Campaign, cid), fact.id, source_turn_id=turn2.id,
             operation_id="op-half-turn",
         )
     db.rollback()
     with pytest.raises(ValueError):
-        supersede_fact_inline(
+        supersede_fact(
             db, db.get(Campaign, cid), fact.id, source_attempt_id=attempt2.id,
             operation_id="op-half-attempt",
         )
     db.rollback()
-    new_fact, fcreated = supersede_fact_inline(
+    new_fact, fcreated = supersede_fact(
         db, db.get(Campaign, cid), fact.id,
         source_turn_id=turn2.id, source_attempt_id=attempt2.id,
         operation_id="op-full-repoint",
@@ -529,25 +510,25 @@ def test_source_turn_attempt_refs_fail_closed():
 
     # Same rule for relations.
     mara, _, rrev = _entities(db, cid, int(db.get(Campaign, cid).revision))
-    rel, _ = create_relation_authoritative(
-        db, cid, rrev,
+    rel, _ = commit_world_write(
+        db, cid, rrev, create_relation,
         subject_entity_id=mara.id, relation_type="knows",
         object_label="someone", source_turn_id=turn1.id,
         source_attempt_id=attempt1.id, operation_id="op-r-src",
     )
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel.id, source_turn_id=turn2.id,
             operation_id="op-r-half-turn",
         )
     db.rollback()
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel.id, source_attempt_id=attempt2.id,
             operation_id="op-r-half-attempt",
         )
     db.rollback()
-    new_rel, rcreated = supersede_relation_inline(
+    new_rel, rcreated = supersede_relation(
         db, db.get(Campaign, cid), rel.id,
         source_turn_id=turn2.id, source_attempt_id=attempt2.id,
         operation_id="op-r-full-repoint",
@@ -570,26 +551,23 @@ def test_restricted_records_filtered_for_ordinary_member():
     assert is_world_authority(campaign, owner) is True
     assert is_world_authority(campaign, member) is False
     mara, guild, rev = _entities(db, cid, 0)
-    hidden_rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="spies_for",
+    hidden_rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="spies_for",
         object_entity_id=guild.id, visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-hidden-rel",
     )
     # Fail-closed default: unmarked assertions stay restricted.
-    default_rel, _ = create_relation_authoritative(
-        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="owes",
+    default_rel, _ = commit_world_write(
+        db, cid, rev + 1, create_relation, subject_entity_id=mara.id, relation_type="owes",
         object_label="a debt", operation_id="op-default-rel",
     )
     assert default_rel.visibility == "dm_only"
-    open_fact, _ = create_fact_authoritative(
-        db, cid, rev + 2, content="The market opens at dawn.",
+    open_fact, _ = commit_world_write(
+        db, cid, rev + 2, create_fact, content="The market opens at dawn.",
         visibility="campaign", operation_id="op-open-fact",
     )
-    assert relation_visible_to_viewer(hidden_rel, True) is True
-    assert relation_visible_to_viewer(hidden_rel, False) is False
-    assert [str(r.id) for r in filter_relations_for_viewer(list_relations(db, cid, include_history=True), False)] == []
-    assert [str(f.id) for f in filter_facts_for_viewer(list_facts(db, cid), False)] == [str(open_fact.id)]
-    assert fact_visible_to_viewer(open_fact, False) is True
+    assert hidden_rel.visibility == "dm_only"
+    assert open_fact.visibility == "campaign"
 
 
 # ── staged effects + post-turn atomicity ────────────────────────────────────
@@ -733,7 +711,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
     db = Fac()
     mara, guild, _rev = _entities(db, cid, 0)
     campaign = db.get(Campaign, cid)
-    winner, created = create_fact_inline(
+    winner, created = create_fact(
         db, campaign, content="Mara serves the Guild.",
         entity_refs=[mara.id], epistemic_state="confirmed",
         visibility="campaign", idempotency_key="fact-race-1",
@@ -754,7 +732,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
         return real_find(db_, cid_, key_)
 
     with mock.patch.object(knowledge, "_find_fact_by_idempotency", side_effect=flaky_find):
-        loser, created2 = create_fact_inline(
+        loser, created2 = create_fact(
             db, db.get(Campaign, cid), content="Guild owns Mara (loser).",
             entity_refs=[guild.id], epistemic_state="suspected",
             visibility="campaign", idempotency_key="fact-race-1",
@@ -776,18 +754,18 @@ def test_inline_supersede_retry_after_commit_returns_existing_version():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, operation_id="op-r1",
     )
-    new, created = supersede_relation_inline(
+    new, created = supersede_relation(
         db, db.get(Campaign, cid), rel.id, epistemic_state="confirmed",
         operation_id="op-r-sup",
     )
     assert created is True
     db.commit()
     # Exact retry after the prior flipped to superseded: idempotent, no raise.
-    same, created2 = supersede_relation_inline(
+    same, created2 = supersede_relation(
         db, db.get(Campaign, cid), rel.id, epistemic_state="confirmed",
         operation_id="op-r-sup",
     )
@@ -795,17 +773,17 @@ def test_inline_supersede_retry_after_commit_returns_existing_version():
     assert str(same.id) == str(new.id)
     db.commit()
 
-    fact, _ = create_fact_authoritative(
-        db, cid, rev + 1, content="The vault is sealed.",
+    fact, _ = commit_world_write(
+        db, cid, rev + 1, create_fact, content="The vault is sealed.",
         operation_id="op-f1",
     )
-    new_fact, fcreated = supersede_fact_inline(
+    new_fact, fcreated = supersede_fact(
         db, db.get(Campaign, cid), fact.id, epistemic_state="confirmed",
         operation_id="op-f-sup",
     )
     assert fcreated is True
     db.commit()
-    same_fact, fcreated2 = supersede_fact_inline(
+    same_fact, fcreated2 = supersede_fact(
         db, db.get(Campaign, cid), fact.id, epistemic_state="confirmed",
         operation_id="op-f-sup",
     )
@@ -818,22 +796,22 @@ def test_supersede_idempotency_key_collision_fails_closed():
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
     campaign = db.get(Campaign, cid)
-    rel_a, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel_a, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, operation_id="op-ra",
     )
-    rel_b, _ = create_relation_authoritative(
-        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="owes",
+    rel_b, _ = commit_world_write(
+        db, cid, rev + 1, create_relation, subject_entity_id=mara.id, relation_type="owes",
         object_label="a debt", operation_id="op-rb",
     )
-    supersede_relation_inline(
+    supersede_relation(
         db, campaign, rel_a.id, epistemic_state="confirmed",
         operation_id="op-shared-key",
     )
     db.commit()
     # Same key reused against a DIFFERENT prior: fail closed, not mislinked.
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel_b.id, epistemic_state="confirmed",
             operation_id="op-shared-key",
         )
@@ -845,22 +823,22 @@ def test_new_version_status_superseded_is_rejected():
     Fac, cid, _owner = _setup()
     db = Fac()
     mara, guild, rev = _entities(db, cid, 0)
-    rel, _ = create_relation_authoritative(
-        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, operation_id="op-r1",
     )
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel.id, new_status="superseded",
             operation_id="op-r-bad",
         )
     db.rollback()
-    fact, _ = create_fact_authoritative(
-        db, cid, rev + 1, content="The vault is sealed.",
+    fact, _ = commit_world_write(
+        db, cid, rev + 1, create_fact, content="The vault is sealed.",
         operation_id="op-f1",
     )
     with pytest.raises(ValueError):
-        supersede_fact_inline(
+        supersede_fact(
             db, db.get(Campaign, cid), fact.id, new_status="superseded",
             operation_id="op-f-bad",
         )
@@ -877,14 +855,14 @@ def test_overlong_object_label_rejected_not_truncated():
     campaign = db.get(Campaign, cid)
     long_label = "x" * 257
     with pytest.raises(ValueError):
-        create_relation_inline(
+        create_relation(
             db, campaign, subject_entity_id=mara.id, relation_type="owes",
             object_label=long_label, operation_id="op-long",
         )
     db.rollback()
     # 256-char boundary is accepted verbatim.
     ok_label = "y" * 256
-    rel, created = create_relation_inline(
+    rel, created = create_relation(
         db, db.get(Campaign, cid), subject_entity_id=mara.id,
         relation_type="owes", object_label=ok_label, operation_id="op-ok",
     )
@@ -892,7 +870,7 @@ def test_overlong_object_label_rejected_not_truncated():
     assert rel.object_label == ok_label
     db.commit()
     with pytest.raises(ValueError):
-        supersede_relation_inline(
+        supersede_relation(
             db, db.get(Campaign, cid), rel.id, object_label=long_label,
             operation_id="op-long-sup",
         )
@@ -1172,26 +1150,26 @@ def test_restricted_rows_do_not_mask_visible_rows_under_limit():
     # Hidden rows sort before the visible ones (created first).
     cur = rev
     for i in range(3):
-        create_relation_authoritative(
-            db, cid, cur, subject_entity_id=mara.id,
+        commit_world_write(
+            db, cid, cur, create_relation, subject_entity_id=mara.id,
             relation_type=f"hidden_rel_{i}", object_label=f"secret {i}",
             visibility="dm_only", operation_id=f"op-hidden-rel-{i}",
         )
         cur += 1
-        create_fact_authoritative(
-            db, cid, cur, content=f"Secret {i}.",
+        commit_world_write(
+            db, cid, cur, create_fact, content=f"Secret {i}.",
             visibility="dm_only", operation_id=f"op-hidden-fact-{i}",
         )
         cur += 1
     # One visible row of each kind, last in created_at order.
-    rel, _ = create_relation_authoritative(
-        db, cid, cur, subject_entity_id=mara.id, relation_type="works_for",
+    rel, _ = commit_world_write(
+        db, cid, cur, create_relation, subject_entity_id=mara.id, relation_type="works_for",
         object_entity_id=guild.id, visibility="campaign",
         operation_id="op-open-rel",
     )
     cur += 1
-    fact, _ = create_fact_authoritative(
-        db, cid, cur, content="The market opens at dawn.",
+    fact, _ = commit_world_write(
+        db, cid, cur, create_fact, content="The market opens at dawn.",
         visibility="campaign", operation_id="op-open-fact",
     )
     # Member-equivalent query: hidden rows must not consume the window —
@@ -1214,29 +1192,29 @@ def test_widening_supersession_drops_restricted_metadata():
         "details": {"dm_note": "Guild is broke."},
         "grants": {"dm_only_flag": True},
     }
-    fact, _ = create_fact_authoritative(
-        db, cid, rev, content="Mara guards the bridge.",
+    fact, _ = commit_world_write(
+        db, cid, rev, create_fact, content="Mara guards the bridge.",
         entity_refs=[mara.id], epistemic_state="false",
         visibility="dm_only", operation_id="op-f-secret",
         **secrets,
     )
-    rel, _ = create_relation_authoritative(
-        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="spies_for",
+    rel, _ = commit_world_write(
+        db, cid, rev + 1, create_relation, subject_entity_id=mara.id, relation_type="spies_for",
         object_entity_id=guild.id, visibility="dm_only",
         operation_id="op-r-secret", **secrets,
     )
     # Widen to member-visible without explicit metadata: successor keeps
     # only the record itself, never the prior DM-only context.
-    open_fact, _ = supersede_fact_authoritative(
-        db, cid, rev + 2, fact.id, content="Mara guards the bridge.",
+    open_fact, _ = commit_world_write(
+        db, cid, rev + 2, supersede_fact, fact.id, content="Mara guards the bridge.",
         epistemic_state="believed", visibility="campaign",
         operation_id="op-f-open",
     )
     assert open_fact.provenance == {}
     assert open_fact.details == {}
     assert open_fact.grants == {}
-    open_rel, _ = supersede_relation_authoritative(
-        db, cid, rev + 3, rel.id, epistemic_state="believed",
+    open_rel, _ = commit_world_write(
+        db, cid, rev + 3, supersede_relation, rel.id, epistemic_state="believed",
         visibility="campaign", operation_id="op-r-open",
     )
     assert open_rel.provenance == {}
@@ -1244,143 +1222,17 @@ def test_widening_supersession_drops_restricted_metadata():
     # Prior history still preserves the secrets for the DM.
     assert get_relation_strict(db, cid, rel.id).provenance["dm_private_context"].startswith("Mara lies")
     # Explicitly supplied metadata on a widening supersession is kept.
-    open_fact2, _ = supersede_fact_authoritative(
-        db, cid, rev + 4, open_fact.id, epistemic_state="confirmed",
+    open_fact2, _ = commit_world_write(
+        db, cid, rev + 4, supersede_fact, open_fact.id, epistemic_state="confirmed",
         provenance={"source": "dm_adjudication", "note": "party witnessed it"},
         operation_id="op-f-open2",
     )
     assert open_fact2.provenance == {"source": "dm_adjudication", "note": "party witnessed it"}
     # Non-widening supersession still inherits.
-    still_open, _ = supersede_fact_authoritative(
-        db, cid, rev + 5, open_fact2.id,
+    still_open, _ = commit_world_write(
+        db, cid, rev + 5, supersede_fact, open_fact2.id,
         epistemic_state="confirmed", operation_id="op-f-same",
     )
     assert still_open.provenance == {"source": "dm_adjudication", "note": "party witnessed it"}
 
 
-@pytest.fixture
-def knowledge_api(monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from app.auth.service import TEST_USER_ID
-    from database import get_db
-    from main import app
-
-    eng = _engine()
-    Fac = sessionmaker(bind=eng, expire_on_commit=False)
-    owner = TEST_USER_ID
-    member = uuid.uuid4()
-    cid = uuid.uuid4()
-    db = Fac()
-    db.add(Profile(id=owner, email="owner@example.com"))
-    db.add(Profile(id=member, email="member@example.com"))
-    db.add(Campaign(id=cid, owner_id=owner, name="Knowledge campaign", revision=0))
-    db.flush()
-    db.add(CampaignMember(campaign_id=cid, user_id=owner, role="owner"))
-    db.add(CampaignMember(campaign_id=cid, user_id=member, role="player"))
-    db.commit()
-    db.close()
-
-    def override_db():
-        session = Fac()
-        try:
-            yield session
-        finally:
-            session.close()
-
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, TEST_USER_ID),
-    )
-    app.dependency_overrides[get_db] = override_db
-    try:
-        yield TestClient(app), cid, owner, member
-    finally:
-        app.dependency_overrides.clear()
-
-
-def test_knowledge_reads_are_viewer_aware_over_http(knowledge_api, monkeypatch):
-    client, cid, owner, member = knowledge_api
-    base = f"/api/campaigns/{cid}/world"
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 0, "entity_type": "npc", "name": "Mara",
-        "operation_id": "op-mara",
-    }, headers={"Idempotency-Key": "op-mara"})
-    assert r.status_code == 200, r.text
-    mara_id = r.json()["entity"]["id"]
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 1, "entity_type": "faction", "name": "Guild",
-        "operation_id": "op-guild",
-    }, headers={"Idempotency-Key": "op-guild"})
-    assert r.status_code == 200, r.text
-    guild_id = r.json()["entity"]["id"]
-    # Public relation + restricted fact.
-    r = client.post(f"{base}/relations", json={
-        "expected_revision": 2, "subject_entity_id": mara_id,
-        "relation_type": "works_for", "object_entity_id": guild_id,
-        "epistemic_state": "confirmed", "visibility": "campaign",
-        "operation_id": "op-rel",
-    }, headers={"Idempotency-Key": "op-rel"})
-    assert r.status_code == 200, r.text
-    rel_id = r.json()["relation"]["id"]
-    r = client.post(f"{base}/facts", json={
-        "expected_revision": 3, "content": "Mara lies to the party.",
-        "entity_refs": [mara_id], "epistemic_state": "false",
-        "visibility": "dm_only", "operation_id": "op-fact",
-    }, headers={"Idempotency-Key": "op-fact"})
-    assert r.status_code == 200, r.text
-    fact_id = r.json()["fact"]["id"]
-    # Owner sees everything.
-    assert len(client.get(f"{base}/relations").json()["relations"]) == 1
-    assert len(client.get(f"{base}/facts").json()["facts"]) == 1
-    # Ordinary member: public relation visible, dm_only fact hidden as 404.
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, member),
-    )
-    assert [x["id"] for x in client.get(f"{base}/relations").json()["relations"]] == [rel_id]
-    assert client.get(f"{base}/facts").json()["facts"] == []
-    assert client.get(f"{base}/facts/{fact_id}").status_code == 404
-    assert client.get(f"{base}/relations/{rel_id}").status_code == 200
-
-
-def test_widened_successor_hides_prior_secrets_from_member_over_http(knowledge_api, monkeypatch):
-    client, cid, owner, member = knowledge_api
-    base = f"/api/campaigns/{cid}/world"
-    r = client.post(f"{base}/entities", json={
-        "expected_revision": 0, "entity_type": "npc", "name": "Mara",
-        "operation_id": "op-mara",
-    }, headers={"Idempotency-Key": "op-mara"})
-    assert r.status_code == 200, r.text
-    mara_id = r.json()["entity"]["id"]
-    # DM-only fact carrying secret provenance/details.
-    r = client.post(f"{base}/facts", json={
-        "expected_revision": 1, "content": "Mara guards the bridge.",
-        "entity_refs": [mara_id], "epistemic_state": "false",
-        "visibility": "dm_only",
-        "provenance": {"source": "npc_utterance", "dm_private_context": "Mara lies about the retreat."},
-        "details": {"dm_note": "s3cr3t-note"},
-        "operation_id": "op-fact-secret",
-    }, headers={"Idempotency-Key": "op-fact-secret"})
-    assert r.status_code == 200, r.text
-    fact_id = r.json()["fact"]["id"]
-    # Owner widens to campaign-visible without supplying metadata.
-    r = client.post(f"{base}/facts/{fact_id}/supersede", json={
-        "expected_revision": 2, "epistemic_state": "believed",
-        "visibility": "campaign", "operation_id": "op-fact-open",
-    }, headers={"Idempotency-Key": "op-fact-open"})
-    assert r.status_code == 200, r.text
-    open_id = r.json()["fact"]["id"]
-    # Ordinary member sees the record but none of the prior secrets.
-    monkeypatch.setattr(
-        "app.world.router.resolve_profile",
-        lambda req, db: db.get(Profile, member),
-    )
-    facts = client.get(f"{base}/facts").json()["facts"]
-    assert [f["id"] for f in facts] == [open_id]
-    single = client.get(f"{base}/facts/{open_id}").json()["fact"]
-    blob = str(single)
-    assert "retreat" not in blob
-    assert "s3cr3t-note" not in blob
-    assert single["provenance"] == {}
-    assert single["details"] == {}

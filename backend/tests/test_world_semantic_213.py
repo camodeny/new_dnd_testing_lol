@@ -28,20 +28,20 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.context import ContextAudience  # noqa: E402
 from app.dm.evidence import execute_evidence_round, validate_evidence_requests  # noqa: E402
 from app.world import semantic  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
-    create_fact_authoritative,
-    create_relation_authoritative,
+    create_fact,
+    create_relation,
     list_facts,
     list_relations,
-    supersede_fact_authoritative,
+    supersede_fact,
 )
 from app.world.retrieval import (  # noqa: E402
     STATUS_DEFER,
     STATUS_OK,
-    apply_rerank,
     lookup_fact,
 )
 from app.world.semantic import (  # noqa: E402
@@ -50,16 +50,17 @@ from app.world.semantic import (  # noqa: E402
     STATUS_NO_MATCH as SEM_NO_MATCH,
     STATUS_OK as SEM_OK,
     build_source_text,
-    get_semantic_stats,
     index_source_record,
     mark_stale,
+    note_authoritative_write,
+    note_supersession,
     note_turn_committed,
     request_semantic_index,
     resolve_embedding_model,
     run_semantic_index_sweep,
     semantic_search,
 )
-from app.world.service import create_entity_authoritative  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldEmbedding  # noqa: E402
@@ -93,9 +94,10 @@ def _setup():
 
 def _seed_fact(db, cid, rev=0, content="Asha hides the key in Cinder Keep.",
                visibility="campaign", operation_id="op-sem-fact"):
-    fact, _ = create_fact_authoritative(
-        db, cid, rev, content=content, epistemic_state="confirmed",
+    fact, event = commit_world_write(
+        db, cid, rev, create_fact, content=content, epistemic_state="confirmed",
         visibility=visibility, operation_id=operation_id)
+    note_authoritative_write(db, cid, [("world_fact", fact.id), ("domain_event", event.id)])
     return fact
 
 
@@ -143,7 +145,7 @@ def test_embedding_model_version_change_does_not_corrupt_old_rows():
     assert hit_v1.embedding_version == "1"
 
 
-def test_writer_hook_stages_async_index_without_breaking_canon():
+def test_write_hook_stages_async_index_without_breaking_canon():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
     fact = _seed_fact(db, cid, operation_id="op-sem-hook")
@@ -272,11 +274,12 @@ def test_superseded_source_is_retired_and_replaced():
     index_source_record(db, cid, "world_fact", fact.id)
     old_query = build_source_text(db, "world_fact", fact)
 
-    fixed, _ = supersede_fact_authoritative(
-        db, cid, 1, fact.id, content="The bridge has fallen.",
+    fixed, _ = commit_world_write(
+        db, cid, 1, supersede_fact, fact.id, content="The bridge has fallen.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-supersede")
-    # Writer hook retired the prior source's vectors.
+    note_supersession(db, cid, ("world_fact", fact.id), ("world_fact", fixed.id))
+    # Supersession hook retired the prior source's vectors.
     prior_rows = db.execute(
         __import__("sqlalchemy").select(WorldEmbedding).where(
             WorldEmbedding.source_id == fact.id)
@@ -298,8 +301,8 @@ def test_superseded_source_is_retired_and_replaced():
 def test_version_mismatch_detected_at_search_time():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mara",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Mara",
         visibility="campaign", operation_id="op-sem-ent")
     row = index_source_record(db, cid, "world_entity", entity.id)
     assert row.status == "active"
@@ -330,8 +333,8 @@ def test_search_is_campaign_scoped():
 
     fact = _seed_fact(db, cid, content="Campaign A battle plan.")
     index_source_record(db, cid, "world_fact", fact.id)
-    other_fact, _ = create_fact_authoritative(
-        db, other.id, 0, content="Campaign B secret ritual.",
+    other_fact, _ = commit_world_write(
+        db, other.id, 0, create_fact, content="Campaign B secret ritual.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-other")
     index_source_record(db, other.id, "world_fact", other_fact.id)
@@ -391,46 +394,6 @@ def test_empty_index_defers_to_direct_retrieval():
     assert direct.status == STATUS_OK and len(direct.packets) == 1
 
 
-def test_rerank_only_reorders_authorized_candidates():
-    Fac, cid, owner, _player, _ = _setup()
-    db = Fac()
-    first = _seed_fact(db, cid, content="First chronicle entry.",
-                       operation_id="op-sem-r1")
-    second = _seed_fact(db, cid, rev=1, content="Second chronicle entry.",
-                        operation_id="op-sem-r2")
-    for fact in (first, second):
-        index_source_record(db, cid, "world_fact", fact.id)
-    outcome = semantic_search(db, cid, build_source_text(db, "world_fact", first),
-                              owner, dm_internal=True, min_similarity=-1.0,
-                              limit=10)
-    assert len(outcome.packets) == 2
-    by_id = {f"{p.source_type}:{p.source_id}": p for p in outcome.packets}
-
-    # Invented candidate IDs are rejected; deterministic order is kept.
-    rejected = apply_rerank(
-        list(outcome.packets), order=["world_fact:00000000-0000-0000-0000-000000000000"])
-    assert rejected.fallback is True
-    assert rejected.reranked is False
-    assert [p.source_id for p in rejected.packets] == [p.source_id for p in outcome.packets]
-    # Provenance untouched by the rejected rerank.
-    assert rejected.packets[0].provenance["retrieved_by"] == "world_retrieval_212"
-
-    # A valid subset order reorders presentation only.
-    target = f"world_fact:{second.id}"
-    reordered = apply_rerank(list(outcome.packets), order=[target])
-    assert reordered.reranked is True
-    assert reordered.packets[0].source_id == str(second.id)
-    assert reordered.packets[0].retrieval_score == by_id[target].retrieval_score
-
-    # Reranker failure falls back to similarity order, never loses evidence.
-    def _boom(_candidates):
-        raise RuntimeError("reranker down")
-
-    fell_back = apply_rerank(list(outcome.packets), reranker=_boom)
-    assert fell_back.fallback is True
-    assert len(fell_back.packets) == 2
-
-
 def test_embedding_failure_falls_back_to_direct_retrieval(monkeypatch):
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
@@ -448,22 +411,6 @@ def test_embedding_failure_falls_back_to_direct_retrieval(monkeypatch):
     assert direct.status == STATUS_OK
 
 
-def test_semantic_stats_observability():
-    Fac, cid, _owner, _player, _ = _setup()
-    db = Fac()
-    fact = _seed_fact(db, cid)
-    index_source_record(db, cid, "world_fact", fact.id)
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == 1
-    # The authoritative write also enqueued its domain event (stale
-    # placeholder awaiting async index) — derived work stays observable.
-    assert stats["stale"] == 1
-    assert stats["total"] == 2
-    mark_stale(db, cid, "world_fact", fact.id)
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == 0 and stats["stale"] == 2
-
-
 def test_all_supported_source_types_index_and_resolve():
     from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn
@@ -471,12 +418,12 @@ def test_all_supported_source_types_index_and_resolve():
 
     Fac, cid, owner, player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Asha",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Asha",
         summary="Asha guards Cinder Keep.", visibility="campaign",
         operation_id="op-sem-all-ent")
-    rel, _ = create_relation_authoritative(
-        db, cid, 1, subject_entity_id=entity.id, relation_type="guards",
+    rel, _ = commit_world_write(
+        db, cid, 1, create_relation, subject_entity_id=entity.id, relation_type="guards",
         object_label="Cinder Keep", epistemic_state="confirmed",
         visibility="campaign", operation_id="op-sem-all-rel")
     fact = _seed_fact(db, cid, rev=2, operation_id="op-sem-all-fact")
@@ -495,9 +442,9 @@ def test_all_supported_source_types_index_and_resolve():
                ("source_turn", turn.id), ("scene", cid)]
     for source_type, source_id in targets:
         if source_type == "scene":
-            from app.world.service import set_scene_authoritative
-            set_scene_authoritative(
-                db, cid, 3, location_name="Cinder Keep",
+            from app.world.service import apply_scene_update
+            commit_world_write(
+                db, cid, 3, apply_scene_update, location_name="Cinder Keep",
                 operation_id="op-sem-all-scene")
         row = index_source_record(db, cid, source_type, source_id)
         assert row is not None and row.status == "active", source_type
@@ -510,9 +457,6 @@ def test_all_supported_source_types_index_and_resolve():
         outcome = semantic_search(db, cid, query, owner, dm_internal=True)
         assert outcome.status == SEM_OK, source_type
         assert outcome.packets[0].source_id == str(source_id), source_type
-
-    stats = get_semantic_stats(db, cid)
-    assert stats["active"] == len(targets)
 
 
 # ── #203 mediation integration ───────────────────────────────────────────────
@@ -712,11 +656,11 @@ def test_committed_turn_staged_effects_become_searchable():
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    entity, _ = create_entity_authoritative(
-        db, cid, 0, entity_type="npc", name="Mara",
+    entity, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="npc", name="Mara",
         visibility="campaign", operation_id="op-turn-ent")
-    guild, _ = create_entity_authoritative(
-        db, cid, 1, entity_type="faction", name="Guild",
+    guild, _ = commit_world_write(
+        db, cid, 1, create_entity, entity_type="faction", name="Guild",
         visibility="campaign", operation_id="op-turn-guild")
     thread = get_or_create_campaign_thread(db, cid, created_by=owner)
     db.commit()
@@ -769,34 +713,11 @@ def test_committed_turn_staged_effects_become_searchable():
     assert turn_outcome.packets[0].source_id == str(turn.id)
 
 
-def test_authoritative_write_enqueues_its_domain_event():
-    Fac, cid, _owner, _player, _ = _setup()
-    db = Fac()
-    fact, event = create_fact_authoritative(
-        db, cid, 0, content="The bridge has fallen.",
-        epistemic_state="confirmed", visibility="campaign",
-        operation_id="op-sem-evt")
-    assert event is not None
-    # The committing domain event is a declared semantic source: its async
-    # index placeholder exists alongside the record's.
-    rows = {str(r.source_id): r for r in db.execute(
-        select(WorldEmbedding).where(WorldEmbedding.campaign_id == cid)
-    ).scalars().all()}
-    assert str(fact.id) in rows
-    assert str(event.id) in rows
-    assert rows[str(event.id)].source_type == "domain_event"
-    # The sweep indexes the event under the authoritative seq version.
-    assert run_semantic_index_sweep(db)["failed"] == []
-    db.refresh(rows[str(event.id)])
-    assert rows[str(event.id)].status == "active"
-    assert rows[str(event.id)].source_version == f"seq{int(event.sequence)}"
-
-
 def test_domain_event_embedding_version_matches_evidence_packet():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    _fact, event = create_fact_authoritative(
-        db, cid, 0, content="The bridge has fallen.",
+    _fact, event = commit_world_write(
+        db, cid, 0, create_fact, content="The bridge has fallen.",
         epistemic_state="confirmed", visibility="campaign",
         operation_id="op-sem-evtver")
     row = index_source_record(db, cid, "domain_event", event.id)
@@ -811,12 +732,12 @@ def test_domain_event_embedding_version_matches_evidence_packet():
 
 
 def test_same_id_version_change_rebuilds_index():
-    from app.world.service import set_scene_authoritative
+    from app.world.service import apply_scene_update
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
-    scene, _ = set_scene_authoritative(
-        db, cid, 0, location_name="Cinder Keep",
+    scene, _ = commit_world_write(
+        db, cid, 0, apply_scene_update, location_name="Cinder Keep",
         operation_id="op-scene-1")
     assert scene is not None
     assert request_semantic_index(db, cid, "scene", cid) is not None
@@ -836,8 +757,8 @@ def test_same_id_version_change_rebuilds_index():
 
     # Same-ID source change: the scene row keeps its id, the version moves.
     rev1 = int(scene.revision)
-    scene2, _ = set_scene_authoritative(
-        db, cid, 1, location_name="Ember Gate",
+    scene2, _ = commit_world_write(
+        db, cid, 1, apply_scene_update, location_name="Ember Gate",
         operation_id="op-scene-2")
     assert scene2 is not None
     assert int(scene2.revision) == rev1 + 1

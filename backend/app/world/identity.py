@@ -407,18 +407,18 @@ def create_entity_after_resolution(
             raise ValueError(
                 f"new entity name {name!r} is already an alias of canonical identity {owner.id}"
             )
-    from app.world.service import create_entity_inline
+    from app.world.service import create_entity
     payload = dict(details or {})
     payload["identity_resolution"] = {
         "frame_id": frame.frame_id, "outcome": candidate.id,
         "state_revision": frame.state_revision,
     }
-    return create_entity_inline(db, campaign, entity_type=entity_type, name=name,
-                                summary=summary, details=payload,
-                                source_turn_id=source_turn_id,
-                                source_attempt_id=source_attempt_id,
-                                operation_id=operation_id,
-                                idempotency_key=idempotency_key)
+    return create_entity(db, campaign, entity_type=entity_type, name=name,
+                         summary=summary, details=payload,
+                         source_turn_id=source_turn_id,
+                         source_attempt_id=source_attempt_id,
+                         operation_id=operation_id,
+                         idempotency_key=idempotency_key)
 
 
 def serialize_identity_frame(frame: DecisionFrame) -> dict:
@@ -477,14 +477,3 @@ def rebuild_identity_frame(payload: dict) -> DecisionFrame:
     )
 
 
-def supersede_entity(db: Session, duplicate: WorldEntity, canonical: WorldEntity, *, provenance: dict) -> None:
-    """Auditable repair hook; callers must apply their stronger merge policy first."""
-    if duplicate.campaign_id != canonical.campaign_id or duplicate.id == canonical.id:
-        raise ValueError("merge identities must be distinct entities in one campaign")
-    duplicate.superseded_by_id = canonical.id
-    duplicate.status = "archived"
-    duplicate.revision = int(duplicate.revision or 1) + 1
-    details = dict(duplicate.details or {})
-    details["identity_supersession"] = {"canonical_id": str(canonical.id), "provenance": dict(provenance)}
-    duplicate.details = details
-    db.flush()

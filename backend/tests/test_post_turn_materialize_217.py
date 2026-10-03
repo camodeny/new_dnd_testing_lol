@@ -15,6 +15,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.decisions import DecisionService  # noqa: E402
 from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
@@ -30,11 +31,10 @@ from app.post_turn.materialize import (  # noqa: E402
 from app.post_turn.service import get_checkpoint, run_post_turn_range  # noqa: E402
 from app.world.identity import IDENTITY_QUESTION_ID  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
-    fact_visible_to_viewer,
     list_facts,
     list_relations,
 )
-from app.world.service import create_entity_inline  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignDomainEvent  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldEntity  # noqa: E402
@@ -172,7 +172,6 @@ def test_player_claim_and_npc_lie_stay_unconfirmed_and_private():
     lie = by_content["The informant lied; the vault is full."]
     assert lie.epistemic_state == "suspected"
     assert lie.visibility == "dm_only"
-    assert fact_visible_to_viewer(lie, False) is False
 
 
 # ── Duplicate identity routes through #214 ────────────────────────────────
@@ -180,7 +179,7 @@ def test_player_claim_and_npc_lie_stay_unconfirmed_and_private():
 def test_exact_alias_reuses_owner_without_duplicate():
     _F, db, c = _setup()
     from app.world.identity import add_alias
-    owner_entity, _ = create_entity_inline(
+    owner_entity, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-mira", idempotency_key="seed-mira",
     )
@@ -203,7 +202,7 @@ def test_exact_alias_reuses_owner_without_duplicate():
 
 def test_ambiguous_same_name_resolves_through_bounded_identity():
     _F, db, c = _setup()
-    existing, _ = create_entity_inline(
+    existing, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-mira", idempotency_key="seed-mira",
     )
@@ -223,7 +222,7 @@ def test_ambiguous_same_name_resolves_through_bounded_identity():
 
 def test_ambiguous_same_name_defers_without_decision_service():
     _F, db, c = _setup()
-    _existing, _ = create_entity_inline(
+    _existing, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-mira", idempotency_key="seed-mira",
     )
@@ -420,9 +419,9 @@ def test_normal_turn_record_world_event_materializes_fact():
 
 def test_committed_staged_fact_is_not_duplicated():
     """Effects already applied at turn commit are skipped, never recompiled."""
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     _F, db, c = _setup()
-    row, _ = create_fact_inline(
+    row, _ = create_fact(
         db, c, content="Committed at turn time.", epistemic_state="confirmed",
         visibility="campaign", operation_id="turn-commit",
         idempotency_key="turn-commit-fact",
@@ -447,15 +446,15 @@ def test_committed_staged_fact_is_not_duplicated():
 def test_knowledge_acquisition_hint_for_absent_learner():
     """One PC's discovery becomes that character's stance — never party-wide."""
     from app.world.epistemics import list_knowledge_for_subject
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     _F, db, c = _setup()
-    hero, _ = create_entity_inline(
+    hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",
         operation_id="seed", idempotency_key="seed-ash")
-    scout, _ = create_entity_inline(
+    scout, _ = create_entity(
         db, c, entity_type="character", name="Bram", visibility="campaign",
         operation_id="seed", idempotency_key="seed-bram")
-    fact, _ = create_fact_inline(
+    fact, _ = create_fact(
         db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
         visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
     db.flush()
@@ -494,14 +493,14 @@ def test_scene_projection_hint_updates_current_scene():
 
 def test_visibility_grant_hint_authorizes_human_access():
     from app.world.epistemics import has_active_grant
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     from models.campaigns import CampaignMember
     _F, db, c = _setup()
     reader = uuid.uuid4()
     db.add(Profile(id=reader, email="reader@x.com"))
     db.add(CampaignMember(campaign_id=c.id, user_id=reader))
     db.flush()
-    fact, _ = create_fact_inline(
+    fact, _ = create_fact(
         db, c, content="Secret map.", epistemic_state="confirmed",
         visibility="dm_only", operation_id="seed", idempotency_key="seed-map")
     db.flush()
@@ -590,7 +589,7 @@ def test_generated_widening_is_rejected_not_applied():
 # ── Round-2: bounded digest idempotency keys ──────────────────────────────
 
 def test_long_keys_apply_with_bounded_idempotency():
-    from app.world.knowledge import create_fact_inline  # noqa: F401
+    from app.world.knowledge import create_fact  # noqa: F401
     _F, db, c = _setup()
     long_key = "k" * 128
     event = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
@@ -720,7 +719,7 @@ def test_generated_entity_unsupported_is_not_created():
 
 def test_generated_entity_supported_still_passes_identity_gate():
     _F, db, c = _setup()
-    existing, _ = create_entity_inline(
+    existing, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-mira", idempotency_key="seed-mira")
     db.flush()
@@ -836,15 +835,14 @@ def test_two_npc_updates_same_range_both_apply():
 # ── Round-5: grants require real provenance ────────────────────────────────
 
 def test_supported_grant_with_missing_provenance_creates_nothing():
-    from app.world.epistemics import list_active_grants
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     from models.campaigns import CampaignMember
     _F, db, c = _setup()
     reader = uuid.uuid4()
     db.add(Profile(id=reader, email="reader@x.com"))
     db.add(CampaignMember(campaign_id=c.id, user_id=reader))
     db.flush()
-    fact, _ = create_fact_inline(
+    fact, _ = create_fact(
         db, c, content="Secret map.", epistemic_state="confirmed",
         visibility="dm_only", operation_id="seed", idempotency_key="seed-map")
     db.flush()
@@ -861,7 +859,9 @@ def test_supported_grant_with_missing_provenance_creates_nothing():
     )
     assert summary["rejected"] == 1
     assert summary["outcomes"][0]["reason"].startswith("invalid_provenance")
-    assert list_active_grants(db, c.id, "fact", fact.id) == []
+    from models.world import WorldVisibilityGrant
+    assert db.execute(select(WorldVisibilityGrant).where(
+        WorldVisibilityGrant.target_id == fact.id)).scalars().all() == []
 
 
 # ── Round-5: same-category writes follow committed chronology ──────────────
@@ -914,7 +914,7 @@ def test_promoted_keep_distinct_proposal_is_recognized():
     """A turn-promoted proposal (jit-keyed row) compiles to nothing."""
     from app.world.service import _stable_jit_key
     _F, db, c = _setup()
-    first, _ = create_entity_inline(
+    first, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed", idempotency_key="seed-mira-1")
     db.flush()
@@ -955,10 +955,10 @@ def test_promoted_keep_distinct_proposal_is_recognized():
 
 def test_hint_multi_name_match_defers_through_identity():
     _F, db, c = _setup()
-    create_entity_inline(
+    create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-1", idempotency_key="seed-mira-1")
-    create_entity_inline(
+    create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-2", idempotency_key="seed-mira-2")
     db.flush()
@@ -1002,7 +1002,7 @@ def test_adventure_completed_turn_materializes_record_event():
 def test_reuse_first_later_keep_distinct_stays_two():
     from models.dm import DmTurn, DmTurnAttempt
     _F, db, c = _setup()
-    first, _ = create_entity_inline(
+    first, _ = create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed", idempotency_key="seed-mira-1")
     db.flush()
@@ -1030,7 +1030,7 @@ def test_reuse_first_later_keep_distinct_stays_two():
         operation_id=f"turn-{turn_id}")
     # Turn 2 legitimately adds a KEEP_DISTINCT second Mira before
     # post-turn catches up with turn 1.
-    create_entity_inline(
+    create_entity(
         db, c, entity_type="npc", name="Mira", visibility="campaign",
         operation_id="seed-2", idempotency_key="seed-mira-2")
     db.flush()
@@ -1046,7 +1046,7 @@ def test_reuse_first_later_keep_distinct_stays_two():
 # ── Round-9: delayed ranges never clobber newer current state ───────────────
 
 def test_delayed_scene_hint_preserves_newer_committed_scene():
-    from app.world.service import apply_scene_update_inline, get_current_scene
+    from app.world.service import apply_scene_update, get_current_scene
     _F, db, c = _setup()
     old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
         {"category": "scene", "key": "old", "visibility": "campaign",
@@ -1054,7 +1054,7 @@ def test_delayed_scene_hint_preserves_newer_committed_scene():
     newer = _commit(db, c, payload={"n": 2})
     # A newer committed scene update lands before the old range runs.
     db.refresh(db.get(Campaign, c.id))
-    apply_scene_update_inline(
+    apply_scene_update(
         db, db.get(Campaign, c.id), new_revision=newer.sequence,
         fictional_time="dusk", operation_id="commit-newer")
     db.commit()
@@ -1069,10 +1069,21 @@ def test_delayed_scene_hint_preserves_newer_committed_scene():
     assert get_checkpoint(db, c.id, commit=False).processed_through_sequence == old.sequence
 
 
-# ── Round-10: authoritative writer paths also guard staleness ───────────────
+def _turn_at_current_revision(db, c):
+    """A committed turn whose commit lands at the next campaign sequence."""
+    from models.dm import DmTurn
 
-def test_delayed_npc_hint_preserves_authoritative_update():
-    from app.world.npcs import get_npc_state, update_npc_state_authoritative
+    turn_id = uuid.uuid4()
+    db.add(DmTurn(id=turn_id, campaign_id=c.id, thread_id="thread-1",
+                  source_revision=_rev(db, c), status="succeeded"))
+    db.flush()
+    return turn_id
+
+
+# ── Round-10: newer in-turn writes also guard staleness ─────────────────────
+
+def test_delayed_npc_hint_preserves_newer_update():
+    from app.world.npcs import get_npc_state, apply_npc_state
     _F, db, c = _setup()
     old = _commit(db, c, payload={"n": 1, "post_turn_materialize": [
         {"category": "entities", "key": "arn", "visibility": "campaign",
@@ -1082,13 +1093,13 @@ def test_delayed_npc_hint_preserves_authoritative_update():
     newer = _commit(db, c, payload={"n": 2})
     entity = db.execute(select(WorldEntity).where(
         WorldEntity.campaign_id == c.id, WorldEntity.name == "Arn")).scalars().first()
-    assert entity is None  # not yet materialized; create for the auth write
-    entity, _ = create_entity_inline(
+    assert entity is None  # not yet materialized; create for the newer write
+    entity, _ = create_entity(
         db, c, entity_type="npc", name="Arn", visibility="campaign",
         operation_id="seed-arn", idempotency_key="seed-arn")
     db.flush()
-    update_npc_state_authoritative(
-        db, c.id, entity.id, _rev(db, c),
+    commit_world_write(
+        db, c.id, _rev(db, c), apply_npc_state, entity.id,
         current_activity="Sounding the alarm.",
         provenance={"source": "world_api"}, source_event_id=newer.id,
         operation_id="auth-newer")
@@ -1103,17 +1114,17 @@ def test_delayed_npc_hint_preserves_authoritative_update():
     assert get_npc_state(db, c.id, entity.id).current_activity == "Sounding the alarm."
 
 
-def test_delayed_knowledge_hint_preserves_authoritative_stance():
+def test_delayed_knowledge_hint_preserves_newer_turn_stance():
     from app.world.epistemics import (
-        assert_knowledge_authoritative,
+        assert_knowledge,
         list_knowledge_for_subject,
     )
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     _F, db, c = _setup()
-    hero, _ = create_entity_inline(
+    hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",
         operation_id="seed", idempotency_key="seed-ash")
-    fact, _ = create_fact_inline(
+    fact, _ = create_fact(
         db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
         visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
     db.flush()
@@ -1124,12 +1135,13 @@ def test_delayed_knowledge_hint_preserves_authoritative_stance():
                   "knowledge_state": "suspects",
                   "acquisition_source": "explicit_disclosure"}}]})
     _commit(db, c, payload={"n": 2})
-    assert_knowledge_authoritative(
-        db, c.id, _rev(db, c), subject_kind="character",
+    commit_world_write(
+        db, c.id, _rev(db, c), assert_knowledge, subject_kind="character",
         subject_entity_id=hero.id, target_kind="fact",
         target_fact_id=fact.id, knowledge_state="knows",
         acquisition_source="explicit_disclosure", visibility="dm_only",
-        operation_id="auth-newer")
+        source_turn_id=_turn_at_current_revision(db, c),
+        operation_id="turn-newer")
     db.commit()
     out = run_post_turn_range(
         db, c.id, old.sequence, old.sequence,
@@ -1145,17 +1157,17 @@ def test_delayed_knowledge_hint_preserves_authoritative_stance():
 
 # ── Round-11: merged provenance never hides newer channels ─────────────────
 
-def test_materialized_then_authoritative_then_delayed_preserves_newer():
+def test_materialized_then_turn_then_delayed_preserves_newer():
     from app.world.epistemics import (
-        assert_knowledge_authoritative,
+        assert_knowledge,
         list_knowledge_for_subject,
     )
-    from app.world.knowledge import create_fact_inline
+    from app.world.knowledge import create_fact
     _F, db, c = _setup()
-    hero, _ = create_entity_inline(
+    hero, _ = create_entity(
         db, c, entity_type="character", name="Ash", visibility="campaign",
         operation_id="seed", idempotency_key="seed-ash")
-    fact, _ = create_fact_inline(
+    fact, _ = create_fact(
         db, c, content="The vault combination is 3-33.", epistemic_state="confirmed",
         visibility="dm_only", operation_id="seed", idempotency_key="seed-fact")
     db.flush()
@@ -1176,13 +1188,14 @@ def test_materialized_then_authoritative_then_delayed_preserves_newer():
                   "target_kind": "fact", "target_fact_id": str(fact.id),
                   "knowledge_state": "suspects",
                   "acquisition_source": "explicit_disclosure"}}]})
-    # Authoritative update at N+2 merges (preserves) that provenance.
-    assert_knowledge_authoritative(
-        db, c.id, _rev(db, c), subject_kind="character",
+    # In-turn update at N+2 merges (preserves) that provenance.
+    commit_world_write(
+        db, c.id, _rev(db, c), assert_knowledge, subject_kind="character",
         subject_entity_id=hero.id, target_kind="fact",
         target_fact_id=fact.id, knowledge_state="knows",
         acquisition_source="explicit_disclosure", visibility="dm_only",
-        operation_id="auth-newer")
+        source_turn_id=_turn_at_current_revision(db, c),
+        operation_id="turn-newer")
     db.commit()
     # Delayed range N+1 must not rewind to its older stance.
     out2 = run_post_turn_range(

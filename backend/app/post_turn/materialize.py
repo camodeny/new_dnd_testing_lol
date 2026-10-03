@@ -707,7 +707,7 @@ def _apply_entity(
         decide_identity,
         exact_identity,
     )
-    from app.world.service import create_entity_inline, validate_entity_status, validate_entity_type
+    from app.world.service import create_entity, validate_entity_status, validate_entity_type
 
     data = assertion.data
     name = data.get("name")
@@ -750,7 +750,7 @@ def _apply_entity(
     if entity is None:
         collision = exact_identity(db, campaign.id, name)
         if collision is None and _canonical_name_count(db, campaign.id, name) == 0:
-            created, is_new = create_entity_inline(
+            created, is_new = create_entity(
                 db, campaign, entity_type=str(entity_type).strip().lower(),
                 name=name.strip(), summary=data.get("summary"),
                 status=status, visibility=assertion.visibility,
@@ -803,7 +803,7 @@ def _apply_relation(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.knowledge import create_relation_inline, validate_relation_type
+    from app.world.knowledge import create_relation, validate_relation_type
 
     data = assertion.data
     relation_type = data.get("relation_type")
@@ -828,7 +828,7 @@ def _apply_relation(
                 f"relations/{assertion.key}: requires object_ref or object_label"
             )
         return {"outcome": "rejected", "reason": "missing_object"}
-    row, created = create_relation_inline(
+    row, created = create_relation(
         db, campaign, subject_entity_id=subject.id,
         relation_type=relation_type.strip(),
         object_entity_id=obj.id if obj else None,
@@ -851,7 +851,7 @@ def _apply_fact(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.knowledge import create_fact_inline, validate_fact_content
+    from app.world.knowledge import create_fact, validate_fact_content
 
     data = assertion.data
     content = data.get("content")
@@ -871,7 +871,7 @@ def _apply_fact(
         if entity is None:
             return {"outcome": "deferred", "reason": "unresolvable_entity_ref"}
         entity_ids.append(str(entity.id))
-    row, created = create_fact_inline(
+    row, created = create_fact(
         db, campaign, content=content.strip(), entity_refs=entity_ids,
         epistemic_state=assertion.epistemic_state,
         visibility=assertion.visibility,
@@ -900,7 +900,7 @@ def _apply_npc_state(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.npcs import apply_npc_state_inline, get_npc_state
+    from app.world.npcs import apply_npc_state, get_npc_state
 
     data = assertion.data
     entity = _resolve_required_ref(db, campaign.id, data.get("entity_ref"), assertion=assertion, role="entity_ref")
@@ -914,7 +914,7 @@ def _apply_npc_state(
     if existing is not None:
         # Newer-state channels, strongest signal wins: the provenance
         # channel stamped by this materializer, then the row's revision
-        # channel maintained by authoritative NPC writers (which replace
+        # channel maintained by in-turn NPC writes (which replace
         # provenance without stamping source_sequence).
         known = _provenance_order(existing.provenance)
         campaign_rev = existing.campaign_revision
@@ -938,7 +938,7 @@ def _apply_npc_state(
             updates["location_entity_id"] = location.id
         else:
             updates["location_name"] = str(location_ref)
-    row = apply_npc_state_inline(
+    row = apply_npc_state(
         db, campaign, entity.id,
         # Source-ordered stamp, not the execution-time campaign revision:
         # a delayed range must not make old state look current.
@@ -964,14 +964,10 @@ def _knowledge_current_order(
 ) -> int:
     """Committed ordering of the live stance for one (subject, target).
 
-    Strongest signal wins: the materializer's provenance channel, then
-    the authoritative ``world.knowledge_asserted`` event for the live row
-    (authoritative writers emit the event without assigning the row a
-    turn/source-sequence), then the row's source turn ordering, else
-    unknown (-1, never treated as newer).
+    Strongest signal wins: the materializer's provenance channel, then the
+    row's source turn ordering, else unknown (-1, never treated as newer).
     """
     from app.world.epistemics import list_knowledge_for_subject
-    from models.campaigns import CampaignDomainEvent
     from models.dm import DmTurn
 
     tid: uuid.UUID | None = None
@@ -992,39 +988,16 @@ def _knowledge_current_order(
         )
         if not match:
             continue
-        # Every channel always counts (maximum wins): authoritative
-        # re-assertion merges provenance, so a row first written by
-        # post-turn keeps its old source_sequence even after a newer
-        # authoritative update — the event/turn channels must still be
-        # consulted rather than treated as fallbacks.
+        # Every channel always counts (maximum wins): in-turn re-assertion
+        # merges provenance, so a row first written by post-turn keeps its
+        # old source_sequence even after a newer turn update — the turn
+        # channel must still be consulted rather than treated as a fallback.
         order = _provenance_order(row.provenance)
-        order = max(order, _knowledge_asserted_order(
-            db, campaign_id, row.id))
         if row.source_turn_id is not None:
             turn = db.get(DmTurn, row.source_turn_id)
             if turn is not None and turn.campaign_id == campaign_id:
                 order = max(order, int(turn.source_revision or 0) + 1)
         best = max(best, order)
-    return best
-
-
-def _knowledge_asserted_order(
-    db: Session, campaign_id: uuid.UUID, knowledge_id: uuid.UUID,
-) -> int:
-    """Latest authoritative assertion event sequence for one knowledge row."""
-    from models.campaigns import CampaignDomainEvent
-
-    best = -1
-    events = db.execute(select(CampaignDomainEvent).where(
-        CampaignDomainEvent.campaign_id == campaign_id,
-        CampaignDomainEvent.event_type == "world.knowledge_asserted",
-    )).scalars().all()
-    for event in events:
-        for container in (event.targets, event.payload):
-            if isinstance(container, dict) and str(
-                    container.get("knowledge_id") or "") == str(knowledge_id):
-                best = max(best, int(event.sequence or 0))
-                break
     return best
 
 
@@ -1038,7 +1011,7 @@ def _apply_knowledge(
     single current row per (subject, target) in place.
     """
     from app.world.epistemics import (
-        assert_knowledge_inline,
+        assert_knowledge,
         validate_knower_kind,
         validate_knowledge_target_kind,
     )
@@ -1084,7 +1057,7 @@ def _apply_knowledge(
         # A newer committed stance already exists (transfer_knowledge at
         # commit writes in place): never clobber it with older state.
         return {"outcome": "skipped", "reason": "stale_source_order"}
-    row, created = assert_knowledge_inline(
+    row, created = assert_knowledge(
         db, campaign, subject_kind=subject_kind, subject_entity_id=subject.id,
         target_kind=target_kind, **target_ids,
         knowledge_state=data.get("knowledge_state", "knows"),
@@ -1114,7 +1087,7 @@ def _apply_scene(
     numbering (sequence == resulting revision), so a delayed older
     assertion never overwrites newer committed state.
     """
-    from app.world.service import UNSET, apply_scene_update_inline, get_current_scene
+    from app.world.service import UNSET, apply_scene_update, get_current_scene
 
     data = assertion.data
     if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
@@ -1141,7 +1114,7 @@ def _apply_scene(
         # A newer committed scene already exists (e.g. update_scene at a
         # later commit ran before this delayed range): preserve it.
         return {"outcome": "skipped", "reason": "stale_source_order"}
-    row = apply_scene_update_inline(
+    row = apply_scene_update(
         db, campaign, new_revision=source_order,
         location_entity_id=location_id,
         location_name=patch.get("location_name", data.get("location_name")),
@@ -1165,7 +1138,7 @@ def _apply_visibility_grant(
     Grants are the durable form of explicit disclosure: they widen human
     access without touching fictional-character knowledge or truth rows.
     """
-    from app.world.epistemics import grant_visibility_inline, validate_grant_target_kind
+    from app.world.epistemics import grant_visibility, validate_grant_target_kind
 
     data = assertion.data
     try:
@@ -1194,7 +1167,7 @@ def _apply_visibility_grant(
                 f"visibility_grants/{assertion.key}: requires target_ref or a target id")
         return {"outcome": "rejected", "reason": "missing_target"}
     try:
-        row, created = grant_visibility_inline(
+        row, created = grant_visibility(
             db, campaign, target_kind=target_kind, target_id=tid,
             grantee_user_id=data.get("grantee_user_id"),
             granted_by=data.get("granted_by"),

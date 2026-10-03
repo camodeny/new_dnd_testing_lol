@@ -1,10 +1,10 @@
 """Authoritative world service — issue #209.
 
 Typed lookup/read APIs + transactional writers for canonical world entities
-and the current-scene row. All fictional writers go through
+and the current-scene row. Writers flush inside the caller's
 ``commit_campaign_mutation`` so scene/entity changes participate in campaign
 revision/event ordering; stale revisions fail safely via
-``RevisionConflictError`` (HTTP 409 at the boundary).
+``RevisionConflictError``.
 
 JIT promotion: ``promote_new_entities_from_contract`` assigns durable
 canonical identity to committed ``new_entities`` proposals exactly once,
@@ -20,7 +20,7 @@ import time
 import uuid
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,12 +31,7 @@ from models.world import CampaignCurrentScene, WorldEntity
 
 logger = logging.getLogger(__name__)
 
-# Canonical entity types (at least NPC/location/faction/object + landmark);
-# any other lowercase snake_case type is accepted as extensible.
-CANONICAL_ENTITY_TYPES = frozenset({
-    "npc", "location", "faction", "organization",
-    "object", "item", "landmark", "character",
-})
+# Entity types are open: any lowercase snake_case type is accepted.
 _ENTITY_TYPE_RE = re.compile(r"^[a-z0-9_]{2,32}$")
 ENTITY_STATUSES = frozenset({"active", "inactive", "archived", "dead", "destroyed"})
 SCENE_VISIBILITIES = frozenset({"public", "campaign", "private", "dm_only"})
@@ -114,21 +109,8 @@ def is_world_authority(campaign: Campaign, viewer_id: uuid.UUID) -> bool:
     return campaign.owner_id == viewer_id
 
 
-def entity_visible_to_viewer(entity: WorldEntity, is_authority: bool) -> bool:
-    return bool(is_authority) or entity.visibility not in RESTRICTED_VISIBILITIES
-
-
 def scene_visible_to_viewer(scene: CampaignCurrentScene, is_authority: bool) -> bool:
     return bool(is_authority) or scene.visibility not in RESTRICTED_VISIBILITIES
-
-
-def filter_entities_for_viewer(
-    entities: list[WorldEntity], is_authority: bool
-) -> list[WorldEntity]:
-    """Restricted entities are filtered (not redacted) for ordinary members."""
-    if is_authority:
-        return list(entities)
-    return [e for e in entities if e.visibility not in RESTRICTED_VISIBILITIES]
 
 
 def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
@@ -155,10 +137,6 @@ def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
 
 
 # ── Typed reads ─────────────────────────────────────────────────────────────
-
-def get_entity(db: Session, entity_id: uuid.UUID) -> WorldEntity | None:
-    return db.get(WorldEntity, entity_id)
-
 
 def get_entity_strict(db: Session, campaign_id: uuid.UUID, entity_id: uuid.UUID) -> WorldEntity:
     entity = db.get(WorldEntity, entity_id)
@@ -200,11 +178,6 @@ def get_current_scene(db: Session, campaign_id: uuid.UUID) -> CampaignCurrentSce
     return scene
 
 
-def get_current_scene_dict(db: Session, campaign_id: uuid.UUID) -> dict | None:
-    scene = get_current_scene(db, campaign_id)
-    return scene.to_dict() if scene else None
-
-
 # ── Internal writers (no revision bump; caller owns the transaction) ─────────
 
 def _find_by_idempotency(
@@ -239,7 +212,7 @@ def _dialect_upsert_insert(db: Session):
     return None
 
 
-def create_entity_inline(
+def create_entity(
     db: Session,
     campaign: Campaign,
     *,
@@ -388,7 +361,7 @@ def create_entity_inline(
     return entity, True
 
 
-def apply_scene_update_inline(
+def apply_scene_update(
     db: Session,
     campaign: Campaign,
     *,
@@ -504,179 +477,6 @@ def apply_scene_update_inline(
         operation_id=str(operation_id) if operation_id else None,
     )
     return scene
-
-
-# ── Authoritative writers (bump campaign revision + emit domain event) ───────
-
-def create_entity_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    *,
-    entity_type: str,
-    name: str,
-    summary: str | None = None,
-    status: str = "active",
-    visibility: str = "campaign",
-    details: dict | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    idempotency_key: str | None = None,
-    source_turn_id: uuid.UUID | None = None,
-    source_attempt_id: uuid.UUID | None = None,
-) -> tuple[WorldEntity, Any]:
-    """Direct-API entity creation with revision ordering + idempotent retry."""
-    from app.campaigns.events import commit_campaign_mutation
-
-    key = str(idempotency_key or operation_id or "").strip() or None
-    if key:
-        existing = _find_by_idempotency(db, campaign_id, key)
-        if existing is not None:
-            structured_log(
-                logger, logging.INFO, "world_entity_duplicate_conflict",
-                campaign_id=str(campaign_id), entity_id=str(existing.id),
-                idempotency_key=key, path="authoritative_precheck",
-            )
-            campaign = db.get(Campaign, campaign_id)
-            return existing, None
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        entity, _ = create_entity_inline(
-            db, campaign, entity_type=entity_type, name=name, summary=summary,
-            status=status, visibility=visibility, details=details,
-            source_turn_id=source_turn_id, source_attempt_id=source_attempt_id,
-            operation_id=operation_id, idempotency_key=key,
-        )
-        holder["entity_id"] = entity.id
-
-    # Payload/targets are built AFTER mutate via builders so the persisted
-    # event carries the real allocated entity_id (building them upfront from
-    # holder would persist entity_id: "").
-    validated_type = validate_entity_type(entity_type)
-    validated_name = validate_entity_name(name)
-
-    def _payload() -> dict[str, Any]:
-        return {
-            "entity_id": str(holder["entity_id"]),
-            "entity_type": validated_type,
-            "name": validated_name,
-            "idempotency_key": key,
-        }
-
-    def _targets() -> dict[str, Any]:
-        return {"entity_id": str(holder["entity_id"])}
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.entity_created",
-        payload_builder=_payload,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets_builder=_targets,
-        # Event visibility follows the record's disclosure level (PR #348
-        # re-review): restricted entities must not leak name/type/id to
-        # ordinary members through the campaign-events endpoint, whose
-        # viewer filter only returns public events to non-actors.
-        # Member-visible world levels (public/campaign) collapse onto the
-        # event system's public value so members see history for records
-        # they can read; private/dm_only stay restricted.
-        visibility=world_event_visibility(visibility),
-        provenance={"source": "world_api", "idempotency_key": key},
-        mutate=_mutate,
-    )
-    entity = db.get(WorldEntity, holder["entity_id"])
-    try:  # Best-effort #213 async-index hook; never breaks canon commits.
-        from app.world import semantic as _semantic
-
-        _semantic.note_authoritative_write(db, campaign_id, [("world_entity", holder["entity_id"])])
-        if event is not None and getattr(event, "id", None) is not None:
-            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
-    except Exception:
-        pass
-    return entity, event
-
-
-def set_scene_authoritative(
-    db: Session,
-    campaign_id: uuid.UUID,
-    expected_revision: int,
-    *,
-    location_entity_id: uuid.UUID | str | None | Any = UNSET,
-    location_name: str | None = None,
-    fictional_time: str | None = None,
-    fictional_time_details: dict | None = None,
-    present_actors: list | None = None,
-    environment: dict | None = None,
-    visibility: str | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    source_turn_id: uuid.UUID | None = None,
-    source_attempt_id: uuid.UUID | None = None,
-) -> tuple[CampaignCurrentScene, Any]:
-    """Direct-API scene transition with revision ordering (stale → 409)."""
-    from app.campaigns.events import commit_campaign_mutation
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(campaign: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
-        require_playable_campaign(campaign)
-        # new_revision is prior+1 — mirrors commit_campaign_mutation's bump.
-        prior = int(campaign.revision) if campaign.revision is not None else 0
-        scene = apply_scene_update_inline(
-            db, campaign, new_revision=prior + 1,
-            location_entity_id=location_entity_id, location_name=location_name,
-            fictional_time=fictional_time, fictional_time_details=fictional_time_details,
-            present_actors=present_actors, environment=environment,
-            visibility=visibility, source_turn_id=source_turn_id,
-            source_attempt_id=source_attempt_id, operation_id=operation_id,
-        )
-        holder["scene"] = scene.to_dict()
-
-    def _visibility() -> str:
-        # Event visibility follows the resulting record's disclosure level
-        # (PR #348 re-review): the scene payload carries the full snapshot,
-        # so a restricted scene must not persist a public event readable by
-        # ordinary members. Member-visible levels (public/campaign) map to
-        # the event system's public value; restricted levels pass through.
-        # Built AFTER mutate because a None visibility input preserves the
-        # pre-existing scene visibility.
-        return world_event_visibility((holder.get("scene") or {}).get("visibility"))
-
-    campaign_after, event = commit_campaign_mutation(
-        db, campaign_id, int(expected_revision),
-        event_type="world.scene_updated",
-        # Built AFTER mutate so the persisted event carries the real scene
-        # snapshot (building it upfront from holder would persist scene: {}).
-        payload_builder=lambda: {
-            "scene": holder["scene"],
-            "location_name": location_name,
-            "fictional_time": fictional_time,
-        },
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets={"campaign_id": str(campaign_id)},
-        visibility="public",
-        visibility_builder=_visibility,
-        provenance={"source": "world_api"},
-        mutate=_mutate,
-    )
-    scene = db.get(CampaignCurrentScene, campaign_id)
-    try:  # Best-effort #213 async-index hook; never breaks canon commits.
-        from app.world import semantic as _semantic
-
-        _semantic.note_authoritative_write(db, campaign_id, [("scene", campaign_id)])
-        if event is not None and getattr(event, "id", None) is not None:
-            _semantic.note_authoritative_write(db, campaign_id, [("domain_event", event.id)])
-    except Exception:
-        pass
-    return scene, event
 
 
 # ── JIT promotion from a committed structured turn ──────────────────────────
@@ -1211,7 +1011,3 @@ def build_current_scene_context_record(
     }
 
 
-def count_entities(db: Session, campaign_id: uuid.UUID) -> int:
-    return int(db.scalar(
-        select(func.count()).select_from(WorldEntity).where(WorldEntity.campaign_id == campaign_id)
-    ) or 0)

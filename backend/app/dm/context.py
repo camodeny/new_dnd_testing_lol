@@ -6,7 +6,7 @@ an authorization scope, a use boundary, and deterministic budget behavior.
 
 Current production tables provide turn identity, exact IC/OOC inputs, protected
 PC ownership/state, ruleset identity, and recent committed domain events.  Other
-authoritative readers (scene, combat, canon, clocks, repair, policy) can add
+authoritative readers (scene, combat, canon, clocks, policy) can add
 ``ContextRecord`` objects without changing this contract.
 """
 
@@ -1458,36 +1458,6 @@ def assemble_attempt_context(
         )
 
     supplemental_records = supplemental_records or {}
-    # Issue #221 — open repair directives enter the next relevant forward-DM
-    # context automatically (dm_only/adjudication_only so narration can never
-    # carry them to players). Scoped to directives with no thread binding or
-    # bound to this attempt's thread. Best-effort: a missing repair table
-    # (pre-migration deployment) leaves the lane empty rather than failing.
-    try:
-        from app.repair.service import build_repair_directive_context_records as _repair_records
-
-        for item in _repair_records(db, campaign.id, thread_id=uuid.UUID(turn.thread_id)):
-            records[LaneName.REPAIR_DIRECTIVES].append(
-                ContextRecord(
-                    record_id=str(item["record_id"]),
-                    required=bool(item.get("required", True)),
-                    priority=int(item.get("priority", 100)),
-                    value=dict(item["value"]),
-                    sources=[
-                        _source(
-                            str(item.get("source_type") or "repair_directive"),
-                            item.get("source_id"),
-                            item.get("source_version") or "1",
-                            attempt.source_revision,
-                        )
-                    ],
-                    authorization=_scope(campaign.id, thread_ids=[attempt.thread_id]),
-                    visibility="dm_only",  # type: ignore[arg-type]
-                    use="adjudication_only",
-                )
-            )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("repair directive lane unavailable: %s", exc)
     for key, values in supplemental_records.items():
         name = key if isinstance(key, LaneName) else LaneName(key)
         records[name].extend(list(values))
@@ -1539,8 +1509,6 @@ def assemble_attempt_context(
             "world_visibility_grants",
             "player_roll_requests",
             "player_roll_fulfillments",
-            "campaign_repairs",
-            "repair_directives",
         ],
     )
     # Include DB collection in total duration without contaminating deterministic payload.

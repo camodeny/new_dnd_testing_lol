@@ -17,8 +17,8 @@ from app.decisions import DecisionError, DecisionService, record_fail_soft, to_d
 from app.decisions.adapters.fake import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
-    normalize_alias, supersede_entity)
-from app.world.service import create_entity_inline, promote_new_entities_from_contract
+    normalize_alias)
+from app.world.service import create_entity, promote_new_entities_from_contract
 from models.campaigns import Campaign
 from models.profiles import Profile
 
@@ -35,9 +35,9 @@ def setup_db():
 
 
 def make_entity(db, campaign, name, kind="npc", visibility="campaign", idempotency_key=None, **details):
-    return create_entity_inline(db, campaign, entity_type=kind, name=name,
-                                visibility=visibility, details=details,
-                                idempotency_key=idempotency_key)[0]
+    return create_entity(db, campaign, entity_type=kind, name=name,
+                         visibility=visibility, details=details,
+                         idempotency_key=idempotency_key)[0]
 
 
 def test_normalized_alias_and_stable_ref_resolve_without_model():
@@ -173,16 +173,13 @@ def test_bounded_candidates_and_stale_revalidation_fail_closed():
     assert exc.value.kind == "stale"
 
 
-def test_provider_failure_defers_and_supersession_is_auditable():
+def test_provider_failure_defers():
     db, campaign = setup_db()
-    canonical = make_entity(db, campaign, "Mara Venn")
-    duplicate = make_entity(db, campaign, "Mara of the Gate")
+    make_entity(db, campaign, "Mara Venn")
+    make_entity(db, campaign, "Mara of the Gate")
     frame = build_identity_frame(db, campaign, name="Mara", entity_type="npc")
     result = decide_identity(db, campaign, frame, DecisionService(FakeDecisionAdapter()))
     assert result.selected_id == DEFER
-    supersede_entity(db, duplicate, canonical, provenance={"repair_id": "r1"})
-    assert duplicate.superseded_by_id == canonical.id
-    assert duplicate.details["identity_supersession"]["provenance"] == {"repair_id": "r1"}
 
 
 class _NearTieDeferStub:

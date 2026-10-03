@@ -23,6 +23,7 @@ from models.dm import DMStreamChunk, DmTurn, DmTurnAttempt  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
 
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.dm.contract import CONTRACT_VERSION, ContractValidationError, normalize_contract  # noqa: E402
 from app.dm.execution import (  # noqa: E402
     execute_dm_attempt,
@@ -144,12 +145,12 @@ def test_submission_autonomously_executes_to_persisted_dm_reply(db):
 def test_existing_npc_proposal_is_readjudicated_before_narration(db):
     from app.dm.context import LaneName
     from app.world.identity import add_alias
-    from app.world.service import create_entity_inline
+    from app.world.service import create_entity
     from models.world import WorldEntity
 
     s, camp_id, thread_id, _ = db
     campaign = s.get(Campaign, camp_id)
-    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    npc, _ = create_entity(s, campaign, entity_type="npc", name="Mara Venn")
     add_alias(s, npc, "Mara")
     s.commit()
     turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
@@ -200,11 +201,11 @@ def test_existing_npc_proposal_is_readjudicated_before_narration(db):
 
 def test_repeated_existing_npc_proposal_never_streams(db):
     from app.world.identity import IdentityReuseRequiresReadjudication, add_alias
-    from app.world.service import create_entity_inline
+    from app.world.service import create_entity
 
     s, camp_id, thread_id, _ = db
     campaign = s.get(Campaign, camp_id)
-    npc, _ = create_entity_inline(s, campaign, entity_type="npc", name="Mara Venn")
+    npc, _ = create_entity(s, campaign, entity_type="npc", name="Mara Venn")
     add_alias(s, npc, "Mara")
     s.commit()
     turn, attempt = _submit(s, camp_id, thread_id, "I ask Mara what she saw.")
@@ -736,18 +737,18 @@ def test_perspective_repair_packet_carries_through_validation(db):
     """Issue #455 review: a contract that passed against the perspective-repaired
     packet must not be re-validated against the unrepaired one (which would
     fail again and start a second full regeneration)."""
-    from app.world.epistemics import assert_knowledge_inline
-    from app.world.service import create_entity_authoritative
+    from app.world.epistemics import assert_knowledge
+    from app.world.service import create_entity
 
     s, camp_id, thread_id, _ = db
     camp = s.get(Campaign, camp_id)
-    npc, _ = create_entity_authoritative(
-        s, camp_id, 0, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-exec",
+    npc, _ = commit_world_write(
+        s, camp_id, 0, create_entity, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-exec",
     )
-    well, _ = create_entity_authoritative(
-        s, camp_id, 1, entity_type="location", name="Old Well", operation_id="op-well-exec",
+    well, _ = commit_world_write(
+        s, camp_id, 1, create_entity, entity_type="location", name="Old Well", operation_id="op-well-exec",
     )
-    assert_knowledge_inline(
+    assert_knowledge(
         s, camp, subject_kind="npc", subject_entity_id=npc.id,
         target_kind="entity", target_entity_id=well.id,
         knowledge_state="knows", acquisition_source="direct_observation",

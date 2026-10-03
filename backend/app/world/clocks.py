@@ -34,8 +34,9 @@ imply a separate human DM or moderator. This module never advances state
 from wall-clock time: progress moves only against committed domain-event
 evidence, so real-world idle time can never tick a clock.
 
-Conventions mirror ``app.world.npcs`` (inline vs. authoritative writers)
-and ``app.world.identity`` (bounded decision integration + telemetry).
+Conventions mirror ``app.world.npcs`` (writers run inside the caller's
+revision transaction) and ``app.world.identity`` (bounded decision
+integration + telemetry).
 """
 
 from __future__ import annotations
@@ -102,10 +103,8 @@ _ADVANCE_RE = re.compile(r"^ADVANCE_(\d+)$")
 # Domain events recording clock lifecycle. No-change / deferral outcomes
 # emit no domain event (they change no fictional state); they are recorded
 # in decision telemetry plus the post-turn run result instead.
-CLOCK_CREATED_EVENT = "clock.created"
 CLOCK_ADVANCED_EVENT = "clock.advanced"
 CLOCK_COMPLETED_EVENT = "clock.completed"
-CLOCK_RETIRED_EVENT = "clock.retired"
 
 # Bound on evidence refs serialized into one decision state payload.
 MAX_EVIDENCE_REFS = 25
@@ -113,7 +112,7 @@ MAX_EVIDENCE_REFS = 25
 # Clock lifecycle bookkeeping shares the campaign sequence with gameplay
 # but is never gameplay evidence (see collect_evidence).
 CLOCK_LIFECYCLE_EVENT_TYPES = frozenset({
-    CLOCK_CREATED_EVENT, CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT, CLOCK_RETIRED_EVENT,
+    CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT,
 })
 
 register_policy(DecisionClassPolicy(
@@ -355,7 +354,7 @@ def _validate_new_clock(
     }
 
 
-def create_clock_inline(
+def create_clock(
     db: Session, campaign: Campaign, *, name: Any, threshold: Any,
     advancement_criteria: Any, status: Any = "pending", progress: Any = None,
     stages: Any = None, completion_criteria: Any = None, completion_effect: Any = None,
@@ -408,70 +407,6 @@ def _clock_event_visibility(clock_visibility: str) -> str:
     return world_event_visibility(clock_visibility)
 
 
-def create_clock_authoritative(
-    db: Session, campaign_id: Any, expected_revision: int, *, name: Any,
-    threshold: Any, advancement_criteria: Any, status: Any = "pending",
-    progress: Any = None, stages: Any = None, completion_criteria: Any = None,
-    completion_effect: Any = None, visibility: Any = "dm_only",
-    provenance: dict | None = None, source_turn_id: Any = None,
-    source_attempt_id: Any = None, source_event_id: Any = None,
-    operation_id: str | None = None, idempotency_key: str | None = None,
-) -> tuple[CampaignClock, Any | None]:
-    """Create a clock under campaign revision ordering with a domain event.
-
-    Duplicate ``idempotency_key`` returns the existing row with no new event.
-    """
-    cid = _uuid(campaign_id, "campaign_id")
-    prov = _provenance(provenance)
-    holder: dict[str, Any] = {}
-    started_ms = _now_ms()
-
-    # Fast idempotent path first: a duplicate key must not bump the revision
-    # or emit a second created event.
-    if idempotency_key:
-        existing = db.execute(select(CampaignClock).where(
-            CampaignClock.campaign_id == cid,
-            CampaignClock.idempotency_key == str(idempotency_key).strip(),
-        )).scalars().first()
-        if existing is not None:
-            try:
-                same_threshold = int(existing.threshold) == int(threshold)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                same_threshold = False
-            if existing.name != str(name or "").strip() or not same_threshold:
-                raise ValueError("idempotency key belongs to a different clock")
-            return existing, None
-
-    def mutate(campaign: Campaign) -> None:
-        holder["row"], holder["created"] = create_clock_inline(
-            db, campaign, name=name, threshold=threshold,
-            advancement_criteria=advancement_criteria, status=status,
-            progress=progress, stages=stages, completion_criteria=completion_criteria,
-            completion_effect=completion_effect, visibility=visibility,
-            provenance=prov, source_turn_id=source_turn_id,
-            source_attempt_id=source_attempt_id, source_event_id=source_event_id,
-            operation_id=operation_id, idempotency_key=idempotency_key,
-        )
-
-    _campaign, event = commit_campaign_mutation(
-        db, cid, expected_revision, event_type=CLOCK_CREATED_EVENT,
-        operation_id=operation_id, mutate=mutate,
-        payload_builder=lambda: {
-            "clock_id": str(holder["row"].id), "name": holder["row"].name,
-            "status": holder["row"].status, "threshold": holder["row"].threshold,
-        },
-        targets_builder=lambda: {"clock_id": str(holder["row"].id)},
-        visibility_builder=lambda: _clock_event_visibility(holder["row"].visibility),
-        provenance=prov,
-    )
-    row = holder["row"]
-    structured_log(
-        logger, logging.INFO, "clock_created", campaign_id=str(cid), clock_id=str(row.id),
-        status=row.status, threshold=row.threshold, update_ms=round(_now_ms() - started_ms, 3),
-    )
-    return row, event
-
-
 # ── Evidence matching (deterministic, authority lane) ──────────────────────
 
 def _payload_lookup(payload: Any, path: str) -> tuple[bool, Any]:
@@ -503,10 +438,9 @@ def collect_evidence(
 
     ``event_types`` filters candidacy; an empty filter admits every event
     type and the ``match`` clause alone decides. Clock lifecycle events
-    (``clock.created/advanced/completed/retired``) never qualify: they are
-    this feature's own bookkeeping in the same campaign sequence, not
-    committed gameplay, so counting them would let a clock tick on its own
-    creation. Matching ignores event visibility: post-turn evaluation runs
+    (``clock.advanced/completed``) never qualify: they are this feature's
+    own bookkeeping in the same campaign sequence, not committed gameplay,
+    so counting them would let a clock tick on its own progress. Matching ignores event visibility: post-turn evaluation runs
     in the authority lane, so DM-private gameplay can advance hidden
     clocks without disclosure.
     """
@@ -799,12 +733,6 @@ def decide_clock(
 
 
 # ── Application (deterministic, idempotent, revision-guarded) ──────────────
-
-def _now_ms() -> float:
-    import time as _time
-
-    return _time.monotonic() * 1000.0
-
 
 def apply_clock_outcome(
     db: Session, campaign_id: Any, clock_id: Any, *, frame: DecisionFrame,
@@ -1255,95 +1183,3 @@ def project_clocks_for_viewer(
     return result
 
 
-def get_clock_for_viewer(
-    db: Session, campaign: Campaign, clock_id: Any, viewer_user_id: Any,
-) -> dict[str, Any]:
-    """Fetch one clock for a viewer; unauthorized reads get a blind stub."""
-    viewer = _uuid(viewer_user_id, "viewer_user_id")
-    row = get_clock(db, campaign.id, clock_id)
-    if row is None:
-        raise ValueError(f"clock {clock_id} not found in campaign {campaign.id}")
-    if not _is_member(db, campaign, viewer):
-        return {"clock_id": str(row.id), "visible": False}
-    if _is_authority(campaign, viewer) or str(row.visibility) in ("public", "campaign"):
-        data = row.to_dict()
-        if not _is_authority(campaign, viewer):
-            for key in ("provenance", "completion_effect", "resolution",
-                        "progress_carry", "evaluated_through_sequence",
-                        "operation_id", "idempotency_key",
-                        "source_turn_id", "source_attempt_id", "source_event_id"):
-                data.pop(key, None)
-        return {**data, "visible": True}
-    return {"clock_id": str(row.id), "visible": False}
-
-
-# ── Adventure-resolution hook (later #185/#261 flows call this) ────────────
-
-RETIRE_DISPOSITIONS = frozenset({"retired", "completed"})
-
-
-def retire_clock_authoritative(
-    db: Session, campaign_id: Any, clock_id: Any, expected_revision: int, *,
-    disposition: str, reason: str, successor_clock_id: Any = None,
-    provenance: dict | None = None, operation_id: str | None = None,
-) -> tuple[CampaignClock, Any]:
-    """Resolve a clock at adventure completion: retire, complete, or chain.
-
-    ``disposition="completed"`` marks the threshold met by adventure
-    outcome; ``"retired"`` ends the pressure without completion. An optional
-    ``successor_clock_id`` records a transform chain for later flows to
-    follow — this call never creates the successor itself. Terminal clocks
-    reject a second resolution (fail closed).
-    """
-    cid = _uuid(campaign_id, "campaign_id")
-    disp = str(disposition or "").strip().lower()
-    if disp not in RETIRE_DISPOSITIONS:
-        raise ValueError(f"disposition must be one of {sorted(RETIRE_DISPOSITIONS)}")
-    cleaned_reason = _non_empty_str(reason, "reason", limit=2000)
-    prov = _provenance(provenance)
-    successor = _uuid(successor_clock_id, "successor_clock_id") if successor_clock_id else None
-    clock = get_clock_strict(db, cid, _uuid(clock_id, "clock_id"))
-    if clock.status in CLOCK_TERMINAL_STATUSES:
-        raise ValueError(f"clock {clock.id} is already terminal ({clock.status})")
-    if successor is not None:
-        get_clock_strict(db, cid, successor)
-    holder: dict[str, Any] = {}
-
-    def mutate(campaign: Campaign) -> None:
-        fresh = db.execute(select(CampaignClock).where(
-            CampaignClock.id == clock.id,
-        ).with_for_update()).scalars().first()
-        if fresh is None or fresh.campaign_id != cid:
-            raise ValueError(f"clock {clock_id} vanished during resolution")
-        if fresh.status in CLOCK_TERMINAL_STATUSES:
-            raise ValueError(f"clock {fresh.id} is already terminal ({fresh.status})")
-        fresh.status = "completed" if disp == "completed" else "retired"
-        if disp == "completed":
-            fresh.progress = int(fresh.threshold)
-            fresh.completed_at = datetime.now(timezone.utc)
-        fresh.revision = int(fresh.revision or 1) + 1
-        fresh.resolution = {
-            "outcome": disp, "reason": cleaned_reason,
-            "successor_clock_id": str(successor) if successor else None,
-            "completion_effect": dict(fresh.completion_effect or {}),
-        }
-        holder.update(status=fresh.status, revision=fresh.revision, progress=int(fresh.progress or 0))
-
-    _campaign, event = commit_campaign_mutation(
-        db, cid, expected_revision,
-        event_type=CLOCK_COMPLETED_EVENT if disp == "completed" else CLOCK_RETIRED_EVENT,
-        operation_id=operation_id, mutate=mutate,
-        payload_builder=lambda: {
-            "clock_id": str(clock.id), "disposition": disp, "reason": cleaned_reason,
-            "successor_clock_id": str(successor) if successor else None,
-        },
-        targets_builder=lambda: {"clock_id": str(clock.id)},
-        visibility_builder=lambda: _clock_event_visibility(clock.visibility),
-        provenance=prov,
-    )
-    row = get_clock_strict(db, cid, clock.id)
-    structured_log(
-        logger, logging.INFO, "clock_retired", campaign_id=str(cid), clock_id=str(row.id),
-        disposition=disp,
-    )
-    return row, event

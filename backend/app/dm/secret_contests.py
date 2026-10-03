@@ -718,8 +718,8 @@ def resolve_secret_contest(
     Duplicate retries replay the committed outcome.
     """
     from app.campaigns.events import commit_campaign_mutation
-    from app.world.epistemics import grant_visibility_inline
-    from app.world.knowledge import create_fact_inline
+    from app.world.epistemics import grant_visibility
+    from app.world.knowledge import create_fact
     from models.campaigns import Campaign, CampaignDomainEvent
     from models.dm import SecretContest
 
@@ -763,7 +763,7 @@ def resolve_secret_contest(
 
     def _mutate(locked_campaign) -> None:
         for index, spec in enumerate(branch):
-            fact, _created = create_fact_inline(
+            fact, _created = create_fact(
                 db, locked_campaign, content=spec["content"],
                 visibility=spec["visibility"], epistemic_state=spec["epistemic_state"],
                 provenance={
@@ -832,7 +832,7 @@ def resolve_secret_contest(
             continue
         for user_index, raw_user in enumerate(grantees):
             try:
-                grant_visibility_inline(
+                grant_visibility(
                     db, campaign, target_kind="fact", target_id=fact.id,
                     grantee_user_id=uuid.UUID(str(raw_user)),
                     granted_by=contest.initiator_user_id,

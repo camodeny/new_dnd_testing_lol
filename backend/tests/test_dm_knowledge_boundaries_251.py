@@ -19,6 +19,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.decisions.errors import DecisionError  # noqa: E402
 from app.decisions.frames import (  # noqa: E402
     CandidateRecord,
@@ -43,13 +44,13 @@ from app.dm.effects import _handle_transfer_knowledge  # noqa: E402
 from app.dm.narration import build_narration_judge_evidence  # noqa: E402
 from app.dm.validators import KnowledgeValidator  # noqa: E402
 from app.world.epistemics import (  # noqa: E402
-    assert_knowledge_inline,
-    grant_visibility_inline,
+    assert_knowledge,
+    grant_visibility,
     what_does_subject_know,
     who_knows_target,
 )
-from app.world.knowledge import create_fact_authoritative  # noqa: E402
-from app.world.service import create_entity_authoritative  # noqa: E402
+from app.world.knowledge import create_fact  # noqa: E402
+from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldKnowledge  # noqa: E402
@@ -300,10 +301,10 @@ def test_validator_skips_unresolvable_or_unrelated():
 def test_transfer_knowledge_effect_writes_stance_idempotently():
     Fac, camp, owner, _ = _setup()
     db = Fac()
-    subject, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="character", name="Aria", operation_id="op-aria-tk")
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="The vault is under the chapel.",
+    subject, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="character", name="Aria", operation_id="op-aria-tk")
+    fact, _ = commit_world_write(
+        db, camp.id, 1, create_fact, content="The vault is under the chapel.",
         entity_refs=[subject.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-tk")
     turn = SimpleNamespace(id=uuid.uuid4())
@@ -344,15 +345,15 @@ def test_judge_evidence_merges_knowledge_restricted_texts():
 def test_one_pc_discovery_is_not_party_knowledge():
     Fac, camp, owner, alice, *_ = _setup()
     db = Fac()
-    aria, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="character", name="Aria", operation_id="op-aria-sep")
-    bram, _ = create_entity_authoritative(
-        db, camp.id, 1, entity_type="character", name="Bram", operation_id="op-bram-sep")
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 2, content="The bridge is trapped.",
+    aria, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="character", name="Aria", operation_id="op-aria-sep")
+    bram, _ = commit_world_write(
+        db, camp.id, 1, create_entity, entity_type="character", name="Bram", operation_id="op-bram-sep")
+    fact, _ = commit_world_write(
+        db, camp.id, 2, create_fact, content="The bridge is trapped.",
         entity_refs=[aria.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-sep")
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="character", subject_entity_id=aria.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="direct_observation",
@@ -366,14 +367,14 @@ def test_one_pc_discovery_is_not_party_knowledge():
 def test_human_disclosure_does_not_create_character_knowledge():
     Fac, camp, owner, alice = _setup()
     db = Fac()
-    bram, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="character", name="Bram", operation_id="op-bram-hum")
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="The vault is under the chapel.",
+    bram, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="character", name="Bram", operation_id="op-bram-hum")
+    fact, _ = commit_world_write(
+        db, camp.id, 1, create_fact, content="The vault is under the chapel.",
         entity_refs=[bram.id], epistemic_state="confirmed", visibility="private",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-hum")
     # The human may receive the truth via an explicit grant...
-    grant_visibility_inline(
+    grant_visibility(
         db, camp, target_kind="fact", target_id=fact.id, grantee_user_id=alice,
         operation_id="op-grant-hum")
     from app.world.epistemics import may_user_receive
@@ -505,13 +506,13 @@ def test_lane_builder_includes_npc_subjects():
 
     Fac, camp, *_ = _setup()
     db = Fac()
-    mara, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="npc", name="Mara", operation_id="op-mara-lane")
-    fact, _ = create_fact_authoritative(
-        db, camp.id, 1, content="The cellar connects to the old mine.",
+    mara, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="npc", name="Mara", operation_id="op-mara-lane")
+    fact, _ = commit_world_write(
+        db, camp.id, 1, create_fact, content="The cellar connects to the old mine.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-lane")
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="npc", subject_entity_id=mara.id,
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="suspects", acquisition_source="eavesdropping",
@@ -528,24 +529,24 @@ def test_collect_subject_restricted_fact_texts():
 
     Fac, camp, *_ = _setup()
     db = Fac()
-    mara, _ = create_entity_authoritative(
-        db, camp.id, 0, entity_type="npc", name="Mara", operation_id="op-mara-rs")
-    theo, _ = create_entity_authoritative(
-        db, camp.id, 1, entity_type="npc", name="Theo", operation_id="op-theo-rs")
-    known_fact, _ = create_fact_authoritative(
-        db, camp.id, 2, content="Mara knows the cellar route.",
+    mara, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="npc", name="Mara", operation_id="op-mara-rs")
+    theo, _ = commit_world_write(
+        db, camp.id, 1, create_entity, entity_type="npc", name="Theo", operation_id="op-theo-rs")
+    known_fact, _ = commit_world_write(
+        db, camp.id, 2, create_fact, content="Mara knows the cellar route.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs1")
-    hidden_fact, _ = create_fact_authoritative(
-        db, camp.id, 3, content="The vault combination is 12-34-56.",
+    hidden_fact, _ = commit_world_write(
+        db, camp.id, 3, create_fact, content="The vault combination is 12-34-56.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="dm_only",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs2")
     # Campaign-visible OOC truth is still a speaker's misuse to state.
-    open_fact, _ = create_fact_authoritative(
-        db, camp.id, 4, content="The festival is at dusk.",
+    open_fact, _ = commit_world_write(
+        db, camp.id, 4, create_fact, content="The festival is at dusk.",
         entity_refs=[mara.id], epistemic_state="confirmed", visibility="campaign",
         provenance={"source": "dm_adjudication"}, operation_id="op-truth-rs3")
-    assert_knowledge_inline(
+    assert_knowledge(
         db, camp, subject_kind="npc", subject_entity_id=mara.id,
         target_kind="fact", target_fact_id=known_fact.id,
         knowledge_state="knows", acquisition_source="direct_observation",

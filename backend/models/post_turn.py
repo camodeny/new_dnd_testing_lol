@@ -102,17 +102,16 @@ class PostTurnConsistencyIncident(Base):
     """Explicit post-turn consistency incident — issue #220.
 
     A detected contradiction between newly materialized state, completed
-    visible turns, clocks, current scene, facts, and summaries. Incidents
-    are recorded instead of silently normalizing canon away; the #221
-    repair workflow consumes them (this verifier never rewrites canon).
+    visible turns, clocks, current scene, and facts. Incidents are recorded
+    instead of silently normalizing canon away (this verifier never rewrites
+    canon).
 
     ``incident_key`` makes creation idempotent per (campaign, conflict,
     source range): re-verifying the same range reuses the row and bumps
     ``repeat_count``. ``status`` stays required-unresolved (``open``,
-    ``deferred``, ``verifier_failed``) until repair marks it ``resolved``.
+    ``deferred``, ``verifier_failed``) until marked ``resolved``.
 
-    Rows are DM/operator-only by default; player-facing correction is
-    decided by repair.
+    Rows are DM/operator-only by default.
     """
 
     __tablename__ = "post_turn_consistency_incidents"
@@ -176,7 +175,6 @@ class PostTurnConsistencyIncident(Base):
             "operation_id": self.operation_id,
             "error": self.error,
             "visibility": "dm_only",
-            "repair_status": "needs_repair" if self.status != "resolved" else "resolved",
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
         }

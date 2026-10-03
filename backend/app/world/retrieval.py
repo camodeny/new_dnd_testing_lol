@@ -17,12 +17,6 @@ Design rules (pre-alpha, single canonical implementation):
   packet for later projection instead of erasing it.
 - Provenance is code-owned: built from persisted record fields plus a
   ``retrieved_by`` marker. Callers can never supply provenance.
-- Semantic reranking (#380/#381) is an optional post-filter hook: it
-  receives only the already-authorized bounded candidate set and may return
-  only those candidate IDs (or an explicit defer). It can reorder
-  presentation but never changes the authoritative source record, version,
-  or provenance attached to a packet. Reranker failure falls back to
-  deterministic retrieval order — authoritative evidence is never lost.
 - The AI is the only DM; no copy here implies a human DM/moderator.
 
 #203 integration: ``TOOL_HANDLERS`` maps the world evidence tools onto
@@ -59,32 +53,12 @@ RETRIEVAL_DEFAULT_DEPTH = 1
 RETRIEVAL_MAX_DEPTH = 3
 TIMELINE_DEFAULT_LIMIT = 20
 
-# Evidence tools exposed through the #203 mediation interface.
-WORLD_TOOL_NAMES = frozenset({
-    "lookup_world_entity",
-    "traverse_world_relations",
-    "lookup_world_fact",
-    "query_world_timeline",
-    "lookup_source_turn",
-    "query_character_knowledge",
-    "search_campaign_memory",
-})
-
 # Outcome statuses. ``not_found`` / ``defer`` / ``no_match`` are explicit
 # evidence states — never fabricated substitutes.
 STATUS_OK = "ok"
 STATUS_NOT_FOUND = "not_found"
 STATUS_DEFER = "defer"
 STATUS_NO_MATCH = "no_match"
-STATUS_PARTIAL = "partial"
-
-# Reranker escape: mirrors the decisions DEFER candidate without importing
-# the decisions package at module load (core retrieval must not block on
-# #380/#381 availability).
-RERANK_DEFER_ID = "DEFER"
-RERANK_NO_MATCH_ID = "NO_MATCH"
-
-
 # ── Typed evidence packet ────────────────────────────────────────────────────
 
 @dataclass
@@ -93,8 +67,7 @@ class EvidencePacket:
 
     ``source_type``/``source_id``/``source_version`` form the stable source
     identity used by validators and audit tooling. ``retrieval_rank`` is the
-    deterministic retrieval order; ``presentation_rank`` is set only by the
-    optional rerank hook (``None`` means retrieval order stands).
+    deterministic retrieval order.
     ``revealable`` is meaningful in player-facing mode (True = authorized
     for the viewer); in DM-internal mode it is None (deferred to later
     projection) while ``visibility`` is always preserved.
@@ -111,7 +84,6 @@ class EvidencePacket:
     provenance: dict[str, Any]
     retrieval_rank: int = 0
     retrieval_score: float = 0.0
-    presentation_rank: int | None = None
     revealable: bool | None = None
     denial_reason: str | None = None
     created_at: str | None = None
@@ -129,7 +101,6 @@ class EvidencePacket:
             "provenance": self.provenance,
             "retrieval_rank": self.retrieval_rank,
             "retrieval_score": self.retrieval_score,
-            "presentation_rank": self.presentation_rank,
             "revealable": self.revealable,
             "denial_reason": self.denial_reason,
             "created_at": self.created_at,
@@ -175,41 +146,6 @@ class RetrievalOutcome:
             "truncated": self.truncated,
             "latency_ms": self.latency_ms,
             "source_ids": list(self.source_ids),
-            "error": self.error,
-        }
-
-
-@dataclass
-class RerankedOutcome:
-    """Result of the optional semantic rerank hook.
-
-    ``packets`` always carries the full authorized set in presentation order
-    (empty only for defer/no-match); every packet keeps its original
-    ``retrieval_rank``/source identity/provenance — reranking only sets
-    ``presentation_rank``. ``fallback`` is True when the reranker failed or
-    returned invented IDs and deterministic order was kept instead.
-    """
-
-    status: str = STATUS_OK
-    packets: list[EvidencePacket] = field(default_factory=list)
-    presented_ids: list[str] = field(default_factory=list)
-    reordered_ids: list[str] = field(default_factory=list)
-    reranked: bool = False
-    fallback: bool = False
-    reranker_model: str | None = None
-    reranker_policy: str | None = None
-    error: str | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "status": self.status,
-            "packets": [p.to_dict() for p in self.packets],
-            "presented_ids": list(self.presented_ids),
-            "reordered_ids": list(self.reordered_ids),
-            "reranked": self.reranked,
-            "fallback": self.fallback,
-            "reranker_model": self.reranker_model,
-            "reranker_policy": self.reranker_policy,
             "error": self.error,
         }
 
@@ -332,7 +268,6 @@ def _log_query(
     limit: int,
     outcome: RetrievalOutcome,
     dm_internal: bool,
-    rerank: dict[str, Any] | None = None,
 ) -> None:
     structured_log(
         logger, logging.INFO, "world_retrieval_query",
@@ -349,7 +284,6 @@ def _log_query(
         status=outcome.status,
         source_ids=outcome.source_ids,
         latency_ms=round(outcome.latency_ms, 3),
-        **(rerank or {}),
     )
 
 
@@ -466,30 +400,6 @@ def _turn_packet(turn: DmTurn, rank: int, *,
         retrieval_score=float(1000 - rank),
         revealable=revealable,
         created_at=_created_iso(turn),
-    )
-
-
-def _submission_packet(submission: PlayerSubmission, rank: int,
-                       *, revealable: bool | None) -> EvidencePacket:
-    audience = str(getattr(submission, "audience", "campaign") or "campaign")
-    visibility = audience if audience in {"public", "campaign", "private", "dm_only"} else "campaign"
-    return EvidencePacket(
-        source_type="submission",
-        source_id=str(submission.id),
-        source_version=f"seq{int(submission.sequence)}",
-        content=submission.to_dict(),
-        epistemic_state=None,
-        visibility=visibility,
-        campaign_id=str(submission.campaign_id),
-        revision_or_sequence=int(submission.sequence),
-        provenance=_provenance(submission, extra={
-            "author_user_id": str(submission.user_id),
-            "thread_id": str(submission.thread_id),
-        }),
-        retrieval_rank=rank,
-        retrieval_score=float(1000 - rank),
-        revealable=revealable,
-        created_at=_created_iso(submission),
     )
 
 
@@ -803,57 +713,6 @@ def lookup_fact(
     outcome.source_ids = _packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
     _log_query("lookup_world_fact", campaign, depth=0, limit=1,
-               outcome=outcome, dm_internal=dm_internal)
-    return outcome
-
-
-def facts_for_entity(
-    db: Session,
-    campaign_id: Any,
-    entity_id: Any,
-    viewer_user_id: Any = None,
-    *,
-    limit: Any = RETRIEVAL_DEFAULT_LIMIT,
-    dm_internal: bool = False,
-) -> RetrievalOutcome:
-    """All active facts referencing one canonical entity (bounded)."""
-    from app.world.knowledge import list_facts
-    from app.world.service import get_entity_strict
-
-    started = time.monotonic()
-    limit_applied = _clamp_limit(limit)
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
-    try:
-        eid = _coerce_uuid(entity_id, field_name="entity_id")
-        get_entity_strict(db, campaign.id, eid)
-    except ValueError as exc:
-        return _not_found("lookup_world_fact", campaign, depth=0,
-                          limit=limit_applied, detail=str(exc))
-    rows = list_facts(db, campaign.id, entity_id=eid, limit=limit_applied + 1)
-    outcome = RetrievalOutcome(depth_applied=0, limit_applied=limit_applied)
-    outcome.total = len(rows)
-    packets: list[EvidencePacket] = []
-    for row in rows:
-        allowed, reason = _authorize_world_record(
-            db, campaign, "fact", row.id, viewers, dm_internal=dm_internal)
-        if not allowed:
-            outcome.denied += 1
-            outcome.denied_reasons[reason or "denied"] = outcome.denied_reasons.get(reason or "denied", 0) + 1
-            continue
-        packets.append(_fact_packet(row, campaign.id, len(packets),
-                                    revealable=None if dm_internal else True))
-    if len(packets) > limit_applied:
-        packets = packets[:limit_applied]
-        outcome.truncated = True
-    for rank, packet in enumerate(packets):
-        packet.retrieval_rank = rank
-        packet.retrieval_score = float(1000 - rank)
-    outcome.packets = packets
-    outcome.visible = len(packets)
-    outcome.source_ids = _packet_source_ids(packets)
-    outcome.latency_ms = (time.monotonic() - started) * 1000
-    _log_query("lookup_world_fact", campaign, depth=0, limit=limit_applied,
                outcome=outcome, dm_internal=dm_internal)
     return outcome
 
@@ -1191,99 +1050,7 @@ def lookup_source_turn(
     return outcome
 
 
-def lookup_submission(
-    db: Session,
-    campaign_id: Any,
-    submission_id: Any,
-    viewer_user_id: Any = None,
-    *,
-    dm_internal: bool = False,
-) -> RetrievalOutcome:
-    """Retrieve one player submission as source evidence (bounded, scoped)."""
-    started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
-    try:
-        sid = _coerce_uuid(submission_id, field_name="submission_id")
-        submission = db.get(PlayerSubmission, sid)
-        if submission is None or submission.campaign_id != campaign.id:
-            raise ValueError(f"Submission {sid} not found in campaign {campaign.id}")
-    except ValueError as exc:
-        return _not_found("lookup_source_turn", campaign, depth=0,
-                          limit=1, detail=str(exc))
-    allowed, reason = _submission_gate(db, campaign, submission, viewers,
-                                       dm_internal=dm_internal)
-    outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
-    outcome.total = 1
-    if not allowed:
-        outcome.denied = 1
-        outcome.denied_reasons[reason or "denied"] = 1
-        outcome.latency_ms = (time.monotonic() - started) * 1000
-        _log_query("lookup_source_turn", campaign, depth=0, limit=1,
-                   outcome=outcome, dm_internal=dm_internal)
-        return outcome
-    outcome.packets = [_submission_packet(
-        submission, 0, revealable=None if dm_internal else True)]
-    outcome.visible = 1
-    outcome.source_ids = _packet_source_ids(outcome.packets)
-    outcome.latency_ms = (time.monotonic() - started) * 1000
-    _log_query("lookup_source_turn", campaign, depth=0, limit=1,
-               outcome=outcome, dm_internal=dm_internal)
-    return outcome
-
-
 # ── Current scene ────────────────────────────────────────────────────────────
-
-def retrieve_current_scene(
-    db: Session,
-    campaign_id: Any,
-    viewer_user_id: Any = None,
-    *,
-    dm_internal: bool = False,
-) -> RetrievalOutcome:
-    """Authoritative current-scene value as an evidence packet (None-safe:
-    no scene established returns an explicit not-found outcome)."""
-    from app.world.service import (
-        get_current_scene,
-        is_world_authority,
-        scene_visible_to_viewer,
-    )
-
-    started = time.monotonic()
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
-    scene = get_current_scene(db, campaign.id)
-    if scene is None:
-        return _not_found("get_current_scene", campaign, depth=0, limit=1,
-                          detail="No current scene established for campaign")
-    outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
-    outcome.total = 1
-    if not dm_internal:
-        if not viewers:
-            outcome.denied = 1
-            outcome.denied_reasons["viewer_required"] = 1
-            outcome.latency_ms = (time.monotonic() - started) * 1000
-            _log_query("get_current_scene", campaign, depth=0, limit=1,
-                       outcome=outcome, dm_internal=dm_internal)
-            return outcome
-        authority = any(is_world_authority(campaign, viewer) for viewer in viewers)
-        member = all(_membership(db, campaign, viewer) for viewer in viewers)
-        if not member or not scene_visible_to_viewer(scene, authority):
-            outcome.denied = 1
-            outcome.denied_reasons["scene_not_visible"] = 1
-            outcome.latency_ms = (time.monotonic() - started) * 1000
-            _log_query("get_current_scene", campaign, depth=0, limit=1,
-                       outcome=outcome, dm_internal=dm_internal)
-            return outcome
-    outcome.packets = [_scene_packet(
-        scene, 0, revealable=None if dm_internal else True)]
-    outcome.visible = 1
-    outcome.source_ids = _packet_source_ids(outcome.packets)
-    outcome.latency_ms = (time.monotonic() - started) * 1000
-    _log_query("get_current_scene", campaign, depth=0, limit=1,
-               outcome=outcome, dm_internal=dm_internal)
-    return outcome
-
 
 # ── Character / NPC knowledge ────────────────────────────────────────────────
 
@@ -1551,359 +1318,6 @@ def _query_character_knowledge_multi(
     return outcome
 
 
-def query_who_knows(
-    db: Session,
-    campaign_id: Any,
-    target_kind: str,
-    target_id: Any,
-    viewer_user_id: Any = None,
-    *,
-    knowledge_state: str | None = None,
-    limit: Any = RETRIEVAL_DEFAULT_LIMIT,
-    dm_internal: bool = False,
-) -> RetrievalOutcome:
-    """Which subjects may the viewer see as holding one truth target?
-
-    Player-facing retrieval wraps the #211 ``who_knows_target`` projection.
-    DM-internal retrieval bypasses human disclosure filtering while
-    remaining campaign-scoped, returning every knower row with its real
-    visibility metadata preserved.
-    """
-    from app.world.epistemics import (
-        validate_knowledge_state,
-        validate_knowledge_target_kind,
-        who_knows_target,
-    )
-
-    started = time.monotonic()
-    limit_applied = _clamp_limit(limit)
-    campaign = _resolve_campaign(db, campaign_id)
-    viewers = _resolve_viewers(viewer_user_id)
-    kind = validate_knowledge_target_kind(target_kind)
-    if knowledge_state is not None:
-        validate_knowledge_state(knowledge_state)
-    try:
-        tid = _coerce_uuid(target_id, field_name="target_id")
-    except ValueError as exc:
-        return _not_found("query_character_knowledge", campaign, depth=0,
-                          limit=limit_applied, detail=str(exc))
-    if dm_internal:
-        from app.world.epistemics import list_knowledge_for_target
-        from models.world import WorldEntity, WorldFact, WorldRelation
-
-        target_record = None
-        try:
-            if kind == "fact":
-                target_record = db.get(WorldFact, tid)
-            elif kind == "relation":
-                target_record = db.get(WorldRelation, tid)
-            else:
-                target_record = db.get(WorldEntity, tid)
-        except Exception:
-            target_record = None
-        if target_record is None or getattr(target_record, "campaign_id", None) != campaign.id:
-            return _not_found("query_character_knowledge", campaign, depth=0,
-                              limit=limit_applied,
-                              detail=f"Target {kind} {tid} not found")
-        rows = list_knowledge_for_target(
-            db, campaign.id, kind, tid,
-            knowledge_state=knowledge_state, limit=limit_applied + 1)
-        total_rows = len(rows)
-        truncated = total_rows > limit_applied
-        rows = rows[:limit_applied]
-        packets = [
-            _knowledge_packet(_knowledge_entry_from_row(db, row, campaign.id), rank,
-                              revealable=None)
-            for rank, row in enumerate(rows)
-        ]
-        outcome = RetrievalOutcome(
-            status=STATUS_OK, packets=packets, total=total_rows,
-            visible=len(packets), denied=0, denied_reasons={},
-            depth_applied=0, limit_applied=limit_applied,
-            truncated=truncated,
-            source_ids=_packet_source_ids(packets),
-            latency_ms=(time.monotonic() - started) * 1000,
-        )
-        _log_query("query_character_knowledge", campaign, depth=0,
-                   limit=limit_applied, outcome=outcome, dm_internal=dm_internal)
-        return outcome
-    if len(viewers) >= 1:
-        effective_viewer = viewers[0]
-    else:
-        outcome = RetrievalOutcome(depth_applied=0, limit_applied=limit_applied)
-        outcome.denied = 1
-        outcome.denied_reasons["viewer_required"] = 1
-        outcome.latency_ms = (time.monotonic() - started) * 1000
-        return outcome
-    projection = who_knows_target(
-        db, campaign, kind, tid, effective_viewer,
-        knowledge_state=knowledge_state, limit=limit_applied + 1)
-    knowers = list(projection.get("knowers", []))[:limit_applied]
-    _enrich_entries_with_row_visibility(db, campaign.id, knowers)
-    from models.world import WorldEntity as _WhoKnowsEntity
-    from models.world import WorldFact as _WhoKnowsFact
-    from models.world import WorldRelation as _WhoKnowsRelation
-
-    _target_record = None
-    try:
-        if kind == "fact":
-            _target_record = db.get(_WhoKnowsFact, tid)
-        elif kind == "relation":
-            _target_record = db.get(_WhoKnowsRelation, tid)
-        else:
-            _target_record = db.get(_WhoKnowsEntity, tid)
-    except Exception:
-        _target_record = None
-    _target_vis = (
-        getattr(_target_record, "visibility", "dm_only")
-        if _target_record is not None
-        and getattr(_target_record, "campaign_id", None) == campaign.id
-        else "dm_only"
-    )
-    for _knower in knowers:
-        _knower["visibility"] = _most_restrictive_visibility(
-            _knower.get("visibility", "dm_only"), _target_vis)
-    packets = [
-        _knowledge_packet(
-            {"knowledge_id": k["knowledge_id"],
-             "subject_kind": k.get("subject_kind"),
-             "subject_entity_id": k.get("subject_entity_id"),
-             "target_kind": kind, "target_id": str(tid),
-             "knowledge_state": k.get("knowledge_state"),
-             "acquisition_source": k.get("acquisition_source"),
-             "visibility": k.get("visibility", "dm_only"),
-             "campaign_id": str(campaign.id)}, rank,
-            revealable=True)
-        for rank, k in enumerate(knowers)
-    ]
-    outcome = RetrievalOutcome(
-        status=STATUS_OK, packets=packets, total=int(projection.get("total", 0)),
-        visible=len(packets), denied=int(projection.get("denied", 0)),
-        denied_reasons=dict(projection.get("denied_reasons", {})),
-        depth_applied=0, limit_applied=limit_applied,
-        truncated=len(projection.get("knowers", [])) > limit_applied,
-        source_ids=_packet_source_ids(packets),
-        latency_ms=(time.monotonic() - started) * 1000,
-    )
-    _log_query("query_character_knowledge", campaign, depth=0,
-               limit=limit_applied, outcome=outcome, dm_internal=dm_internal)
-    return outcome
-
-
-# ── Optional semantic rerank hook (#380/#381, never blocking) ────────────────
-
-def build_rerank_candidates(packets: list[EvidencePacket],
-                            *, max_candidates: int = RETRIEVAL_MAX_LIMIT
-                            ) -> list[dict[str, str]]:
-    """Bounded candidate descriptors for a decision-model reranker.
-
-    Only stable candidate IDs plus a short human-readable description leave
-    this boundary — never hidden content beyond what is already authorized.
-    """
-    candidates: list[dict[str, str]] = []
-    for packet in packets[:max(1, min(int(max_candidates), RETRIEVAL_MAX_LIMIT))]:
-        summary = packet.source_id
-        content = packet.content if isinstance(packet.content, dict) else {}
-        for key in ("name", "content", "relation_type", "location_name"):
-            value = content.get(key)
-            if isinstance(value, str) and value.strip():
-                summary = value.strip()[:160]
-                break
-        candidates.append({
-            "id": f"{packet.source_type}:{packet.source_id}",
-            "description": f"{packet.source_type} {summary} "
-                           f"(epistemic={packet.epistemic_state or 'n/a'} "
-                           f"visibility={packet.visibility} "
-                           f"version={packet.source_version})",
-        })
-    return candidates
-
-
-def apply_rerank(
-    packets: list[EvidencePacket],
-    *,
-    order: list[str] | None = None,
-    defer: bool = False,
-    reranker: Callable[[list[dict[str, str]]], dict[str, Any] | list[str] | str | None] | None = None,
-    reranker_model: str | None = None,
-    reranker_policy: str | None = None,
-) -> RerankedOutcome:
-    """Apply an optional semantic rerank over an authorized packet set.
-
-    Either ``order`` (explicit candidate-ID list, e.g. from a test or a
-    #380/#381 decision answer) or ``reranker`` (a callable receiving
-    ``build_rerank_candidates`` output) drives presentation order. The
-    callable may return an ID list, ``{"order": [...]}``, ``{"defer": True}``,
-    or the ``DEFER``/``NO_MATCH`` escape IDs for the no-relevant-evidence
-    outcome. Unknown IDs and reranker exceptions fall back to deterministic
-    retrieval order so authoritative evidence is never lost; the original
-    retrieval rank, score, source identity, and provenance on every packet
-    are preserved either way.
-    """
-    candidates = build_rerank_candidates(packets)
-    candidate_ids = [c["id"] for c in candidates]
-    allowed = set(candidate_ids)
-
-    resolved_order: list[str] | None = list(order) if order is not None else None
-    resolved_defer = bool(defer)
-    model = reranker_model
-    policy = reranker_policy
-    fallback = False
-    error: str | None = None
-
-    if reranker is not None and resolved_order is None and not resolved_defer:
-        try:
-            raw = reranker(candidates)
-            if isinstance(raw, str):
-                if raw.strip().upper() in {RERANK_DEFER_ID, RERANK_NO_MATCH_ID}:
-                    resolved_defer = True
-                else:
-                    resolved_order = [raw]
-            elif isinstance(raw, list):
-                resolved_order = [str(item) for item in raw]
-            elif isinstance(raw, dict):
-                if raw.get("defer") or raw.get("no_match"):
-                    resolved_defer = True
-                else:
-                    inner = raw.get("order", [])
-                    resolved_order = [str(item) for item in (inner or [])]
-                model = model or (str(raw.get("model")) if raw.get("model") else None)
-                policy = policy or (str(raw.get("policy")) if raw.get("policy") else None)
-            elif raw is None:
-                resolved_order = None
-            else:
-                raise ValueError(f"reranker returned {type(raw).__name__!r}")
-        except Exception as exc:
-            fallback = True
-            error = str(exc)[:300]
-            resolved_order = None
-            resolved_defer = False
-
-    by_id = {f"{p.source_type}:{p.source_id}": p for p in packets}
-
-    if resolved_defer:
-        for packet in packets:
-            packet.presentation_rank = None
-        structured_log(
-            logger, logging.INFO, "world_retrieval_reranked",
-            reranked=False, fallback=False, outcome=STATUS_DEFER,
-            candidate_count=len(packets), reordered_ids=[],
-            reranker_model=model, reranker_policy=policy,
-        )
-        return RerankedOutcome(
-            status=STATUS_DEFER, packets=list(packets), presented_ids=[],
-            reordered_ids=[], reranked=False, fallback=False,
-            reranker_model=model, reranker_policy=policy)
-
-    if resolved_order is not None:
-        unknown = [cid for cid in resolved_order if cid not in allowed]
-        if unknown:
-            # A decision model must never invent a source ID: reject the
-            # whole order and keep deterministic evidence handling.
-            structured_log(
-                logger, logging.WARNING, "world_retrieval_rerank_rejected",
-                reason="unknown_candidate_ids", unknown_ids=unknown[:8],
-                candidate_count=len(packets),
-            )
-            fallback = True
-            error = (error + "; " if error else "") + f"unknown candidate IDs: {unknown[:4]}"
-            resolved_order = None
-
-    if resolved_order is None:
-        for packet in packets:
-            packet.presentation_rank = None
-        structured_log(
-            logger, logging.INFO, "world_retrieval_reranked",
-            reranked=False, fallback=fallback, outcome=STATUS_OK,
-            candidate_count=len(packets), reordered_ids=[],
-            reranker_model=model, reranker_policy=policy, error=error,
-        )
-        return RerankedOutcome(
-            status=STATUS_OK, packets=list(packets),
-            presented_ids=list(candidate_ids),
-            reordered_ids=[], reranked=False, fallback=fallback,
-            reranker_model=model, reranker_policy=policy, error=error)
-
-    seen: set[str] = set()
-    ordered: list[EvidencePacket] = []
-    for cid in resolved_order:
-        if cid in seen:
-            continue
-        seen.add(cid)
-        ordered.append(by_id[cid])
-    # Authorized candidates the reranker omitted stay available in retrieval
-    # order after the ranked ones — ranking changes presentation, never
-    # access to authoritative evidence.
-    for packet in packets:
-        key = f"{packet.source_type}:{packet.source_id}"
-        if key not in seen:
-            ordered.append(packet)
-    for rank, packet in enumerate(ordered):
-        packet.presentation_rank = rank
-    reordered = [f"{p.source_type}:{p.source_id}" for p in ordered]
-    structured_log(
-        logger, logging.INFO, "world_retrieval_reranked",
-        reranked=True, fallback=False, outcome=STATUS_OK,
-        candidate_count=len(packets), reordered_ids=reordered,
-        reranker_model=model, reranker_policy=policy,
-    )
-    return RerankedOutcome(
-        status=STATUS_OK, packets=ordered, presented_ids=list(reordered),
-        reordered_ids=list(reordered), reranked=True, fallback=False,
-        reranker_model=model, reranker_policy=policy)
-
-
-def decision_service_reranker(
-    service: Any,
-    *,
-    question_id: str = "world_evidence_rank",
-    instructions: str = "Select the most relevant evidence candidate.",
-    model: str | None = None,
-    policy: str | None = None,
-) -> Callable[[list[dict[str, str]]], dict[str, Any]]:
-    """Adapt a #380 ``DecisionService`` into an ``apply_rerank`` callable.
-
-    Issues one bounded choice question over the supplied candidate IDs plus
-    the standard DEFER escape; the selected ID must be a supplied candidate
-    (DecisionService rejects invented IDs) or DEFER for no-match. Provider
-    failures propagate to ``apply_rerank``'s fallback path.
-    """
-    def _rerank(candidates: list[dict[str, str]]) -> dict[str, Any]:
-        from app.decisions.contracts import (
-            ChoiceQuestion,
-            DecisionCandidate,
-            DecisionRequest,
-        )
-
-        request = DecisionRequest(
-            questions=(ChoiceQuestion(
-                question_id=question_id,
-                instructions=instructions,
-                candidates=tuple(
-                    [DecisionCandidate(id=c["id"], description=c.get("description"))
-                     for c in candidates]
-                    + [DecisionCandidate(id=RERANK_DEFER_ID,
-                                         description="No candidate is relevant; defer.")]
-                ),
-            ),),
-            state={"rerank_candidate_count": len(candidates)},
-            **({"model": model} if model else {}),
-        )
-        response = service.decide(request)
-        result = response.results[question_id]
-        selected = getattr(result, "selected_id", None)
-        if selected == RERANK_DEFER_ID:
-            return {"defer": True, "model": getattr(response, "model", model),
-                    "policy": policy}
-        # Choice selects the single most relevant candidate; keep every other
-        # authorized candidate available behind it in retrieval order.
-        rest = [c["id"] for c in candidates if c["id"] != selected]
-        return {"order": [selected, *rest],
-                "model": getattr(response, "model", model), "policy": policy}
-
-    return _rerank
-
-
 # ── #203 evidence-tool handlers ──────────────────────────────────────────────
 
 def _audience_viewers(audience: Any) -> list[str]:
@@ -1913,31 +1327,16 @@ def _audience_viewers(audience: Any) -> list[str]:
         return []
 
 
-def _resolve_tool_campaign(db: Session, audience: Any) -> Campaign | None:
-    try:
-        cid = _coerce_uuid(getattr(audience, "campaign_id", None), field_name="campaign_id")
-    except ValueError:
-        return None
-    try:
-        return db.get(Campaign, cid)
-    except Exception:
-        return None
-
-
 def _bundle_result(
     request_id: str, tool: str, audience: Any, outcome: RetrievalOutcome,
-    *, dm_internal: bool, rerank: RerankedOutcome | None = None,
+    *, dm_internal: bool,
 ) -> dict[str, Any]:
-    packets = rerank.packets if rerank is not None else outcome.packets
+    packets = outcome.packets
     sources = [p.to_source_ref() for p in packets]
     if outcome.status == STATUS_NOT_FOUND and not packets:
         status = "missing"
     elif outcome.status in {STATUS_DEFER, STATUS_NO_MATCH}:
         status = "unknown"
-    elif rerank is not None and rerank.status in {STATUS_DEFER, STATUS_NO_MATCH}:
-        status = "unknown"
-        packets = []
-        sources = []
     else:
         status = "ok" if packets else "unknown"
     if dm_internal:
@@ -1963,7 +1362,7 @@ def _bundle_result(
     if visibility == "private":
         authorization["user_ids"] = _audience_viewers(audience)
     payload = {
-        "retrieval_status": rerank.status if rerank is not None else outcome.status,
+        "retrieval_status": outcome.status,
         "packets": [p.to_dict() for p in packets],
         "total": outcome.total,
         "visible": outcome.visible,
@@ -1974,15 +1373,6 @@ def _bundle_result(
         "truncated": outcome.truncated,
         "latency_ms": outcome.latency_ms,
     }
-    if rerank is not None:
-        payload["rerank"] = {
-            "reranked": rerank.reranked,
-            "fallback": rerank.fallback,
-            "presented_ids": list(rerank.presented_ids),
-            "reordered_ids": list(rerank.reordered_ids),
-            "model": rerank.reranker_model,
-            "policy": rerank.reranker_policy,
-        }
     return {
         "status": status,
         "sources": sources,
@@ -2094,14 +1484,6 @@ def handle_query_character_knowledge(req: Any, audience: Any, db: Any = None) ->
     return _bundle_result(req.id, req.tool, audience, outcome, dm_internal=dm_internal)
 
 
-def handle_search_campaign_memory(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
-    """Semantic recall over the #213 derived index (lazy import: semantic.py
-    imports this module for its authorization gates and packet builders)."""
-    from app.world.semantic import handle_search_campaign_memory as _semantic_handler
-
-    return _semantic_handler(req, audience, db)
-
-
 TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "lookup_world_entity": handle_lookup_world_entity,
     "traverse_world_relations": handle_traverse_world_relations,
@@ -2109,5 +1491,4 @@ TOOL_HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     "query_world_timeline": handle_query_world_timeline,
     "lookup_source_turn": handle_lookup_source_turn,
     "query_character_knowledge": handle_query_character_knowledge,
-    "search_campaign_memory": handle_search_campaign_memory,
 }

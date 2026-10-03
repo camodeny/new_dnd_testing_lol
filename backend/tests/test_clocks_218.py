@@ -15,6 +15,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
+from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import commit_campaign_mutation, list_campaign_events  # noqa: E402
 from app.decisions import DecisionService  # noqa: E402
 from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
@@ -90,7 +91,7 @@ def _mkclock(db, c, **kw):
         "status": "active", "provenance": {"source": "test"},
     }
     params.update(kw)
-    row, _event = C.create_clock_authoritative(db, c.id, _rev(db, c), **params)
+    row, _event = commit_world_write(db, c.id, _rev(db, c), C.create_clock, **params)
     return row
 
 
@@ -141,7 +142,7 @@ def test_create_validation_fails_closed():
     ]
     for params in bad:
         with pytest.raises(ValueError):
-            C.create_clock_authoritative(db, c.id, _rev(db, c), **params)
+            commit_world_write(db, c.id, _rev(db, c), C.create_clock, **params)
     db.rollback()
     assert db.execute(select(CampaignClock)).scalars().all() == []
     db.close()
@@ -149,29 +150,15 @@ def test_create_validation_fails_closed():
 
 def test_create_idempotent_on_key():
     _F, db, c, *_ = _setup()
-    first, event = C.create_clock_authoritative(
-        db, c.id, _rev(db, c), name="Siege", threshold=3,
-        advancement_criteria={"kind": "deterministic"},
-        status="active", provenance={"source": "test"},
-        idempotency_key="seed-pressure-1")
-    assert event is not None and event.event_type == "clock.created"
-    rev_after_first = _rev(db, c)
-    second, event2 = C.create_clock_authoritative(
-        db, c.id, _rev(db, c), name="Siege", threshold=3,
-        advancement_criteria={"kind": "deterministic"},
-        status="active", provenance={"source": "test"},
-        idempotency_key="seed-pressure-1")
-    assert second.id == first.id and event2 is None
-    assert _rev(db, c) == rev_after_first  # no revision bump, no second event
+    kw = dict(name="Siege", threshold=3, advancement_criteria={"kind": "deterministic"},
+              status="active", provenance={"source": "test"}, idempotency_key="seed-pressure-1")
+    first, created = C.create_clock(db, c, **kw)
+    second, created_again = C.create_clock(db, c, **kw)
+    assert created and not created_again and second.id == first.id
     with pytest.raises(ValueError, match="different clock"):
-        C.create_clock_authoritative(
-            db, c.id, _rev(db, c), name="Other", threshold=3,
-            advancement_criteria={"kind": "deterministic"},
-            provenance={"source": "test"}, idempotency_key="seed-pressure-1")
+        C.create_clock(db, c, **{**kw, "name": "Other"})
     db.close()
 
-
-# ── Deterministic criteria (no model call) ─────────────────────────────────
 
 def test_deterministic_advance_without_model_call():
     _F, db, c, *_ = _setup()
@@ -370,10 +357,7 @@ def test_inactive_clock_skipped_without_consuming(status):
 def test_terminal_clocks_never_loaded():
     _F, db, c, *_ = _setup()
     _mkclock(db, c, status="completed", progress=4, threshold=4)
-    retired = _mkclock(db, c, status="active", name="Doomed")
-    C.retire_clock_authoritative(db, c.id, retired.id, _rev(db, c),
-                                 disposition="retired", reason="arc ended",
-                                 provenance={"source": "test"})
+    _mkclock(db, c, status="retired", name="Doomed")
     hi = _rev(db, c)
     out = C.consolidate_clocks_for_range(db, c.id, 1, hi, _range(db, c, 1, hi),
                                          decision_service=DecisionService(_NeverCall()))
@@ -385,7 +369,7 @@ def test_terminal_clocks_never_loaded():
 
 def test_hidden_clock_projection_and_feed():
     _F, db, c, owner, member, outsider = _setup()
-    hidden = _mkclock(db, c, name="Secret Doom", visibility="dm_only")
+    _mkclock(db, c, name="Secret Doom", visibility="dm_only")
     _mkclock(db, c, name="Open Siege", visibility="campaign", status="active")
     owner_view = C.project_clocks_for_viewer(db, c, owner)
     assert {r["name"] for r in owner_view["clocks"]} == {"Secret Doom", "Open Siege"}
@@ -395,13 +379,7 @@ def test_hidden_clock_projection_and_feed():
     assert "advancement_criteria" in member_view["clocks"][0]  # visible-clock pressure is player-facing
     assert "provenance" not in member_view["clocks"][0]
     assert "completion_effect" not in member_view["clocks"][0]
-    stub = C.get_clock_for_viewer(db, c, hidden.id, member)
-    assert stub == {"clock_id": str(hidden.id), "visible": False}
     assert C.project_clocks_for_viewer(db, c, outsider) == {"clocks": [], "count": 0}
-    assert C.get_clock_for_viewer(db, c, hidden.id, outsider) == {
-        "clock_id": str(hidden.id), "visible": False}
-    full = C.get_clock_for_viewer(db, c, hidden.id, owner)
-    assert full["visible"] is True and full["name"] == "Secret Doom"
     db.close()
 
 
@@ -436,7 +414,7 @@ def test_private_gameplay_advances_hidden_clock_without_disclosure():
     assert C.project_clocks_for_viewer(db, c, member)["clocks"] == []
     member_feed = list_campaign_events(db, c.id, viewer_id=member)
     assert all(e.visibility == "public" for e in member_feed)
-    assert C.get_clock_for_viewer(db, c, clock.id, owner)["progress"] == 1
+    assert int(db.get(CampaignClock, clock.id).progress) == 1
     db.close()
 
 
@@ -513,7 +491,7 @@ def test_semantic_complete_requires_completion_evidence():
                                           "event_types": ["council.vote"]},
                   "status": "active", "provenance": {"source": "test"}}
         params.update(kw)
-        row, _event = C.create_clock_authoritative(db, c.id, _rev(db, c), **params)
+        row, _event = commit_world_write(db, c.id, _rev(db, c), C.create_clock, **params)
         return row
 
     # Mismatched range: only game.play events, so the council.vote completion
@@ -722,12 +700,12 @@ def test_stale_apply_preserves_progress_carry(monkeypatch):
 def test_clock_lifecycle_events_are_not_evidence():
     _F, db, c, *_ = _setup()
     clock = _mkclock(db, c, advancement_criteria={"kind": "deterministic"})
-    created = db.execute(select(CampaignDomainEvent).where(
-        CampaignDomainEvent.event_type == "clock.created")).scalars().one()
-    seq = int(created.sequence)
-    # A range holding only the clock's own creation event advances nothing:
-    # lifecycle bookkeeping is not gameplay evidence, even unfiltered.
-    out = C.consolidate_clocks_for_range(db, c.id, seq, seq, [created],
+    _row, bookkeeping = commit_world_write(
+        db, c.id, _rev(db, c), lambda _db, _campaign: None, event_type=C.CLOCK_COMPLETED_EVENT)
+    seq = int(bookkeeping.sequence)
+    # A range holding only clock bookkeeping advances nothing: lifecycle
+    # events are not gameplay evidence, even unfiltered.
+    out = C.consolidate_clocks_for_range(db, c.id, seq, seq, [bookkeeping],
                                          decision_service=DecisionService(_NeverCall()))
     res = out["results"][0]
     assert res["outcome"] == "no_change" and res["evidence_count"] == 0
@@ -825,32 +803,13 @@ def test_apply_rejects_evidence_outside_range():
     db.close()
 
 
-# ── Adventure-resolution hook + seed composition ───────────────────────────
-
-def test_retire_clock_for_adventure_resolution():
-    _F, db, c, *_ = _setup()
-    clock = _mkclock(db, c, name="Doomed")
-    row, event = C.retire_clock_authoritative(
-        db, c.id, clock.id, _rev(db, c), disposition="retired",
-        reason="arc ended peacefully", provenance={"source": "test"})
-    assert row.status == "retired" and event.event_type == "clock.retired"
-    assert row.resolution["reason"] == "arc ended peacefully"
-    with pytest.raises(ValueError, match="already terminal"):
-        C.retire_clock_authoritative(
-            db, c.id, clock.id, _rev(db, c), disposition="retired",
-            reason="again", provenance={"source": "test"})
-    with pytest.raises(ValueError, match="disposition"):
-        C.retire_clock_authoritative(
-            db, c.id, clock.id, _rev(db, c), disposition="paused",
-            reason="x", provenance={"source": "test"})
-    db.close()
-
+# ── Seed composition ───────────────────────────
 
 def test_seed_flow_composes_inline_creation():
     _F, db, c, *_ = _setup()
 
     def mutate(campaign):
-        row, created = C.create_clock_inline(
+        row, created = C.create_clock(
             db, campaign, name="Opening Pressure", threshold=6,
             advancement_criteria={"kind": "deterministic"},
             status="active", provenance={"source": "world_seed"})

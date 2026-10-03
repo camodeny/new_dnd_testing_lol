@@ -1540,10 +1540,9 @@ def commit_turn(
             logger.warning("dm_turn encounter-end post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
     # Post-commit #213 semantic-index hook for turn-path writes. Staged
-    # assert_fact / upsert_relation effects (and JIT-promoted entities) use
-    # the *_inline writers inside the turn transaction, so they bypass the
-    # *_authoritative hooks — without this, committed turn records would
-    # never become searchable. Best-effort derived work only: never breaks
+    # assert_fact / upsert_relation effects (and JIT-promoted entities) are
+    # written inside the turn transaction — without this, committed turn
+    # records would never become searchable. Best-effort derived work only: never breaks
     # the committed turn. Skipped when the caller owns the transaction
     # (commit=False), mirroring the encounter hook above.
     if commit:
