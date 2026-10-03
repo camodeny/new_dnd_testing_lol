@@ -44,8 +44,9 @@ from typing import Any, Callable, Literal
 
 from pydantic import Field
 
+from app.idempotency import execute_idempotent_command
 from app.observability.tracing import structured_log
-from app.rules.mechanics import MECHANICS_VERSION, RULES_REVISION
+from app.rules.mechanics import RULES_REVISION
 from app.schema import StrictModel
 
 logger = logging.getLogger(__name__)
@@ -1542,8 +1543,6 @@ def apply_state_consequence(
     reused on retry) via the existing ``app.idempotency`` durable command
     record — no new persistence mechanism. Returns ``(result, replayed)``.
     """
-    from app.idempotency import execute_idempotent_command
-
     t0 = time.monotonic()
     try:
         result, replayed = execute_idempotent_command(

@@ -28,6 +28,28 @@ import logging
 from sqlalchemy.orm import Session
 
 from app.dm.turns import DM_TURN_RESOLVED
+from app.visibility.policy import canonical_visibility
+from app.world.clocks import (
+    create_clock,
+    validate_advancement_criteria,
+    validate_completion_criteria,
+    validate_stages,
+)
+from app.world.facts import (
+    create_fact,
+    create_relation,
+    validate_epistemic_state,
+    validate_fact_content,
+    validate_relation_type,
+)
+from app.world.knowledge import assert_knowledge
+from app.world.service import (
+    apply_scene_update,
+    create_entity,
+    validate_entity_name,
+    validate_entity_status,
+    validate_entity_type,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -301,17 +323,6 @@ def generate_seed_spec(
 
 def validate_seed_spec(spec: dict, *, required_pc_ids: list[str]) -> None:
     """Fail-closed structural validation before any write."""
-    from app.world.service import (
-        validate_entity_name, validate_entity_status, validate_entity_type,
-    )
-    from app.world.facts import (
-        validate_epistemic_state, validate_fact_content, validate_relation_type,
-    )
-    from app.world.clocks import (
-        validate_advancement_criteria, validate_completion_criteria, validate_stages,
-    )
-    from app.visibility.policy import canonical_visibility
-
     if not isinstance(spec, dict) or spec.get("contract_version") != WORLD_SEED_CONTRACT_VERSION:
         raise WorldSeedError("World seed spec contract version mismatch")
     validate_entity_type("location")
@@ -386,10 +397,6 @@ def run_world_seed(
     from app.campaigns.service import (
         CampaignArchivedError, compute_start_eligibility, require_playable_campaign,
     )
-    from app.world.clocks import create_clock
-    from app.world.knowledge import assert_knowledge
-    from app.world.facts import create_fact, create_relation
-    from app.world.service import apply_scene_update, create_entity
     from models.campaigns import Campaign, CampaignMember
 
     campaign = db.get(Campaign, campaign_id)

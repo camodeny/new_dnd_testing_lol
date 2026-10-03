@@ -31,7 +31,7 @@ from app.decisions import (  # noqa: E402
     shared_trace,
     to_decision_request,
 )
-from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
+from tests.support.fake_decisions import FakeDecisionAdapter  # noqa: E402
 from app.decisions.contracts import ChoiceResult  # noqa: E402
 from app.decisions.errors import DecisionError  # noqa: E402
 from app.decisions.policy import POLICY_SCHEMA_VERSION  # noqa: E402

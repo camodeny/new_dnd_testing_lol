@@ -5,9 +5,12 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+from app.combat.service import get_encounter
 from app.deps.campaign import campaign_for, require_owner, run_campaign_command
 from app.deps.auth import current_profile
 from app.deps.idempotency import require_idempotency_key
+from app.dm.recovery import execute_committed_attempt
+from app.realtime.service import publish_encounter_ready, publish_encounter_turn
 from app.rolls.service import (
     RollAuthorizationError, RollLifecycleError, cancel_or_replace, fulfill_roll,
     get_fulfillment, list_roll_requests, request_rolls,
@@ -52,9 +55,6 @@ def _publish_encounter_ready_post_commit(db: Session, result: dict) -> None:
     if not isinstance(ready, dict) or not ready.get("ready") or not ready.get("encounter_id"):
         return
     try:
-        from app.combat.service import get_encounter
-        from app.realtime.service import publish_encounter_ready, publish_encounter_turn
-
         encounter = get_encounter(db, uuid.UUID(str(ready["encounter_id"])))
         if encounter is None:
             return
@@ -174,7 +174,6 @@ def fulfill_roll_request(
     _publish_encounter_ready_post_commit(db, result)
     resumed = result.get("resumed_attempt")
     if resumed:
-        from app.dm.recovery import execute_committed_attempt
         background_tasks.add_task(execute_committed_attempt, resumed["id"])
     return result
 

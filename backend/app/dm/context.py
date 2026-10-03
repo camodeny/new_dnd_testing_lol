@@ -25,8 +25,13 @@ from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
+from app.rules.mechanics import get_character_mechanics_for_sheet
 from app.schema import StrictModel
+from app.world.identity import exact_identity
+from app.world.knowledge import build_knowledge_visibility_values
+from app.world.service import build_current_scene_context_record
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 from models.campaigns import CampaignMember
@@ -811,8 +816,6 @@ def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
     }
     # Additive #224 mechanics — try pure derivation, surface error without blocking lane
     try:
-        from app.rules.mechanics import get_character_mechanics_for_sheet
-
         m = get_character_mechanics_for_sheet(sheet)
         # Keep payload bounded: include deterministic derived views gameplay needs,
         # plus provenance/version for evidence. Full DTO available via evidence tool.
@@ -1039,11 +1042,7 @@ def assemble_attempt_context(
                 use="adjudication_only",
             )
         )
-        sheet = db.scalar(
-            select(Dnd5eCharacterSheet).where(
-                Dnd5eCharacterSheet.character_id == character.id
-            )
-        )
+        sheet = latest_sheet(db, character.id)
         if character.system == "dnd5e" and sheet is None:
             raise MissingAuthoritativeContextError(
                 f"Relevant PC {character.id} has no authoritative D&D 5e sheet"
@@ -1223,8 +1222,6 @@ def assemble_attempt_context(
     # location/time/present actors without parsing chat history. Absent
     # scene rows leave the lane empty so #202 fail-closed rules apply.
     lane_started = time.monotonic()
-    from app.world.service import build_current_scene_context_record
-
     # Source failure (malformed row, reader regression, DB error) raises:
     # fail closed — never silently convert to "no scene established".
     scene_value = build_current_scene_context_record(db, campaign)
@@ -1339,8 +1336,6 @@ def assemble_attempt_context(
                     scene_npc_ids.append(eid)
             if len(scene_npc_ids) >= 32:
                 break
-    from app.world.knowledge import build_knowledge_visibility_values
-
     knowledge_values = build_knowledge_visibility_values(
         db, campaign, sorted(character_ids, key=str),
         npc_entity_ids=scene_npc_ids,
@@ -1507,9 +1502,6 @@ def repair_packet_missing_perspectives(
     scope-narrowing). Never raises: repair is best-effort.
     """
     try:
-        from app.world.knowledge import build_knowledge_visibility_values
-        from app.world.identity import exact_identity
-
         ordered = [str(s or "").strip() for s in (subject_ids or [])]
         ordered = [s for s in dict.fromkeys(ordered) if s][:8]
         if not ordered or packet is None:

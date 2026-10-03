@@ -18,7 +18,7 @@
 
 **Retrieval:** `app/rules_corpus/store.py` — exact `lookup_by_rule_id` + bounded hybrid lexical (`tsvector`/`LIKE`) + vector (`pgvector HNSW`, fallback to lexical if unavailable) with RRF fusion; scores are metadata only, citations from canonical records. Duplicate concepts remain separately addressable.
 
-**Evidence tools:** `app/rules_corpus/evidence_tools.py` → `lookup_rule` / `search_rules` via `app/dm/evidence.py#203` (`ALLOWED_TOOLS`). Bounded output, `missing`/`tool_failure` never hallucinated.
+**Evidence tools:** `app/dm/tools/rules.py` → `lookup_rule` / `search_rules` via `app/dm/evidence.py#203` (`ALLOWED_TOOLS`). Bounded output, `missing`/`tool_failure` never hallucinated.
 
 **Embeddings:** `app/rules_corpus/embeddings.py` + `scripts/build_rule_embeddings.py` — section_with_heading_context, versioned `model/version/build_id`; rebuild does not mutate `rule_id`.
 - Default: `stub-hash-v1` (1536 dims, deterministic, offline/test).

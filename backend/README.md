@@ -1,5 +1,7 @@
 # Backend (FastAPI + SQLAlchemy + Alembic + Supabase)
 
+Code layout, the DM turn flow, the async model (BackgroundTasks + Supabase pg_cron sweeps), and where auth/visibility/dice authority live: see [`app/ARCHITECTURE.md`](app/ARCHITECTURE.md).
+
 ## Env
 Copy `.env.example` to `.env` locally. On Vercel the Supabase integration injects `DATABASE_URL`/`POSTGRES_URL`, `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_JWT_SECRET` automatically.
 
@@ -18,7 +20,7 @@ Alembic is configured in `alembic/env.py` to read `DATABASE_URL`/`POSTGRES_URL`/
 ### Local development
 
 ```bash
-# create a new migration after editing models.py
+# create a new migration after editing models/
 alembic revision --autogenerate -m "add campaigns"
 
 # preview SQL without touching DB
@@ -80,7 +82,7 @@ Canonical local commands mirror CI: `scripts/ci/backend.sh` and `scripts/ci/fron
 Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) should be added as separate `workflow_dispatch` / `schedule` jobs or new workflows reusing the same `setup-python`/`setup-node`/postgres service conventions — do not add paid model calls or production credentials to the required PR path.
 
 ## Auth
-`auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
+`app/auth/jwt.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, RS256/ES256). Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
 
 There is no mock/dev auth bypass: every request must bear a real Supabase
 JWT, including local development. Sign in through the app with a dev user

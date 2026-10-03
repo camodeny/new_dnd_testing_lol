@@ -12,7 +12,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.world._common import coerce_uuid, require_provenance
+from app.schema import coerce_uuid
+from app.world._common import require_provenance
 from app.visibility.policy import MEMBER_VISIBILITIES
 from app.world.service import UNSET, get_entity_strict
 from models.campaigns import Campaign

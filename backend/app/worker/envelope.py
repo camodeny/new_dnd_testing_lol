@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from app.observability.tracing import current_trace_id
 
 # Keys that would indicate an embedded snapshot — forbidden in payload
 FORBIDDEN_PAYLOAD_KEYS = {
@@ -94,7 +95,6 @@ def new_envelope(
 ) -> WorkerEnvelope:
     """Create envelope with identifiers only; validates no snapshot."""
     if trace_id is None:
-        from app.observability.tracing import current_trace_id
         trace_id = current_trace_id()
     return WorkerEnvelope(
         job_id=job_id or uuid.uuid4(),

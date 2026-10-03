@@ -14,12 +14,12 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base
 from models.rules import RulesCorpus, RulesCorpusImport, RulesEmbedding, RulesSection
-from app.rules_corpus.ids import derive_rule_id_with_path, derive_source_section_id, slugify, check_collisions
+from app.rules_corpus.ids import derive_rule_id_with_path, slugify, check_collisions
 from app.rules_corpus.metadata import ATTRIBUTION, CORPUS_ID, CORPUS_VERSION, LICENSE, OFFICIAL_SRD_URL
 from app.rules_corpus.ingest import import_fixture_sections, normalize_raw_sections, parse_cantilux_json
-from app.rules_corpus.store import hybrid_search, lookup_by_rule_id, lookup_by_locator, search_lexical
+from app.rules_corpus.store import hybrid_search, lookup_by_rule_id, search_lexical
 from app.rules_corpus.embeddings import build_embeddings
-from app.rules_corpus.evidence_tools import handle_lookup_rule, handle_search_rules
+from app.dm.tools.rules import handle_lookup_rule, handle_search_rules
 from app.dm.context import ContextAudience
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import ALLOWED_TOOLS, validate_evidence_requests
@@ -52,11 +52,9 @@ def _audience():
 
 
 def test_source_locators_derive_from_full_heading_hierarchy():
-    loc = derive_source_section_id("playing-the-game", ["Combat", "Melee Attacks", "Opportunity Attacks"])
-    assert loc == "playing-the-game-combat-melee-attacks-opportunity-attacks"
     rid, src = derive_rule_id_with_path(CORPUS_ID, CORPUS_VERSION, "playing-the-game", ["Combat", "Melee Attacks", "Opportunity Attacks"])
     assert rid.startswith("dndsrd521.") or rid.startswith("srd521.") or "521" in rid
-    assert src == loc
+    assert src == "playing-the-game-combat-melee-attacks-opportunity-attacks"
     assert slugify("Melee Attacks") == "melee-attacks"
 
 
@@ -153,9 +151,6 @@ def test_exact_stable_id_lookup_independent_of_search(db):
     row = lookup_by_rule_id(db, sample.rule_id)
     assert row is not None
     assert row.rule_id == sample.rule_id
-    # locator lookup
-    row2 = lookup_by_locator(db, sample.source_locator)
-    assert row2 is not None
 
 
 def test_natural_language_hybrid_retrieval(db):

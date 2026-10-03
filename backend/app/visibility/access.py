@@ -18,8 +18,8 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_uuid
 from app.observability.tracing import structured_log
-from app.world._common import coerce_uuid
 from app.visibility.policy import MEMBER_VISIBILITIES, canonical_visibility
 from models.campaigns import Campaign, CampaignMember
 from models.world import (

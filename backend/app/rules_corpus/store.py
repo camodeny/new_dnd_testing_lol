@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any
@@ -19,14 +18,8 @@ from sqlalchemy.orm import Session
 
 from app.rules_corpus.gemini import EMBEDDING_DIM
 from models.rules import RulesSection
-from models.rules import RulesCorpus
-from models.rules import RulesEmbedding
 
 logger = logging.getLogger(__name__)
-
-
-def get_corpus(db: Session, corpus_id: str, corpus_version: str) -> RulesCorpus | None:
-    return db.get(RulesCorpus, (corpus_id, corpus_version))
 
 
 def lookup_by_rule_id(db: Session, rule_id: str, *, corpus_version: str | None = None) -> RulesSection | None:
@@ -40,14 +33,6 @@ def lookup_by_rule_id(db: Session, rule_id: str, *, corpus_version: str | None =
     latency = (time.monotonic() - t0) * 1000
     logger.info("rules_lookup", extra={"rule_id": rule_id, "found": row is not None, "latency_ms": round(latency, 2)})
     return row
-
-
-def lookup_by_locator(db: Session, source_locator: str, *, corpus_id: str = "dnd-srd", corpus_version: str = "5.2.1") -> RulesSection | None:
-    return db.query(RulesSection).filter(
-        RulesSection.source_locator == source_locator,
-        RulesSection.corpus_id == corpus_id,
-        RulesSection.corpus_version == corpus_version,
-    ).first()
 
 
 def _dialect(db: Session) -> str:
@@ -249,10 +234,4 @@ def hybrid_search(
     latency = (time.monotonic() - t0) * 1000
     logger.info("rules_hybrid_search", extra={"query": query[:80], "limit": limit, "lexical": len(lexical), "vector": len(vector), "results": len(results), "latency_ms": round(latency, 2)})
     return results
-
-
-def format_citation(section: RulesSection) -> str:
-    c = section.citation()
-    path = c.get("path") or "/".join(c.get("heading_path") or [])
-    return f"{c['title']} — {c['corpus_id']} {c['corpus_version']} [{path}] ({c['source_locator']}) · {c['license']}"
 

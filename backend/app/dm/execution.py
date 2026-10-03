@@ -34,8 +34,12 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.service import CampaignArchivedError
 from app.clock import utcnow
 from app.observability.tracing import structured_log
+from app.providers import policy as role_policy
+from app.worker.executor import RETRIABLE, TERMINAL, classify_error
+from app.world.identity import IdentityReuseRequiresReadjudication
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +104,6 @@ def _execute_owned_attempt(
     Returns the narration ``ValidatedTurnResult`` or a
     :class:`NonNarratedResult`; ``None`` when skipped or deferred.
     """
-    from app.campaigns.service import CampaignArchivedError
     from app.dm.narration import NarrationStreamError
 
     run = _claim(db, attempt_id, trace_id=trace_id or str(uuid.uuid4()), timeout_seconds=timeout_seconds)
@@ -292,8 +295,6 @@ def _build_adjudicator(run: _Run, adjudicate, provider_name: str | None):
     """Production adjudicator through the role-aware failover path (#208)."""
     run.provider = provider_name
     if adjudicate is None:
-        from app.providers import policy as role_policy
-
         path = role_policy.execution_path("forward_dm")
         run.provider = provider_name or path[0][0]
         run.model = path[0][1]
@@ -463,7 +464,6 @@ def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, ca
     """
     from app.dm.context import LaneName
     from app.dm.narration import execute_validated_turn
-    from app.world.identity import IdentityReuseRequiresReadjudication
     from models.dm import DmTurnAttempt
 
     db = run.db
@@ -679,8 +679,6 @@ def _complete_silent(db: Session, run: _Run, contract) -> NonNarratedResult:
 
 def _classify_failure(exc: BaseException) -> str:
     """Map execution failures to attempt error_class (retriable default)."""
-    from app.providers import policy as role_policy
-
     if isinstance(exc, RuntimeError) and "Unapproved model substitution" in str(exc):
         return "terminal"
     try:
@@ -688,8 +686,6 @@ def _classify_failure(exc: BaseException) -> str:
         return cls
     except Exception:
         pass
-    from app.worker.executor import TERMINAL, classify_error
-
     if _is_config_error(exc):
         return "retriable"
     try:
@@ -705,8 +701,6 @@ def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
     is the only player-facing surface and never includes provider, model,
     status code, or exception text.
     """
-    from app.providers import policy as role_policy
-
     from models.dm import DmTurnAttempt
 
     try:
@@ -739,7 +733,6 @@ def _record_failure(run: _Run, exc: BaseException, *, retryable: bool = True) ->
     from datetime import datetime, timedelta, timezone
 
     from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING, mark_attempt_failed
-    from app.worker.executor import RETRIABLE
     from models.dm import DmTurn, DmTurnAttempt
 
     db = run.db

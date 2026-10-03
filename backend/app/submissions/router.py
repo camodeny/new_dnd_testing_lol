@@ -6,10 +6,19 @@ import uuid
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+from app.billing.resolution_guarantee import (
+    CapacityPausedError as _CapPausedPre,
+    CapacityPausedError as _CapPaused,
+    capacity_state_payload,
+    require_new_ai_work,
+)
 from app.deps.campaign import campaign_for
 from app.campaigns.service import CampaignArchivedError
 from app.deps.auth import current_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+from app.dm.recovery import execute_committed_attempt
+from app.dm.turns import StreamBoundaryError, TurnConflictError, coordinate_turn, get_active_turn
+from app.realtime.service import publish_submission_created
 from app.submissions.service import (
     SubmissionValidationError,
     accept_submission,
@@ -140,12 +149,6 @@ def create_player_submission(
         # editable local draft. Merging into an existing owed turn, and all
         # owed continuations (rolls, streaming, commit, post-turn), proceed.
         try:
-            from app.billing.resolution_guarantee import (
-                CapacityPausedError as _CapPausedPre,
-                require_new_ai_work,
-            )
-            from app.dm.turns import get_active_turn
-
             _active = get_active_turn(db, campaign.id, thread_id_str)
             # Direct player conversations never invoke the AI DM (coordination
             # is skipped below), so the capacity gate does not apply to them
@@ -193,13 +196,6 @@ def create_player_submission(
         # acceptance. The submission is durably stored; DM turn will be
         # observable via the dm-turns API.
         try:
-            from app.dm.turns import (
-                StreamBoundaryError,
-                TurnConflictError,
-                coordinate_turn,
-            )
-            from app.billing.resolution_guarantee import CapacityPausedError as _CapPaused
-
             # Direct player conversations do not summon or expose their content
             # to the AI DM. Shared and AI-DM threads retain normal coordination.
             coord = None
@@ -277,8 +273,6 @@ def create_player_submission(
                         .order_by(PlayerSubmissionSegment.position)
                         .all()
                     )  # type: ignore[attr-defined]
-                    from app.realtime.service import publish_submission_created
-
                     publish_submission_created(db, db_sub, segments=segs)
             except Exception as pub_exc:
                 logger.warning(
@@ -306,8 +300,6 @@ def create_player_submission(
     # stays ``prepared`` and ``/api/cron/dm-execute`` reconciles it.
     attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
     if attempt_data and attempt_data.get("id"):
-        from app.dm.recovery import execute_committed_attempt
-
         background_tasks.add_task(
             execute_committed_attempt, str(attempt_data["id"])
         )
@@ -325,8 +317,6 @@ def get_capacity_state(
     Aggregates + AI-pause/grace/owed flags only (no secrets, keys, or
     narrative). Non-AI surface: stays usable while AI play is paused.
     """
-    from app.billing.resolution_guarantee import capacity_state_payload
-
     return capacity_state_payload(db, campaign.id)
 
 

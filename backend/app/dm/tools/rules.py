@@ -14,8 +14,9 @@ import logging
 from app.dm.context import AuthorizationScope, ContextAudience, SourceRef
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import EvidenceResult, EvidenceValidationError
+from app.rules_corpus.gemini import gemini_embed_query
 from app.rules_corpus.store import hybrid_search, lookup_by_rule_id
-from app.rules_corpus.metadata import ATTRIBUTION, LICENSE, OFFICIAL_SRD_URL
+from app.rules_corpus.metadata import LICENSE
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +181,6 @@ def handle_search_rules(request: EvidenceRequest, audience: ContextAudience, *, 
             if embedding_model is None:
                 logger.warning("rules evidence search lexical-only reason=no_gemini_index stub_vectors_ignored")
             else:
-                from app.rules_corpus.gemini import gemini_embed_query
-
                 # Use detected model or default gemini-embedding-2
                 try:
                     query_embedding = gemini_embed_query(query, model=embedding_model)

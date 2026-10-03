@@ -36,6 +36,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.replacements import PcLifecycleError, declare_pc_death
 from app.characters.service import latest_sheet
 from app.clock import ms_between, utcnow
 from app.combat.service import (
@@ -46,6 +48,7 @@ from app.combat.service import (
     lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_ended
 from models.campaigns import Campaign
 from models.combat import (
     END_FOLLOWUP_HOOKS,
@@ -257,8 +260,6 @@ def _apply_slain_deaths(
     the encounter and lifecycle rows untouched. Already-terminal PCs converge
     (duplicate-safe) instead of failing the end.
     """
-    from app.campaigns.replacements import PcLifecycleError, declare_pc_death
-
     declared: list[str] = []
     by_id = {str(p.id): p for p in list_participants(db, encounter.id)}
     for pid, fate in outcomes.items():
@@ -402,8 +403,6 @@ def end_encounter(
 
     Returns (encounter, ended_event, followups).
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise EndEncounterError("operation_id is required (1-128 characters)")
@@ -515,8 +514,6 @@ def end_encounter(
         operation_id=operation_id, revision=int(campaign_after.revision or 0),
     )
     if commit:
-        from app.realtime.service import publish_encounter_ended
-
         publish_encounter_ended(db, encounter)
     return encounter, event, holder.get("hooks") or []
 

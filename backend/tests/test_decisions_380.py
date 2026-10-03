@@ -6,7 +6,7 @@ import requests
 
 import pytest
 
-from app.decisions.adapters.fake import FAKE_MODEL_NAME, FakeDecisionAdapter
+from tests.support.fake_decisions import FAKE_MODEL_NAME, FakeDecisionAdapter
 from app.decisions.adapters.jev import JevAdapter
 from app.decisions.contracts import (
     ChoiceQuestion,

@@ -152,7 +152,6 @@ class _StubPacket:
 
 
 def test_dm_contract_via_meta_choices_envelope(monkeypatch):
-    import app.providers as providers_pkg
     from app.dm.adjudication import adjudicate_with_failover
 
     monkeypatch.setenv("META_API_KEY", "dummy")
@@ -180,6 +179,6 @@ def test_dm_contract_via_meta_choices_envelope(monkeypatch):
         assert request.json_schema is not None
         return MetaAdapter().parse_response(envelope)
 
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
     contract, _ = adjudicate_with_failover(_StubPacket())
     assert contract.mode == "silent"

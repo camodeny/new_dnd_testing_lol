@@ -31,6 +31,8 @@ from app.decisions.contracts import (
     ScoreQuestion,
 )
 from app.decisions.errors import DecisionError
+from app.observability import tracing as tracing_module
+from app.observability.service import fail_soft, finish_ai_run, start_ai_run
 
 DECISION_ROLE = "decision"
 DECISION_LOGICAL_OPERATION = "bounded_decision"
@@ -191,8 +193,6 @@ class DecisionService:
         request: DecisionRequest,
     ) -> DecisionResponse:
         """Execute one bounded decision request through the configured adapter."""
-        from app.observability import tracing as tracing_module
-
         validate_request(request)
         adapter = self._adapter
         capabilities = adapter.capabilities() or {}
@@ -273,8 +273,6 @@ class DecisionService:
         if self._session_factory is None:
             return None
         try:
-            from app.observability.service import fail_soft, start_ai_run
-
             def _start() -> Any:
                 return start_ai_run(
                     self._session_factory,
@@ -304,8 +302,6 @@ class DecisionService:
         if self._session_factory is None or run_id is None:
             return
         try:
-            from app.observability.service import fail_soft, finish_ai_run
-
             run = getattr(run_id, "id", run_id)
             usage = usage or {}
             fail_soft(

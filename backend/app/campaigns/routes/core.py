@@ -26,6 +26,7 @@ from app.deps.campaign import (
     run_campaign_command,
 )
 from app.deps.idempotency import command_keys, execute_http_idempotent
+from app.dm.recovery import execute_committed_attempt
 from database import get_db
 from models.campaigns import Campaign
 
@@ -231,8 +232,6 @@ def campaign_start(
     writes. Failures leave the campaign startable with an owed opening turn.
     """
     from app.campaigns.campaign_start import CampaignStartError, run_campaign_start
-    from app.dm.recovery import execute_committed_attempt
-
     cid = parse_campaign_id_or_404(campaign_id)
     operation_id, idempotency_key = command_keys(request, payload)
 

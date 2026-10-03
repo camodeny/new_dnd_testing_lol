@@ -40,6 +40,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
 from app.combat.geometry import (
     GeometryError,
     cheapest_path,
@@ -60,6 +61,8 @@ from app.combat.service import (
     lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_map, publish_encounter_moved
+from app.visibility.access import may_user_receive
 from models.campaigns import Campaign
 from models.combat import (
     MOVEMENT_MODES,
@@ -181,8 +184,6 @@ def _hidden_token_ids(
             entity_by_participant[str(participant.id)] = entity
     if not hidden or viewer_user_id is None or campaign is None:
         return hidden
-    from app.visibility.access import may_user_receive
-
     revealed: set[str] = set()
     for participant_id, entity in entity_by_participant.items():
         try:
@@ -444,31 +445,6 @@ def _bump_map_revision(encounter_map: EncounterMap) -> None:
     encounter_map.revision = int(encounter_map.revision or 1) + 1
 
 
-def _emit_map_event(
-    db: Session,
-    campaign: Campaign,
-    encounter: Encounter,
-    *,
-    expected_revision: int,
-    operation_id: str,
-    payload: dict,
-    commit: bool,
-):
-    from app.campaigns.events import commit_campaign_mutation
-
-    _, event = commit_campaign_mutation(
-        db,
-        campaign.id,
-        expected_revision=int(expected_revision),
-        event_type=MAP_UPDATED_EVENT,
-        payload={"encounter_id": str(encounter.id), "thread_id": encounter.thread_id, **payload},
-        operation_id=operation_id,
-        actor_id=campaign.owner_id,
-        commit=commit,
-    )
-    return event
-
-
 def ensure_map(
     db: Session,
     encounter_id: uuid.UUID,
@@ -589,8 +565,6 @@ def ensure_map(
         holder["zone_count"] = len(zone_rows)
         holder["placement_count"] = len(full)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     try:
         campaign_after, event = commit_campaign_mutation(
             db,
@@ -630,8 +604,6 @@ def ensure_map(
         zone_count=holder["zone_count"], operation_id=operation_id,
     )
     if commit:
-        from app.realtime.service import publish_encounter_map
-
         publish_encounter_map(db, encounter)
     return encounter_map, event
 
@@ -701,8 +673,6 @@ def update_terrain(
         holder["zone_count"] = len(list_zones(db, encounter_map.id))
         holder["stranded"] = _stranded_placements(db, encounter, encounter_map)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     def _terrain_payload() -> dict:
         # The domain event is thread-scoped/shared history: stranded flags
         # carry exact cells, so hidden-entity tokens are filtered here too
@@ -744,8 +714,6 @@ def update_terrain(
         operation_id=operation_id,
     )
     if commit:
-        from app.realtime.service import publish_encounter_map
-
         publish_encounter_map(db, encounter)
     return encounter_map, event
 
@@ -1182,8 +1150,6 @@ def move_participant(
         db.flush()
         holder["move"] = move
 
-    from app.campaigns.events import commit_campaign_mutation
-
     def _moved_payload() -> dict:
         # A hidden token's coordinates must not ride the shared/thread-scoped
         # event: non-owners get a position-free invalidation (the movement
@@ -1271,8 +1237,6 @@ def move_participant(
         path_calc_latency_ms=latency_ms,
     )
     if commit:
-        from app.realtime.service import publish_encounter_moved
-
         publish_encounter_moved(db, encounter, participant.id, move_id=str(move.id))
     return move, encounter, event
 
@@ -1383,14 +1347,3 @@ def map_projection(
         "stranded_placements": stranded,
     }
 
-
-def get_snapshot_map(
-    db: Session, campaign_id: uuid.UUID, viewer_id: uuid.UUID, *, is_owner: bool = False
-) -> dict | None:
-    """Reconnect-safe map projection for the live-table snapshot."""
-    from app.combat.service import get_active_encounter
-
-    encounter = get_active_encounter(db, campaign_id)
-    if encounter is None:
-        return None
-    return map_projection(db, encounter, viewer_id=viewer_id, is_owner=is_owner)

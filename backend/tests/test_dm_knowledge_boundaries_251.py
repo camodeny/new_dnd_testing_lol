@@ -44,7 +44,6 @@ from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     grant_visibility,
     what_does_subject_know,
-    who_knows_target,
 )
 from app.world.facts import create_fact  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
@@ -326,8 +325,6 @@ def test_one_pc_discovery_is_not_party_knowledge():
         operation_id="op-know-sep")
     assert what_does_subject_know(db, camp, aria.id, owner)["visible"] == 1
     assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
-    knowers = who_knows_target(db, camp, "fact", fact.id, owner)["knowers"]
-    assert [k["subject_entity_id"] for k in knowers] == [str(aria.id)]
 
 
 def test_human_disclosure_does_not_create_character_knowledge():
@@ -347,7 +344,6 @@ def test_human_disclosure_does_not_create_character_knowledge():
     assert may_user_receive(db, camp, "fact", fact.id, alice)["allowed"] is True
     # ...but no character knowledge row exists for anyone.
     assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
-    assert who_knows_target(db, camp, "fact", fact.id, owner)["total"] == 0
 
 
 # ── review findings: contract, mixed refs, scene relevance, lane NPCs ─────

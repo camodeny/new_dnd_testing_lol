@@ -13,6 +13,8 @@ from fastapi import APIRouter, Request
 from fastapi.params import Depends
 from sqlalchemy.orm import Session
 
+from app.deps.cron import require_cron_secret
+from app.world.semantic_index import run_semantic_index_sweep
 from database import get_db
 
 logger = logging.getLogger(__name__)
@@ -26,12 +28,8 @@ def post_turn_cron_get(request: Request, db: Session = Depends(get_db)):
 
     Semantic indexing is derived work: its failure never fails the sweep.
     """
-    from app.deps.cron import require_cron_secret
-
     require_cron_secret(request.headers.get("authorization"))
     from app.post_turn.service import run_post_turn_sweep
-    from app.world.semantic_index import run_semantic_index_sweep
-
     result = run_post_turn_sweep(db)
     logger.info(
         "post_turn cron executed=%s failed=%s",

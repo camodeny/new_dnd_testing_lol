@@ -694,11 +694,8 @@ def test_map_redefine_without_placements_preserves_positions():
 
 
 def test_two_moves_same_turn_have_distinct_realtime_event_ids():
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        build_encounter_moved_event,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import build_encounter_moved_event, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     fac, ctx = _fixture()
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)
@@ -723,7 +720,8 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
 
 
 def test_hidden_mover_move_redacts_positions():
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     fac, ctx = _fixture()
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)

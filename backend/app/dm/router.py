@@ -14,7 +14,18 @@ from sqlalchemy.orm import Session
 
 from app.deps.campaign import campaign_for, require_owner, run_campaign_command
 from app.deps.auth import current_profile
-from app.threads.service import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
+from app.deps.cron import require_cron_secret
+from app.deps.idempotency import require_idempotency_key
+from app.post_turn.backpressure import describe_client_state, evaluate_backpressure
+from app.realtime.service import publish_dm_status
+from app.threads.service import (
+    ThreadAuthorizationError,
+    ThreadNotFoundError,
+    assert_can_read_thread,
+    list_threads_for_user,
+    parse_thread_id,
+    resolve_thread_id,
+)
 from database import get_db
 from models.campaigns import Campaign
 
@@ -33,7 +44,6 @@ def retry_adjudication(
     campaign: Campaign = Depends(campaign_for()),
     db: Session = Depends(get_db),
 ):
-    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import retry_failed_adjudication, execute_committed_attempt
     from models.dm import DmTurn
     require_owner(campaign, profile.id)
@@ -73,7 +83,6 @@ def retry_narration(
     db: Session = Depends(get_db),
 ):
     """Narration-independent retry reusing the preserved structured result."""
-    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import retry_narration_only, execute_committed_attempt
     from models.dm import DmTurn
     require_owner(campaign, profile.id)
@@ -128,7 +137,6 @@ def continue_stream(
     Realtime delivery happens after that commit returns (never before
     durability), via a best-effort post-commit status publish.
     """
-    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import recover_partial_stream
     from models.dm import DmTurn
     require_owner(campaign, profile.id)
@@ -189,8 +197,6 @@ def _publish_recovery_status(db: Session, stream_id) -> None:
     _logger = _logging.getLogger(__name__)
     try:
         from app.dm.streams import get_stream
-        from app.realtime.service import publish_dm_status
-
         stream = get_stream(db, stream_id)
         if stream is not None and stream.status == "completed":
             publish_dm_status(db, stream, visible_text=stream.final_text)
@@ -222,8 +228,6 @@ def list_dm_turns(
             raise HTTPException(status_code=403, detail="Not authorized for this thread") from exc
     # No thread filter: return only turns for threads the user is authorized to see
     # (prevents private-turn metadata leakage)
-    from app.threads.service import list_threads_for_user
-
     visible_threads = list_threads_for_user(db, campaign.id, profile.id)
     visible_ids = {str(t.id) for t in visible_threads}
     all_turns = list_turns(db, campaign.id, thread_id=None, limit=200)
@@ -268,8 +272,6 @@ def get_dm_turn(
     # Issue #222 — low-key client state: ready vs temporary DM processing
     # delay. Never exposes queues, providers, models, or internals.
     try:
-        from app.post_turn.backpressure import describe_client_state, evaluate_backpressure
-
         readiness = describe_client_state(evaluate_backpressure(db, campaign.id))
     except Exception:
         readiness = {"dm_state": "processing",
@@ -290,8 +292,6 @@ def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
     API/database intervention. Shared cron auth guard (``app.deps.cron``):
     ``CRON_SECRET`` bearer, or ``ALLOW_INSECURE_CRON=1`` local/test bypass.
     """
-    from app.deps.cron import require_cron_secret
-
     require_cron_secret(request.headers.get("authorization"))
     from app.dm.execution import run_dm_execute_sweep
 

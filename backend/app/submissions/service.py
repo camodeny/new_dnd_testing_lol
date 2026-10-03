@@ -11,6 +11,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.service import require_playable_campaign
 from models.campaigns import Campaign
 from models.campaigns import CampaignMember
 from models.characters import Character
@@ -124,8 +125,6 @@ def accept_submission(
         raise SubmissionValidationError("Campaign not found")
     # Issue #265 — re-check on the locked row: a concurrent archive that won
     # the row lock after the transport-level check must still refuse the write.
-    from app.campaigns.service import require_playable_campaign
-
     require_playable_campaign(campaign)
 
     if character_id is not None:

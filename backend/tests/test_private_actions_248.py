@@ -26,7 +26,8 @@ from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
 from app.dm.execution import execute_dm_attempt  # noqa: E402
 from app.dm.turns import commit_turn, coordinate_turn  # noqa: E402
 from app.realtime.channels import live_table_channel  # noqa: E402
-from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher  # noqa: E402
+from app.realtime.service import set_realtime_publisher  # noqa: E402
+from tests.support.realtime import InMemoryRealtimePublisher  # noqa: E402
 from app.submissions.service import accept_submission  # noqa: E402
 from app.threads.service import (  # noqa: E402
     can_read_thread,

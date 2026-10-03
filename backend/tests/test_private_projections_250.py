@@ -17,12 +17,12 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
 from app.realtime.service import (  # noqa: E402
-    InMemoryRealtimePublisher,
     build_projection_invalidated_event,
     publish_projection_invalidated,
     publish_projection_invalidated_for_grantee,
     set_realtime_publisher,
 )
+from tests.support.realtime import InMemoryRealtimePublisher  # noqa: E402
 from app.snapshot.surfaces import build_surfaces_for_viewer  # noqa: E402
 from app.world import clocks as _clocks  # noqa: E402
 from app.world import knowledge as _knowledge  # noqa: E402

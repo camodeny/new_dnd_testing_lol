@@ -44,7 +44,15 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.billing.resolution_guarantee import require_new_ai_work, require_new_ai_work as _require_new_ai_work
+from app.campaigns.events import RevisionConflictError, commit_campaign_mutation
+from app.campaigns.opening_intro import maybe_advance_opening_intro
+from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
+from app.combat.service import publish_turn_encounter_events, stage_turn_encounter_events
+from app.decisions import record_fail_soft
+from app.world.identity import promote_new_entities_from_contract
+from app.world.semantic_index import note_turn_committed
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
@@ -439,8 +447,6 @@ def coordinate_turn(
             # continuations of the blocking turn and stay ungated. This also
             # covers the pending→awaiting-roll race between the endpoint
             # pre-check and this coordination.
-            from app.billing.resolution_guarantee import require_new_ai_work
-
             require_new_ai_work(db, campaign_id, tid)
         if set(new_ids) == active_ids:
             cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
@@ -480,8 +486,6 @@ def coordinate_turn(
     # already-accepted turn — so refuse with the #254 draft-safe boundary
     # instead of superseding. Covers both expansion paths below (with and
     # without a prior attempt).
-    from app.billing.resolution_guarantee import require_new_ai_work as _require_new_ai_work
-
     _require_new_ai_work(db, campaign_id, tid)
 
     # Input set expanded pre-stream — must supersede old attempt, create new one.
@@ -726,8 +730,6 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     # one commit, so archive can neither slip between check and persist nor
     # strand visible output on an archived table. Lock order is turn/attempt
     # rows first, campaign row second — archive only takes the campaign row.
-    from app.campaigns.service import require_playable_campaign
-
     try:
         from models.campaigns import Campaign as _Campaign
 
@@ -1083,8 +1085,6 @@ def _advance_opening_intro(db: Session, turn: DmTurn) -> None:
     self-heals on the next commit. Never breaks a turn.
     """
     try:
-        from app.campaigns.opening_intro import maybe_advance_opening_intro
-
         maybe_advance_opening_intro(db, turn.campaign_id)
     except Exception as exc:
         logger.warning(
@@ -1096,15 +1096,11 @@ def _advance_opening_intro(db: Session, turn: DmTurn) -> None:
 def _run_post_commit_hooks(db: Session, turn: DmTurn, attempt: DmTurnAttempt, event, *, encounters, identity_telemetry: list) -> None:
     """Best-effort derived work after the turn commit; never breaks the turn."""
     # Encounter start/end realtime delivery (issues #230, #239).
-    from app.combat.service import publish_turn_encounter_events
-
     publish_turn_encounter_events(db, *encounters)
     # #213 semantic-index hook: staged assert_fact / upsert_relation effects
     # (and JIT-promoted entities) are written inside the turn transaction —
     # without this, committed turn records would never become searchable.
     try:
-        from app.world.semantic_index import note_turn_committed
-
         note_turn_committed(db, turn.campaign_id, turn.id, attempt.id, event_id=event.id)
     except Exception as e:
         logger.warning("dm_turn semantic index hook skipped turn_id=%s error=%s", turn.id, e)
@@ -1113,8 +1109,6 @@ def _run_post_commit_hooks(db: Session, turn: DmTurn, attempt: DmTurnAttempt, ev
     # the entities are durable.
     if identity_telemetry:
         try:
-            from app.decisions import record_fail_soft
-
             from database import SessionLocal
 
             for record in identity_telemetry:
@@ -1156,8 +1150,6 @@ def commit_turn(
         turn_completion_args,
         turn_completion_payload,
     )
-    from app.campaigns.events import RevisionConflictError, commit_campaign_mutation
-
     turn, attempt = _lock_turn_and_attempt(db, turn_id, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
@@ -1271,8 +1263,6 @@ def commit_turn(
             # Issue #265 — a silent completion still advances the table;
             # serialize the dormancy decision with the campaign row lock the
             # revision guard already holds.
-            from app.campaigns.service import require_playable_campaign
-
             require_playable_campaign(locked_campaign)
         # Apply staged effects via registry (fail-closed)
         if staged_list:
@@ -1291,8 +1281,6 @@ def commit_turn(
         # identity exactly once (issue #209). Runs in the same revision
         # transaction: failed commit leaves no half-created authority.
         # Idempotency key per (attempt, temp_id) makes retries safe.
-        from app.world.identity import promote_new_entities_from_contract
-
         promoted = promote_new_entities_from_contract(
             db, locked_campaign, turn, attempt,
             identity_telemetry_outbox=identity_telemetry_outbox)
@@ -1353,8 +1341,6 @@ def commit_turn(
             db, turn=turn, event=event, revision=campaign_after.revision,
             adventure_id=(base_payload.get("adventure_completion") or {}).get("adventure_id"),
         )
-    from app.combat.service import stage_turn_encounter_events
-
     encounters = stage_turn_encounter_events(
         db, turn=turn, attempt=attempt, turn_event=event, campaign_after=campaign_after,
     )

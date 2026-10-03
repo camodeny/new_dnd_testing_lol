@@ -36,14 +36,10 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_optional_uuid, coerce_uuid
 from app.observability.tracing import structured_log
 from app.visibility.policy import RESTRICTED_VISIBILITIES, normalize_visibility
-from app.world._common import (
-    coerce_optional_uuid,
-    coerce_uuid,
-    dialect_upsert_insert,
-    normalize_idempotency_key,
-)
+from app.world._common import dialect_upsert_insert, normalize_idempotency_key
 from app.world.service import UNSET
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.dm import DmTurn, DmTurnAttempt

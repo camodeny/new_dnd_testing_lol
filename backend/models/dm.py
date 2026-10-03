@@ -1,4 +1,4 @@
-"""DM turns, streams, player-roll, and secret-contest domain models."""
+"""DM turns, attempts, streams, and player-roll domain models."""
 
 import uuid
 from datetime import datetime

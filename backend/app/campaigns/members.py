@@ -25,6 +25,7 @@ from app.campaigns.service import (
     parse_character_id,
 )
 from app.characters.service import latest_sheet
+from app.threads.service import get_lobby_thread
 from models.campaigns import Campaign, CampaignInvite, CampaignMember
 from models.characters import Character
 from models.profiles import Profile
@@ -80,8 +81,6 @@ def lobby_projection(db: Session, campaign: Campaign, viewer_id: uuid.UUID) -> d
     """Authoritative lobby projection — issue #241. Side-effect-free."""
     from app.campaigns.invites import invite_usability, lobby_invite_projection
     from app.campaigns.party_lore import build_party_composition
-    from app.threads.service import get_lobby_thread
-
     members = campaign_members(db, campaign.id)
     viewer_is_owner = campaign.owner_id == viewer_id
     invite_rows = db.execute(

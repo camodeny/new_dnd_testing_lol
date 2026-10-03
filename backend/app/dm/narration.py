@@ -52,10 +52,6 @@ The narrator can never apply game-state effects: this module never touches
 ``commit_turn``/``apply_staged_effects``; staged effects stay attempt-local
 until the separate three-phase commit (#206).
 
-Observability: ``get_narration_metrics()`` tracks projection size,
-provider, TTFT, chunk cadence, fidelity-validation failures,
-secret/unsupported/contradiction rejection counts, and total narration
-duration.
 """
 
 from __future__ import annotations
@@ -70,8 +66,11 @@ from typing import Any, Callable, Iterable, Iterator
 
 from sqlalchemy.orm import Session
 
+from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 from app.dm.contract import DmTurnContractV1, public_projection
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_dm_chunk_created, publish_dm_status
+from app.world.identity import resolve_new_entity_identities_pre_narration
 
 logger = logging.getLogger(__name__)
 
@@ -165,44 +164,6 @@ class NarrationStreamError(NarrationError):
         self.stream_id = stream_id
         self.persisted_chunks = persisted_chunks
         self.violations = violations or []
-
-
-# ── Metrics (process-local observability) ─────────────────────────────────────
-
-_metrics: dict[str, Any] = {
-    "narrations_started": 0,
-    "narrations_completed": 0,
-    "narrations_failed_pre_chunk": 0,
-    "narrations_failed_post_chunk": 0,
-    "fidelity_failures": 0,
-    "secret_rejections": 0,
-    "unsupported_rejections": 0,
-    "contradiction_rejections": 0,
-    "ttft_ms_samples": [],
-    "chunk_cadence_ms_samples": [],
-    "total_duration_ms_samples": [],
-    "projection_bytes_samples": [],
-}
-
-
-def get_narration_metrics() -> dict[str, Any]:
-    """Return a snapshot of narration observability counters."""
-    out = {k: (list(v) if isinstance(v, list) else v) for k, v in _metrics.items()}
-    ttfts = out["ttft_ms_samples"] or [0]
-    durs = out["total_duration_ms_samples"] or [0]
-    out["ttft_ms_p50"] = sorted(ttfts)[len(ttfts) // 2]
-    out["ttft_ms_max"] = max(ttfts)
-    out["duration_ms_p50"] = sorted(durs)[len(durs) // 2]
-    return out
-
-
-def _inc(key: str, n: int = 1) -> None:
-    _metrics[key] += n
-
-
-def reset_narration_metrics() -> None:
-    for k, v in _metrics.items():
-        _metrics[k] = [] if isinstance(v, list) else 0
 
 
 # ── 1. Audience-safe projection ───────────────────────────────────────────────
@@ -320,8 +281,6 @@ def build_recent_conversation(
     from models.profiles import Profile as _Profile
     from models.threads import PlayerSubmission as _PlayerSubmission
 
-    from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
-
     try:
         thread_uuid = thread_id if isinstance(thread_id, uuid.UUID) else uuid.UUID(str(thread_id))
     except (ValueError, TypeError, AttributeError):
@@ -437,10 +396,6 @@ def format_recent_conversation(history: list[dict[str, str]]) -> str:
 
 
 # ── 2. Deterministic template narrator (no provider) ──────────────────────────
-
-
-def _claim_visible_texts(contract: DmTurnContractV1) -> list[str]:
-    return [c.text for b in contract.beats for c in b.claims if c.visibility == "public"]
 
 
 def render_deterministic_narration(
@@ -589,6 +544,7 @@ _INTERNAL_JARGON_PHRASES = (
     "evidence_refs",
     "trigger_refs",
 )
+
 
 def _collect_secret_strings(contract: DmTurnContractV1) -> set[str]:
     """All strings the narration must never contain."""
@@ -760,17 +716,6 @@ def validate_narration_fidelity(
     return violations
 
 
-def _tally_fidelity_violations(violations: list[dict[str, Any]]) -> None:
-    _inc("fidelity_failures")
-    for v in violations:
-        if v["category"] == "secret_leakage":
-            _inc("secret_rejections")
-        elif v["category"] == "unsupported_addition":
-            _inc("unsupported_rejections")
-        elif v["category"] == "contradiction":
-            _inc("contradiction_rejections")
-
-
 def check_narration_fidelity_or_raise(
     narration: str,
     contract: DmTurnContractV1,
@@ -779,7 +724,6 @@ def check_narration_fidelity_or_raise(
 ) -> None:
     violations = validate_narration_fidelity(narration, contract, history=history)
     if violations:
-        _tally_fidelity_violations(violations)
         structured_log(
             logger, logging.WARNING, "narration_fidelity_rejected",
             violation_count=len(violations),
@@ -971,7 +915,6 @@ def stream_narration(
     # immediately after adjudication/validation completes, so t_start is the
     # validated-adjudication moment on the critical path.
     t_validated = t_start
-    _inc("narrations_started")
     if not turn_id or not str(turn_id).strip():
         raise ValueError("turn_id is required")
     if not attempt_id or not str(attempt_id).strip():
@@ -979,7 +922,6 @@ def stream_narration(
 
     projection = build_narration_projection(contract)
     proj_bytes = projection_size_bytes(projection)
-    _metrics["projection_bytes_samples"].append(proj_bytes)
 
     # Recent visible conversation for narrator coherence (fail-soft: a
     # history-query failure must never break narration — the beats alone
@@ -1020,7 +962,6 @@ def stream_narration(
         db.refresh(stream)
     except Exception as exc:
         db.rollback()
-        _inc("narrations_failed_pre_chunk")
         raise NarratorGenerationError(f"Stream creation failed: {exc}") from exc
     stream_id = stream.id
 
@@ -1054,8 +995,6 @@ def stream_narration(
         if not publish_realtime:
             return
         try:
-            from app.realtime.service import publish_dm_chunk_created
-
             publish_dm_chunk_created(db, stream, persisted_chunk)
         except Exception as pub_exc:  # never roll back authoritative state
             logger.warning(
@@ -1104,7 +1043,6 @@ def stream_narration(
         now = time.monotonic()
         if seq == 0:
             ttft_ms = (now - t_validated) * 1000
-            _metrics["ttft_ms_samples"].append(ttft_ms)
             if on_first_persist is not None:
                 # Post-commit notification only (must not own the boundary).
                 # A raise here is a post-first-chunk failure: the chunk is
@@ -1122,7 +1060,6 @@ def stream_narration(
                     ) from hook_exc
         else:
             cadence.append((now - last_persist) * 1000)
-            _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
         last_persist = now
         persisted_texts.append(piece)
         _publish_chunk(chunk, seq)
@@ -1170,7 +1107,6 @@ def stream_narration(
                     cumulative = "".join(full_parts)
                     incremental = validate_narration_incremental(cumulative, contract)
                     if incremental:
-                        _tally_fidelity_violations(incremental)
                         if persisted == 0:
                             _delete_invisible_header()
                             raise NarrationFidelityError(
@@ -1225,7 +1161,6 @@ def stream_narration(
             narration_text, contract, history=history,
         )
         if violations:
-            _tally_fidelity_violations(violations)
             if persisted == 0:
                 _delete_invisible_header()
                 raise NarrationFidelityError(
@@ -1244,7 +1179,6 @@ def stream_narration(
                 violations=violations,
             )
     except NarrationStreamError:
-        _inc("narrations_failed_post_chunk")
         raise
     except (NarrationFidelityError, NarrationProjectionError, NarratorGenerationError):
         # Classify by durable state, not the in-memory counter: a boundary
@@ -1255,10 +1189,8 @@ def stream_narration(
         persisted = max(persisted, durable)
         if durable == 0:
             _delete_invisible_header()
-            _inc("narrations_failed_pre_chunk")
             raise
         _fail_visible_stream("narration_stream_error")
-        _inc("narrations_failed_post_chunk")
         raise NarrationStreamError(
             f"Narration stream failed after {persisted} chunk(s)",
             stream_id=stream_id, persisted_chunks=persisted,
@@ -1268,12 +1200,10 @@ def stream_narration(
         persisted = max(persisted, durable)
         if durable == 0:
             _delete_invisible_header()
-            _inc("narrations_failed_pre_chunk")
             if isinstance(exc, NarrationError):
                 raise
             raise NarratorGenerationError(f"Narrator generation failed: {exc}") from exc
         _fail_visible_stream("narration_stream_error")
-        _inc("narrations_failed_post_chunk")
         raise NarrationStreamError(
             f"Narration stream failed after {persisted} chunk(s): {exc}",
             stream_id=stream_id, persisted_chunks=persisted,
@@ -1298,7 +1228,6 @@ def stream_narration(
         db.refresh(stream)
     except Exception as exc:
         db.rollback()
-        _inc("narrations_failed_post_chunk")
         try:
             fail_stream(db, stream.id, reason="narration_complete_error")
             db.commit()
@@ -1310,8 +1239,6 @@ def stream_narration(
         ) from exc
     if publish_realtime:
         try:
-            from app.realtime.service import publish_dm_status
-
             publish_dm_status(db, stream, visible_text=stream.final_text)
         except Exception as pub_exc:
             logger.warning(
@@ -1319,8 +1246,6 @@ def stream_narration(
             )
 
     duration_ms = (time.monotonic() - t_start) * 1000
-    _metrics["total_duration_ms_samples"].append(duration_ms)
-    _inc("narrations_completed")
     structured_log(
         logger, logging.INFO, "narration_streamed",
         stream_id=str(stream.id), turn_id=str(turn_id), attempt_id=str(attempt_id),
@@ -1427,8 +1352,6 @@ def execute_validated_turn(
     # attempt-local; commit only revalidates/applies with no second call.
     if getattr(contract, "new_entities", None):
         from models.campaigns import Campaign as _Campaign
-
-        from app.world.identity import resolve_new_entity_identities_pre_narration
 
         _campaign = db.get(_Campaign, turn.campaign_id)
         if _campaign is None:
@@ -1537,14 +1460,11 @@ def resume_narration_stream(
     suffix, then materializes the final narration. Idempotent: already
     persisted chunks are re-used, never duplicated.
     """
-    from app.providers import policy as role_policy
-
     result = _resume_stream_suffix(
         db, stream_id, full_text,
         chunk_size=chunk_size, publish_realtime=publish_realtime,
         completion_reason="narration_resumed",
     )
-    role_policy.record_partial_resume("direct_resume")
     return result
 
 
@@ -1572,8 +1492,6 @@ def continue_partial_stream(
     ``NarrationStreamError`` on gate failure.
     """
     from app.dm.streams import reconstruct_text
-    from app.providers import policy as role_policy
-
     visible = reconstruct_text(db, stream_id)
     if not (continued_text or "").startswith(visible):
         raise ValueError(
@@ -1590,26 +1508,7 @@ def continue_partial_stream(
         commit=commit,
         completion_reason="narration_continued",
     )
-    role_policy.record_partial_resume("semantic_continuation")
     return result
-
-
-def build_continuation_prompt(
-    projection: dict[str, Any],
-    visible_prefix: str,
-    history: list[dict[str, str]] | None = None,
-) -> str:
-    """Build a regeneration prompt constrained to continue the prefix.
-
-    The persisted prefix is quoted verbatim with an instruction to continue
-    exactly from it without contradicting or restating it differently.
-    """
-    base = build_narrator_prompt(projection, history)
-    return (
-        base + "\nALREADY VISIBLE (do not rewrite, contradict, or restate):\n"
-        + (visible_prefix or "")[:4000]
-        + "\nContinue exactly from the visible text above."
-    )
 
 
 def _resume_stream_suffix(
@@ -1656,12 +1555,9 @@ def _resume_stream_suffix(
         db.refresh(stream)
         now = time.monotonic()
         cadence.append((now - last) * 1000)
-        _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
         last = now
         if publish_realtime:
             try:
-                from app.realtime.service import publish_dm_chunk_created
-
                 publish_dm_chunk_created(db, stream, chunk)
             except Exception as pub_exc:
                 logger.warning(
@@ -1676,15 +1572,12 @@ def _resume_stream_suffix(
     db.refresh(stream)
     if publish_realtime:
         try:
-            from app.realtime.service import publish_dm_status
-
             publish_dm_status(db, stream, visible_text=stream.final_text)
         except Exception as pub_exc:
             logger.warning(
                 "narration resume status publish failed stream_id=%s error=%s", stream_id, pub_exc
             )
     duration_ms = (time.monotonic() - t_start) * 1000
-    _inc("narrations_completed")
     return NarrationResult(
         stream_id=stream_id, visible_text=reconstruct_text(db, stream_id),
         final_text=stream.final_text, chunk_count=len(plan),

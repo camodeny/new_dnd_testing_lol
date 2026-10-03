@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select, update as sa_update
 from sqlalchemy.orm import Session
 
+from app.campaigns.replacements import is_historical_canon as _is_canon
+from app.campaigns.service import character_launch_validity
 from app.characters.service import character_with_sheet, latest_sheet
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
@@ -193,8 +195,6 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
             status_code=409,
             detail="Launch character is locked after campaign start; progression only",
         )
-    from app.campaigns.replacements import is_historical_canon as _is_canon
-
     if _is_canon(db, char.id):
         logger.warning(
             "character edit rejected character_id=%s actor_id=%s reason=historical_canon",
@@ -209,8 +209,6 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
         updated_sheet = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
         if char.status == "draft":
             from types import SimpleNamespace
-
-            from app.campaigns.service import character_launch_validity
 
             validity = character_launch_validity(
                 SimpleNamespace(name=new_name, status="complete"), updated_sheet,
@@ -292,8 +290,6 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
             status_code=409,
             detail="Launch character is locked after campaign start; progression only",
         )
-    from app.campaigns.replacements import is_historical_canon as _is_canon
-
     if _is_canon(db, char.id):
         logger.warning(
             "character delete rejected character_id=%s actor_id=%s reason=historical_canon",

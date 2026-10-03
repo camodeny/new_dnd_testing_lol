@@ -156,12 +156,7 @@ def test_same_model_failover_recovers_and_records_non_billable(db, monkeypatch):
     from app.providers import registry as reg
 
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
-    monkeypatch.setattr("app.providers.execute_chat", _fake_execute)
-    # adjudication imports execute_chat from app.providers at call time;
-    # patch the re-exported reference too.
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     contract, info = adj.adjudicate_with_failover(packet, db=s, role="forward_dm")
     assert contract.mode == "respond"
@@ -205,9 +200,7 @@ def test_failover_path_requests_low_reasoning_effort(db, monkeypatch):
     from app.providers import registry as reg
 
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     contract, _ = adj.adjudicate_with_failover(packet, db=None, role="forward_dm")
     assert contract.mode == "respond"
@@ -477,9 +470,7 @@ def test_explicit_retry_executes_as_non_billable_recovery(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     result = execute_dm_attempt(s, fresh.id, narrator="deterministic")
     assert result.attempt.status == "succeeded"
@@ -553,7 +544,6 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
 # ── Narration failover through the role policy ──────────────────────────────
 
 def test_narration_failover_uses_next_candidate_pre_token(db, monkeypatch):
-    import app.providers as providers_pkg
     from app.dm.adjudication import build_provider_narrator
     from app.dm.narration import NarratorRequest
     from app.providers import registry as reg
@@ -571,7 +561,7 @@ def test_narration_failover_uses_next_candidate_pre_token(db, monkeypatch):
         yield NormalizedStreamEvent(kind="token", text="hello ")
         yield NormalizedStreamEvent(kind="token", text="world")
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.dm.adjudication.stream_chat", _fake_stream)
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("p1", "m"), ("p2", "m")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
@@ -605,7 +595,6 @@ def _provider_narrator_mocks(monkeypatch, *, path, fail_first=None):
     fail_first: exception instance raised by the first provider after
     yielding ``fail_first_prefix`` (None = raise before any yield).
     """
-    import app.providers as providers_pkg
     from app.providers import registry as reg
     from app.providers.contracts import NormalizedStreamEvent
 
@@ -621,7 +610,7 @@ def _provider_narrator_mocks(monkeypatch, *, path, fail_first=None):
         for piece in state["pieces"]:
             yield NormalizedStreamEvent(kind="token", text=piece)
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.dm.adjudication.stream_chat", _fake_stream)
     monkeypatch.setattr(role_policy, "execution_path", lambda role: list(path))
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
@@ -848,9 +837,7 @@ def test_automatic_retry_executes_as_non_billable_recovery(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _flaky_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _flaky_execute)
 
     with pytest.raises(ProviderError):
         execute_dm_attempt(s, attempt.id, narrator="deterministic")
@@ -886,9 +873,7 @@ def test_failed_runs_survive_gameplay_rollback(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _always_terminal)
 
     with pytest.raises(ProviderError):
         adjudicate_with_failover(packet, db=s)
@@ -945,9 +930,7 @@ def test_failed_runs_durable_on_postgres(monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _always_terminal)
 
     with Fac() as s:
         with pytest.raises(ProviderError):
@@ -994,9 +977,7 @@ def test_superseded_attempt_executes_as_primary_billable(db, monkeypatch):
     monkeypatch.setattr(role_policy, "execution_path",
                         lambda role: [("primary", "model-x")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
-    import app.providers as providers_pkg
-
-    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
 
     result = execute_dm_attempt(s, child.id, narrator="deterministic")
     assert result.attempt.status == "succeeded"

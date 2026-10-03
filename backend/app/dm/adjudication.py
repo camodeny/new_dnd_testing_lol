@@ -11,7 +11,11 @@ import json
 import logging
 import uuid
 
-from app.providers import policy as role_policy
+from app.observability.tracing import structured_log
+from app.providers import ProviderRequest, execute_chat, policy as role_policy, stream_chat
+from app.providers.areas import resolve_area
+from app.providers.contracts import ProviderError
+from app.providers.runner import AiRunLedger, classification_for, require_approved, resolve_candidate
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +94,7 @@ After fulfillment, use the supplied roll evidence to resolve the original
 intent; do not request the same roll again.
 """
 
+
 def resolve_dm_provider():
     """Resolve (adapter, model, provider_name) for forward-DM execution.
 
@@ -97,8 +102,6 @@ def resolve_dm_provider():
     (test fakes patch it). Provider + model are pinned in code (see
     ``app.providers.areas``); only the API key comes from env.
     """
-    from app.providers.areas import resolve_area
-
     return resolve_area("dm")
 
 
@@ -147,8 +150,6 @@ def _strip_fences(text: str) -> str:
 
 def parse_contract_json(text: str) -> dict:
     """Parse model output to a raw contract dict (strict, no fabrication)."""
-    from app.providers.contracts import ProviderError
-
     cleaned = _strip_fences(text or "")
     if not cleaned:
         raise ProviderError("DM provider returned empty adjudication output", kind="malformed")
@@ -168,9 +169,6 @@ def _adjudicate_once(packet, *, adapter, model: str, timeout_seconds: float,
                      trace_id: str, attempt: int = 1, classification: str = "primary"):
     """One schema-constrained adjudication call; returns (contract, response)."""
     from app.dm.contract import contract_json_schema_strict, normalize_contract
-    from app.providers import ProviderRequest, execute_chat
-    from app.observability.tracing import structured_log
-
     request = ProviderRequest(
         messages=build_forward_dm_messages(packet),
         model=model,
@@ -220,11 +218,6 @@ def adjudicate_with_failover(
     """
     import time
 
-    from app.providers.runner import (
-        AiRunLedger, classification_for, require_approved, resolve_candidate,
-    )
-    from app.observability.tracing import structured_log
-
     tid = trace_id or str(uuid.uuid4())
     t_start = time.monotonic()
     role_policy.get_role_policy(role)
@@ -264,15 +257,12 @@ def adjudicate_with_failover(
             last_exc = exc
             reason = f"config_unavailable:{provider_name}"
             failover_reasons.append(reason)
-            role_policy.record_failover_attempt(reason, provider_name, candidate_model)
             continue
         classification = classification_for(index, is_retry)
         run = ledger.start(
             adapter=cand_adapter, model=cand_model, path_index=index,
             classification=classification,
         )
-        if run.tracked and classification == "recovery":
-            role_policy.record_recovery_run(billable=False)
         try:
             contract, response = _adjudicate_once(
                 packet, adapter=cand_adapter, model=cand_model,
@@ -284,7 +274,6 @@ def adjudicate_with_failover(
             run.failed(exc)
             cls, reason = role_policy.classify_execution_failure(exc)
             failover_reasons.append(reason)
-            role_policy.record_failover_attempt(reason, cand_adapter.name, cand_model)
             if cls == "terminal" or index >= len(path) - 1:
                 break
             continue
@@ -302,7 +291,6 @@ def adjudicate_with_failover(
             "ttft_added_ms": ttft_added,
         }
     assert last_exc is not None
-    role_policy.record_exhausted()
     raise last_exc
 
 
@@ -341,12 +329,6 @@ def build_provider_narrator(
     recovery AI runs when ``db`` is given (as is narration on an
     explicit-retry attempt).
     """
-    from app.providers import ProviderRequest, stream_chat
-    from app.providers.runner import (
-        AiRunLedger, classification_for, require_approved, resolve_candidate,
-    )
-    from app.observability.tracing import structured_log
-
     tid = trace_id or str(uuid.uuid4())
     ledger = AiRunLedger(
         db, role=role, logical_operation="narration_stream",
@@ -375,10 +357,6 @@ def build_provider_narrator(
             except Exception as exc:
                 if first_error is None:
                     first_error = exc
-                role_policy.record_failover_attempt(
-                    f"config_unavailable:{provider_name}", str(provider_name),
-                    candidate_model,
-                )
                 continue
             resolved.append((path_index, cand_adapter, cand_model))
         if not resolved:
@@ -434,9 +412,6 @@ def build_provider_narrator(
                 except Exception as exc:
                     run.failed(exc)
                     cls, reason = role_policy.classify_execution_failure(exc)
-                    role_policy.record_failover_attempt(
-                        reason, cand_adapter.name, cand_model
-                    )
                     # Switching is keyed on DURABLE visibility, not raw token
                     # emission: a retryable failure with nothing durably
                     # visible moves to the next approved candidate (the
@@ -456,8 +431,6 @@ def build_provider_narrator(
                         and pre_visible
                     )
                     if can_switch:
-                        if db is not None:
-                            role_policy.record_recovery_run(billable=False)
                         if yielded_downstream:
                             # The failed provider's prefix reached the
                             # service but was never durable: tell it to

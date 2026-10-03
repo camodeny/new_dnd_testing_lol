@@ -30,9 +30,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from app.combat.service import get_snapshot_encounter
+from app.dm.turns import ACTIVE_TURN_STATUSES
+from app.rolls.service import get_fulfillment
 from app.threads.service import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
+    assert_can_read_thread,
     get_campaign_thread,
     list_threads_for_user,
     parse_thread_id,
@@ -268,7 +272,6 @@ def build_live_table_snapshot(
             raise SnapshotNotFoundError(str(exc)) from exc
 
         try:
-            from app.threads.service import assert_can_read_thread
             thread = assert_can_read_thread(db, campaign_id, resolved_tid, viewer_id)
         except ThreadNotFoundError as exc:
             raise SnapshotNotFoundError(str(exc)) from exc
@@ -296,7 +299,6 @@ def build_live_table_snapshot(
             )
         ) or 0
 
-        from app.rolls.service import get_fulfillment
         from models.dm import PlayerRollRequest
 
         roll_rows = db.execute(
@@ -358,8 +360,6 @@ def build_live_table_snapshot(
                     "started_at": None, "chunk_count": 0, "visible_text": "",
                 }
                 from models.dm import DmTurn, DmTurnAttempt
-                from app.dm.turns import ACTIVE_TURN_STATUSES
-
                 turn = db.execute(select(DmTurn).where(
                     DmTurn.campaign_id == campaign_id,
                     DmTurn.thread_id == thread_id_str,
@@ -416,8 +416,6 @@ def build_live_table_snapshot(
         # so reconnect never mistakes broken combat state for out-of-combat.
         encounter_projection = None
         try:
-            from app.combat.service import get_snapshot_encounter
-
             encounter_projection = get_snapshot_encounter(db, campaign_id, viewer_id)
         except Exception as exc:
             logger.warning(

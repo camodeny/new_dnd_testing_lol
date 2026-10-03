@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import uuid
 from typing import Any
 
@@ -215,12 +214,3 @@ def build_embeddings(
     db.commit()
     return bid
 
-
-def clear_embeddings(db: Session, *, embedding_model: str | None = None, build_id: str | None = None):
-    q = db.query(RulesEmbedding)
-    if embedding_model:
-        q = q.filter(RulesEmbedding.embedding_model == embedding_model)
-    if build_id:
-        q = q.filter(RulesEmbedding.build_id == build_id)
-    q.delete(synchronize_session=False)
-    db.commit()

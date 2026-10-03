@@ -50,6 +50,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_uuid
 from app.campaigns.events import commit_campaign_mutation
 from app.decisions import (
     ACTIVE,
@@ -73,7 +74,7 @@ from app.decisions import (
 from app.observability.tracing import structured_log
 from app.visibility.access import is_campaign_participant, is_world_authority
 from app.visibility.policy import RESTRICTED_VISIBILITIES, visible_to_viewer, world_event_visibility
-from app.world._common import coerce_uuid, require_provenance
+from app.world._common import require_provenance
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import (
     CLOCK_EVALUABLE_STATUSES,

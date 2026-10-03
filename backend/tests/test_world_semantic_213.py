@@ -561,7 +561,6 @@ def test_default_model_selection_prefers_configured_real_model(monkeypatch):
 
 
 def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
-    import app.rules_corpus.gemini as gemini_mod
 
     for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY",
                 "GEMINI_EMBEDDING_MODEL"):
@@ -578,7 +577,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
 
         return _fake_provider
 
-    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _fake_factory)
+    monkeypatch.setattr("app.world.semantic_index.make_gemini_provider", _fake_factory)
 
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
@@ -604,7 +603,7 @@ def test_non_stub_provider_path_uses_callable_and_task_modes(monkeypatch):
               output_dimensionality=None):
         raise RuntimeError("GEMINI_API_KEY not set")
 
-    monkeypatch.setattr(gemini_mod, "make_gemini_provider", _boom)
+    monkeypatch.setattr("app.world.semantic_index.make_gemini_provider", _boom)
     with pytest.raises(RuntimeError, match="no provider"):
         index_source_record(db, cid, "world_fact", fact.id,
                             embedding_model="gemini-embedding-2")

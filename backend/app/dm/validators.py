@@ -19,11 +19,11 @@ from __future__ import annotations
 import logging
 import time
 import uuid
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable, Protocol
 
 from pydantic import Field
 
-from app.dm.context import ContextAudience, ForwardDmContextPacket, LaneName
+from app.dm.context import ForwardDmContextPacket, LaneName
 from app.dm.contract import Claim, ContractValidationError, DmTurnContractV1
 from app.observability.tracing import structured_log
 from app.schema import StrictModel
@@ -140,21 +140,6 @@ def _extract_submission_map(
                 "character_id": str(rec.value.get("character_id") or ""),
             }
     return out
-
-
-def _extract_player_input_texts(packet: ForwardDmContextPacket | None) -> list[str]:
-    if packet is None:
-        return []
-    lane = next((lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS), None)
-    if lane is None:
-        return []
-    texts: list[str] = []
-    for rec in lane.records:
-        for seg in rec.value.get("segments") or []:
-            t = seg.get("text") if isinstance(seg, dict) else None
-            if t:
-                texts.append(str(t))
-    return texts
 
 
 def _known_ids_from_packet(packet: ForwardDmContextPacket | None) -> set[str]:
@@ -1022,22 +1007,6 @@ class ValidatorPipeline:
     def __init__(self, validators: list[Validator] | None = None):
         self.validators: list[Validator] = list(validators) if validators is not None else list(DEFAULT_VALIDATORS)
 
-    def add_validator(self, validator: Validator, *, before: str | None = None, after: str | None = None) -> None:
-        """Extension point: add later validators without rewriting orchestration."""
-        if before:
-            for idx, v in enumerate(self.validators):
-                if v.name == before:
-                    self.validators.insert(idx, validator)
-                    return
-            raise ValueError(f"before target {before!r} not found")
-        if after:
-            for idx, v in enumerate(self.validators):
-                if v.name == after:
-                    self.validators.insert(idx + 1, validator)
-                    return
-            raise ValueError(f"after target {after!r} not found")
-        self.validators.append(validator)
-
     def validate(
         self,
         contract: DmTurnContractV1,
@@ -1092,22 +1061,6 @@ class ValidatorPipeline:
         )
         return report
 
-    def validate_or_raise(
-        self,
-        contract: DmTurnContractV1,
-        packet: ForwardDmContextPacket | None = None,
-        *,
-        correlation_id: str | None = None,
-        regeneration_index: int = 0,
-    ) -> ValidationReport:
-        report = self.validate(
-            contract, packet,
-            correlation_id=correlation_id, regeneration_index=regeneration_index,
-        )
-        if not report.passed:
-            raise ValidatorRejectionError("Contract failed pre-narration validation", report)
-        return report
-
 
 # Singleton pipeline
 default_pipeline = ValidatorPipeline()
@@ -1122,19 +1075,6 @@ def validate_contract(
 ) -> ValidationReport:
     """Convenience: validate before first visible chunk using default pipeline."""
     return default_pipeline.validate(
-        contract, packet,
-        correlation_id=correlation_id, regeneration_index=regeneration_index,
-    )
-
-
-def validate_contract_or_raise(
-    contract: DmTurnContractV1,
-    packet: ForwardDmContextPacket | None = None,
-    *,
-    correlation_id: str | None = None,
-    regeneration_index: int = 0,
-) -> ValidationReport:
-    return default_pipeline.validate_or_raise(
         contract, packet,
         correlation_id=correlation_id, regeneration_index=regeneration_index,
     )

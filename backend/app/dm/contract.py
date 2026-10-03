@@ -33,8 +33,7 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from enum import Enum
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
@@ -103,9 +102,6 @@ class EntityRef(StrictModel):
         if len(s) > 160:
             raise ValueError("EntityRef.id too long")
         return v
-
-    def normalized_id(self) -> str:
-        return str(self.id)
 
 
 class NewEntityProposal(StrictModel):
@@ -1003,23 +999,6 @@ class DmTurnContractV1(StrictModel):
 
         return self
 
-    def output_size_metrics(self) -> dict[str, int]:
-        """Cheap size/observability metrics without re-serializing twice when possible."""
-        try:
-            blob = json.dumps(self.model_dump(mode="json"), ensure_ascii=False)
-            bytes_len = len(blob.encode("utf-8"))
-        except Exception:
-            bytes_len = 0
-        claim_count = sum(len(b.claims) for b in self.beats)
-        return {
-            "bytes": bytes_len,
-            "beats": len(self.beats),
-            "claims": claim_count,
-            "staged_effects": len(self.staged_effects),
-            "new_entities": len(self.new_entities),
-            "evidence_requests": len(self.evidence_requests),
-        }
-
 
 # ── Errors and helpers ───────────────────────────────────────────────────────
 
@@ -1096,11 +1075,6 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
                 beat.dm_private_context = "Not established in private canon; do not treat the utterance as authoritative."
 
     return contract
-
-
-def parse_contract(raw: Any) -> DmTurnContractV1:
-    """Alias for normalize_contract for callers that prefer parse_* naming."""
-    return normalize_contract(raw)
 
 
 def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:

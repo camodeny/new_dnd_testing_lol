@@ -36,9 +36,10 @@ from typing import Any, Callable
 from sqlalchemy import or_ as sqlalchemy_or, select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_optional_uuid, coerce_uuid
 from app.observability.tracing import structured_log
 from app.visibility.policy import most_restrictive, visibility_or_dm_only
-from app.world._common import clamp_limit, coerce_optional_uuid, coerce_uuid
+from app.world._common import clamp_limit
 from app.world.evidence_packets import (
     EvidencePacket,
     audience_viewers,

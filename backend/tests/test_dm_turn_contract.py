@@ -297,9 +297,6 @@ def test_version_normalize_serialize_and_metrics():
     c2 = normalize_contract(json.loads(blob))
     assert c2.mode == "silent"
     assert c2.contract_version == CONTRACT_VERSION
-    metrics = c.output_size_metrics()
-    assert metrics["bytes"] > 0
-    assert metrics["beats"] == 0
     # unknown version must fail
     with pytest.raises(ContractValidationError) as ei:
         normalize_contract({"contract_version": "dm_turn_contract_v2", "mode": "silent", "reason": "x", "beats": []})

@@ -30,8 +30,9 @@ from typing import Any, Callable
 from sqlalchemy import select, text as sql_text
 from sqlalchemy.orm import Session
 
+from app.rules_corpus.gemini import make_gemini_provider
+from app.schema import coerce_uuid
 from app.observability.tracing import structured_log
-from app.world._common import coerce_uuid
 from app.world.evidence_packets import resolve_campaign, version_of
 from models.campaigns import CampaignDomainEvent
 from models.dm import DmTurn
@@ -162,8 +163,6 @@ def resolve_embedder(
         return provider
     if embedding_model.startswith(("gemini", "text-embedding", "models/")):
         try:
-            from app.rules_corpus.gemini import make_gemini_provider
-
             return make_gemini_provider(model=embedding_model, task_type=task_type)
         except Exception as exc:
             raise RuntimeError(

@@ -434,7 +434,6 @@ def test_two_sessions_only_one_executor_reaches_adjudication(db):
 
 def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch):
     """Scene source failure must never downgrade to not_applicable."""
-    from app.world import service as world_service
 
     s, camp_id, thread_id, _ = db
     _, attempt = _submit(s, camp_id, thread_id)
@@ -443,7 +442,7 @@ def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch)
         raise RuntimeError("simulated scene reader failure")
 
     monkeypatch.setattr(
-        world_service, "build_current_scene_context_record", _boom
+        "app.dm.context.build_current_scene_context_record", _boom
     )
     calls = []
 
@@ -465,7 +464,6 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
     """A DB error naming the scene table must not downgrade to no-scene."""
     from sqlalchemy.exc import ProgrammingError
 
-    from app.world import service as world_service
 
     s, camp_id, thread_id, _ = db
     _, attempt = _submit(s, camp_id, thread_id)
@@ -480,7 +478,7 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
         )
 
     monkeypatch.setattr(
-        world_service, "build_current_scene_context_record", _denied
+        "app.dm.context.build_current_scene_context_record", _denied
     )
     calls = []
 

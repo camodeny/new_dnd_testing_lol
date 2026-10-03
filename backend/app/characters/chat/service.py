@@ -9,6 +9,8 @@ import uuid as uuid_lib
 from typing import Optional
 
 from pydantic import BaseModel, Field
+from app.providers import ProviderRequest as PR, stream_chat
+from app.providers.areas import resolve_area
 
 logger = logging.getLogger(__name__)
 
@@ -65,22 +67,6 @@ class CharacterChatRequest(BaseModel):
         "party composition itself (member-only) and adds it as advisory creator "
         "context. Never carries private lore (issue #244).",
     )
-
-
-def get_character_chat_model(adapter=None) -> str:
-    """Model slug for the ``character_chat`` area (pinned in code).
-
-    When an adapter is passed, its explicit env model wins; otherwise the
-    area pin is returned.
-    """
-    from app.providers.areas import resolve_area
-
-    if adapter is not None:
-        model = (adapter.env_model() or "").strip()
-        if model:
-            return model
-    _, model, _ = resolve_area("character_chat")
-    return model
 
 
 def build_party_advisory_text(composition: dict, advice: dict) -> str:
@@ -157,8 +143,6 @@ def character_chat_sync_generator(
     party_advisory: str | None = None,
 ):
     try:
-        from app.providers.areas import resolve_area
-
         adapter, model, _ = resolve_area("character_chat")
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
@@ -169,8 +153,6 @@ def character_chat_sync_generator(
     full_text = ""
     has_patch = False
     try:
-        from app.providers import ProviderRequest as PR, stream_chat
-
         pr = PR(
             messages=messages,
             model=model,

@@ -33,10 +33,8 @@ from app.dm.narration import (  # noqa: E402
     chunk_narration_text,
     execute_validated_turn,
     format_recent_conversation,
-    get_narration_metrics,
     materialize_final_narration,
     render_deterministic_narration,
-    reset_narration_metrics,
     resume_narration_stream,
     stream_narration,
     validate_narration_fidelity,
@@ -112,14 +110,6 @@ def db():
         s.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
         s.commit()
         yield s, camp_id, thread_id
-    reset_narration_metrics()
-
-
-@pytest.fixture(autouse=True)
-def _reset_metrics():
-    reset_narration_metrics()
-    yield
-    reset_narration_metrics()
 
 
 # ── projection: audience-safe ───────────────────────────────────────────────
@@ -248,8 +238,6 @@ def test_secret_fact_leak_rejected_pre_commit_with_no_persistence(db):
         )
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
     assert s.scalar(select(func.count()).select_from(DMStream)) == 0
-    m = get_narration_metrics()
-    assert m["secret_rejections"] >= 1 and m["fidelity_failures"] >= 1
 
 
 def test_unsupported_narrator_addition_rejected():
@@ -292,7 +280,8 @@ def test_contradiction_with_structured_result_rejected():
 # ── streaming: durable-first, realtime-second, TTFT, resume ─────────────────
 
 def test_stream_persists_before_delivery_and_ttft_measured(db, monkeypatch):
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     s, camp_id, thread_id = db
     pub = InMemoryRealtimePublisher()
     set_realtime_publisher(pub)
@@ -322,10 +311,6 @@ def test_stream_persists_before_delivery_and_ttft_measured(db, monkeypatch):
         assert "".join(ch.text for ch in persisted) == res.visible_text
         # stable dedupe identity
         assert len({e["payload"]["event_id"] for e in chunk_events}) == res.chunk_count
-        m = get_narration_metrics()
-        assert m["narrations_completed"] == 1
-        assert m["ttft_ms_samples"] and m["total_duration_ms_samples"]
-        assert m["projection_bytes_samples"] == [res.projection_bytes]
     finally:
         from app.realtime.service import SupabaseRealtimePublisher
         set_realtime_publisher(SupabaseRealtimePublisher())
@@ -850,7 +835,7 @@ def test_chunk0_and_streaming_boundary_share_single_commit(db, monkeypatch):
     monkeypatch.setattr(s, "commit", _spy_commit)
     monkeypatch.setattr(stream_svc, "append_chunk", _spy_append)
     monkeypatch.setattr(turns_mod, "mark_streaming_started", _spy_boundary)
-    monkeypatch.setattr(realtime_mod, "publish_dm_chunk_created", _spy_publish)
+    monkeypatch.setattr("app.dm.narration.publish_dm_chunk_created", _spy_publish)
 
     out = execute_validated_turn(
         s, turn_id=turn_id, attempt_id=attempt_id, contract=c,

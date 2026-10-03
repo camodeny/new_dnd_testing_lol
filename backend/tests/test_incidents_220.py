@@ -25,7 +25,7 @@ import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.decisions import DecisionService  # noqa: E402
-from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
+from tests.support.fake_decisions import FakeDecisionAdapter  # noqa: E402
 from app.post_turn.incidents import (  # noqa: E402
     CONSISTENT,
     CONTRADICTION,

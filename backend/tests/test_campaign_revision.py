@@ -12,7 +12,6 @@ Covers all acceptance criteria:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -34,7 +33,6 @@ from app.campaigns.events import (  # noqa: E402
     RevisionConflictError,
     commit_campaign_mutation,
     list_campaign_events,
-    update_campaign_derived,
 )
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
@@ -191,46 +189,6 @@ def test_stale_write_does_not_create_event():
         commit_campaign_mutation(db, cid, expected_revision=0, event_type="campaign.stale")
     after = len(list_campaign_events(db, cid))
     assert after == before
-    db.close()
-
-
-def test_non_fictional_derived_update_does_not_advance_revision():
-    eng = _sqlite_engine()
-    S = sessionmaker(bind=eng)
-    db = S()
-    camp = _new_campaign(db)
-    cid = camp.id
-
-    # fictional mutation to get to revision 1
-    commit_campaign_mutation(db, cid, expected_revision=0, event_type="campaign.fictional")
-
-    # derived metadata update must not bump
-    derived_timestamp = datetime.now(timezone.utc)
-    fresh = update_campaign_derived(db, cid, updated_at=derived_timestamp)
-    assert fresh.revision == 1
-
-    # another fictional mutation should still require revision 1 and go to 2
-    _, evt = commit_campaign_mutation(db, cid, expected_revision=1, event_type="campaign.fictional2")
-    assert evt.sequence == 2
-    assert db.get(Campaign, cid).revision == 2
-
-    # ensure no extra domain events were created for derived update
-    events = list_campaign_events(db, cid)
-    assert len(events) == 2
-    assert all(e.sequence in (1, 2) for e in events)
-    db.close()
-
-
-def test_derived_update_rejects_fictional_campaign_fields():
-    eng = _sqlite_engine()
-    S = sessionmaker(bind=eng)
-    db = S()
-    camp = _new_campaign(db)
-
-    unchanged = update_campaign_derived(db, camp.id, name="revision bypass")
-
-    assert unchanged.name == "Test Campaign"
-    assert unchanged.revision == 0
     db.close()
 
 

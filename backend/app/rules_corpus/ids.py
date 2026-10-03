@@ -46,53 +46,6 @@ def slugify(text: str) -> str:
     return kebab
 
 
-def derive_source_section_id(document: str, heading_path: list[str]) -> str:
-    """Derive deterministic locator from full document + heading hierarchy.
-
-    Example:
-        document="playing-the-game", heading_path=["Combat","Melee Attacks","Opportunity Attacks"]
-        -> "playing-the-game-combat-melee-attacks-opportunity-attacks"
-    """
-    parts: list[str] = []
-    doc_slug = slugify(document)
-    if doc_slug:
-        parts.append(doc_slug)
-    for h in heading_path or []:
-        if h and h.strip():
-            parts.append(slugify(h))
-    if not parts:
-        return "untitled"
-    # Join with '-', but keep document prefix distinct
-    return "-".join(parts)
-
-
-def derive_rule_id(corpus_id: str, corpus_version: str, source_section_id: str) -> str:
-    """Application-owned semantic identity, namespaced.
-
-    corpus_id e.g. "dnd-srd" -> prefix "srd"
-    corpus_version e.g. "5.2.1" -> "521"
-    Example: srd521.playing-the-game.combat.melee-attacks.opportunity-attacks
-    """
-    # Normalize corpus prefix: "dnd-srd" -> "srd", "srd" -> "srd"
-    prefix = corpus_id.lower().replace("-", "")
-    # Version digits only
-    ver_digits = re.sub(r"[^0-9]", "", corpus_version)
-    if not ver_digits:
-        ver_digits = "0"
-    ns = f"{prefix}{ver_digits}"
-    # source_section_id is kebab; convert to dotted hierarchy for rule_id readability
-    # First segment is document slug, rest are heading slugs — dot-separate
-    dotted = source_section_id.replace("-", ".")  # fallback dotted; but preserve kebab segments?
-    # Better: split on '-' boundaries would lose multi-word segments. Instead split original kebab parts
-    # We have source_section_id as "-".join(slugs). So dotted = ".".join(slugs)
-    # We can reconstruct by splitting on '-'? That would over-split multi-word headings.
-    # Instead keep source_section_id's hyphen grouping but use dots between major segments:
-    # We need heading_path to do it correctly. Caller should use derive_rule_id_with_path for precise.
-    # Fallback heuristic: treat each slug part as already kebab, keep as single dot segment.
-    # For now return f"{ns}.{dotted}" — tests assert stability, not perfect segmentation.
-    return f"{ns}.{dotted}"
-
-
 def derive_rule_id_with_path(corpus_id: str, corpus_version: str, document: str, heading_path: list[str]) -> tuple[str, str]:
     """Precise rule_id using document+heading segmentation (not just flattened kebab).
 
@@ -132,12 +85,6 @@ def load_aliases(path: Path | None = None) -> dict[str, str]:
         return {}
     except Exception:
         return {}
-
-
-def resolve_alias(rule_id: str, aliases: dict[str, str] | None = None) -> str:
-    if aliases is None:
-        aliases = load_aliases()
-    return aliases.get(rule_id, rule_id)
 
 
 def check_collisions(records: list[dict], *, aliases: dict[str, str] | None = None) -> None:

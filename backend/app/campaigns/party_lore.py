@@ -190,19 +190,6 @@ def get_own_lore(
     return assert_lore_readable(row, user_id)
 
 
-def list_lore_presence(db: Session, *, campaign_id: uuid_lib.UUID) -> dict[str, bool]:
-    """Presence map (character_id -> has lore) without content.
-
-    Used for DM/seed observability counts; content stays out of projections.
-    """
-    rows = db.execute(
-        select(CampaignCharacterLore.character_id).where(
-            CampaignCharacterLore.campaign_id == campaign_id
-        )
-    ).all()
-    return {str(r[0]): True for r in rows}
-
-
 def get_seed_lore_bundle(db: Session, *, campaign_id: uuid_lib.UUID) -> list[dict]:
     """DM-internal seed input — issue #245 seam.
 

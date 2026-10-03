@@ -1,52 +1,27 @@
-# Backend Application Modules
+# Backend application modules
 
-This directory defines the **modular monolith** layout for the production runtime.
-There is still **one FastAPI application** (`backend/main.py` / `app/factory.py`) and
-one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
+One FastAPI application (`backend/main.py` -> `app/factory.py`) over one Postgres schema
+(`backend/models/`, Alembic). The package map, the turn flow, the async model, and
+where auth/visibility/dice authority live are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
-## Module responsibilities
+## Rules
 
-| Module | Responsibility |
-|---|---|
-| `app/campaigns` | Campaign aggregate: creation, membership, invites, validation |
-| `app/characters` | Character aggregate + sheet persistence |
-| `app/characters/chat` | Character-creator chat (SSE) — streams via provider abstraction |
-| `app/world` | World state written inside turn/post-turn commits: entities, current scene, facts/relations, knowledge, clocks, NPC state, retrieval + semantic index |
-| `app/submissions` | Live-table player submissions: validation, acceptance, DM turn coordination |
-| `app/threads` | Campaign threads: shared/private lifecycle, membership, read/write authorization |
-| `app/rules` | Deterministic 5e mechanics: sheet-derived stats, checks/saves, attacks/damage, spells, rules-state effects (no FastAPI; only DB read is loading the canonical sheet) |
-| `app/rules_corpus` | SRD rules-text corpus: ingest, embeddings, hybrid search, DM evidence tools, `/api/rules/*` |
-| `app/visibility` | Disclosure vocabulary/normalization/ordering (`policy`) and campaign participation, DM-authority, and per-record receive checks (`access`) |
-| `app/billing` | Billing / entitlement checks — placeholder |
-| `app/realtime` | Realtime projections / websocket fan-out — placeholder |
-| `app/providers` | LLM provider adapters — re-exports `llm_providers` without workflow branching |
-| `app/observability` | Structured logging, tracing hooks, TTFT helpers (see #192) |
-| `app/health` | Health check |
-| `app/auth` | Auth config + `/api/me` (transport) + `app/auth/service.py` pure profile resolution + `app/auth/jwt.py` JWT/JWKS verification (application) |
-| `app/deps` | Transport adapters that extract `Request` headers and map errors to HTTP (e.g. `resolve_profile(Request) -> Profile`, the cron secret guard) |
-| `app/worker` | Worker job envelope + idempotent `WorkerExecution` ledger used by the cron sweeps |
+- **Services do not import `fastapi`.** Pure helpers take plain values and raise domain
+  errors. Transport adapters (`*/router.py`, `campaigns/routes/`, `deps/`) map those errors
+  to HTTP. Example: `app/auth/service.py` (pure) vs `app/deps/auth.py` (transport).
+  Campaign commands raise `CampaignCommandError` (status + detail), which `app/factory.py`
+  maps to the standard `{"detail": ...}` shape.
+- **Provider adapters stay isolated.** Gameplay code imports from `app.providers`
+  (`stream_chat`, `execute_chat`, `ProviderRequest`, `policy`). It never branches on
+  provider names.
+- **Import lower layers at module top.** Use a function-level import only to break a
+  genuine package cycle; `ARCHITECTURE.md` lists the ones that remain.
+- **One deployable.** All routers mount on the single `FastAPI` instance in `app/factory.py`.
 
-## Dependency direction
+## Adding a route
 
-```
-transport (app/*/router.py, app/campaigns/routes/*, app/deps/*, FastAPI Request/APIRouter/HTTPException)
-   -> application (app/*/service.py, app/auth/service.py, app/campaigns/service.py)
-   -> domain (app/rules/*, models.py pure helpers, value objects)
-   -> infrastructure (database.py, app/auth/jwt.py verify_supabase_jwt, providers, observability)
-```
-
-Rules:
-- **Domain / application MUST NOT import `fastapi`** (`Request`, `APIRouter`, `HTTPException`). Pure helpers take plain values (e.g. `auth_header: str | None`, `token: str`) and raise `app.auth.errors.AuthError` (a `ValueError`); transport adapters translate `AuthError` → `HTTPException`. See `app/auth/service.py` (pure) vs `app/deps/auth.py` (transport). Campaign commands raise `app.campaigns.service.CampaignCommandError` (status + detail), which `app/factory.py` maps to the same `{"detail": ...}` HTTP error shape.
-- **Provider adapters remain isolated**: gameplay workflows import from `app.providers` (`provider_registry`, `stream_chat`, `ProviderRequest`) and never branch on provider names or import `llm_providers` directly. `app.providers` is the mock seam for tests (see `app/characters/chat/service.py:118`).
-- **One deployable**: no new services or ports; all routers are mounted on the single `FastAPI` instance in `app/factory.py`.
-- New gameplay modules must be importable without importing any `router` or `app/deps/*` module (no circular `router -> service -> router`).
-
-## Adding a new gameplay route
-
-1. Add domain logic to `app/<domain>/service.py` (plain functions, no FastAPI).
-2. Expose it via `app/<domain>/router.py` (`APIRouter`, dependency injection, HTTP mapping). Campaign-scoped routes use `app.deps.campaign.campaign_for(...)` for load/authorize and `run_campaign_command` for idempotent revision-guarded commands.
+1. Put the logic in `app/<domain>/service.py` (plain functions, no FastAPI).
+2. Expose it from `app/<domain>/router.py`.
+   - Campaign-scoped routes use `app.deps.campaign.campaign_for(...)` to load and authorize.
+   - Idempotent, revision-guarded commands go through `run_campaign_command`.
 3. Register the router in `app/factory.py:create_app()`.
-
-## Rollback
-
-Moves are import-safe: `backend/main.py` re-exports `app` for backward compat (`from main import app` still works). If a module move breaks, revert the `include_router` line and restore the function to `main.py` — no data migration required.

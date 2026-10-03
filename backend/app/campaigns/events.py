@@ -7,7 +7,6 @@ mutations against an expected campaign revision. Guarantees:
 - Revision increments exactly once per successful fictional mutation.
 - Domain event gets stable monotonic campaign sequence == resulting revision.
 - Whole operation is transactional — rollback leaves revision + events unchanged.
-- Non-fictional derived updates bypass revision intentionally.
 
 Observability: logs campaign_id, prior/new revision, operation_id, conflict.
 
@@ -23,9 +22,6 @@ Usage:
         operation_id="op-123", actor_id=profile.id,
         mutate=mutate,
     )
-
-    # Non-fictional: don't bump revision
-    update_campaign_derived(db, campaign_id, description="index only")
 """
 
 from __future__ import annotations
@@ -37,6 +33,7 @@ from typing import Callable, Optional
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
+from app.observability.tracing import current_trace_id
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 
@@ -207,8 +204,6 @@ def commit_campaign_mutation(
     )
 
     # 2) Insert immutable domain event with sequence == new_revision
-    from app.observability.tracing import current_trace_id
-
     event = CampaignDomainEvent(
         id=uuid.uuid4(),
         campaign_id=campaign_id,
@@ -285,68 +280,6 @@ def commit_campaign_mutation(
     )
 
     return campaign, event
-
-
-def update_campaign_derived(
-    db: Session,
-    campaign_id: uuid.UUID,
-    *,
-    commit: bool = True,
-    **fields,
-) -> Campaign:
-    """Update non-fictional derived/index fields WITHOUT bumping revision.
-
-    This is the correct path for metadata/derived updates that must not be
-    considered authoritative fictional mutations (per AC: non-fictional derived
-    updates must NOT advance revision).
-
-    Example: search index, denormalized counters, cached projections.
-
-    Whitelisted fields are applied directly to the Campaign row. Unknown keys
-    are ignored to avoid accidental fictional field bumps.
-
-    Args:
-        db: Session
-        campaign_id: Campaign id
-        fields: keyword updates (e.g. description via derived path? Usually very
-                limited. For flexibility, any Campaign column except revision is accepted
-                but callers should be deliberate.)
-
-    Returns:
-        Updated Campaign (revision unchanged).
-    """
-    campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id)).scalars().first()
-    if campaign is None:
-        raise ValueError(f"Campaign {campaign_id} not found")
-
-    prior_revision = int(campaign.revision) if campaign.revision is not None else 0
-
-    # Campaign currently has one derived metadata field. Keep this explicit so
-    # fictional fields cannot accidentally bypass revision ordering.
-    allowed = {"updated_at"}
-    applied = {}
-    for k, v in fields.items():
-        if k in allowed:
-            setattr(campaign, k, v)
-            applied[k] = v
-
-    if not applied:
-        return campaign
-
-    db.flush()
-    if commit:
-        db.commit()
-        db.refresh(campaign)
-
-    logger.info(
-        "campaign derived update campaign_id=%s revision=%s fields=%s (no revision bump)",
-        campaign_id,
-        prior_revision,
-        list(applied.keys()),
-    )
-    # Ensure revision truly unchanged
-    assert int(campaign.revision) == prior_revision, "derived update must not bump revision"
-    return campaign
 
 
 def list_campaign_events(

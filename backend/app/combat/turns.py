@@ -32,6 +32,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
 from app.clock import ms_between, utcnow
 from app.combat.service import (
     TURN_ENDED_EVENT,
@@ -45,6 +46,7 @@ from app.combat.service import (
     lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
+from app.rules.mechanics import get_character_mechanics
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
@@ -125,8 +127,6 @@ def _resolve_movement_max(db: Session, participant: EncounterParticipant) -> int
     """Deterministic speed resolution with a fixed fallback (never blocks ready)."""
     if participant.kind == "pc" and participant.character_id is not None:
         try:
-            from app.rules.mechanics import get_character_mechanics
-
             mechanics = get_character_mechanics(db, participant.character_id)
             return max(0, min(500, int(mechanics.combat["speed"]["value"])))
         except Exception:
@@ -593,8 +593,6 @@ def _advance(
     commit: bool = False,
 ) -> tuple[Encounter, Any, Any]:
     """Advance to the next turn in initiative order (round rollover included)."""
-    from app.campaigns.events import commit_campaign_mutation
-
     order = get_turn_order(db, encounter.id)
     if not order:
         raise TurnError("cannot advance: turn order is empty")

@@ -24,7 +24,6 @@ from app.world.knowledge import (  # noqa: E402
     project_facts_for_user,
     project_relations_for_user,
     what_does_subject_know,
-    who_knows_target,
 )
 from app.world.facts import create_fact, create_relation  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
@@ -116,7 +115,6 @@ def test_dm_only_truth_exists_with_zero_knowers():
     assert db.execute(
         select(WorldKnowledge).where(WorldKnowledge.campaign_id == camp.id)
     ).scalars().all() == []
-    assert who_knows_target(db, camp, "fact", fact.id, owner)["total"] == 0
     assert may_user_receive(db, camp, "fact", fact.id, owner)["allowed"] is True
     denied = may_user_receive(db, camp, "fact", fact.id, alice)
     assert denied == {"allowed": False, "reason": "dm_only_requires_authority"}
@@ -161,11 +159,6 @@ def test_one_character_knowledge_and_two_characters_differ():
     bram_view = what_does_subject_know(db, camp, bram.id, owner)
     assert [(e["target_id"], e["knowledge_state"]) for e in aria_view["entries"]] == [(str(fact.id), "knows")]
     assert [(e["target_id"], e["knowledge_state"]) for e in bram_view["entries"]] == [(str(fact.id), "does_not_know")]
-    # Who-knows lists both stances for the DM.
-    who = who_knows_target(db, camp, "fact", fact.id, owner)
-    assert who["total"] == 2 and who["visible"] == 2
-    by_subject = {k["subject_entity_id"]: k["knowledge_state"] for k in who["knowers"]}
-    assert by_subject == {str(aria.id): "knows", str(bram.id): "does_not_know"}
 
 
 # ── Party belief vs truth ───────────────────────────────────────────────────
@@ -381,9 +374,6 @@ def test_no_access_inferred_from_related_shared_records():
     }
     proj = project_relations_for_user(db, camp, alice, [open_rel])
     assert proj["visible"] == 1
-    who = who_knows_target(db, camp, "fact", secret_fact.id, alice)
-    assert who["knowers"] == []  # target itself not visible → knowers hidden
-    assert who["denied_reasons"] == {"target_not_visible": 1}
 
 
 # ── Hidden subject is never disclosed through projections ───────────────────
@@ -415,14 +405,8 @@ def test_hidden_subject_never_disclosed_through_projections():
     assert subj_view["entries"] == []
     assert subj_view["total"] == 0
     assert subj_view["denied_reasons"] == {"subject_not_visible": 1}
-    who = who_knows_target(db, camp, "fact", fact.id, alice)
-    assert who["knowers"] == []
-    assert who["visible"] == 0 and who["total"] == 1 and who["denied"] == 1
-    assert who["denied_reasons"] == {"subject_not_visible": 1}
     # DM authority still sees the full picture in both directions.
     assert what_does_subject_know(db, camp, shade.id, owner)["visible"] == 1
-    owner_who = who_knows_target(db, camp, "fact", fact.id, owner)
-    assert [k["subject_entity_id"] for k in owner_who["knowers"]] == [str(shade.id)]
 
 
 # ── Re-assertion updates source provenance; same-key retry is idempotent ───

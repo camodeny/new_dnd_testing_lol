@@ -50,6 +50,14 @@ from app.combat.ending import (
 from app.deps.auth import current_profile
 from app.deps.idempotency import require_idempotency_key
 from app.campaigns.events import RevisionConflictError
+from app.realtime.service import (
+    publish_encounter_ended,
+    publish_encounter_map,
+    publish_encounter_moved,
+    publish_encounter_ready,
+    publish_encounter_started,
+    publish_encounter_turn,
+)
 from app.threads.service import ThreadNotFoundError
 from database import get_db
 from models.campaigns import Campaign
@@ -105,13 +113,6 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
     if replayed:
         return
     try:
-        from app.realtime.service import (
-            publish_encounter_ended,
-            publish_encounter_ready,
-            publish_encounter_started,
-            publish_encounter_turn,
-        )
-
         encounter_id = (result.get("encounter") or {}).get("id")
         if not encounter_id:
             return
@@ -598,8 +599,6 @@ def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, re
     if replayed:
         return
     try:
-        from app.realtime.service import publish_encounter_map, publish_encounter_moved
-
         encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
         if encounter is None:
             return

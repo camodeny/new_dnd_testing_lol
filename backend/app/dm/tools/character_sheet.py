@@ -25,6 +25,7 @@ from app.dm.context import AuthorizationScope, ContextAudience, SourceRef
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import EvidenceResult
 from app.observability.tracing import structured_log
+from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +67,6 @@ def _resolve_character_ids_for_scope(
     db: Any,
 ) -> list[uuid.UUID]:
     """Resolve evidence scope to concrete character UUIDs, scoped to audience campaign."""
-    from models.campaigns import CampaignMember
     from models.characters import Character
 
     try:
@@ -227,8 +227,6 @@ def handle_ask_character_sheet(
             error="no characters found for requested scope",
             latency_ms=(time.monotonic() - t0) * 1000,
         )
-
-    from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
 
     results_payload: list[dict[str, Any]] = []
     sources: list[SourceRef] = []

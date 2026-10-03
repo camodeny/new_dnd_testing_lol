@@ -213,8 +213,7 @@ def test_revoked_membership_immediately_denies_but_preserves_history(api, monkey
     client.post(f"/api/campaigns/{campaign_id}/submissions", json={"content": "before revoke", "thread_id": private_tid}, headers={"Idempotency-Key": "rev-1"})
     # owner revokes member by deleting membership
     with factory() as db:
-        from app.threads.service import remove_thread_member
-        assert remove_thread_member(db, uuid.UUID(private_tid), member_id) is True
+        db.delete(db.get(CampaignThreadMember, {"thread_id": uuid.UUID(private_tid), "user_id": member_id}))
         db.commit()
         # history still durable
         assert db.query(PlayerSubmission).filter_by(thread_id=private_tid).count() == 1

@@ -9,7 +9,7 @@ Transport: triggers stage a durable ``PostTurnRun`` row; the
 ``/api/cron/post-turn`` sweep executes it idempotently via WorkerExecution
 fencing (#191) with the run id as the worker job id.
 
-The memory/repair contents of a post-turn patch are built by the
+The memory contents of a post-turn patch are built by the
 explicit materializer (issue #217) behind ``consolidate_fn``-style
 default consolidation: ``materialize_range`` compiles the range into
 validated durable writes (entities, relations, facts, NPC state,
@@ -30,6 +30,13 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.observability.service import telemetry_factory_for
+from app.observability.tracing import current_trace_id
+from app.realtime.service import publish_projection_invalidated_for_grantee
+from app.worker.envelope import new_envelope
+from app.worker.executor import execute_worker_job
+from app.world.clocks import consolidate_clocks_for_range
+from app.world.semantic_index import note_authoritative_write
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.post_turn import PostTurnCheckpoint, PostTurnRun
 
@@ -260,8 +267,6 @@ def maybe_trigger_post_turn(
     if existing is not None:
         logger.info("post_turn trigger duplicate campaign=%s %s-%s run=%s", campaign_id, from_seq, to_seq, existing.id)
         return existing
-
-    from app.observability.tracing import current_trace_id
 
     run = PostTurnRun(
         id=uuid.uuid4(),
@@ -549,8 +554,6 @@ def run_post_turn_range(
             # a clock-processing failure raises here so the run fails and the
             # checkpoint stays put for cumulative retry. Custom
             # consolidate_fn callers own their content and opt out.
-            from app.world.clocks import consolidate_clocks_for_range
-
             patch["clocks"] = consolidate_clocks_for_range(
                 db, campaign_id, effective_from, to_sequence, events,
                 decision_service=clock_decision_service,
@@ -564,8 +567,6 @@ def run_post_turn_range(
             # put for cumulative retry).
             # Custom consolidate_fn callers own their content and opt out.
             from app.post_turn.incidents import ConsistencyBlocked, verify_post_turn_consistency
-
-            from app.observability.service import telemetry_factory_for
 
             incident_factory = (
                 clock_telemetry_factory
@@ -808,8 +809,6 @@ def _publish_grant_invalidations(db: Session, campaign_id: uuid.UUID, patch: dic
         })
         if not grantees:
             return
-        from app.realtime.service import publish_projection_invalidated_for_grantee
-
         campaign = db.get(Campaign, campaign_id)
         if campaign is None:
             return
@@ -833,7 +832,6 @@ def _request_range_semantic_index(
     committed checkpoint.
     """
     try:
-        from app.world.semantic_index import note_authoritative_write
         from models.world import WorldFact, WorldRelation
 
         event_ids = [e.id for e in events]
@@ -920,8 +918,6 @@ def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
 
 def _envelope_for_run(run: PostTurnRun):
     """Build the worker envelope for a durable run (locator only)."""
-    from app.worker.envelope import new_envelope
-
     return new_envelope(
         job_id=run.id,
         job_type=POST_TURN_JOB_TYPE,
@@ -953,8 +949,6 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     through the idempotent worker fence.
     """
     from datetime import timedelta as _timedelta
-
-    from app.worker.executor import execute_worker_job
 
     try:
         repaired = repair_missing_post_turn_runs(db)

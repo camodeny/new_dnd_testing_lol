@@ -71,6 +71,7 @@ def roll_api(monkeypatch):
 
     executed = []
     monkeypatch.setattr("app.dm.recovery.execute_committed_attempt", executed.append)
+    monkeypatch.setattr("app.rolls.router.execute_committed_attempt", executed.append)
     monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db

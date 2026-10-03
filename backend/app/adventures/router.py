@@ -42,6 +42,7 @@ from app.campaigns.events import RevisionConflictError
 from app.campaigns.service import CampaignArchivedError
 from app.deps.auth import current_profile
 from app.deps.campaign import campaign_for, parse_uuid_or_404, require_expected_revision, run_campaign_command
+from app.deps.cron import require_cron_secret
 from app.deps.idempotency import command_keys
 from database import get_db
 from models.campaigns import Adventure, AdventureEpilogue, AdventureSummary, Campaign
@@ -320,8 +321,6 @@ def mark_stale_endpoint(
 @router.get("/api/cron/adventure-closing")
 def adventure_closing_cron_get(request: Request, db: Session = Depends(get_db)):
     """Drive pending adventure closing work via the idempotent worker fence."""
-    from app.deps.cron import require_cron_secret
-
     require_cron_secret(request.headers.get("authorization"))
     from app.adventures.service import run_adventure_closing_sweep
 

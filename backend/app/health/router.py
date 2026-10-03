@@ -3,8 +3,10 @@ import os
 
 from fastapi import APIRouter
 
-from app.factory import APP_NAME, APP_VERSION
 from database import db_healthcheck
+
+APP_NAME = "dnd-backend"
+APP_VERSION = "0.1.0"
 
 router = APIRouter()
 

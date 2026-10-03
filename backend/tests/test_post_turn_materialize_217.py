@@ -18,7 +18,7 @@ import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.decisions import DecisionService  # noqa: E402
-from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
+from tests.support.fake_decisions import FakeDecisionAdapter  # noqa: E402
 from app.post_turn.materialize import (  # noqa: E402
     DEFER,
     MATERIALIZE_QUESTION_ID,
@@ -492,7 +492,6 @@ def test_scene_projection_hint_updates_current_scene():
 
 
 def test_visibility_grant_hint_authorizes_human_access(monkeypatch):
-    import app.realtime.service as realtime
     from app.visibility.access import has_active_grant
     from app.world.facts import create_fact
     from models.campaigns import CampaignMember
@@ -511,7 +510,7 @@ def test_visibility_grant_hint_authorizes_human_access(monkeypatch):
                   "grantee_user_id": str(reader)}}]})
     invalidated: list = []
     monkeypatch.setattr(
-        realtime, "publish_projection_invalidated_for_grantee",
+        "app.post_turn.service.publish_projection_invalidated_for_grantee",
         lambda _db, campaign, *, grantee_user_id: invalidated.append(grantee_user_id) or 1)
     out = run_post_turn_range(
         db, c.id, event.sequence, event.sequence,

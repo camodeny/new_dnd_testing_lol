@@ -18,7 +18,7 @@ import models  # noqa: E402, F401
 from tests.support.world_writes import commit_world_write  # noqa: E402
 from app.campaigns.events import commit_campaign_mutation, list_campaign_events  # noqa: E402
 from app.decisions import DecisionService  # noqa: E402
-from app.decisions.adapters.fake import FakeDecisionAdapter  # noqa: E402
+from tests.support.fake_decisions import FakeDecisionAdapter  # noqa: E402
 from app.post_turn.service import get_checkpoint, run_post_turn_range  # noqa: E402
 from app.world import clocks as C  # noqa: E402
 from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402

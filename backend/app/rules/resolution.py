@@ -34,6 +34,7 @@ from typing import Any, Callable, Literal, Protocol
 
 from pydantic import Field
 
+from app.idempotency import execute_idempotent_command
 from app.observability.tracing import structured_log
 from app.rules.mechanics import (
     MECHANICS_VERSION,
@@ -667,8 +668,6 @@ def apply_resolution_consequence(
 
     Returns ``(result, replayed)`` where ``replayed`` is True on dedup hits.
     """
-    from app.idempotency import execute_idempotent_command
-
     return execute_idempotent_command(
         db,
         actor_id=actor_id,

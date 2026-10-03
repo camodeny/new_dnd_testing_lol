@@ -27,6 +27,8 @@ import logging
 
 from sqlalchemy import select as _select
 from sqlalchemy.orm import Session
+from app.submissions.service import accept_submission
+from app.threads.service import get_or_create_campaign_thread
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +88,6 @@ def _find_opening_turn(db: Session, campaign_id, thread_id_str: str):
 def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id, operation_id: str):
     """Create the opening submission + DM turn once; reuse #246 provenance only."""
     from app.dm.turns import StreamBoundaryError, TurnConflictError, coordinate_turn
-    from app.submissions.service import accept_submission
     from models.campaigns import CampaignMember
 
     turn, attempt, opening = _find_opening_turn(db, campaign.id, thread_id_str)
@@ -148,7 +149,6 @@ def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id,
 
 def _started_snapshot(db: Session, campaign, *, replayed: bool) -> dict:
     from app.campaigns.service import compute_start_eligibility
-    from app.threads.service import get_or_create_campaign_thread
     from models.campaigns import CampaignMember
 
     members = db.execute(
@@ -198,7 +198,6 @@ def run_campaign_start(
         CampaignArchivedError, compute_start_eligibility, require_playable_campaign,
     )
     from app.campaigns.world_seed import WORLD_SEEDED_EVENT
-    from app.threads.service import get_or_create_campaign_thread
     from models.campaigns import Campaign, CampaignMember
 
     campaign = db.get(Campaign, campaign_id)

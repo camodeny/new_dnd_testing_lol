@@ -763,12 +763,12 @@ def test_ic_ooc_chat_non_blocking_during_active_turn():
 
 def test_turn_realtime_projections_have_stable_ids_and_no_hidden_stats():
     from app.realtime.service import (
-        InMemoryRealtimePublisher,
         build_encounter_turn_event,
         get_realtime_publisher,
         publish_encounter_turn,
         set_realtime_publisher,
     )
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     fac, ctx = _fixture()
     previous = get_realtime_publisher()
@@ -880,11 +880,8 @@ def test_hidden_npc_speed_redacted_for_non_owners():
 def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
@@ -1006,11 +1003,8 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
 def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel

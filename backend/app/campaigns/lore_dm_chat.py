@@ -21,7 +21,10 @@ import logging
 import uuid as uuid_lib
 
 from app.campaigns.service import CampaignCommandError
+from app.characters.chat.service import build_party_advisory_text
 from app.characters.service import latest_sheet
+from app.providers import ProviderRequest as PR, stream_chat
+from app.providers.areas import resolve_area
 
 logger = logging.getLogger(__name__)
 
@@ -153,17 +156,6 @@ def save_lore_dm_message(
         logger.warning("failed to save lore-DM chat message: %s", e)
 
 
-def get_lore_dm_model(adapter=None) -> str:
-    from app.providers.areas import resolve_area
-
-    if adapter is not None:
-        model = (adapter.env_model() or "").strip()
-        if model:
-            return model
-    _, model, _ = resolve_area("lore_dm_chat")
-    return model
-
-
 def _extract_proposal(tool_call) -> str | None:
     try:
         args_raw = tool_call.arguments
@@ -198,8 +190,6 @@ def lore_dm_chat_sync_generator(
     context: str,
 ):
     try:
-        from app.providers.areas import resolve_area
-
         adapter, model, _ = resolve_area("lore_dm_chat")
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
@@ -210,8 +200,6 @@ def lore_dm_chat_sync_generator(
     full_text = ""
     proposal: str | None = None
     try:
-        from app.providers import ProviderRequest as PR, stream_chat
-
         pr = PR(
             messages=messages,
             model=model,
@@ -305,7 +293,6 @@ def start_lore_chat_turn(db, *, campaign, character, user_id: uuid_lib.UUID, con
 
     from app.campaigns.members import campaign_members
     from app.campaigns.party_lore import build_party_advice, build_party_composition, require_lore_writable
-    from app.characters.chat.service import build_party_advisory_text
     from models.campaigns import CampaignLoreChatMessage
 
     require_lore_writable(campaign)

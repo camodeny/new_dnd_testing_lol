@@ -25,8 +25,16 @@ import uuid
 
 from sqlalchemy.orm import Session
 
+from app.realtime.channels import live_table_channel
+from app.realtime.service import publish_submission_created
 from app.submissions.service import MAX_CONTENT_LENGTH, accept_submission, list_submissions
-from app.threads.service import get_or_create_lobby_thread
+from app.threads.service import (
+    ThreadAuthorizationError,
+    ThreadNotFoundError,
+    assert_can_read_thread,
+    assert_can_write_thread,
+    get_or_create_lobby_thread,
+)
 from app.campaigns.service import CampaignCommandError
 from models.campaigns import Campaign
 from models.threads import CampaignThread, PlayerSubmission, PlayerSubmissionSegment
@@ -146,8 +154,6 @@ def list_lobby_messages(
 
 
 def _thread_error(exc: Exception, *, campaign_id: uuid.UUID, user_id: uuid.UUID, action: str) -> CampaignCommandError:
-    from app.threads.service import ThreadNotFoundError
-
     if isinstance(exc, ThreadNotFoundError):
         return CampaignCommandError("Thread not found", status_code=404)
     logger.info("lobby_chat %s denied campaign_id=%s user_id=%s", action, campaign_id, user_id)
@@ -160,9 +166,6 @@ def lobby_chat_snapshot(db: Session, campaign: Campaign, user_id: uuid.UUID) -> 
     Ensures the lobby thread so pre-existing campaigns converge without a
     dedicated backfill.
     """
-    from app.realtime.channels import live_table_channel
-    from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread
-
     thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
     db.commit()
     try:
@@ -184,8 +187,6 @@ def lobby_chat_snapshot(db: Session, campaign: Campaign, user_id: uuid.UUID) -> 
 
 def writable_lobby_thread(db: Session, campaign: Campaign, user_id: uuid.UUID, payload: object) -> tuple[CampaignThread, str]:
     """Pre-start, write-authorized lobby thread plus the validated content."""
-    from app.threads.service import ThreadAuthorizationError, assert_can_write_thread
-
     require_lobby_chat_writable(campaign)
     thread = get_or_create_lobby_thread(db, campaign.id, created_by=user_id)
     db.commit()
@@ -212,8 +213,6 @@ def post_lobby_chat(
     (accept_submission's own lock only re-checks archive).
     """
     from sqlalchemy import select
-
-    from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_write_thread
 
     locked = db.execute(
         select(Campaign)
@@ -243,8 +242,6 @@ def publish_lobby_message(db: Session, result: dict, *, campaign_id: uuid.UUID, 
     recovery path.
     """
     try:
-        from app.realtime.service import publish_submission_created
-
         msg = result.get("message") if isinstance(result, dict) else None
         if msg and msg.get("id"):
             db_sub = db.get(PlayerSubmission, uuid.UUID(str(msg["id"])))

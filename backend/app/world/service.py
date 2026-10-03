@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
+from app.rules.state import project_npc_details_for_viewer as _project_details
 from app.visibility.policy import normalize_visibility
 from app.world._common import dialect_upsert_insert, normalize_idempotency_key
 from models.campaigns import Campaign
@@ -74,10 +75,6 @@ def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
     """
     data = entity.to_dict()
     if is_authority:
-        return data
-    try:
-        from app.rules.state import project_npc_details_for_viewer as _project_details
-    except Exception:
         return data
     try:
         data["details"] = _project_details(data.get("details"), False)

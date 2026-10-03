@@ -48,6 +48,8 @@ from app.dm.context import (
 from app.dm.contract import DmTurnContractV1, EvidenceRequest, normalize_contract
 from app.observability.tracing import structured_log
 from app.schema import StrictModel
+from app.world.retrieval import TOOL_HANDLERS as world_handlers
+from app.world.semantic import handle_search_campaign_memory
 
 logger = logging.getLogger(__name__)
 
@@ -212,10 +214,7 @@ def _tool_registry() -> dict[str, Callable[..., Any]]:
     Imported lazily: the handler modules import this module's result types.
     """
     from app.dm.tools import handle_ask_character_sheet
-    from app.rules_corpus.evidence_tools import TOOL_HANDLERS as rules_handlers
-    from app.world.retrieval import TOOL_HANDLERS as world_handlers
-    from app.world.semantic import handle_search_campaign_memory
-
+    from app.dm.tools.rules import TOOL_HANDLERS as rules_handlers
     return {
         "ask_character_sheet": handle_ask_character_sheet,
         "search_campaign_memory": handle_search_campaign_memory,

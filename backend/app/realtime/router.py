@@ -18,7 +18,13 @@ from sqlalchemy.orm import Session
 from app.deps.campaign import campaign_for
 from app.deps.auth import current_profile
 from app.realtime.channels import live_table_channel, parse_live_table_channel
-from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
+from app.threads.service import (
+    ThreadAuthorizationError,
+    ThreadNotFoundError,
+    assert_can_read_thread,
+    list_threads_for_user,
+    parse_thread_id,
+)
 from database import get_db
 from models.campaigns import Campaign
 
@@ -38,8 +44,6 @@ def list_realtime_channels(
     caller is an explicit member. The returned channel names can be used with
     Supabase Realtime (`supabase.channel(name).subscribe()`).
     """
-    from app.threads.service import list_threads_for_user
-
     threads = list_threads_for_user(db, campaign.id, profile.id)
     channels = [
         {
@@ -99,8 +103,4 @@ def authorize_realtime_channel(
 
     authorized_channel = live_table_channel(campaign.id, tid)
     logger.info("realtime channel authorized campaign_id=%s thread_id=%s user_id=%s channel=%s", campaign.id, tid, profile.id, authorized_channel)
-    # Count as subscription attempt for observability (accepted)
-    from app.realtime.service import _inc
-
-    _inc("subscription_count")
     return {"authorized": True, "channel": authorized_channel, "thread_id": str(tid)}

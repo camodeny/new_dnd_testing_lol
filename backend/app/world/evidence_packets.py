@@ -16,9 +16,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_uuid
+from app.threads.service import can_read_thread, parse_thread_id
 from app.visibility.access import is_campaign_participant, is_world_authority, may_user_receive
 from app.visibility.policy import RECORD_VISIBILITIES, evidence_bundle_visibility, visible_to_viewer
-from app.world._common import coerce_uuid
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.dm import DmTurn
 from models.threads import CampaignThread, PlayerSubmission
@@ -364,8 +365,6 @@ def _thread_readable_for_viewer(
     private-audience records; shared-audience legacy ``"main"`` turns
     without a durable thread row never reach it.)
     """
-    from app.threads.service import can_read_thread, parse_thread_id
-
     raw = "" if raw_thread_id is None else str(raw_thread_id)
     if not raw or raw == "main":
         thread = db.execute(

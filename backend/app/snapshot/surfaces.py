@@ -44,7 +44,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.combat.service import get_snapshot_encounter
 from app.visibility.access import is_campaign_participant, is_world_authority, may_user_receive
+from app.world import clocks as _clocks, facts as _facts, knowledge as _knowledge, service as _world
 from models.campaigns import Campaign
 
 logger = logging.getLogger(__name__)
@@ -85,9 +87,6 @@ def _empty_surface(reason: str | None = None) -> dict[str, Any]:
 def _knowledge_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
-    from app.world import knowledge as _knowledge
-    from app.world import facts as _facts
-
     try:
         facts = _facts.list_facts(
             db, campaign.id, status="active", limit=_FACT_SCAN_LIMIT
@@ -123,8 +122,6 @@ def _entity_surface(
     *,
     is_authority: bool,
 ) -> dict[str, Any]:
-    from app.world import service as _world
-
     try:
         rows = _world.list_entities(db, campaign.id, limit=_ENTITY_SCAN_LIMIT)
         records: list[dict[str, Any]] = []
@@ -172,8 +169,6 @@ def _maps_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
     try:
-        from app.combat.service import get_snapshot_encounter
-
         encounter = get_snapshot_encounter(db, campaign.id, viewer_id)
     except Exception as exc:
         logger.warning(
@@ -193,8 +188,6 @@ def _clocks_surface(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
     try:
-        from app.world import clocks as _clocks
-
         return _clocks.project_clocks_for_viewer(db, campaign, viewer_id)
     except Exception as exc:
         logger.warning(

@@ -35,6 +35,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.dm.context import _history_record, _size as _record_size
 from app.observability.tracing import structured_log
 from models.campaigns import CampaignDomainEvent
 
@@ -92,8 +93,6 @@ def estimate_unprocessed_cost(
     Raises on any failure — callers must treat that as blocked, never as
     zero (fail-safe: never silently omit history).
     """
-    from app.dm.context import _history_record
-    from app.dm.context import _size as _record_size
     from app.post_turn.service import get_checkpoint, get_max_sequence
 
     cp = get_checkpoint(db, campaign_id, commit=False)

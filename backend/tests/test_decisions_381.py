@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.decisions.adapters.fake import FakeDecisionAdapter
+from tests.support.fake_decisions import FakeDecisionAdapter
 from app.decisions.errors import DecisionError
 from app.decisions.frames import (
     CLARIFY_CANDIDATE_ID,

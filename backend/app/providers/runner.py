@@ -17,6 +17,9 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
+from app.billing.config import cost_usd_for, tokens_from_usage
+from app.billing.ledger import charge_finished_run
+from app.observability.service import finish_ai_run, start_ai_run, telemetry_factory_for
 from app.providers import policy as role_policy
 
 
@@ -78,10 +81,6 @@ class _AiRun:
         if self._run_id is None:
             return
         try:
-            from app.billing.config import cost_usd_for, tokens_from_usage
-            from app.billing.ledger import charge_finished_run
-            from app.observability.service import finish_ai_run
-
             in_tokens, out_tokens = tokens_from_usage(usage)
             finish_ai_run(
                 self._ledger.telemetry, self._run_id, status="succeeded",
@@ -101,8 +100,6 @@ class _AiRun:
         if self._run_id is None:
             return
         try:
-            from app.observability.service import finish_ai_run
-
             finish_ai_run(
                 self._ledger.telemetry, self._run_id, status="failed",
                 error_type=type(exc).__name__[:128],
@@ -123,8 +120,6 @@ class AiRunLedger:
         self.telemetry = None
         if db is not None:
             try:
-                from app.observability.service import telemetry_factory_for
-
                 self.telemetry = telemetry_factory_for(db)
             except Exception:
                 self.telemetry = None
@@ -135,8 +130,6 @@ class AiRunLedger:
         run_id = None
         if self.telemetry is not None:
             try:
-                from app.observability.service import start_ai_run
-
                 run_id = start_ai_run(
                     self.telemetry, logical_operation=self.logical_operation,
                     role=self.role, provider=adapter.name, model=model,

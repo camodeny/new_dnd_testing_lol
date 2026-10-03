@@ -43,6 +43,7 @@ from typing import Any, Literal
 
 from pydantic import Field
 
+from app.idempotency import execute_idempotent_command
 from app.observability.tracing import structured_log
 from app.rules.mechanics import (
     MECHANICS_VERSION,
@@ -1039,7 +1040,7 @@ def stage_spell_cast(
 
 def spell_attacker(holder: Any, spell_name: Any, *, caster_kind: CasterKind = "pc"):
     """Authoritative spell-attack offense (spell attack bonus, never weapon math)."""
-    from app.rules.attacks import AttackError, CombatantOffense
+    from app.rules.attacks import CombatantOffense
 
     definition = get_spell_def(spell_name)
     if not definition.attack_roll:
@@ -1401,8 +1402,6 @@ def apply_spell_consequence(
     on retry) via the existing ``app.idempotency`` durable command record.
     Returns ``(result, replayed)``.
     """
-    from app.idempotency import execute_idempotent_command
-
     t0 = time.monotonic()
     try:
         result, replayed = execute_idempotent_command(

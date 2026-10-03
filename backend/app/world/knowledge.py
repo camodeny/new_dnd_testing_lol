@@ -16,7 +16,6 @@ Reusable server-side queries (all SQL-expressible, RLS-compatible); the
 per-record receive check itself is :func:`app.visibility.access.may_user_receive`:
 
 - ``what_does_subject_know(db, campaign, subject_entity_id, viewer_user_id, ...)``
-- ``who_knows_target(db, campaign, target_kind, target_id, viewer_user_id, ...)``
 
 Fail-closed everywhere: missing/ambiguous visibility, unknown records,
 non-membership, and revoked/missing grants all deny with a reason code.
@@ -38,6 +37,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.schema import coerce_optional_uuid, coerce_uuid
 from app.observability.tracing import structured_log
 from app.visibility.access import (
     is_campaign_participant,
@@ -46,7 +46,7 @@ from app.visibility.access import (
     validate_grant_target_kind,
 )
 from app.visibility.policy import canonical_visibility
-from app.world._common import coerce_optional_uuid, coerce_uuid, normalize_idempotency_key
+from app.world._common import normalize_idempotency_key
 from models.campaigns import Campaign
 from models.profiles import Profile
 from models.world import (
@@ -328,28 +328,6 @@ def list_knowledge_for_subject(
     return list(db.execute(q).scalars().all())
 
 
-def list_knowledge_for_target(
-    db: Session, campaign_id: uuid.UUID, target_kind: str, target_id: Any, *,
-    knowledge_state: str | None = None, limit: int = 100,
-) -> list[WorldKnowledge]:
-    kind = validate_knowledge_target_kind(target_kind)
-    tid = coerce_uuid(target_id, field="target_id")
-    q = select(WorldKnowledge).where(
-        WorldKnowledge.campaign_id == campaign_id,
-        WorldKnowledge.target_kind == kind,
-    )
-    if kind == "fact":
-        q = q.where(WorldKnowledge.target_fact_id == tid)
-    elif kind == "relation":
-        q = q.where(WorldKnowledge.target_relation_id == tid)
-    else:
-        q = q.where(WorldKnowledge.target_entity_id == tid)
-    if knowledge_state is not None:
-        q = q.where(WorldKnowledge.knowledge_state == validate_knowledge_state(knowledge_state))
-    q = q.order_by(WorldKnowledge.created_at.asc()).limit(max(1, min(int(limit or 100), 200)))
-    return list(db.execute(q).scalars().all())
-
-
 # ── Visibility grants (arbitrary authorized subsets) ────────────────────────
 
 def _find_grant_by_idempotency(
@@ -515,61 +493,6 @@ def what_does_subject_know(
         "visible": len(entries),
         "denied": denied,
         "denied_reasons": denied_reasons,
-    }
-
-
-def who_knows_target(
-    db: Session, campaign: Campaign, target_kind: str, target_id: Any,
-    viewer_user_id: Any, *, knowledge_state: str | None = None, limit: int = 100,
-) -> dict[str, Any]:
-    """Projection: which subjects may viewer U see as holding target T?
-
-    The viewer must independently be allowed the target, each knowledge row,
-    AND each knower's subject entity; knower identities behind denied rows or
-    hidden subjects are never listed.
-    """
-    try:
-        kind = validate_knowledge_target_kind(target_kind)
-        tid = coerce_uuid(target_id, field="target_id")
-        viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
-    except ValueError:
-        return {
-            "target_kind": str(target_kind), "target_id": str(target_id),
-            "knowers": [], "total": 0, "visible": 0, "denied": 0,
-            "denied_reasons": {"record_not_found": 1},
-        }
-    if may_user_receive(db, campaign, kind, tid, viewer)["allowed"] is False:
-        return {
-            "target_kind": kind, "target_id": str(tid),
-            "knowers": [], "total": 0, "visible": 0, "denied": 0,
-            "denied_reasons": {"target_not_visible": 1},
-        }
-    rows = list_knowledge_for_target(
-        db, campaign.id, kind, tid, knowledge_state=knowledge_state, limit=limit,
-    )
-    knowers: list[dict] = []
-    denied_reasons: dict[str, int] = {}
-    for row in rows:
-        if not may_user_receive(db, campaign, "knowledge", row.id, viewer)["allowed"]:
-            denied_reasons["knowledge_not_visible"] = denied_reasons.get("knowledge_not_visible", 0) + 1
-            continue
-        if not may_user_receive(db, campaign, "entity", row.subject_entity_id, viewer)["allowed"]:
-            denied_reasons["subject_not_visible"] = denied_reasons.get("subject_not_visible", 0) + 1
-            continue
-        knowers.append({
-            "knowledge_id": str(row.id),
-            "subject_kind": row.subject_kind,
-            "subject_entity_id": str(row.subject_entity_id),
-            "knowledge_state": row.knowledge_state,
-            "acquisition_source": row.acquisition_source,
-        })
-    denied = len(rows) - len(knowers)
-    reasons = dict(denied_reasons)
-    return {
-        "target_kind": kind, "target_id": str(tid),
-        "knowers": knowers, "total": len(rows),
-        "visible": len(knowers), "denied": denied,
-        "denied_reasons": reasons,
     }
 
 

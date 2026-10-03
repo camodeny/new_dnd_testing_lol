@@ -52,11 +52,49 @@ from app.decisions import (
 )
 from app.dm.turns import DM_TURN_RESOLVED
 from app.observability.tracing import structured_log
+from app.visibility.access import validate_grant_target_kind
 from app.visibility.policy import (
     disclosure_rank,
     effect_to_record_visibility,
     normalize_visibility,
     visibility_or_dm_only,
+)
+from app.world.facts import (
+    create_fact,
+    create_relation,
+    validate_epistemic_state,
+    validate_fact_content,
+    validate_relation_type,
+)
+from app.world.identity import (
+    DEFER as IDENTITY_DEFER,
+    KEEP_DISTINCT,
+    NEW_ENTITY,
+    build_identity_frame,
+    create_entity_after_resolution,
+    decide_identity,
+    exact_identity,
+    exact_identity_match,
+    normalize_alias,
+    stable_jit_key,
+    stored_identity_outcomes,
+)
+from app.world.knowledge import (
+    assert_knowledge,
+    grant_visibility,
+    list_knowledge_for_subject,
+    validate_knower_kind,
+    validate_knowledge_state,
+    validate_knowledge_target_kind,
+)
+from app.world.npcs import apply_npc_state, get_npc_state
+from app.world.service import (
+    UNSET,
+    apply_scene_update,
+    create_entity,
+    get_current_scene,
+    validate_entity_status,
+    validate_entity_type,
 )
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import WorldEntity
@@ -170,7 +208,6 @@ def validate_hint(hint: Any, *, event_sequence: int) -> CandidateAssertion:
         raise MaterializeError(f"event {event_sequence}: hint {key!r} has invalid visibility: {exc}") from exc
     epistemic_state = hint.get("epistemic_state", "claimed")
     if category in ("relations", "facts"):
-        from app.world.facts import validate_epistemic_state
         try:
             epistemic_state = validate_epistemic_state(epistemic_state)
         except ValueError as exc:
@@ -178,7 +215,6 @@ def validate_hint(hint: Any, *, event_sequence: int) -> CandidateAssertion:
                 f"event {event_sequence}: hint {key!r} has invalid epistemic_state: {exc}"
             ) from exc
     if category == "knowledge":
-        from app.world.knowledge import validate_knowledge_state
         try:
             validate_knowledge_state(data.get("knowledge_state", "knows"))
         except ValueError as exc:
@@ -429,7 +465,6 @@ def compile_committed_candidates(
         if not isinstance(proposals, list):
             raise MaterializeError(
                 f"event {event.sequence}: contract new_entities must be a list")
-        from app.world.identity import stable_jit_key, stored_identity_outcomes
         stored_outcomes = stored_identity_outcomes(attempt)
         for proposal in proposals:
             if not isinstance(proposal, dict):
@@ -492,7 +527,6 @@ def resolve_entity_ref(db: Session, campaign_id: uuid.UUID, ref: Any):
     Returns (entity, how) via exact uuid/alias/name match, or (None, None).
     Name collisions are returned with how="name" for the bounded path.
     """
-    from app.world.identity import exact_identity_match
     return exact_identity_match(db, campaign_id, ref)
 
 
@@ -670,7 +704,6 @@ def _idempotency_key(
 
 def _canonical_name_count(db: Session, campaign_id: uuid.UUID, name: str) -> int:
     """Live canonical entities sharing one normalized name."""
-    from app.world.identity import normalize_alias
     normalized = normalize_alias(name)
     rows = db.execute(select(WorldEntity).where(
         WorldEntity.campaign_id == campaign_id,
@@ -691,17 +724,6 @@ def _apply_entity(
     collisions via #214, or create. Ambiguity without a decision service
     defers fail-closed. The visibility cap re-checks once the canonical
     id is known, so an id-matched reveal authorizes precisely."""
-    from app.world.identity import (
-        DEFER as IDENTITY_DEFER,
-        KEEP_DISTINCT,
-        NEW_ENTITY,
-        build_identity_frame,
-        create_entity_after_resolution,
-        decide_identity,
-        exact_identity,
-    )
-    from app.world.service import create_entity, validate_entity_status, validate_entity_type
-
     data = assertion.data
     name = data.get("name")
     if not isinstance(name, str) or not name.strip():
@@ -796,8 +818,6 @@ def _apply_relation(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.facts import create_relation, validate_relation_type
-
     data = assertion.data
     relation_type = data.get("relation_type")
     if not isinstance(relation_type, str) or not relation_type.strip():
@@ -844,8 +864,6 @@ def _apply_fact(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.facts import create_fact, validate_fact_content
-
     data = assertion.data
     content = data.get("content")
     if not isinstance(content, str) or not content.strip():
@@ -893,8 +911,6 @@ def _apply_npc_state(
     db: Session, campaign: Campaign, assertion: CandidateAssertion,
     *, from_sequence: int, to_sequence: int, operation_id: str | None,
 ) -> dict[str, Any]:
-    from app.world.npcs import apply_npc_state, get_npc_state
-
     data = assertion.data
     entity = _resolve_required_ref(db, campaign.id, data.get("entity_ref"), assertion=assertion, role="entity_ref")
     if entity is None:
@@ -960,7 +976,6 @@ def _knowledge_current_order(
     Strongest signal wins: the materializer's provenance channel, then the
     row's source turn ordering, else unknown (-1, never treated as newer).
     """
-    from app.world.knowledge import list_knowledge_for_subject
     from models.dm import DmTurn
 
     tid: uuid.UUID | None = None
@@ -1003,12 +1018,6 @@ def _apply_knowledge(
     Never mutates truth tables by construction; re-assertion updates the
     single current row per (subject, target) in place.
     """
-    from app.world.knowledge import (
-        assert_knowledge,
-        validate_knower_kind,
-        validate_knowledge_target_kind,
-    )
-
     data = assertion.data
     try:
         subject_kind = validate_knower_kind(data.get("subject_kind"))
@@ -1080,8 +1089,6 @@ def _apply_scene(
     numbering (sequence == resulting revision), so a delayed older
     assertion never overwrites newer committed state.
     """
-    from app.world.service import UNSET, apply_scene_update, get_current_scene
-
     data = assertion.data
     if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
         if assertion.mechanical:
@@ -1131,9 +1138,6 @@ def _apply_visibility_grant(
     Grants are the durable form of explicit disclosure: they widen human
     access without touching fictional-character knowledge or truth rows.
     """
-    from app.visibility.access import validate_grant_target_kind
-    from app.world.knowledge import grant_visibility
-
     data = assertion.data
     try:
         target_kind = validate_grant_target_kind(data.get("target_kind"))

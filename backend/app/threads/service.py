@@ -36,10 +36,6 @@ def parse_thread_id(thread_id: str) -> uuid.UUID:
         raise ThreadNotFoundError("Invalid thread id") from exc
 
 
-def get_thread(db: Session, thread_id: uuid.UUID) -> CampaignThread | None:
-    return db.get(CampaignThread, thread_id)
-
-
 def get_campaign_thread(
     db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID
 ) -> CampaignThread | None:
@@ -476,12 +472,3 @@ def list_threads_for_user(
             visible.append(thread)
     return visible
 
-
-def remove_thread_member(db: Session, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-    member = db.get(CampaignThreadMember, {"thread_id": thread_id, "user_id": user_id})
-    if member is None:
-        return False
-    db.delete(member)
-    db.flush()
-    logger.info("thread membership revoked thread_id=%s user_id=%s", thread_id, user_id)
-    return True

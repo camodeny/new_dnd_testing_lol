@@ -31,6 +31,8 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Adventure, AdventureEpilogue, Campaign, CampaignMember
@@ -165,8 +167,6 @@ def open_epilogues(
     Idempotent: reopening an open phase returns the adventure unchanged.
     A closed phase never reopens (single canonical pass).
     """
-    from app.campaigns.service import require_playable_campaign
-
     camp = db.get(Campaign, campaign_id)
     if camp is None:
         raise EpilogueError(f"Campaign {campaign_id} not found")
@@ -202,8 +202,6 @@ def close_epilogues(
     who participated, who skipped, and whose roster PCs simply never answered.
     Idempotent: closing a closed phase returns the same stats shape.
     """
-    from app.campaigns.service import require_playable_campaign
-
     camp = db.get(Campaign, campaign_id)
     if camp is None:
         raise EpilogueError(f"Campaign {campaign_id} not found")
@@ -259,7 +257,6 @@ def submit_epilogue(
     :class:`EpilogueDuplicateError` (a prior ``skipped`` row converts to the
     new submission — players may change their mind, still one row).
     """
-    from app.campaigns.service import require_playable_campaign
     from models.characters import Character
 
     camp = db.get(Campaign, campaign_id)
@@ -390,8 +387,6 @@ def _commit_epilogue_event(
     input. Any failure rolls back the whole mutation and never touches the
     already-completed adventure.
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     expected = (
         int(expected_revision)
         if expected_revision is not None
@@ -467,8 +462,6 @@ def fulfill_epilogue_roll(
     or beats the DC. The resolved outcome commits through the same canonical
     event path as simple entries.
     """
-    from app.campaigns.service import require_playable_campaign
-
     row = db.get(AdventureEpilogue, epilogue_id)
     if row is None:
         raise EpilogueError(f"Epilogue {epilogue_id} not found")
@@ -560,7 +553,6 @@ def skip_epilogue(
     skip for a non-responsive player's roster PC (roster bookkeeping only —
     no fiction is authored). Skipping after submitting is rejected.
     """
-    from app.campaigns.service import require_playable_campaign
     from models.characters import Character
 
     camp = db.get(Campaign, campaign_id)

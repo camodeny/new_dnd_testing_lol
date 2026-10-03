@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.clock import utcnow
+from app.observability.tracing import current_trace_id
 from models.dm import DMStream
 from models.dm import DMStreamChunk
 
@@ -61,7 +62,6 @@ def create_stream(
     # Resolve trace if not provided
     if trace_id is None:
         try:
-            from app.observability.tracing import current_trace_id
             trace_id = current_trace_id()
         except Exception:
             trace_id = None

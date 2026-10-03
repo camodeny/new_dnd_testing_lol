@@ -113,7 +113,7 @@ def test_rules_search_degrades_to_lexical_when_embedding_fails(db, monkeypatch):
     def boom(*_a, **_k):
         raise RuntimeError("simulated provider failure")
 
-    monkeypatch.setattr("app.rules_corpus.gemini.gemini_embed_query", boom)
+    monkeypatch.setattr("app.dm.tools.rules.gemini_embed_query", boom)
 
     # Must degrade to lexical search without raising, and still return hits
     result = rules_router.search(q="attack", limit=5, corpus_id=None, db=db)

@@ -64,29 +64,6 @@ class NormalizedChatResponse:
     reasoning_details: object
     raw: dict
 
-    def message_view(self):
-        """Canonical assistant-message payload for workflow consumption.
-
-        Built solely from normalized fields, so workflows never need to index
-        the provider's native response shape. ``raw`` remains available for
-        audit/debugging only.
-        """
-        message = {'content': self.content}
-        if self.tool_calls:
-            message['tool_calls'] = [
-                {
-                    'id': tool_call.id,
-                    'type': 'function',
-                    'function': {'name': tool_call.name, 'arguments': tool_call.arguments},
-                }
-                for tool_call in self.tool_calls
-            ]
-        if self.reasoning:
-            message['reasoning_content'] = self.reasoning
-        if self.reasoning_details is not None:
-            message['reasoning_details'] = self.reasoning_details
-        return message
-
 
 @dataclass
 class NormalizedStreamEvent:

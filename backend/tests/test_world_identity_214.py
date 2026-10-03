@@ -14,7 +14,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base
 import models  # noqa: F401
 from app.decisions import DecisionError, DecisionService, record_fail_soft, to_decision_request
-from app.decisions.adapters.fake import FakeDecisionAdapter
+from tests.support.fake_decisions import FakeDecisionAdapter
 from app.world.identity import (DEFER, KEEP_DISTINCT, NEW_ENTITY, add_alias,
     build_identity_frame, candidate_entities, create_entity_after_resolution, decide_identity, exact_identity,
     normalize_alias, promote_new_entities_from_contract)

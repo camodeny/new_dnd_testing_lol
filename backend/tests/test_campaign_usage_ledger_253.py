@@ -496,7 +496,6 @@ def test_cost_usd_for_uses_configured_pricing(monkeypatch):
 # ── 16. production narration: streamed usage is charged exactly once ────────
 
 def test_primary_narration_stream_charges_exactly_once(monkeypatch):
-    import app.providers as providers_pkg
     from app.billing import config as billing_config
     from app.dm.adjudication import build_provider_narrator
     from app.dm.narration import NarratorRequest
@@ -520,7 +519,7 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
         yield NormalizedStreamEvent(kind="done", usage={"prompt_tokens": 1_000_000,
                                                        "completion_tokens": 500_000})
 
-    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr("app.dm.adjudication.stream_chat", _fake_stream)
     monkeypatch.setattr(role_policy, "execution_path", lambda role: [("p1", "m")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
     monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter())

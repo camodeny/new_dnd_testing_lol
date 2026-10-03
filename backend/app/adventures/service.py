@@ -22,8 +22,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.adventures.summaries import finalize_adventure_derived
+from app.dm.contract import normalize_contract, public_projection
+from app.observability.tracing import current_trace_id
+from app.worker.envelope import new_envelope
+from app.worker.executor import RetriableError, TerminalError, execute_worker_job
 from models.campaigns import Adventure, Campaign
 
 logger = logging.getLogger(__name__)
@@ -144,16 +150,10 @@ def redact_private_contract_snapshot(snapshot: dict | None) -> dict | None:
     if not isinstance(snapshot, dict):
         return snapshot
     try:
-        from app.dm.contract import normalize_contract, public_projection
-
         return public_projection(normalize_contract(snapshot))
     except Exception:
         logger.warning("adventure redaction dropped unparseable contract snapshot")
         return None
-
-
-def get_adventure(db: Session, adventure_id: uuid.UUID) -> Adventure | None:
-    return db.get(Adventure, adventure_id)
 
 
 def get_current_adventure(db: Session, campaign_id: uuid.UUID) -> Adventure | None:
@@ -246,8 +246,6 @@ def start_adventure(
     # Archive dormancy (issue #265): no new adventure may open on a frozen
     # table. Guarded on the locked row so a concurrent archive cannot slip
     # past a transport-level check.
-    from app.campaigns.service import require_playable_campaign
-
     require_playable_campaign(campaign)
     existing = get_current_adventure(db, campaign_id)
     if existing is not None:
@@ -450,8 +448,6 @@ def complete_adventure(
         existing (adventure, event) with ``duplicate=True`` in the caller
         response (the event payload itself is unchanged).
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         raise AdventureNotFoundError(f"Campaign {campaign_id} not found")
@@ -495,8 +491,6 @@ def complete_adventure(
     completed: dict[str, Adventure] = {}
 
     def _mutate(locked: Campaign):
-        from app.campaigns.service import require_playable_campaign
-
         require_playable_campaign(locked)
         adv = db.get(Adventure, adventure.id)
         if adv is None:
@@ -570,7 +564,6 @@ def stage_adventure_closing(db: Session, adventure: Adventure, *, operation_id: 
     The row commits atomically with the completion; ``run_adventure_closing_sweep``
     (``/api/cron/adventure-closing``) consumes it.
     """
-    from app.observability.tracing import current_trace_id
     from models.reliability import Outbox
 
     db.add(Outbox(
@@ -599,7 +592,6 @@ def handle_adventure_closing(envelope, db: Session | None = None) -> dict:
     Best-effort by design: a failure here is retried via the worker ledger
     but never invalidates the already-committed narrative completion.
     """
-    from app.worker.executor import RetriableError
     from database import SessionLocal
 
     own_session = False
@@ -688,8 +680,6 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
 
     from sqlalchemy import or_ as _or_
 
-    from app.worker.envelope import new_envelope
-    from app.worker.executor import TerminalError, execute_worker_job
     from models.reliability import Outbox
 
     def _retire(row_id: uuid.UUID) -> None:

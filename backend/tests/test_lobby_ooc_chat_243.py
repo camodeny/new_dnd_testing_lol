@@ -251,7 +251,8 @@ def test_missing_idempotency_key_rejected(api):
 
 def test_realtime_publish_and_channel_auth(api, monkeypatch):
     from app.realtime.channels import live_table_channel
-    from app.realtime.service import InMemoryRealtimePublisher, set_realtime_publisher
+    from app.realtime.service import set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     client, factory, actor, owner_id, member_id, outsider_id = api
     camp = _create(client)

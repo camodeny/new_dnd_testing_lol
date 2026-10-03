@@ -1,11 +1,10 @@
 """Audience-safe Supabase Realtime projections — issue #198.
 
 Responsibilities:
-- Define server-side projection events (submissions, DM chunks/thinking/status, revision)
+- Define server-side projection events (submissions, DM chunks/status, encounters, maps)
   with stable event/revision identifiers for dedupe/reconciliation.
 - Publish only audience-authorized payloads to private channels.
 - Ensure realtime delivery failure never rolls back authoritative DB state.
-- Observability counters (publish failures, dedupe, reconciliation, etc.).
 
 Design notes:
 - DB writes (submissions, dm chunks) commit authoritatively first; publish is
@@ -16,31 +15,27 @@ Design notes:
 - Tests run on SQLite without a real Supabase endpoint — publisher degrades to
   a no-op (or in-memory recorder when monkeypatched) and never raises.
 - Optional Supabase Broadcast path: if SUPABASE_URL + SERVICE_ROLE_KEY are
-  configured we POST to Realtime broadcast; otherwise we log and count the
-  attempt.
+  configured we POST to Realtime broadcast; otherwise we log and skip.
 
 Stable identifiers:
 - submission: event_id = f"submission:{submission.id}"  (also sequence)
 - dm chunk:   event_id = f"dm-chunk:{stream_id}:{sequence}"
 - dm status:  event_id = f"dm-status:{stream_id}:{status}:{completed_at}"
-- revision:   event_id = f"revision:{campaign_id}:{revision}"
 All payloads include channel, revision/sequence, and timestamp for ordering.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
-import time
 import uuid
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.realtime.channels import live_table_channel
+from app.threads.service import list_threads_for_user
 from models.campaigns import Campaign
 from models.dm import DMStream
 from models.dm import DMStreamChunk
@@ -48,30 +43,6 @@ from models.threads import PlayerSubmission
 from models.threads import PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
-
-# ── observability counters (in-memory, process-local) ──────────────────────
-
-_counters: Counter = Counter(
-    {
-        "publish_attempts": 0,
-        "publish_failures": 0,
-        "publish_successes": 0,
-        "duplicate_deliveries": 0,
-        "reconciliation_events": 0,
-        "snapshot_catchups": 0,
-        "subscription_count": 0,
-        "reconnect_count": 0,
-    }
-)
-
-
-def get_realtime_metrics() -> dict[str, int]:
-    return dict(_counters)
-
-
-def _inc(key: str, n: int = 1) -> None:
-    _counters[key] += n
-
 
 # ── projection event builders ───────────────────────────────────────────────
 
@@ -144,38 +115,6 @@ def build_dm_status_event(stream: DMStream, *, visible_text: str | None = None) 
         "abandonment_reason": stream.abandonment_reason,
         "timestamp": _utcnow_iso(),
         "dedupe_key": f"{stream.id}:{stream.status}",
-    }
-
-
-def build_dm_thinking_event(
-    campaign_id: uuid.UUID | str,
-    thread_id: uuid.UUID | str,
-    turn_id: str,
-    status: str = "thinking",
-    trace_id: str | None = None,
-) -> dict[str, Any]:
-    return {
-        "type": "dm.thinking",
-        "event_id": f"dm-thinking:{turn_id}:{status}:{_utcnow_iso()}",
-        "campaign_id": str(campaign_id),
-        "thread_id": str(thread_id),
-        "turn_id": turn_id,
-        "status": status,
-        "trace_id": trace_id,
-        "timestamp": _utcnow_iso(),
-        "dedupe_key": f"{turn_id}:{status}",
-    }
-
-
-def build_revision_event(campaign: Campaign, *, thread_id: uuid.UUID | str | None = None) -> dict[str, Any]:
-    return {
-        "type": "revision",
-        "event_id": f"revision:{campaign.id}:{campaign.revision}",
-        "campaign_id": str(campaign.id),
-        "thread_id": str(thread_id) if thread_id else None,
-        "revision": int(campaign.revision),
-        "timestamp": _utcnow_iso(),
-        "dedupe_key": f"{campaign.id}:{campaign.revision}",
     }
 
 
@@ -358,38 +297,8 @@ class NoopRealtimePublisher(RealtimePublisher):
     """Default: log and count, never fail. Used in tests / when Supabase not configured."""
 
     def publish(self, channel: str, event: str, payload: dict[str, Any]) -> bool:
-        _inc("publish_attempts")
-        _inc("publish_successes")
         logger.info("realtime publish channel=%s event=%s event_id=%s", channel, event, payload.get("event_id"))
         return True
-
-
-class InMemoryRealtimePublisher(RealtimePublisher):
-    """Test helper: records publishes for assertions, can inject failures."""
-
-    def __init__(self, *, fail_next: bool = False):
-        self.published: list[dict[str, Any]] = []
-        self.fail_next = fail_next
-        self.fail_all = False
-
-    def publish(self, channel: str, event: str, payload: dict[str, Any]) -> bool:
-        _inc("publish_attempts")
-        if self.fail_all or self.fail_next:
-            self.fail_next = False
-            _inc("publish_failures")
-            logger.warning("realtime publish injected failure channel=%s event=%s", channel, event)
-            raise RuntimeError("injected realtime publish failure")
-        rec = {"channel": channel, "event": event, "payload": dict(payload)}
-        self.published.append(rec)
-        _inc("publish_successes")
-        logger.info("realtime publish (memory) channel=%s event=%s event_id=%s", channel, event, payload.get("event_id"))
-        return True
-
-    def clear(self) -> None:
-        self.published.clear()
-
-    def events_for_channel(self, channel: str) -> list[dict[str, Any]]:
-        return [p for p in self.published if p["channel"] == channel]
 
 
 class SupabaseRealtimePublisher(RealtimePublisher):
@@ -400,13 +309,11 @@ class SupabaseRealtimePublisher(RealtimePublisher):
     """
 
     def publish(self, channel: str, event: str, payload: dict[str, Any]) -> bool:
-        _inc("publish_attempts")
         url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or ""
         # Private broadcast must use service_role — anon cannot publish to private channels
         # and would be an audience-safety bypass. Intentionally no anon fallback.
         key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
         if not url or not key:
-            _inc("publish_successes")
             if not key and url:
                 logger.warning("realtime publish skipped (SUPABASE_SERVICE_ROLE_KEY missing — private broadcast requires service_role) channel=%s event=%s", channel, event)
             else:
@@ -423,14 +330,11 @@ class SupabaseRealtimePublisher(RealtimePublisher):
             # Short timeout — realtime must not block authoritative work.
             resp = httpx.post(endpoint, json=body, headers=headers, timeout=2.0)
             if resp.status_code >= 400:
-                _inc("publish_failures")
                 logger.warning("realtime publish http failure channel=%s event=%s status=%s body=%s", channel, event, resp.status_code, resp.text[:500])
                 return False
-            _inc("publish_successes")
             logger.info("realtime publish ok channel=%s event=%s", channel, event)
             return True
         except Exception as exc:
-            _inc("publish_failures")
             logger.warning("realtime publish exception channel=%s event=%s error=%s", channel, event, exc)
             return False
 
@@ -451,22 +355,14 @@ def set_realtime_publisher(publisher: RealtimePublisher | None) -> None:
 # ── high-level publish helpers (audience-safe, failure-isolated) ───────────
 
 def _publish_best_effort(channel: str, event: str, payload: dict[str, Any]) -> bool:
-    """Publish without ever raising — failures are logged + counted."""
+    """Publish without ever raising — failures are logged."""
     try:
         ok = _publisher.publish(channel, event, payload)
         if not ok:
-            # Publisher already counted failure (Supabase path); don't double-count.
             logger.warning("realtime publish returned false channel=%s event=%s event_id=%s", channel, event, payload.get("event_id"))
             return False
         return True
     except Exception as exc:
-        # Publisher counted failure for injected cases; if not, count here.
-        # We count once in helper as fallback to ensure metric increments even
-        # for publishers that raise without counting (future impls).
-        # To avoid double-count, check if InMemory already counted: it does,
-        # so we skip extra inc when exception message is our injected marker.
-        if "injected realtime publish failure" not in str(exc):
-            _inc("publish_failures")
         logger.warning("realtime publish failure channel=%s event=%s event_id=%s error=%s", channel, event, payload.get("event_id"), exc)
         return False
 
@@ -493,7 +389,6 @@ def publish_submission_created(
         payload["revision"] = revision
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_submission_created failed submission_id=%s error=%s", submission.id, exc)
         return False
 
@@ -509,7 +404,6 @@ def publish_dm_chunk_created(
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_dm_chunk_created failed stream_id=%s seq=%s error=%s", stream.id, chunk.sequence, exc)
         return False
 
@@ -526,31 +420,7 @@ def publish_dm_status(
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_dm_status failed stream_id=%s error=%s", stream.id, exc)
-        return False
-
-
-def publish_revision(
-    db: Session,
-    campaign: Campaign,
-    *,
-    thread_id: uuid.UUID | str | None = None,
-) -> bool:
-    try:
-        # If thread_id given, publish to that thread's channel; otherwise no channel publish.
-        # Revision is also implied via submission/dm events, but explicit revision event
-        # helps clients reconcile.
-        if thread_id is None:
-            # No channel-scoped revision broadcast — could be campaign-wide but we keep it thread-scoped.
-            return True
-        channel = live_table_channel(campaign.id, thread_id)
-        payload = build_revision_event(campaign, thread_id=thread_id)
-        payload["channel"] = channel
-        return _publish_best_effort(channel, payload["type"], payload)
-    except Exception as exc:
-        _inc("publish_failures")
-        logger.warning("publish_revision failed campaign_id=%s error=%s", campaign.id, exc)
         return False
 
 
@@ -577,7 +447,6 @@ def publish_projection_invalidated(
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_projection_invalidated failed campaign_id=%s error=%s", campaign.id, exc)
         return False
 
@@ -598,11 +467,8 @@ def publish_projection_invalidated_for_grantee(
     the count of successful publishes. Never raises. Call AFTER db.commit().
     """
     try:
-        from app.threads.service import list_threads_for_user
-
         threads = list_threads_for_user(db, campaign.id, grantee_user_id)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning(
             "publish_projection_invalidated thread resolution failed campaign_id=%s error=%s",
             campaign.id, exc,
@@ -629,7 +495,6 @@ def _publish_encounter_event(db: Session, encounter, payload: dict[str, Any]) ->
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning(
             "publish_encounter failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc
         )
@@ -643,7 +508,6 @@ def publish_encounter_started(db: Session, encounter) -> bool:
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
         return _publish_encounter_event(db, encounter, build_encounter_started_event(encounter, revision=revision))
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_started failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
@@ -655,7 +519,6 @@ def publish_encounter_ready(db: Session, encounter) -> bool:
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
         return _publish_encounter_event(db, encounter, build_encounter_ready_event(encounter, revision=revision))
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_ready failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
@@ -674,7 +537,6 @@ def publish_encounter_turn(db: Session, encounter, kind: str) -> bool:
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
         return _publish_encounter_event(db, encounter, build_encounter_turn_event(encounter, kind, revision=revision))
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_turn failed encounter_id=%s kind=%s error=%s", getattr(encounter, "id", "?"), kind, exc)
         return False
 
@@ -686,7 +548,6 @@ def publish_encounter_ended(db: Session, encounter) -> bool:
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
         return _publish_encounter_event(db, encounter, build_encounter_ended_event(encounter, revision=revision))
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_ended failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
@@ -708,7 +569,6 @@ def publish_encounter_map(db: Session, encounter) -> bool:
             ),
         )
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_map failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False
 
@@ -753,6 +613,5 @@ def publish_encounter_moved(db: Session, encounter, participant_id, *, move_id: 
             payload["position_redacted"] = True
         return _publish_encounter_event(db, encounter, payload)
     except Exception as exc:
-        _inc("publish_failures")
         logger.warning("publish_encounter_moved failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)
         return False

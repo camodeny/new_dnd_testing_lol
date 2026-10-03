@@ -11,9 +11,14 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import commit_campaign_mutation
+from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
 from app.campaigns.service import lock_campaign_row, require_playable_campaign
 from app.clock import ms_between, utcnow
 from app.observability.tracing import structured_log
+from app.realtime.service import publish_encounter_ended, publish_encounter_ready, publish_encounter_started
+from app.rules.mechanics import MechanicsError, ability_modifier, get_character_mechanics
+from app.threads.service import ThreadNotFoundError, can_read_thread, parse_thread_id
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
@@ -91,8 +96,6 @@ def is_campaign_owner(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -
 
 def _resolve_pc_stats(db: Session, character_id: uuid.UUID) -> tuple[int, int, dict]:
     """Initiative (modifier, dex) + stat source from the canonical sheet (#224)."""
-    from app.rules.mechanics import MechanicsError, get_character_mechanics
-
     try:
         mechanics = get_character_mechanics(db, character_id)
     except MechanicsError as exc:
@@ -122,8 +125,6 @@ def _resolve_npc_stats(
         raise EncounterError(f"NPC entity {entity_id} not found in this campaign")
     if (entity.entity_type or "").strip().lower() not in ("npc", "monster"):
         raise EncounterError(f"Entity {entity_id} is not an NPC/monster and cannot join combat")
-    from app.rules.mechanics import ability_modifier
-
     # NPC/monster combat stats are always DM-private per #230 security.
     visibility = "dm_private"
     details = entity.details or {}
@@ -213,8 +214,6 @@ def _validate_selection(db: Session, campaign_id: uuid.UUID, participants: list[
             # campaign's active roster — selected by a member — so an owner
             # cannot enroll a member's unrelated character. Terminal lifecycle
             # states (dead/retired) can never join; a missing row means active.
-            from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
-
             roster = db.execute(
                 select(CampaignMember).where(
                     CampaignMember.campaign_id == campaign_id,
@@ -513,8 +512,6 @@ def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) 
     central thread invariant: owner status alone never grants private
     access). Unparseable/missing threads fail closed.
     """
-    from app.threads.service import can_read_thread, parse_thread_id
-
     try:
         thread_id = parse_thread_id(encounter.thread_id)
     except Exception:
@@ -554,8 +551,6 @@ def encounter_event_visible_to(db: Session, event, viewer_id: uuid.UUID) -> bool
     thread_ref = payload.get("thread_id") if isinstance(payload, dict) else None
     if not thread_ref:
         return False
-    from app.threads.service import can_read_thread, parse_thread_id
-
     try:
         thread_id = parse_thread_id(thread_ref)
     except Exception:
@@ -607,8 +602,6 @@ def _build_encounter_rows(
     # read the encounter's source thread would receive an initiative request
     # they can never see, leaving combat permanently pending. Reject up
     # front instead of persisting an unfulfillable combatant.
-    from app.threads.service import can_read_thread, parse_thread_id
-
     try:
         encounter_thread_id = parse_thread_id(turn.thread_id)
     except Exception as exc:
@@ -762,8 +755,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
 
     init_turn_states(db, encounter, now=ready_at)
 
-    from app.campaigns.events import commit_campaign_mutation
-
     # Bounded stable transition key: the start operation_id may legally fill
     # the 128-char column, so suffixing it would overflow on PostgreSQL.
     ready_operation_id = f"encounter:{encounter.id}:initiative-ready"
@@ -841,8 +832,6 @@ def start_encounter(
     Idempotent on (campaign_id, operation_id): retries return the original
     encounter + event without duplicating participants or roll requests.
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     operation_id = (operation_id or "").strip()
     if not operation_id or len(operation_id) > 128:
         raise EncounterError("operation_id is required (1-128 characters)")
@@ -858,8 +847,6 @@ def start_encounter(
         # Thread-scoped writes (#230): the actor must read the source
         # turn's thread, mirroring the encounter read boundary. Hidden as
         # not-found so private-thread existence never leaks.
-        from app.threads.service import ThreadNotFoundError, can_read_thread, parse_thread_id
-
         try:
             thread_ok = can_read_thread(
                 db, campaign_id, parse_thread_id(turn.thread_id), actor_id
@@ -952,8 +939,6 @@ def start_encounter(
         operation_id=operation_id, revision=campaign_after.revision,
     )
     if commit:
-        from app.realtime.service import publish_encounter_started
-
         publish_encounter_started(db, encounter)
     return encounter, event
 
@@ -1046,8 +1031,6 @@ def roll_npc_initiative(
         latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
-        from app.realtime.service import publish_encounter_ready
-
         publish_encounter_ready(db, encounter)
     return participant, encounter, event
 
@@ -1160,8 +1143,6 @@ def fulfill_human_initiative(
         latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
     )
     if commit and event is not None:
-        from app.realtime.service import publish_encounter_ready
-
         publish_encounter_ready(db, encounter)
     return request, fulfillment, participant, encounter, event
 
@@ -1194,8 +1175,6 @@ def stage_turn_encounter_events(
     without its lifecycle event must never commit. Returns the (started,
     ended) encounter ids for post-commit realtime delivery.
     """
-    from app.campaigns.events import commit_campaign_mutation
-
     provenance = {
         "source": "dm_effect",
         "turn_event_id": str(turn_event.id),
@@ -1309,8 +1288,6 @@ def publish_turn_encounter_events(
     The staged lifecycle events are authoritative; this direct publish is
     latency-only and best-effort — it never rolls back committed state.
     """
-    from app.realtime.service import publish_encounter_ended, publish_encounter_started
-
     for ids, publish, label in (
         (started_ids, publish_encounter_started, "start"),
         (ended_ids, publish_encounter_ended, "end"),

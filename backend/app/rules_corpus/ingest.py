@@ -16,7 +16,6 @@ from app.rules_corpus.ids import (
     content_hash,
     derive_rule_id_with_path,
     load_aliases,
-    slugify,
 )
 from app.rules_corpus.metadata import (
     ATTRIBUTION,

@@ -66,6 +66,10 @@ from app.decisions import (
     to_decision_request,
 )
 from app.observability.tracing import structured_log
+from app.visibility.policy import disclosure_rank, normalize_visibility
+from app.world.clocks import CLOCK_EVALUABLE_STATUSES
+from app.world.identity import exact_identity_match
+from app.world.service import get_current_scene
 from models.campaigns import CampaignDomainEvent
 from models.post_turn import PostTurnConsistencyIncident
 
@@ -221,8 +225,6 @@ def _load_range_events(db: Session, campaign_id: uuid.UUID,
 
 def _resolve_entity(db: Session, campaign_id: uuid.UUID, ref: Any):
     """Exact entity resolution (deterministic; no model calls)."""
-    from app.world.identity import exact_identity_match
-
     try:
         entity, _how = exact_identity_match(db, campaign_id, ref)
     except Exception:
@@ -341,8 +343,6 @@ def detect_proposal_conflicts(
     treats newer committed gameplay as authority — the proposal is stale,
     never the canon.
     """
-    from app.world.service import get_current_scene
-
     findings: list[dict[str, Any]] = []
     by_id = _event_by_id(events)
     for proposal in proposals or []:
@@ -551,8 +551,6 @@ def detect_canon_self_conflicts(
     metadata on range records.
     """
     from models.world import CampaignClock, WorldFact, WorldRelation
-    from app.world.clocks import CLOCK_EVALUABLE_STATUSES
-
     findings: list[dict[str, Any]] = []
     known_ids = {e.id for e in events}
     # Clock invariant: progress past threshold while still evaluable.
@@ -620,8 +618,6 @@ def detect_canon_self_conflicts(
 # ── Bounded semantic judgments (ambiguous residue only) ────────────────────
 
 def _pair_visibility(pair: SemanticPair) -> str:
-    from app.visibility.policy import disclosure_rank, normalize_visibility
-
     sides = [pair.canon_claim.get("visibility"), pair.new_claim.get("visibility")]
     try:
         return min(sides, key=lambda v: disclosure_rank(normalize_visibility(v)))

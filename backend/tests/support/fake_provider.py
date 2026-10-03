@@ -459,7 +459,7 @@ class FakeDMProvider:
             "app.dm.adjudication.resolve_dm_provider", _fake_resolve, raising=True
         )
         monkeypatch.setattr(
-            "app.providers.execute_chat", provider.execute_chat, raising=True
+            "app.dm.adjudication.execute_chat", provider.execute_chat, raising=True
         )
         return provider
 

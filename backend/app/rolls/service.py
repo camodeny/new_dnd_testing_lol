@@ -16,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from app.campaigns.service import lock_campaign_row, require_playable_campaign
 from app.clock import utcnow
+from app.combat.service import EncounterAuthorizationError, EncounterError, fulfill_human_initiative
+from app.dm.turns import create_attempt
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign
 from models.characters import Character
@@ -36,10 +38,6 @@ class RollLifecycleError(ValueError):
 
 
 class RollAuthorizationError(PermissionError):
-    pass
-
-
-class PendingRollsError(RollLifecycleError):
     pass
 
 
@@ -166,8 +164,6 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
     parent_attempt.invalidation_reason = "player_roll_input_available"
     parent_attempt.invalidated_at = utcnow()
     campaign = db.get(Campaign, turn.campaign_id)
-    from app.dm.turns import create_attempt
-
     next_attempt = create_attempt(
         db, turn, parent=parent_attempt, roll_evidence=evidence,
         source_revision=int(campaign.revision if campaign else parent_attempt.source_revision),
@@ -209,12 +205,6 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == request_id).limit(1)
     ).scalars().first()
     if linked is not None:
-        from app.combat.service import (
-            EncounterAuthorizationError,
-            EncounterError,
-            fulfill_human_initiative,
-        )
-
         participant = db.get(EncounterParticipant, linked)
         try:
             req_row, fulfillment, _, updated, event = fulfill_human_initiative(

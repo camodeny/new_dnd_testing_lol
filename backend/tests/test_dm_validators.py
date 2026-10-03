@@ -331,23 +331,6 @@ def test_rejection_structured_and_regeneration_wires_feedback():
         pass
 
 
-def test_extension_point_without_rewriting_orchestration():
-    pipe = ValidatorPipeline()
-    n = len(pipe.validators)
-    class MyCombat:
-        name = "my_combat"; category = "combat"
-        def validate(self, contract, packet, **kw):
-            from app.dm.validators import ValidatorResult
-            return ValidatorResult(validator=self.name, category=self.category, passed=True, violations=[], latency_ms=0.1)
-    pipe.add_validator(MyCombat(), after="rules_validator")
-    assert len(pipe.validators) == n + 1
-    # original default pipeline still has same order
-    pkt, _, _ = _packet()
-    c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Hello", "claim_kind": "observation", "origin": "established_state"}]}])
-    r = pipe.validate(c, pkt)
-    assert any(res.validator == "my_combat" for res in r.results)
-
-
 def test_observability_latency_per_validator():
     pkt, _, _ = _packet()
     c = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "Elara declares", "claim_kind": "player_declaration", "origin": "player_transcript", "actor_ref": {"type": "character", "id": "char:elara"}, "evidence_refs": ["s1"]}]}])

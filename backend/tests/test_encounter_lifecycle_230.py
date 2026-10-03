@@ -709,12 +709,12 @@ def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
 
 def test_realtime_hooks_emit_stable_encounter_events():
     from app.realtime.service import (
-        InMemoryRealtimePublisher,
         build_encounter_ready_event,
         build_encounter_started_event,
         get_realtime_publisher,
         set_realtime_publisher,
     )
+    from tests.support.realtime import InMemoryRealtimePublisher
 
     fac, ctx = _fixture()
     previous = get_realtime_publisher()
@@ -889,11 +889,8 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     from fastapi.testclient import TestClient
 
     from app.auth.service import TEST_USER_ID
-    from app.realtime.service import (
-        InMemoryRealtimePublisher,
-        get_realtime_publisher,
-        set_realtime_publisher,
-    )
+    from app.realtime.service import get_realtime_publisher, set_realtime_publisher
+    from tests.support.realtime import InMemoryRealtimePublisher
     from database import get_db
     from main import app
     from models.profiles import Profile as ProfileModel
@@ -1373,7 +1370,6 @@ def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
     """Same-operation integrity races replay; a different active encounter 409s."""
     from sqlalchemy.exc import IntegrityError
 
-    import app.campaigns.events as campaign_events
     import app.combat.service as combat_service
 
     fac, ctx = _fixture()
@@ -1413,7 +1409,7 @@ def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
 
         monkeypatch.setattr(combat_service, "find_by_operation", _find_once_none)
         monkeypatch.setattr(combat_service, "get_active_encounter", _active_once_none)
-        monkeypatch.setattr(campaign_events, "commit_campaign_mutation", _conflict)
+        monkeypatch.setattr(combat_service, "commit_campaign_mutation", _conflict)
         replay, _ = start_encounter(
             db, ctx["campaign_id"], operation_id="op-enc-1", expected_revision=0,
             actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
