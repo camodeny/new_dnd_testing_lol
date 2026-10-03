@@ -1,0 +1,9 @@
+{
+  "name": "dnd-player-cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": { "dnd": "bin/dnd.mjs" },
+  "scripts": { "test": "node --test", "check": "node --check bin/dnd.mjs && node --check src/player.mjs" },
+  "engines": { "node": ">=20" }
+}

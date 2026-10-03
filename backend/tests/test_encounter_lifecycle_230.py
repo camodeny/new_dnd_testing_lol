@@ -901,6 +901,16 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     from models.profiles import Profile as ProfileModel
 
     eng = _engine()
+    # Mirror PostgreSQL's append-only event constraint. Completing initiative
+    # must insert readiness/turn events without updating either afterward.
+    with eng.begin() as connection:
+        connection.exec_driver_sql("""
+            CREATE TRIGGER reject_campaign_domain_event_mutation
+            BEFORE UPDATE ON campaign_domain_events
+            BEGIN
+                SELECT RAISE(ABORT, 'campaign domain events are immutable');
+            END
+        """)
     fac = sessionmaker(bind=eng, expire_on_commit=False)
     with fac() as db:
         db.add(ProfileModel(id=TEST_USER_ID, email="owner@example.com"))
