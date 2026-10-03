@@ -6,7 +6,7 @@ execution, stream persistence, reconnect reconstruction, and
 duplicate-commit boundaries; each must report the expected stage and
 useful identifiers without leaking private state.
 
-The reusable artifact shape lives in ``app.e2e.diagnostics`` so later #267
+The reusable artifact shape lives in ``tests.support.diagnostics`` so later #267
 scenarios (decision, memory, roll, combat, completion, multiplayer) adopt
 it instead of rebuilding harness-specific failure output.
 """
@@ -32,7 +32,7 @@ from app.decisions.policy import (
     POLICY_SCHEMA_VERSION,
     evaluate_execution,
 )
-from app.e2e.diagnostics import (
+from tests.support.diagnostics import (
     CATEGORY_STAGE,
     STAGES,
     ScenarioDiagnostics,
@@ -380,7 +380,7 @@ def test_domain_execution_error_is_distinguished_from_model_errors():
 
 
 def test_provider_failure_names_logical_request():
-    from app.dm.fake_provider import FakeProviderUsageError
+    from tests.support.fake_provider import FakeProviderUsageError
 
     error = FakeProviderUsageError(
         "fake-provider has no fixture for this logical request: "

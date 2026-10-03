@@ -420,10 +420,16 @@ def test_contributor_mismatch_and_zero_cost_collision_are_conflicts():
     db.close()
 
 
-# ── 13. production wiring: finish_ai_run charges exactly once ───────────────
+# ── 13. production wiring: finish + charge_finished_run charges exactly once ─
 
 def test_finish_ai_run_charges_primary_run_exactly_once():
+    from app.billing.ledger import charge_finished_run
     from app.observability.service import finish_ai_run, start_ai_run
+
+    def finish_and_charge(run_id, cost_usd):
+        finish_ai_run(factory, run_id, status="succeeded", cost_usd=cost_usd)
+        charge_finished_run(factory, run_id=run_id, campaign_id=camp)
+
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
@@ -432,7 +438,7 @@ def test_finish_ai_run_charges_primary_run_exactly_once():
     run = start_ai_run(factory, logical_operation="forward_dm_adjudicate", role="ai_dm",
                        provider="test", model="m", classification="primary", billable=True,
                        trace_id=tid)
-    finish_ai_run(factory, run.id, status="succeeded", cost_usd=1.25, campaign_id=camp)
+    finish_and_charge(run.id, 1.25)
     db = factory()
     entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
     assert len(entries) == 1
@@ -441,7 +447,7 @@ def test_finish_ai_run_charges_primary_run_exactly_once():
     assert reconcile(db, camp) == []
     db.close()
     # Re-finalization (retry) replays idempotently: still exactly one entry.
-    finish_ai_run(factory, run.id, status="succeeded", cost_usd=1.25, campaign_id=camp)
+    finish_and_charge(run.id, 1.25)
     db = factory()
     assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
     assert reconcile(db, camp) == []
@@ -450,7 +456,7 @@ def test_finish_ai_run_charges_primary_run_exactly_once():
     recovery = start_ai_run(factory, logical_operation="forward_dm_adjudicate", role="ai_dm",
                             provider="test", model="m", classification="recovery", billable=False,
                             trace_id=f"trace-{uuid.uuid4().hex[:12]}")
-    finish_ai_run(factory, recovery.id, status="succeeded", cost_usd=0.50, campaign_id=camp)
+    finish_and_charge(recovery.id, 0.50)
     db = factory()
     assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
     db.close()

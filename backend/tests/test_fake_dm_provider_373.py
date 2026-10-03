@@ -14,7 +14,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.dm.fake_provider import (
+from tests.support.fake_provider import (
     FAKE_MODEL_NAME,
     FAKE_PROVIDER_NAME,
     FakeDMProvider,

@@ -804,15 +804,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         },
         operation_id=ready_operation_id,
         actor_id=campaign.owner_id,
-        outbox_event_type=ENCOUNTER_READY_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(campaign.id),
-            "thread_id": encounter.thread_id,
-            "turn_order_ids": [str(pid) for pid in ordered_ids],
-            "active_participant_id": str(ordered_ids[0]),
-        },
-        outbox_operation_id=ready_operation_id,
         commit=commit,
     )
     structured_log(
@@ -842,16 +833,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         },
         operation_id=first_turn_operation_id,
         actor_id=campaign.owner_id,
-        outbox_event_type=TURN_STARTED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(campaign.id),
-            "thread_id": encounter.thread_id,
-            "turn_sequence": 1,
-            "active_participant_id": str(ordered_ids[0]),
-            "round": 1,
-        },
-        outbox_operation_id=first_turn_operation_id,
         commit=commit,
     )
     return event
@@ -954,17 +935,10 @@ def start_encounter(
             mutate=_mutate,
             commit=False,
             payload_builder=_payload,
-            outbox_event_type=ENCOUNTER_STARTED_EVENT,
-            outbox_payload={
-                "campaign_id": str(campaign_id),
-                "thread_id": turn.thread_id,
-                "operation_id": operation_id,
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
-        # The shared mutation helper rolls back on every error path, and the
-        # unguarded outbox flush rolls back here: the session is unusable
+        # The shared mutation helper rolls back on every error path, and an
+        # unguarded flush rolls back here: the session is unusable
         # until rolled back, so this rollback is required rather than
         # optional. It never commits partial state — below either returns a
         # genuinely committed same-operation replay or raises.
@@ -1017,7 +991,7 @@ def start_encounter_inline(
 
     No commit here — the outer turn commit owns both. The caller's
     ``commit_turn`` stages the distinct ``encounter.started`` lifecycle
-    event + outbox hook in the same outer transaction and binds it as the
+    event in the same outer transaction and binds it as the
     start provenance (resolved on read via operation_id).
     Duplicate effect replays return the existing encounter.
     """

@@ -37,7 +37,11 @@ class IdempotentCommand(Base):
 
 
 class Outbox(Base):
-    """Transactional outbox — issue #190."""
+    """Transactional outbox — issue #190.
+
+    Durable job rows staged atomically with a domain mutation. Today the only
+    producer/consumer is ``adventure.closing`` (``app.adventures.service``).
+    """
 
     __tablename__ = "outbox"
     __table_args__ = ()

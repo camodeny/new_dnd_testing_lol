@@ -6,11 +6,8 @@ from app.dm.adjudication import (  # noqa: F401
     resolve_dm_provider,
 )
 from app.dm.execution import (  # noqa: F401
-    DM_TURN_EXECUTE_JOB,
     execute_dm_attempt,
     find_prepared_attempts,
-    handle_dm_turn_execute,
-    register_dm_worker,
     run_dm_execute_sweep,
 )
 from app.dm.contract import (  # noqa: F401

@@ -697,7 +697,6 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
     from app.realtime.service import (
         InMemoryRealtimePublisher,
         build_encounter_moved_event,
-        dedupe_events,
         set_realtime_publisher,
     )
     fac, ctx = _fixture()
@@ -716,8 +715,6 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
             ids = [m["payload"]["event_id"] for m in moved]
             assert ids[0] != ids[1]
             assert ids[0].endswith(str(first.id)) and ids[1].endswith(str(second.id))
-            # The realtime deduper must keep both same-turn moves.
-            assert len(dedupe_events([m["payload"] for m in moved])) == 2
             # Legacy callers without a move id keep the turn-scoped key.
             legacy = build_encounter_moved_event(encounter, participant.id)
             assert legacy["event_id"].endswith(f"{int(encounter.turn_sequence or 0)}")

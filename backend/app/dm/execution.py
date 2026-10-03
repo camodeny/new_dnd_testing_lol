@@ -45,8 +45,6 @@ from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 
-DM_TURN_EXECUTE_JOB = "dm.turn.execute"
-
 
 def _is_config_error(exc: BaseException) -> bool:
     msg = str(exc)
@@ -446,9 +444,6 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
             "attempt_id": str(attempt.id),
             "mode": "silent",
         },
-        outbox_event_type="dm.turn_committed",
-        outbox_payload={**base_payload, "operation_id": duplicate_op},
-        outbox_operation_id=duplicate_op,
     )
     now = datetime.now(timezone.utc)
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
@@ -920,10 +915,6 @@ def _execute_owned_attempt(
                     # work is never double-charged.
                     is_retry=_is_recovery_retry,
                     campaign_id=campaign_id,
-                    # Issue #257 — authorized campaign credential (if any)
-                    # serves the first attempt through the approved
-                    # generative route; None falls back to funded/provider
-                    # routing. Resolution is fail-soft by construction.
                 )
                 path_info.update(info)
                 return contract
@@ -1236,8 +1227,6 @@ def _execute_owned_attempt(
                 timeout_seconds=timeout_seconds,
                 db=db, trace_id=tid, is_retry=_is_recovery_retry,
                 campaign_id=campaign_id,
-                # Issue #257 — same authorized-credential first attempt as
-                # adjudication above (narration role approval applies).
             )
         except Exception as exc:
             db.rollback()
@@ -1443,54 +1432,3 @@ def run_dm_execute_sweep(
             logger.warning("dm_execute_sweep attempt_failed attempt_id=%s error=%s", aid, exc)
             outcome["failed"].append({"attempt_id": aid, "error": str(exc)[:300]})
     return outcome
-
-
-def handle_dm_turn_execute(envelope, db: Session | None = None) -> dict:
-    """Queue-worker handler for ``dm.turn.execute`` envelopes.
-
-    Worker contract is single-argument ``handler(envelope)`` (see
-    ``app.worker.executor.execute_worker_job``); the handler owns its DB
-    session via ``SessionLocal``. ``db`` is an optional seam for tests.
-    """
-    payload = getattr(envelope, "payload", None) or {}
-    raw = payload.get("attempt_id") or payload.get("attemptId")
-    if not raw:
-        raise ValueError("dm.turn.execute envelope payload must include attempt_id")
-
-    def _shape(result) -> dict:
-        narration = getattr(result, "narration", None)
-        stream_id = str(narration.stream_id) if narration is not None else None
-        out: dict = {
-            "attempt_id": str(raw),
-            "turn_id": str(result.turn.id),
-            "stream_id": stream_id,
-        }
-        mode = getattr(result, "mode", None)
-        if mode:
-            out["mode"] = mode
-        return out
-
-    if db is not None:
-        result = execute_dm_attempt(db, uuid.UUID(str(raw)))
-        if result is None:
-            return {"attempt_id": str(raw), "skipped": True}
-        return _shape(result)
-    from database import SessionLocal
-
-    if SessionLocal is None:
-        raise RuntimeError("SessionLocal is not configured")
-    with SessionLocal() as session:
-        result = execute_dm_attempt(session, uuid.UUID(str(raw)))
-        if result is None:
-            return {"attempt_id": str(raw), "skipped": True}
-        return _shape(result)
-
-
-def register_dm_worker() -> None:
-    """Register the DM execution handler on the queue consumer."""
-    from app.queue.consumer import WORKER_HANDLERS
-
-    WORKER_HANDLERS[DM_TURN_EXECUTE_JOB] = handle_dm_turn_execute
-
-
-register_dm_worker()

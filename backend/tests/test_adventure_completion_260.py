@@ -658,30 +658,6 @@ def test_member_event_feed_hides_dm_reason(api):
     assert "reason" not in completed[0]["payload"]
 
 
-def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
-    import database
-    from app.outbox.service import envelope_for_outbox
-    from app.queue.consumer import consume_queue_delivery
-    from models.reliability import Outbox
-
-    factory, camp_id, _owner = setup
-    monkeypatch.setattr(database, "SessionLocal", factory)
-    with factory() as db:
-        start_adventure(db, camp_id, "Queue arc")
-    adv, _event = _complete(factory, camp_id, "victory", "op-queue")
-    with factory() as db:
-        assert db.get(Adventure, adv.id).closing_status == "pending"
-        # Translate the actual committed outbox row — the exact translation
-        # the relay uses — so queue and sweep share one worker identity.
-        row = db.execute(
-            select(Outbox).where(Outbox.event_type == "adventure.closing")
-        ).scalars().one()
-        result, dup = consume_queue_delivery(db, envelope_for_outbox(row).to_dict())
-        assert dup is False and result["ok"] is True
-    with factory() as db:
-        assert db.get(Adventure, adv.id).closing_status == "succeeded"
-
-
 def test_closing_sweep_converges_pending_work(setup):
     from app.adventures.service import run_adventure_closing_sweep
     from models.reliability import Outbox

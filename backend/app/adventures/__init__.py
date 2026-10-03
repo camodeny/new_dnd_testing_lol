@@ -18,7 +18,6 @@ from app.adventures.service import (  # noqa: F401
     list_adventures,
     mark_stale,
     project_recap,
-    register_adventure_worker,
     run_adventure_closing_sweep,
     start_adventure,
 )

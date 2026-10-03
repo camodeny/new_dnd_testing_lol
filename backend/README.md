@@ -37,7 +37,7 @@ Alembic is the single schema authority. The single baseline migration `2a04bc8c8
 
 ### Production deploys (Vercel + Supabase)
 
-Application startup **never** runs migrations or `Base.metadata.create_all()` — see `main.py:lifespan`.
+Application startup **never** runs migrations or `Base.metadata.create_all()` (covered by `tests/test_no_cold_start_ddl.py`).
 
 Deploys must apply migrations explicitly **before** serving traffic. This is wired as a single controlled gate before Vercel production promotion (previews do not race):
 

@@ -1,36 +1,24 @@
 """Issue #270: first cross-layer deterministic fault-injection slice.
 
-No real queue, provider, credentials, or production data are used.  The main
-scenario deliberately loses the relay acknowledgement after queue publication,
-then proves convergence after lease recovery and duplicate delivery.
+No real provider, credentials, or production data are used. Also hosts the
+shared disposable-database guard (``_safe_engine``) and campaign seeding used
+by other reliability tests.
 """
 from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
 import pytest
 import requests
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, text
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
-from sqlalchemy.orm import sessionmaker
 
 if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.campaigns.events import commit_campaign_mutation
-from app.outbox.service import (
-    claim_outbox_batch,
-    envelope_for_outbox,
-    process_outbox_batch,
-    recover_expired_claims,
-)
-from app.observability.tracing import trace_context
-from app.queue import InMemoryQueueAdapter
-from app.worker import execute_worker_job
 from database import Base
 from app.providers import (
     LLMProviderAdapter,
@@ -41,10 +29,7 @@ from app.providers import (
     execute_chat,
 )
 from models.campaigns import Campaign
-from models.campaigns import CampaignDomainEvent
 from models.profiles import Profile
-from models.reliability import Outbox
-from models.reliability import WorkerExecution
 from tests.reliability.faults import FaultScenario
 
 
@@ -95,129 +80,6 @@ def test_fault_database_guard_rejects_nonlocal_target(monkeypatch, tmp_path):
     )
     with pytest.raises(pytest.fail.Exception, match="disposable"):
         _safe_engine(tmp_path)
-
-
-def test_commit_publish_ack_loss_redelivery_converges_without_duplicate_effect(tmp_path):
-    scenario = FaultScenario("outbox_ack_loss_duplicate_delivery")
-    engine = _safe_engine(tmp_path)
-    factory = sessionmaker(bind=engine, expire_on_commit=False)
-    campaign_id = _seed_campaign(factory)
-    queue = InMemoryQueueAdapter()
-    operation_id = f"fault-op-{uuid.uuid4()}"
-    trace_id = f"fault-trace-{uuid.uuid4().hex[:16]}"
-
-    # API/domain commit completes, but the process disappears before any relay
-    # publication. A fresh session must still find the durable obligation.
-    with trace_context(trace_id, operation_id):
-        with factory() as command_db:
-            _, command_event = commit_campaign_mutation(
-                command_db,
-                campaign_id,
-                expected_revision=0,
-                event_type="turn.requested",
-                operation_id=operation_id,
-                payload={"synthetic": True},
-                outbox_event_type="turn.resolve",
-                outbox_payload={"campaign_id": str(campaign_id)},
-            )
-            outbox_id = command_db.execute(
-                select(Outbox.id).where(Outbox.operation_id == operation_id)
-            ).scalar_one()
-    scenario.record(
-        "commit_survived_process_loss",
-        campaign_id=campaign_id,
-        event_id=command_event.id,
-        operation_id=operation_id,
-        outbox_id=outbox_id,
-        trace_id=trace_id,
-    )
-
-    # Relay publishes, then loses the acknowledgement. Leave the committed
-    # claim untouched, exactly as a killed relay process would.
-    with factory() as crashed_relay_db:
-        claimed = claim_outbox_batch(
-            crashed_relay_db, batch_size=1, claimed_by="fault-relay-1", lease_seconds=30
-        )
-        assert [record.id for record in claimed] == [outbox_id]
-        queue.publish(envelope_for_outbox(claimed[0]))
-        assert scenario.hit_once(
-            "after_queue_publish_before_outbox_ack",
-            job_id=claimed[0].id,
-            operation_id=claimed[0].operation_id,
-        )
-
-    # Deterministically age the abandoned lease instead of sleeping.
-    with factory() as recovery_db:
-        abandoned = recovery_db.get(Outbox, outbox_id)
-        abandoned.claimed_at = datetime.now(timezone.utc) - timedelta(seconds=31)
-        recovery_db.commit()
-        assert recover_expired_claims(recovery_db, lease_seconds=30) == 1
-        relay_result = process_outbox_batch(
-            recovery_db,
-            publish=lambda record: queue.publish(envelope_for_outbox(record)),
-            batch_size=1,
-            claimed_by="fault-relay-2",
-            lease_seconds=30,
-        )
-        assert relay_result == {"claimed": 1, "succeeded": 1, "failed": 0}
-
-    deliveries = queue.consume_all()
-    assert len(deliveries) == 2
-    assert deliveries[0].job_id == deliveries[1].job_id == outbox_id
-    assert deliveries[0].operation_id == deliveries[1].operation_id == operation_id
-    assert deliveries[0].trace_id == deliveries[1].trace_id == trace_id
-
-    handler_calls = 0
-
-    def apply_gameplay_effect(envelope):
-        nonlocal handler_calls
-        handler_calls += 1
-        with factory() as effect_db:
-            campaign, event = commit_campaign_mutation(
-                effect_db,
-                campaign_id,
-                expected_revision=1,
-                event_type="turn.resolved",
-                operation_id=envelope.operation_id,
-                payload={"synthetic": True, "source_job_id": str(envelope.job_id)},
-                mutate=lambda record: setattr(record, "description", "resolved exactly once"),
-            )
-            return {"campaign_revision": campaign.revision, "event_id": str(event.id)}
-
-    with factory() as worker_db:
-        first_result, first_duplicate = execute_worker_job(worker_db, deliveries[0], apply_gameplay_effect)
-        replay_result, replay_duplicate = execute_worker_job(worker_db, deliveries[1], apply_gameplay_effect)
-
-    with factory() as verification_db:
-        campaign = verification_db.get(Campaign, campaign_id)
-        events = verification_db.execute(
-            select(CampaignDomainEvent)
-            .where(CampaignDomainEvent.campaign_id == campaign_id)
-            .order_by(CampaignDomainEvent.sequence)
-        ).scalars().all()
-        outbox = verification_db.get(Outbox, outbox_id)
-        execution = verification_db.get(WorkerExecution, outbox_id)
-        assert campaign.revision == 2
-        assert campaign.description == "resolved exactly once"
-        assert [event.event_type for event in events] == ["turn.requested", "turn.resolved"]
-        assert outbox.status == "published" and outbox.attempts == 2
-        assert outbox.trace_id == trace_id
-        assert execution.status == "succeeded" and execution.attempts == 1
-        assert execution.trace_id == trace_id
-
-    assert handler_calls == 1
-    assert first_duplicate is False and replay_duplicate is True
-    assert first_result == replay_result
-    scenario.record(
-        "converged",
-        final_revision=campaign.revision,
-        domain_event_count=len(events),
-        handler_calls=handler_calls,
-        outbox_attempts=outbox.attempts,
-        queue_deliveries=len(deliveries),
-        worker_attempts=execution.attempts,
-        duplicate_suppressed=replay_duplicate,
-    )
 
 
 class _FakeAdapter(LLMProviderAdapter):

@@ -20,8 +20,8 @@ never a source of truth:
   + HNSW on Postgres with pgvector, portable JSON text otherwise, with
   ``embedding_text`` always readable for the graceful-degradation path.
 
-Async indexing follows the #191 pattern: writers enqueue a
-``world.semantic.index`` envelope (identifiers only); the worker handler
+Async indexing: writers stage a ``stale`` placeholder row (identifiers
+only); :func:`run_semantic_index_sweep` (driven by the post-turn cron)
 re-reads the authoritative record and upserts the embedding idempotently.
 
 The AI is the only DM; no copy here implies a human DM/moderator.
@@ -58,9 +58,7 @@ logger = logging.getLogger(__name__)
 
 SEMANTIC_SOURCE = "world_semantic_213"
 
-# ── Job type + model defaults ────────────────────────────────────────────────
-
-SEMANTIC_INDEX_JOB_TYPE = "world.semantic.index"
+# ── Model defaults ───────────────────────────────────────────────────────────
 
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"
@@ -718,28 +716,7 @@ def get_semantic_stats(
     }
 
 
-# ── Async wiring (#191 pattern: identifiers-only envelope + worker) ──────────
-
-def _deterministic_job_id(
-    campaign_id: uuid.UUID, source_type: str, source_id: uuid.UUID,
-    embedding_model: str, embedding_version: str,
-    source_version: str | None = None,
-) -> uuid.UUID:
-    """Logical job id for one (source, model) index request.
-
-    The current authoritative ``source_version`` is part of the key when
-    known: after the first job succeeds, the #191 ledger returns the cached
-    result for a repeated id without running the handler, so a changed
-    same-ID source must get a new logical id or its rebuild never runs.
-    Same version re-requests stay idempotent (same id, duplicate hit).
-    """
-    version_part = str(source_version or "")
-    key = (
-        f"semidx:{campaign_id}:{source_type}:{source_id}:"
-        f"{embedding_model}:{embedding_version}:{version_part}"
-    )
-    return uuid.uuid5(uuid.NAMESPACE_URL, key)
-
+# ── Async indexing (placeholder rows + cron sweep) ──────────────────────────
 
 def _read_source_version(
     db: Session | None,
@@ -747,7 +724,7 @@ def _read_source_version(
     source_type: str,
     source_id: uuid.UUID,
 ) -> str | None:
-    """Best-effort current authoritative version for the job key."""
+    """Best-effort current authoritative version of one source record."""
     if db is None:
         return None
     try:
@@ -770,77 +747,54 @@ def request_semantic_index(
     *,
     embedding_model: str | None = None,
     embedding_version: str = DEFAULT_VERSION,
-) -> str | None:
-    """Best-effort async index request: stale placeholder + queue envelope.
+) -> uuid.UUID | None:
+    """Best-effort async index request: stage a ``stale`` placeholder row.
 
-    Never raises — derived index work must not break canon writes. Returns
-    the job id when an envelope was published, else None.
+    :func:`run_semantic_index_sweep` picks the row up and embeds it. Never
+    raises — derived index work must not break canon writes. Returns the
+    placeholder row id when one is pending, else None (no session, or the
+    active vector already matches the current source version).
     """
     try:
         stype = validate_source_type(source_type)
         embedding_model = resolve_embedding_model(embedding_model)
         cid = retrieval_mod._coerce_uuid(campaign_id, field_name="campaign_id")
         sid = retrieval_mod._coerce_uuid(source_id, field_name="source_id")
+        if db is None:
+            return None
         source_version = _read_source_version(db, cid, stype, sid)
-        if db is not None:
+        try:
+            existing = _find_row(db, cid, stype, sid, embedding_model, embedding_version)
+            if existing is None:
+                existing = WorldEmbedding(
+                    id=uuid.uuid4(), campaign_id=cid, source_type=stype,
+                    source_id=sid, source_version="pending",
+                    embedding_model=embedding_model,
+                    embedding_version=embedding_version, status="stale",
+                    error="awaiting_async_index",
+                )
+                db.add(existing)
+            elif (
+                existing.status == "active"
+                and source_version is not None
+                and existing.source_version == source_version
+            ):
+                # Unchanged source: the valid vector keeps serving.
+                return None
+            else:
+                existing.status = "stale"
+                existing.error = "awaiting_async_index"
+                db.add(existing)
+            row_id = existing.id
+            db.commit()
+            return row_id
+        except Exception as exc:
             try:
-                existing = _find_row(db, cid, stype, sid, embedding_model, embedding_version)
-                if existing is None:
-                    db.add(WorldEmbedding(
-                        id=uuid.uuid4(), campaign_id=cid, source_type=stype,
-                        source_id=sid, source_version="pending",
-                        embedding_model=embedding_model,
-                        embedding_version=embedding_version, status="stale",
-                        error="awaiting_async_index",
-                    ))
-                elif existing.status == "active":
-                    if (
-                        source_version is not None
-                        and existing.source_version == source_version
-                    ):
-                        # Unchanged source: the valid vector keeps serving.
-                        # The version-aware job id below intentionally
-                        # duplicates the already-completed job, so staling
-                        # here would leave the row stale forever (the
-                        # ledger returns the cached hit without running the
-                        # handler). Only stale on an actual version change.
-                        pass
-                    else:
-                        existing.status = "stale"
-                        existing.error = "awaiting_async_index"
-                        db.add(existing)
-                db.commit()
-            except Exception as exc:
-                try:
-                    db.rollback()
-                except Exception:
-                    pass
-                logger.warning("world_semantic_placeholder_failed error=%s", exc)
-        from app.queue.adapter import new_envelope, publish_envelope
-
-        version_suffix = f":{source_version}" if source_version else ""
-        envelope = new_envelope(
-            job_id=_deterministic_job_id(
-                cid, stype, sid, embedding_model, embedding_version,
-                source_version),
-            job_type=SEMANTIC_INDEX_JOB_TYPE,
-            campaign_id=cid,
-            aggregate_id=cid,
-            operation_id=f"semidx:{stype}:{sid}{version_suffix}",
-            idempotency_key=(
-                f"semidx:{stype}:{sid}:{embedding_model}:"
-                f"{embedding_version}{version_suffix}"
-            ),
-            payload={
-                "campaign_id": str(cid),
-                "source_type": stype,
-                "source_id": str(sid),
-                "source_version": source_version,
-                "embedding_model": embedding_model,
-                "embedding_version": embedding_version,
-            },
-        )
-        return publish_envelope(envelope)
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning("world_semantic_placeholder_failed error=%s", exc)
+            return None
     except Exception as exc:
         logger.warning("world_semantic_enqueue_failed error=%s", exc)
         return None
@@ -1006,100 +960,79 @@ def note_turn_committed(
     return counts
 
 
-def handle_world_semantic_index(envelope: Any, db: Session | None = None) -> dict[str, Any]:
-    """Worker handler for ``world.semantic.index`` (identifiers only).
+#: Failed rows are retried by the sweep after this backoff (seconds).
+SEMANTIC_RETRY_FAILED_AFTER_SECONDS = 900
 
-    Re-reads the authoritative record inside the worker; the envelope payload
-    is never treated as truth. Missing/superseded sources resolve to a
-    durable ``superseded`` mark (success, no retry); embedder failure
-    propagates as retriable; validation failure is terminal.
+
+def run_semantic_index_sweep(db: Session, *, limit: int = 20) -> dict[str, Any]:
+    """Embed placeholder rows awaiting async indexing.
+
+    Selects ``stale`` rows plus ``failed`` rows past the retry backoff,
+    oldest first, and re-indexes each from its authoritative record via
+    :func:`index_source_record`. Missing/superseded sources resolve to a
+    durable ``superseded`` mark; embedder/validation failures record a
+    durable ``failed`` row. Never raises per row — one bad source cannot
+    stall the rest.
     """
-    from app.worker.executor import RetriableError
+    from datetime import datetime, timedelta, timezone
 
-    payload = getattr(envelope, "payload", None) or {}
-    close_after = False
-    if db is None:
-        from database import SessionLocal
-
-        if SessionLocal is None:
-            raise RetriableError("SessionLocal is not configured")
-        db = SessionLocal()
-        close_after = True
-    try:
-        assert db is not None
+    retry_cutoff = datetime.now(timezone.utc) - timedelta(
+        seconds=SEMANTIC_RETRY_FAILED_AFTER_SECONDS)
+    candidates = db.execute(
+        select(
+            WorldEmbedding.id, WorldEmbedding.campaign_id,
+            WorldEmbedding.source_type, WorldEmbedding.source_id,
+            WorldEmbedding.embedding_model, WorldEmbedding.embedding_version,
+        )
+        .where(
+            (WorldEmbedding.status == "stale")
+            | ((WorldEmbedding.status == "failed")
+               & (WorldEmbedding.updated_at < retry_cutoff))
+        )
+        .order_by(WorldEmbedding.updated_at.asc())
+        .limit(max(1, limit))
+    ).all()
+    indexed: list[str] = []
+    failed: list[dict[str, str]] = []
+    for row_id, cid, stype, sid, model, version in candidates:
         try:
-            row = index_source_record(
-                db,
-                payload.get("campaign_id"),
-                payload.get("source_type"),
-                payload.get("source_id"),
-                embedding_model=(
-                    str(payload.get("embedding_model") or "").strip() or None
-                ),
-                embedding_version=str(payload.get("embedding_version") or DEFAULT_VERSION),
-                commit=True,
+            index_source_record(
+                db, cid, stype, sid,
+                embedding_model=model, embedding_version=version, commit=True,
             )
-        except (ValueError, TypeError) as exc:
-            from app.worker.executor import TerminalError
-
-            raise TerminalError(f"world.semantic.index invalid payload: {exc}") from exc
-        except RuntimeError as exc:
-            # No embedder available (e.g. real model without API key):
-            # record durable failure, retryable derived work.
+            indexed.append(str(row_id))
+        except Exception as exc:  # noqa: BLE001 — sweep must survive bad rows
             try:
-                _record_index_failure(
-                    db, payload, f"{type(exc).__name__}: {exc}", commit=True)
+                db.rollback()
             except Exception:
                 pass
-            raise RetriableError(str(exc)[:500]) from exc
-        return {
-            "source_type": payload.get("source_type"),
-            "source_id": payload.get("source_id"),
-            "status": row.status if row is not None else "superseded",
-            "source_version": row.source_version if row is not None else None,
-        }
-    finally:
-        if close_after:
+            error = f"{type(exc).__name__}: {exc}"
             try:
-                db.close()  # type: ignore[union-attr]
+                _record_index_failure(db, row_id, error)
             except Exception:
                 pass
+            logger.warning(
+                "world_semantic_index_failed row_id=%s source_type=%s error=%s",
+                row_id, stype, error[:300],
+            )
+            failed.append({"row_id": str(row_id), "error": error[:300]})
+    return {"indexed": indexed, "failed": failed}
 
 
-def _record_index_failure(db: Session, payload: dict[str, Any], error: str, *, commit: bool) -> None:
-    try:
-        cid = retrieval_mod._coerce_uuid(payload.get("campaign_id"), field_name="campaign_id")
-        sid = retrieval_mod._coerce_uuid(payload.get("source_id"), field_name="source_id")
-    except ValueError:
-        return
-    row = _find_row(
-        db, cid, str(payload.get("source_type") or ""),
-        sid, resolve_embedding_model(
-            str(payload.get("embedding_model") or "").strip() or None),
-        str(payload.get("embedding_version") or DEFAULT_VERSION),
-    )
+def _record_index_failure(db: Session, row_id: uuid.UUID, error: str) -> None:
+    row = db.get(WorldEmbedding, row_id)
     if row is None:
         return
     row.status = "failed"
     row.error = error[:500]
     db.add(row)
-    if commit:
+    try:
+        db.commit()
+    except Exception:
         try:
-            db.commit()
+            db.rollback()
         except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-
-
-def register_world_semantic_worker() -> None:
-    from app.queue.consumer import WORKER_HANDLERS
-
-    WORKER_HANDLERS[SEMANTIC_INDEX_JOB_TYPE] = handle_world_semantic_index
-
-
-register_world_semantic_worker()
+            pass
 
 
 # ── Bounded semantic search ──────────────────────────────────────────────────

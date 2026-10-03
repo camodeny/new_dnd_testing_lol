@@ -718,16 +718,6 @@ def _advance(
         db, campaign.id, expected_revision=int(expected_revision),
         event_type=end_kind, payload=ended_payload,
         operation_id=end_operation_id, actor_id=actor_id,
-        outbox_event_type=end_kind,
-        outbox_payload={
-            "encounter_id": str(encounter.id), "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "source_turn_sequence": source_sequence,
-            "next_turn_sequence": source_sequence + 1,
-            "next_participant_id": str(next_participant.id),
-            "round": next_round, "skipped": skipped,
-        },
-        outbox_operation_id=end_operation_id,
         commit=False,
     )
     _, start_event = commit_campaign_mutation(
@@ -742,15 +732,6 @@ def _advance(
             "rolled_over": rolled_over,
         },
         operation_id=start_operation_id, actor_id=actor_id,
-        outbox_event_type=TURN_STARTED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id), "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "turn_sequence": source_sequence + 1,
-            "active_participant_id": str(next_participant.id),
-            "round": next_round,
-        },
-        outbox_operation_id=start_operation_id,
         commit=False,
     )
     if commit:

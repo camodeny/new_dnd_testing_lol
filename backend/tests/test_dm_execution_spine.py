@@ -25,12 +25,11 @@ from models.threads import CampaignThread  # noqa: E402
 
 from app.dm.contract import CONTRACT_VERSION, ContractValidationError, normalize_contract  # noqa: E402
 from app.dm.execution import (  # noqa: E402
-    DM_TURN_EXECUTE_JOB,
     execute_dm_attempt,
     run_dm_execute_sweep,
 )
 from app.dm.narration import materialize_final_narration  # noqa: E402
-from app.dm_streams.service import reconstruct_text  # noqa: E402
+from app.dm.streams import reconstruct_text  # noqa: E402
 
 
 @pytest.fixture
@@ -356,17 +355,6 @@ def test_missing_provider_config_fails_clearly(db):
     assert fresh_attempt.last_error and "API_KEY" in fresh_attempt.last_error
 
 
-def test_worker_handler_registered_for_queue_path():
-    from app.queue.consumer import WORKER_HANDLERS, resolve_worker_handler
-
-    assert DM_TURN_EXECUTE_JOB in WORKER_HANDLERS
-
-    class _Env:
-        job_type = DM_TURN_EXECUTE_JOB
-
-    assert resolve_worker_handler(_Env()) is WORKER_HANDLERS[DM_TURN_EXECUTE_JOB]
-
-
 @pytest.mark.parametrize("regenerate", [False, True])
 def test_evidence_survives_validation_and_regeneration(db, regenerate):
     from models.campaigns import CampaignMember
@@ -519,38 +507,6 @@ def test_missing_scene_table_still_downgrades(db):
         s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic"
     )
     assert result.attempt.status == "succeeded"
-
-
-def test_queue_delivery_executes_dm_attempt(db, monkeypatch):
-    """Real consume_queue_delivery() path uses the single-arg worker contract."""
-    import uuid as _uuid
-
-    import database
-    import app.dm.execution as exec_mod
-    from app.queue.consumer import consume_queue_delivery
-    from app.queue.envelope import WorkerEnvelope
-
-    s, camp_id, thread_id, factory = db
-    _, attempt = _submit(s, camp_id, thread_id)
-    real_execute = exec_mod.execute_dm_attempt
-    fake_adj = _fake_adjudicate()
-
-    def _patched(session, attempt_id, **kw):
-        kw.setdefault("adjudicate", fake_adj)
-        kw.setdefault("narrator", "deterministic")
-        return real_execute(session, attempt_id, **kw)
-
-    monkeypatch.setattr(exec_mod, "execute_dm_attempt", _patched)
-    monkeypatch.setattr(database, "SessionLocal", factory)
-    env = WorkerEnvelope(
-        job_id=_uuid.uuid4(),
-        job_type=DM_TURN_EXECUTE_JOB,
-        payload={"attempt_id": str(attempt.id)},
-    )
-    result, duplicate = consume_queue_delivery(s, env.to_dict())
-    assert duplicate is False
-    assert result["attempt_id"] == str(attempt.id)
-    assert s.get(DmTurnAttempt, attempt.id).status == "succeeded"
 
 
 def test_await_roll_creates_request_and_resumes_on_fulfill(db):

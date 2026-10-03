@@ -43,8 +43,8 @@ class PostTurnCheckpoint(Base):
 class PostTurnRun(Base):
     """Durable record of one post-turn consolidation attempt over a sequence range.
 
-    The run id doubles as the outbox/worker job_id so duplicate delivery
-    across outbox relay -> queue -> worker maps to the same logical run.
+    The run id doubles as the worker job_id so repeated sweeps map to the
+    same logical run.
     """
 
     __tablename__ = "post_turn_runs"

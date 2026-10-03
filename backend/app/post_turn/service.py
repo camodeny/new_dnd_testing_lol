@@ -5,9 +5,9 @@ required consolidation for a range succeeds. Failed ranges stay outstanding
 and the next run cumulatively covers checkpoint+1 through the current
 eligible sequence, so nothing accepted is silently dropped.
 
-Transport: triggers enqueue through the transactional outbox (#190) with the
-run id as outbox/job id; the relay publishes to the queue and the worker
-executes idempotently via WorkerExecution fencing (#191).
+Transport: triggers stage a durable ``PostTurnRun`` row; the
+``/api/cron/post-turn`` sweep executes it idempotently via WorkerExecution
+fencing (#191) with the run id as the worker job id.
 
 The memory/repair contents of a post-turn patch are built by the
 explicit materializer (issue #217) behind ``consolidate_fn``-style
@@ -200,7 +200,7 @@ def should_trigger_post_turn(outstanding_relevant: int, trigger: str = NORMAL, *
     return outstanding_relevant >= th
 
 
-# ── Trigger (outbox emission) ──────────────────────────────────────────────
+# ── Trigger (durable run staging) ──────────────────────────────────────────────
 
 
 def maybe_trigger_post_turn(
@@ -213,11 +213,10 @@ def maybe_trigger_post_turn(
     threshold: int | None = None,
     commit: bool = True,
 ) -> PostTurnRun | None:
-    """Evaluate the batch policy and enqueue a cumulative post-turn run via outbox.
+    """Evaluate the batch policy and stage a cumulative post-turn run.
 
     Returns the run (new or existing duplicate) or None when below threshold.
-    The run id is reused as the outbox id / worker job_id for end-to-end
-    idempotency.
+    The run id is reused as the worker job_id for end-to-end idempotency.
 
     NORMAL triggers measure the threshold against relevant events NEW since
     the latest live-run coverage (not the whole checkpoint gap), so a lagging
@@ -280,36 +279,12 @@ def maybe_trigger_post_turn(
     # one winner. A savepoint (not a full rollback) keeps the caller's outer
     # transaction intact so the loser can reuse the winning run — including
     # when called atomically from inside commit_campaign_mutation().
-    from models.reliability import Outbox as _Outbox
-
     try:
         with db.begin_nested():
             db.add(run)
             db.flush()
-            # Atomic outbox emission in the same transaction (#190 pattern).
-            db.add(
-                _Outbox(
-                    id=run.id,
-                    aggregate_type="campaign",
-                    aggregate_id=campaign_id,
-                    campaign_id=campaign_id,
-                    event_type=POST_TURN_JOB_TYPE,
-                    operation_id=operation_id,
-                    trace_id=run.trace_id,
-                    payload={
-                        "run_id": str(run.id),
-                        "campaign_id": str(campaign_id),
-                        "from_sequence": from_seq,
-                        "to_sequence": to_seq,
-                        "trigger": trigger,
-                    },
-                    status="pending",
-                    attempts=0,
-                )
-            )
-            db.flush()
     except IntegrityError:
-        # Lost the race (duplicate range row or outbox id) — reuse winner.
+        # Lost the race (duplicate range row) — reuse winner.
         dup = db.execute(
             select(PostTurnRun).where(
                 PostTurnRun.campaign_id == campaign_id,
@@ -696,7 +671,7 @@ def run_post_turn_range(
 
 
 def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
-    """Queue-worker handler for ``post_turn.process`` envelopes.
+    """Worker handler for ``post_turn.process`` envelopes.
 
     Single-argument worker contract (see execute_worker_job); owns its DB
     session via SessionLocal with a ``db`` seam for tests.
@@ -742,15 +717,6 @@ def handle_post_turn_envelope(envelope, db: Session | None = None) -> dict:
         # Production worker owns its session factory: decision telemetry
         # persists on short independent transactions, fail-soft by design.
         return _run(session, telemetry_factory=SessionLocal)
-
-
-def register_post_turn_worker() -> None:
-    from app.queue.consumer import WORKER_HANDLERS
-
-    WORKER_HANDLERS[POST_TURN_JOB_TYPE] = handle_post_turn_envelope
-
-
-register_post_turn_worker()
 
 
 # ── Explicit audited skip ──────────────────────────────────────────────────
@@ -991,7 +957,7 @@ def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
 
 def _envelope_for_run(run: PostTurnRun):
     """Build the worker envelope for a durable run (locator only)."""
-    from app.queue.adapter import new_envelope
+    from app.worker.envelope import new_envelope
 
     return new_envelope(
         job_id=run.id,
@@ -1021,8 +987,7 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     ``execute_worker_job``) and ``running`` runs whose lease expired
     (executor crash between the running marker and the CAS commit; the
     prefix-conditional update makes re-execution safe) — and run each
-    through the idempotent worker fence. Queue push delivery (when a
-    subscriber is configured) converges on the same run rows via job_id.
+    through the idempotent worker fence.
     """
     from datetime import timedelta as _timedelta
 

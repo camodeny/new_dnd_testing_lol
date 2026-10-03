@@ -32,7 +32,7 @@ Pipeline (critical path optimized for TTFT after validation):
    orchestrator marks the attempt failed-visible (see ``mark_attempt_failed``);
    repair requires a NEW stream on a NEW attempt.
 4. ``stream_narration(...)`` — persists each chunk durably via #197
-   (``dm_streams`` service) BEFORE/with realtime delivery via #198, so the
+   (``app.dm.streams``) BEFORE/with realtime delivery via #198, so the
    first visible text is recoverable after disconnect. TTFT is measured
    from validated adjudication to first persisted visible chunk.
     ``on_first_persist`` fires synchronously after chunk 0's durable
@@ -1234,7 +1234,7 @@ def stream_narration(
     ``max_chunks_to_persist`` is a crash-simulation hook for tests: persist
     at most N chunks and return the partial stream without completing.
     """
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         create_stream,
@@ -1348,7 +1348,7 @@ def stream_narration(
         must therefore consult durable state, not the counter.
         """
         try:
-            from app.dm_streams.service import list_chunks as _list_chunks
+            from app.dm.streams import list_chunks as _list_chunks
 
             return len(_list_chunks(db, stream_id))
         except Exception:
@@ -1935,7 +1935,7 @@ def continue_partial_stream(
     fresh instead) and ``NarrationFidelityError`` /
     ``NarrationStreamError`` on gate failure.
     """
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
     from app.providers import policy as role_policy
 
     visible = reconstruct_text(db, stream_id)
@@ -1993,7 +1993,7 @@ def _resume_stream_suffix(
     completion_reason: str = "narration_resumed",
 ) -> NarrationResult:
     """Shared suffix-persist + complete for resume/continuation."""
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         get_stream,
@@ -2066,7 +2066,7 @@ def _resume_stream_suffix(
 
 def materialize_final_narration(db: Session, stream_id: uuid.UUID) -> dict[str, Any]:
     """Read-model for history: final narration text with chunk provenance."""
-    from app.dm_streams.service import get_stream_with_chunks
+    from app.dm.streams import get_stream_with_chunks
 
     stream, chunks, visible_text = get_stream_with_chunks(db, stream_id)
     final = stream.final_text if stream.status == "completed" else None

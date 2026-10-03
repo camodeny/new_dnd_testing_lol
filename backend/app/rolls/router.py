@@ -44,9 +44,8 @@ def _visible_turn(db: Session, campaign_id: uuid.UUID, turn_id: uuid.UUID, user_
 def _publish_encounter_ready_post_commit(db: Session, result: dict) -> None:
     """Best-effort ready publish for initiative fulfilled via generic rolls.
 
-    Mirrors the encounter router's post-commit pattern: the durable outbox row
-    (enqueued atomically with the mutation) is the guaranteed hook; this
-    direct publish is latency-only. Runs after the outer idempotency commit so
+    Mirrors the encounter router's post-commit pattern: the committed domain
+    event is authoritative; this direct publish is latency-only. Runs after the outer idempotency commit so
     replays (stable event ids) stay idempotent.
     """
     ready = result.get("encounter_ready")

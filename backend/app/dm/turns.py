@@ -1239,9 +1239,6 @@ def commit_turn(
             mutate=_mutate_with_effects,
             commit=False,
             payload_builder=_adventure_event_payload if event_type == "adventure.completed" else None,
-            outbox_event_type="dm.turn_committed",
-            outbox_payload={**base_payload, "operation_id": duplicate_op},
-            outbox_operation_id=duplicate_op,
         )
     except RevisionConflictError as exc:
         logger.warning(
@@ -1327,7 +1324,7 @@ def commit_turn(
     # Stage encounter.started lifecycle semantics for encounters created by
     # this attempt's start_encounter effect (issue #230). The turn commit IS
     # the start's fictional mutation, so each linked encounter gets its own
-    # domain event + durable outbox hook chained in the same outer
+    # domain event chained in the same outer
     # transaction (one event per revision, preserving the
     # sequence == revision invariant). Fail-closed: any staging failure
     # propagates and aborts the turn commit — a durable encounter without
@@ -1384,15 +1381,6 @@ def commit_turn(
                         "turn_event_id": str(event.id),
                         "attempt_id": str(attempt.id),
                     },
-                    outbox_event_type=_ENCOUNTER_STARTED,
-                    outbox_payload={
-                        "encounter_id": str(_enc.id),
-                        "campaign_id": str(turn.campaign_id),
-                        "thread_id": _enc.thread_id,
-                        "participant_count": int(_enc.participant_count or 0),
-                        "start_source": _enc.start_source,
-                    },
-                    outbox_operation_id=f"encounter:{_enc.id}:started",
                     commit=False,
                 )
             _enc.created_event_id = _lifecycle.id
@@ -1402,7 +1390,7 @@ def commit_turn(
     # attempt's end_encounter effect (issue #239). Mirrors the start staging
     # above: the turn commit IS the end's fictional mutation, so each
     # inline-ended encounter without a staged event gets its own domain event
-    # + durable outbox hook in the same outer transaction. Fail-closed like
+    # in the same outer transaction. Fail-closed like
     # the start path — an unstaged durable end must never commit. The API end
     # path stages its own event immediately (ended_event_id set), so the
     # IS NULL scope only catches inline ends from this commit.
@@ -1460,14 +1448,6 @@ def commit_turn(
                         "turn_event_id": str(event.id),
                         "attempt_id": str(attempt.id),
                     },
-                    outbox_event_type=_ENCOUNTER_ENDED,
-                    outbox_payload={
-                        "encounter_id": str(_enc.id),
-                        "campaign_id": str(turn.campaign_id),
-                        "thread_id": _enc.thread_id,
-                        "outcome": _enc.end_outcome,
-                    },
-                    outbox_operation_id=f"encounter:{_enc.id}:ended",
                     commit=False,
                 )
             _enc.ended_event_id = _end_lifecycle.id
@@ -1530,10 +1510,9 @@ def commit_turn(
     db.refresh(campaign_after)
     db.refresh(event)
 
-    # Post-commit encounter-start realtime hook (issue #230). The durable
-    # outbox row staged above is the guaranteed delivery path; this direct
-    # publish is latency-only and best-effort — it never rolls back
-    # committed state.
+    # Post-commit encounter-start realtime hook (issue #230). The lifecycle
+    # event staged above is authoritative; this direct publish is
+    # latency-only and best-effort — it never rolls back committed state.
     if commit and linked_encounter_ids:
         try:
             from app.realtime.service import publish_encounter_started as _publish_started
@@ -1547,7 +1526,7 @@ def commit_turn(
             logger.warning("dm_turn encounter post-commit publish skipped turn_id=%s error=%s", turn.id, e)
 
     # Post-commit encounter-ended realtime hook (issue #239). Same contract
-    # as the start hook above: durable outbox owns delivery, this is
+    # as the start hook above: the lifecycle event is authoritative, this is
     # latency-only and never rolls back committed state.
     if commit and linked_ended_ids:
         try:

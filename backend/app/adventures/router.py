@@ -288,9 +288,9 @@ def mark_stale_endpoint(
 @router.get("/api/cron/adventure-closing")
 def adventure_closing_cron_get(request: Request, db: Session = Depends(get_db)):
     """Drive pending adventure closing work via the idempotent worker fence."""
-    from app.outbox.router import _require_cron_secret
+    from app.deps.cron import require_cron_secret
 
-    _require_cron_secret(request.headers.get("authorization"))
+    require_cron_secret(request.headers.get("authorization"))
     from app.adventures.service import run_adventure_closing_sweep
 
     result = run_adventure_closing_sweep(db)

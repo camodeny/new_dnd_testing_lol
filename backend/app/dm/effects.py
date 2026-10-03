@@ -441,10 +441,10 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
     import uuid as _uuid
 
     from app.adventures.service import (
-        ADVENTURE_CLOSING_JOB,
         complete_adventure_inline,
         find_by_operation,
         get_current_adventure,
+        stage_adventure_closing,
     )
     from models.campaigns import Adventure
 
@@ -497,28 +497,9 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
         operation_id=operation_key,
     )
 
-    # Enqueue downstream closing work (recap/rewards) in the same transaction:
+    # Stage downstream closing work (recap/rewards) in the same transaction:
     # best-effort, never invalidates the committed completion.
-    from app.observability.tracing import current_trace_id
-    from models.reliability import Outbox as _Outbox
-
-    db.add(_Outbox(
-        id=_uuid.uuid4(),
-        aggregate_type="campaign",
-        aggregate_id=campaign.id,
-        campaign_id=campaign.id,
-        event_type=ADVENTURE_CLOSING_JOB,
-        operation_id=operation_key,
-        trace_id=current_trace_id(),
-        payload={
-            "adventure_id": str(adventure.id),
-            "campaign_id": str(campaign.id),
-            "outcome": adventure.outcome,
-            "operation_id": operation_key,
-        },
-        status="pending",
-        attempts=0,
-    ))
+    stage_adventure_closing(db, adventure, operation_id=operation_key)
     # Derived summary finalization happens post-commit in the turn commit
     # path (issue #263): the authoritative completion event/revision only
     # exists after commit_campaign_mutation returns, so binding the end

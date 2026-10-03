@@ -20,10 +20,10 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/realtime` | Realtime projections / websocket fan-out — placeholder |
 | `app/providers` | LLM provider adapters — re-exports `llm_providers` without workflow branching |
 | `app/observability` | Structured logging, tracing hooks, TTFT helpers (see #192) |
-| `app/health` | Health / hello / db ping |
+| `app/health` | Health check |
 | `app/auth` | Auth config + `/api/me` (transport) + `app/auth/service.py` pure profile resolution + `app/auth/jwt.py` JWT/JWKS verification (application) |
-| `app/deps` | Transport adapters that extract `Request` headers and map errors to HTTP (e.g. `resolve_profile(Request) -> Profile`) |
-| `app/infrastructure` | Thin re-export / documentation for the shared DB layer |
+| `app/deps` | Transport adapters that extract `Request` headers and map errors to HTTP (e.g. `resolve_profile(Request) -> Profile`, the cron secret guard) |
+| `app/worker` | Worker job envelope + idempotent `WorkerExecution` ledger used by the cron sweeps |
 
 ## Dependency direction
 

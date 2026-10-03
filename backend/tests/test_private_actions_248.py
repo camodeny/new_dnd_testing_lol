@@ -40,7 +40,7 @@ from app.runtime.threads import (  # noqa: E402
 )
 from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
-from models.dm import DmTurn, DmTurnAttempt, PlayerRollRequest  # noqa: E402
+from models.dm import DMStream, DmTurn, DmTurnAttempt, PlayerRollRequest  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.reliability import DecisionTelemetry  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
@@ -83,6 +83,16 @@ def ctx():
     yield {"factory": factory, "campaign_id": camp_id, "owner": owner, "alice": alice,
            "bob": bob, "alice_char": alice_char, "shared_id": shared.id, "private_id": private.id}
     db.close()
+
+
+def _completed_streams(db, campaign_id, thread_id):
+    return list(db.execute(
+        select(DMStream).where(
+            DMStream.campaign_id == campaign_id,
+            DMStream.thread_id == thread_id,
+            DMStream.status == "completed",
+        ).order_by(DMStream.created_at.asc())
+    ).scalars().all())
 
 
 def _db(ctx):
@@ -427,9 +437,7 @@ def test_private_canonical_effects_without_shared_narration(ctx):
                 rec["channel"] == live_table_channel(ctx["campaign_id"], ctx["private_id"])
 
         # Shared thread has no DM streams from this turn.
-        from app.dm_streams.service import list_streams_for_thread
-
-        assert list_streams_for_thread(db, ctx["campaign_id"], ctx["shared_id"]) == []
+        assert _completed_streams(db, ctx["campaign_id"], ctx["shared_id"]) == []
     finally:
         set_realtime_publisher(None)
         db.close()
@@ -649,7 +657,7 @@ def test_post_turn_preserves_private_visibility(ctx):
 
 
 def test_owner_denied_reconnect_stable_private_history(ctx):
-    from app.dm_streams.service import list_streams_for_thread, reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     db = _db(ctx)
     try:
@@ -682,8 +690,8 @@ def test_owner_denied_reconnect_stable_private_history(ctx):
         try:
             assert reconstruct_text(db2, stream_id) != ""
             assert [str(s.id) for s in
-                    list_streams_for_thread(db2, ctx["campaign_id"], ctx["private_id"])]
-            assert list_streams_for_thread(db2, ctx["campaign_id"], ctx["shared_id"]) == []
+                    _completed_streams(db2, ctx["campaign_id"], ctx["private_id"])]
+            assert _completed_streams(db2, ctx["campaign_id"], ctx["shared_id"]) == []
             assert can_read_thread(db2, ctx["campaign_id"], ctx["private_id"], ctx["owner"]) is False
             assert can_read_thread(db2, ctx["campaign_id"], ctx["private_id"], ctx["bob"]) is False
         finally:

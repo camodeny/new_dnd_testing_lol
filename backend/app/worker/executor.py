@@ -7,8 +7,7 @@ Guarantees:
   backoff hooks.
 - Worker crash before completion leaves execution in running/pending so
   redelivery is safe (lease expiry / sweeper).
-- Exhausted/terminal jobs stay durably inspectable and replayable.
-- Manual replay reuses the same logical idempotency.
+- Exhausted/terminal jobs stay durably inspectable (dead_letter).
 - Atomic committed claim + claim_token fencing prevents concurrent side effects;
   next_attempt_at enforced; heartbeat renewal prevents live-work reclamation
   while fencing protects genuinely crashed ownership.
@@ -22,11 +21,11 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import func, select, update
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.queue.envelope import WorkerEnvelope
+from app.worker.envelope import WorkerEnvelope
 from models.reliability import WorkerExecution
 from app.observability.tracing import trace_context
 
@@ -484,62 +483,7 @@ def execute_worker_job(
     raise handler_exc  # type: ignore[misc]
 
 
-# ── Failed-work / dead-letter ledger ────────────────────────────────────────
-
-
-def list_failed_work(db: Session, *, limit: int = 100, job_type: str | None = None) -> list[WorkerExecution]:
-    q = select(WorkerExecution).where(WorkerExecution.status == DEAD_LETTER)
-    if job_type:
-        q = q.where(WorkerExecution.job_type == job_type)
-    q = q.order_by(WorkerExecution.updated_at.desc()).limit(limit)
-    return list(db.execute(q).scalars().all())
-
-
-def list_retryable_failed(db: Session, *, limit: int = 100) -> list[WorkerExecution]:
-    """Jobs in FAILED that are scheduled for retry (not yet terminal)."""
-    q = select(WorkerExecution).where(WorkerExecution.status == FAILED).order_by(WorkerExecution.next_attempt_at.asc()).limit(limit)
-    return list(db.execute(q).scalars().all())
-
-
-def get_worker_execution(db: Session, job_id: uuid.UUID) -> WorkerExecution | None:
-    return db.get(WorkerExecution, job_id)
-
-
-def replay_failed_job(
-    db: Session,
-    job_id: uuid.UUID,
-    *,
-    reset_attempts: bool = False,
-    commit: bool = True,
-) -> WorkerExecution | None:
-    """Manual replay of a dead_letter/failed job — resets to pending for redelivery.
-
-    Uses same logical job_id so idempotency guarantees still apply.
-    """
-    rec = db.get(WorkerExecution, job_id)
-    if rec is None:
-        return None
-    if rec.status not in (DEAD_LETTER, FAILED):
-        logger.warning("replay not applicable job_id=%s status=%s", job_id, rec.status)
-        return rec
-    rec.status = PENDING
-    rec.next_attempt_at = None
-    rec.started_at = None
-    rec.last_error = None
-    rec.error_class = None
-    rec.claim_token = None
-    if reset_attempts:
-        rec.attempts = 0
-    # keep payload/trace for replay; bump updated_at
-    rec.updated_at = datetime.now(timezone.utc)
-    db.add(rec)
-    if commit:
-        db.commit()
-        db.refresh(rec)
-    else:
-        db.flush()
-    logger.info("worker replay job_id=%s type=%s attempts=%s", job_id, rec.job_type, rec.attempts)
-    return rec
+# ── Lease heartbeat ────────────────────────────────────────────────────────
 
 
 def renew_worker_lease(db: Session, job_id: uuid.UUID, claim_token: str, *, lease_seconds: int = 300) -> bool:
@@ -560,74 +504,3 @@ def renew_worker_lease(db: Session, job_id: uuid.UUID, claim_token: str, *, leas
         return True
     db.rollback()
     return False
-
-
-def recover_stuck_executions(db: Session, *, lease_seconds: int = 300, commit: bool = True) -> int:
-    """Sweeper: reset RUNNING executions whose lease expired (worker crash before completion).
-
-    Healthy workers renew their lease via heartbeat, so expiry implies
-    genuine crash/abandonment, not slow execution.
-    """
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
-    result = db.execute(
-        update(WorkerExecution)
-        .where(WorkerExecution.status == RUNNING, WorkerExecution.started_at < cutoff)
-        .values(status=PENDING, started_at=None, next_attempt_at=None, claim_token=None)
-        .execution_options(synchronize_session=False)
-    )
-    if result.rowcount:
-        if commit:
-            db.commit()
-        else:
-            db.flush()
-        logger.info("worker sweeper recovered %s stuck executions", result.rowcount)
-    return result.rowcount or 0
-
-
-# ── Observability ───────────────────────────────────────────────────────────
-
-
-def get_worker_metrics(db: Session) -> dict:
-    now = datetime.now(timezone.utc)
-    rows = db.execute(select(WorkerExecution.status, func.count()).group_by(WorkerExecution.status)).all()
-    by_status = {k: v for k, v in rows}
-    # attempts / retries / terminal
-    max_attempts = db.execute(select(func.max(WorkerExecution.attempts))).scalar() or 0
-    avg_duration = db.execute(
-        select(func.avg(WorkerExecution.processing_duration_ms)).where(WorkerExecution.processing_duration_ms != None)  # noqa
-    ).scalar()
-    oldest_pending = db.execute(
-        select(func.min(WorkerExecution.created_at)).where(WorkerExecution.status.in_([PENDING, FAILED, RUNNING]))
-    ).scalar()
-    if oldest_pending is not None and oldest_pending.tzinfo is None:
-        oldest_pending = oldest_pending.replace(tzinfo=timezone.utc)
-    lag_s = (now - oldest_pending).total_seconds() if oldest_pending else 0
-    return {
-        "by_status": by_status,
-        "total": sum(by_status.values()),
-        "pending": by_status.get(PENDING, 0),
-        "running": by_status.get(RUNNING, 0),
-        "succeeded": by_status.get(SUCCEEDED, 0),
-        "failed": by_status.get(FAILED, 0),
-        "dead_letter": by_status.get(DEAD_LETTER, 0),
-        "retries": by_status.get(FAILED, 0),
-        "terminal_failures": by_status.get(DEAD_LETTER, 0),
-        "max_attempts": max_attempts,
-        "avg_processing_duration_ms": float(avg_duration) if avg_duration else 0,
-        "oldest_pending_lag_seconds": lag_s,
-    }
-
-
-def get_queue_metrics(db: Session, *, adapter: Any | None = None) -> dict:
-    """Unified queue+worker observability.
-
-    Includes logical job IDs and processing duration; adapter depth when available.
-    """
-    wm = get_worker_metrics(db)
-    depth = None
-    if adapter is not None and hasattr(adapter, "depth"):
-        try:
-            depth = adapter.depth()
-        except Exception:
-            depth = None
-    return {**wm, "queue_depth": depth}

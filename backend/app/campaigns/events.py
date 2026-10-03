@@ -87,9 +87,6 @@ def commit_campaign_mutation(
     payload_builder: Optional[Callable[[], dict]] = None,
     targets_builder: Optional[Callable[[], dict | list]] = None,
     visibility_builder: Optional[Callable[[], str]] = None,
-    outbox_event_type: str | None = None,
-    outbox_payload: dict | None = None,
-    outbox_operation_id: str | None = None,
 ) -> tuple[Campaign, CampaignDomainEvent]:
     """Commit an authoritative fictional mutation transactionally.
 
@@ -243,27 +240,8 @@ def commit_campaign_mutation(
         )
         raise
 
-    # 3) Optionally enqueue outbox atomically in same transaction (issue #190)
-    if outbox_event_type:
-        # lazy import to avoid circular
-        from models.reliability import Outbox as _Outbox
-        ob = _Outbox(
-            id=uuid.uuid4(),
-            aggregate_type="campaign",
-            aggregate_id=campaign_id,
-            campaign_id=campaign_id,
-            event_type=outbox_event_type,
-            operation_id=outbox_operation_id or operation_id,
-            trace_id=current_trace_id(),
-            payload=outbox_payload if outbox_payload is not None else resolved_payload,
-            status="pending",
-            attempts=0,
-        )
-        db.add(ob)
-        db.flush()
-
     # Best-effort post-turn batch evaluation (issue #216), staged in THIS
-    # transaction via savepoint: the run + outbox rows commit atomically with
+    # transaction via savepoint: the run row commits atomically with
     # the event whether this function owns the commit (commit=True) or the
     # caller does (commit=False, e.g. the HTTP idempotency outer transaction
     # in app/deps/idempotency.py). A trigger failure rolls back to the

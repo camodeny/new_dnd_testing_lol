@@ -1,8 +1,9 @@
 """Post-turn cron endpoints — issue #216.
 
 Follows the dm-execute cron pattern: an external scheduler (Supabase Cron
-or equivalent) drives pending post-turn work through the worker layer.
-Same CRON_SECRET auth guard as the outbox relay cron.
+or equivalent) drives pending post-turn work through the worker layer, and
+drains pending world semantic index rows on the same tick.
+Shared CRON_SECRET auth guard (``app.deps.cron``).
 """
 from __future__ import annotations
 
@@ -21,11 +22,15 @@ router = APIRouter(prefix="/api/cron", tags=["cron"])
 
 @router.get("/post-turn")
 def post_turn_cron_get(request: Request, db: Session = Depends(get_db)):
-    """Execute outstanding post-turn runs via the idempotent worker fence."""
-    from app.outbox.router import _require_cron_secret
+    """Execute outstanding post-turn runs, then pending semantic index rows.
 
-    _require_cron_secret(request.headers.get("authorization"))
+    Semantic indexing is derived work: its failure never fails the sweep.
+    """
+    from app.deps.cron import require_cron_secret
+
+    require_cron_secret(request.headers.get("authorization"))
     from app.post_turn.service import run_post_turn_sweep
+    from app.world.semantic import run_semantic_index_sweep
 
     result = run_post_turn_sweep(db)
     logger.info(
@@ -33,7 +38,18 @@ def post_turn_cron_get(request: Request, db: Session = Depends(get_db)):
         len(result.get("executed", [])),
         len(result.get("failed", [])),
     )
-    return {"ok": True, "sweep": result}
+    try:
+        semantic = run_semantic_index_sweep(db)
+    except Exception as exc:  # noqa: BLE001 — derived index work is best-effort
+        db.rollback()
+        logger.warning("semantic index sweep failed error=%s", exc)
+        semantic = {"indexed": [], "failed": [{"error": str(exc)[:300]}]}
+    logger.info(
+        "semantic index cron indexed=%s failed=%s",
+        len(semantic["indexed"]),
+        len(semantic["failed"]),
+    )
+    return {"ok": True, "sweep": result, "semantic_index": semantic}
 
 
 @router.post("/post-turn")

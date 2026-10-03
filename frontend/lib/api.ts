@@ -334,15 +334,6 @@ export const funding = {
     ),
 }
 
-// ── Sessions ──────────────────────────────────────────────────────────────
-
-export const sessions = {
-  start: (campaignId: string | number) =>
-    apiFetch<{ session: import('@/types').Session }>(`/campaigns/${campaignId}/sessions`, {
-      method: 'POST',
-    }),
-}
-
 // ── Encounter maps ────────────────────────────────────────────────────────
 // Removed: the encounter-maps/current stub had no authoritative backend
 // (PR #348 re-review). StoryAtlas owns map state client-side via

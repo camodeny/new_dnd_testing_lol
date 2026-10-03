@@ -38,7 +38,7 @@ from app.combat.service import (  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
-from models.campaigns import Campaign, CampaignMember  # noqa: E402
+from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant  # noqa: E402
 from models.dm import PlayerRollFulfillment, PlayerRollRequest  # noqa: E402
@@ -369,8 +369,6 @@ def test_incomplete_initiative_stays_pending_without_guessing():
 
 
 def test_ready_operation_key_bounded_for_max_length_start_key():
-    from models.reliability import Outbox
-
     fac, ctx = _fixture()
     with fac() as db:
         encounter, _ = _start(
@@ -382,13 +380,13 @@ def test_ready_operation_key_bounded_for_max_length_start_key():
         assert event is not None
         assert event.operation_id == f"encounter:{encounter.id}:initiative-ready"
         assert len(event.operation_id) <= 128
-        outbox_keys = {
+        event_keys = {
             row.operation_id for row in db.execute(
-                select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
+                select(CampaignDomainEvent).where(
+                    CampaignDomainEvent.campaign_id == ctx["campaign_id"])
             ).scalars().all()
         }
-        assert f"encounter:{encounter.id}:initiative-ready" in outbox_keys
-        assert all(len(key or "") <= 128 for key in outbox_keys)
+        assert all(len(key or "") <= 128 for key in event_keys)
 
 
 def test_npc_override_preserves_canonical_dex_tiebreak():

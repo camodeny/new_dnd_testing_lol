@@ -553,10 +553,3 @@ def get_thread_submissions(
         "submissions": list_submissions(db, campaign.id, thread_id=str(tid)),
         "thread_id": str(tid),
     }
-
-
-@router.post("/api/campaigns/{campaign_id}/sessions")
-def stub_start_session(
-    campaign_id: str, request: Request, db: Session = Depends(get_db)
-):
-    raise HTTPException(status_code=501, detail="Sessions not yet implemented")

@@ -340,6 +340,7 @@ def adjudicate_with_failover(
             if ai_run is not None and telemetry is not None:
                 try:
                     from app.billing.config import cost_usd_for, tokens_from_usage
+                    from app.billing.ledger import charge_finished_run
                     from app.observability.service import finish_ai_run
 
                     usage = getattr(response, "usage", None)
@@ -347,8 +348,10 @@ def adjudicate_with_failover(
                     finish_ai_run(telemetry, ai_run.id, status="succeeded",
                                   result_code="contract_ok",
                                   input_tokens=in_tokens, output_tokens=out_tokens,
-                                  cost_usd=cost_usd_for(cand_adapter.name, cand_model, usage),
-                                  campaign_id=campaign_id)
+                                  cost_usd=cost_usd_for(cand_adapter.name, cand_model, usage))
+                    if campaign_id is not None:
+                        charge_finished_run(telemetry, run_id=ai_run.id,
+                                            campaign_id=campaign_id)
                 except Exception:
                     pass
             structured_log(
@@ -559,6 +562,7 @@ def build_provider_narrator(
                     if ai_run is not None and telemetry is not None:
                         try:
                             from app.billing.config import cost_usd_for, tokens_from_usage
+                            from app.billing.ledger import charge_finished_run
                             from app.observability.service import finish_ai_run
 
                             in_tokens, out_tokens = tokens_from_usage(stream_usage)
@@ -566,8 +570,10 @@ def build_provider_narrator(
                                           result_code="stream_ok",
                                           input_tokens=in_tokens, output_tokens=out_tokens,
                                           cost_usd=cost_usd_for(cand_adapter.name, cand_model,
-                                                                stream_usage),
-                                          campaign_id=campaign_id)
+                                                                stream_usage))
+                            if campaign_id is not None:
+                                charge_finished_run(telemetry, run_id=ai_run.id,
+                                                    campaign_id=campaign_id)
                         except Exception:
                             pass
                     return

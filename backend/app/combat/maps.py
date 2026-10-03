@@ -489,14 +489,6 @@ def _emit_map_event(
         payload={"encounter_id": str(encounter.id), "thread_id": encounter.thread_id, **payload},
         operation_id=operation_id,
         actor_id=campaign.owner_id,
-        outbox_event_type=MAP_UPDATED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "map_revision": payload.get("map_revision"),
-        },
-        outbox_operation_id=operation_id,
         commit=commit,
     )
     return event
@@ -644,13 +636,6 @@ def ensure_map(
                 "placement_count": holder["placement_count"],
                 "init": existing is None,
             },
-            outbox_event_type=MAP_UPDATED_EVENT,
-            outbox_payload={
-                "encounter_id": str(encounter.id),
-                "campaign_id": str(encounter.campaign_id),
-                "thread_id": encounter.thread_id,
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
         db.rollback()
@@ -770,14 +755,6 @@ def update_terrain(
         mutate=_mutate,
         commit=False,
         payload_builder=_terrain_payload,
-        outbox_event_type=MAP_UPDATED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "map_revision": int(encounter_map.revision or 1),
-        },
-        outbox_operation_id=operation_id,
     )
     db.flush()
     if commit:
@@ -1268,7 +1245,6 @@ def move_participant(
             "map_revision": int(encounter_map.revision or 1),
         }
 
-    hidden_mover = str(participant.id) in _hidden_token_ids(db, encounter.id)
     try:
         _, event = commit_campaign_mutation(
             db,
@@ -1280,15 +1256,6 @@ def move_participant(
             mutate=_mutate,
             commit=False,
             payload_builder=_moved_payload,
-            outbox_event_type=MOVED_EVENT,
-            outbox_payload={
-                "encounter_id": str(encounter.id),
-                "campaign_id": str(encounter.campaign_id),
-                "thread_id": encounter.thread_id,
-                "participant_id": str(participant.id),
-                **({} if hidden_mover else {"to": {"col": goal[0], "row": goal[1]}}),
-            },
-            outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
         # Lost the ledger race: the winner's row is the authoritative outcome.

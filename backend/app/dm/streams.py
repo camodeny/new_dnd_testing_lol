@@ -16,7 +16,6 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import datetime, timezone
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -29,10 +28,6 @@ logger = logging.getLogger(__name__)
 
 
 class DMStreamNotFoundError(LookupError):
-    pass
-
-
-class DMStreamAuthorizationError(PermissionError):
     pass
 
 
@@ -272,31 +267,6 @@ def complete_stream(
     return stream
 
 
-def abandon_stream(
-    db: Session,
-    stream_id: uuid.UUID,
-    *,
-    reason: str = "abandoned",
-) -> DMStream:
-    stream = _get_stream_for_update(db, stream_id)
-    if stream.status in ("abandoned", "failed"):
-        return stream
-    if stream.status == "completed":
-        raise DMStreamStateError("Cannot abandon a completed stream")
-
-    stream.status = "abandoned"
-    stream.abandoned_at = _now()
-    stream.abandonment_reason = reason
-    # Retain partial chunks for audit; final_text stays None or partial? Store partial for observability but not canonical
-    # Do not set final_text as canonical; keep None to signal not completed. Optionally store partial for audit in separate field?
-    db.flush()
-    logger.info(
-        "dm_stream abandoned stream_id=%s turn_id=%s attempt_id=%s chunk_count=%s last_sequence=%s reason=%s",
-        stream_id, stream.turn_id, stream.attempt_id, stream.chunk_count, stream.last_sequence, reason,
-    )
-    return stream
-
-
 def fail_stream(
     db: Session,
     stream_id: uuid.UUID,
@@ -347,28 +317,3 @@ def reopen_failed_stream(
         stream_id, reason, stream.chunk_count, stream.last_sequence,
     )
     return stream
-
-
-def list_streams_for_thread(
-    db: Session,
-    campaign_id: uuid.UUID,
-    thread_id: uuid.UUID,
-    *,
-    include_abandoned: bool = False,
-) -> list[DMStream]:
-    q = select(DMStream).where(DMStream.campaign_id == campaign_id, DMStream.thread_id == thread_id)
-    if not include_abandoned:
-        q = q.where(DMStream.status == "completed")
-    return list(db.execute(q.order_by(DMStream.created_at.asc())).scalars().all())
-
-
-def list_all_streams_for_thread(
-    db: Session,
-    campaign_id: uuid.UUID,
-    thread_id: uuid.UUID,
-) -> list[DMStream]:
-    return list(
-        db.execute(
-            select(DMStream).where(DMStream.campaign_id == campaign_id, DMStream.thread_id == thread_id).order_by(DMStream.created_at.asc())
-        ).scalars().all()
-    )

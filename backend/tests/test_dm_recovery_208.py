@@ -267,7 +267,7 @@ def test_narration_only_failure_preserves_contract_and_retries_independently(db)
 def test_partial_stream_resume_and_semantic_continuation(db):
     from app.dm.narration import (continue_partial_stream,
                                   resume_narration_stream)
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)
@@ -321,7 +321,7 @@ def _failed_partial(s, camp_id, thread_id, text=LONG_TEXT, effect=None):
     """Build a failed_visible turn/attempt with a failed partial stream."""
     from app.dm.narration import stream_narration
     from app.dm.turns import mark_attempt_failed, stage_validated_attempt
-    from app.dm_streams.service import fail_stream
+    from app.dm.streams import fail_stream
 
     turn, attempt = _submit(s, camp_id, thread_id, text="I step forward.")
     contract = _contract(text)
@@ -365,7 +365,7 @@ def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
     assert final_turn.status == "succeeded"
     assert final_attempt.status == "succeeded"
     assert event is not None
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     assert get_stream(s, stream_id).status == "completed"
     # Consumed input resolved so it is never re-adjudicated.
@@ -390,7 +390,7 @@ def _crash_after_chunks(s, stream_id, full_text, *, chunks_to_append="all"):
     """Simulate a crash mid-recovery: persist chunks + optionally complete,
     without finalizing the turn."""
     from app.dm.narration import chunk_narration_text
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         append_chunk,
         complete_stream,
         list_chunks,
@@ -430,7 +430,7 @@ def test_recover_converges_after_crash_past_completion(db):
 def test_recover_converges_after_crash_mid_suffix(db):
     """Crash after some recovered chunks converges without duplication."""
     from app.dm.recovery import recover_partial_stream
-    from app.dm_streams.service import list_chunks
+    from app.dm.streams import list_chunks
 
     s, camp_id, thread_id, _ = db
     owner = s.get(Campaign, camp_id).owner_id
@@ -442,7 +442,7 @@ def test_recover_converges_after_crash_mid_suffix(db):
         s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
     assert final_turn.status == "succeeded"
     assert final_attempt.status == "succeeded"
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     assert reconstruct_text(s, stream_id) == LONG_TEXT
 
@@ -540,7 +540,7 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
         recover_partial_stream(s, camp_id, turn.id, stream_id,
                                "A completely different story.", actor_id=owner)
     # Prefix-preserving but unfaithful: invented number + consequence.
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
 
     visible = reconstruct_text(s, stream_id)
     with pytest.raises(ValueError):
@@ -639,7 +639,7 @@ def test_narration_failover_drops_unpersisted_prefix(db, monkeypatch):
         render_deterministic_narration,
         stream_narration,
     )
-    from app.dm_streams.service import reconstruct_text
+    from app.dm.streams import reconstruct_text
     from app.providers.contracts import ProviderError
 
     s, camp_id, thread_id, _ = db
@@ -742,7 +742,7 @@ def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
     """With flush-only recovery, a crash after completion/transition/staging
     persists nothing: retry converges to exactly one commit."""
     from app.dm.recovery import recover_partial_stream
-    from app.dm_streams.service import list_chunks, reconstruct_text
+    from app.dm.streams import list_chunks, reconstruct_text
 
     s, camp_id, thread_id, _ = db
     owner = s.get(Campaign, camp_id).owner_id
@@ -782,7 +782,7 @@ def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
                                actor_id=owner, commit=False)
     s.rollback()
     # Nothing durable: stream still failed with original prefix, turn failed.
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     assert get_stream(s, stream_id).status == "failed"
     assert len(list_chunks(s, stream_id)) == chunks_before

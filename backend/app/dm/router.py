@@ -169,7 +169,7 @@ def _publish_recovery_status(db: Session, stream_id) -> None:
 
     _logger = _logging.getLogger(__name__)
     try:
-        from app.dm_streams.service import get_stream
+        from app.dm.streams import get_stream
         from app.realtime.service import publish_dm_status
 
         stream = get_stream(db, stream_id)
@@ -457,12 +457,12 @@ def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
 
     Cron trigger (Supabase Cron / scheduler) that claims and executes eligible
     prepared DM attempts through the production pipeline without manual
-    API/database intervention. Same auth guard as the outbox relay cron:
+    API/database intervention. Shared cron auth guard (``app.deps.cron``):
     ``CRON_SECRET`` bearer, or ``ALLOW_INSECURE_CRON=1`` local/test bypass.
     """
-    from app.outbox.router import _require_cron_secret
+    from app.deps.cron import require_cron_secret
 
-    _require_cron_secret(request.headers.get("authorization"))
+    require_cron_secret(request.headers.get("authorization"))
     from app.dm.execution import run_dm_execute_sweep
 
     result = run_dm_execute_sweep(db, limit=1)

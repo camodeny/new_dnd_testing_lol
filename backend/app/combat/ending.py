@@ -530,14 +530,6 @@ def end_encounter(
         # the full payload for owner/audit reads while member feeds
         # (public-or-own-actor) converge via the redacted encounter view.
         visibility="dm_only",
-        outbox_event_type=ENCOUNTER_ENDED_EVENT,
-        outbox_payload={
-            "encounter_id": str(encounter.id),
-            "campaign_id": str(encounter.campaign_id),
-            "thread_id": encounter.thread_id,
-            "outcome": outcome,
-        },
-        outbox_operation_id=f"encounter:{encounter.id}:ended",
         provenance={"source": "dm_end_encounter"},
     )
     encounter.ended_event_id = event.id

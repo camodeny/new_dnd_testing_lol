@@ -470,20 +470,12 @@ def complete_adventure(
         mutate=_mutate,
         commit=False,
         payload_builder=_payload,
-        outbox_event_type=ADVENTURE_CLOSING_JOB,
-        outbox_payload={
-            "adventure_id": str(adventure.id),
-            "campaign_id": str(campaign_id),
-            "outcome": validate_outcome(outcome),
-            "operation_id": operation_id,
-        },
-        outbox_operation_id=operation_id,
     )
 
     # Link the authoritative event back onto the adventure for provenance.
     adv = completed["adventure"]
     adv.source_event_id = event.id
-    db.flush()
+    stage_adventure_closing(db, adv, operation_id=operation_id)
     if commit:
         db.commit()
         db.refresh(adv)
@@ -499,6 +491,35 @@ def complete_adventure(
 
 
 # ── Downstream closing work (best-effort) ────────────────────────────────────
+
+
+def stage_adventure_closing(db: Session, adventure: Adventure, *, operation_id: str | None) -> None:
+    """Stage the durable ``adventure.closing`` job row in the caller's transaction.
+
+    The row commits atomically with the completion; ``run_adventure_closing_sweep``
+    (``/api/cron/adventure-closing``) consumes it.
+    """
+    from app.observability.tracing import current_trace_id
+    from models.reliability import Outbox
+
+    db.add(Outbox(
+        id=uuid.uuid4(),
+        aggregate_type="campaign",
+        aggregate_id=adventure.campaign_id,
+        campaign_id=adventure.campaign_id,
+        event_type=ADVENTURE_CLOSING_JOB,
+        operation_id=operation_id,
+        trace_id=current_trace_id(),
+        payload={
+            "adventure_id": str(adventure.id),
+            "campaign_id": str(adventure.campaign_id),
+            "outcome": adventure.outcome,
+            "operation_id": operation_id,
+        },
+        status="pending",
+        attempts=0,
+    ))
+    db.flush()
 
 
 def handle_adventure_closing(envelope, db: Session | None = None) -> dict:
@@ -583,32 +604,42 @@ def _run_closing_followups(db: Session, adventure: Adventure) -> None:
     db.flush()
 
 
-def register_adventure_worker() -> None:
-    from app.queue.consumer import WORKER_HANDLERS
-
-    WORKER_HANDLERS[ADVENTURE_CLOSING_JOB] = handle_adventure_closing
-
-
 def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -> dict:
     """Drive pending adventure closing work through the idempotent worker fence.
 
     Production consumption path for ``adventure.closing`` (mirrors the
-    post-turn sweep): consumes the durable outbox rows directly, translating
-    each through ``envelope_for_outbox`` — the exact translation the relay
-    uses — so queue delivery and this sweep converge on one
-    ``WorkerExecution`` per outbox row. A failed sweep never invalidates the
+    post-turn sweep): consumes the durable outbox rows staged by
+    ``stage_adventure_closing`` with one ``WorkerExecution`` per row (the
+    row id is the job id). A failed sweep never invalidates the
     already-committed narrative completion.
     """
-    from datetime import datetime as _datetime
-    from datetime import timezone as _timezone
+    from datetime import timedelta
 
     from sqlalchemy import or_ as _or_
 
-    from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
+    from app.worker.envelope import new_envelope
     from app.worker.executor import TerminalError, execute_worker_job
     from models.reliability import Outbox
 
-    now = _datetime.now(_timezone.utc)
+    def _retire(row_id: uuid.UUID) -> None:
+        rec = db.get(Outbox, row_id)
+        if rec is None or rec.status == "published":
+            return
+        rec.status = "published"
+        rec.published_at = _now()
+        rec.last_error = None
+        db.commit()
+
+    def _mark_failed(row_id: uuid.UUID, error: str) -> None:
+        rec = db.get(Outbox, row_id)
+        if rec is None:
+            return
+        rec.status = "failed"
+        rec.last_error = error[:2000] if error else None
+        rec.next_attempt_at = _now() + timedelta(seconds=60)
+        db.commit()
+
+    now = _now()
     candidates = list(
         db.execute(
             select(Outbox)
@@ -626,14 +657,24 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
     executed: list[str] = []
     failed: list[dict] = []
     for row in candidates:
+        row_id = row.id
         try:
-            env = envelope_for_outbox(row)
+            env = new_envelope(
+                job_id=row.id,
+                job_type=row.event_type,
+                campaign_id=row.campaign_id,
+                aggregate_id=row.aggregate_id,
+                operation_id=row.operation_id,
+                idempotency_key=str(row.id),
+                trace_id=row.trace_id,
+                payload=row.payload,
+            )
             execute_worker_job(
                 db, env, lambda e, _db=db: handle_adventure_closing(e, _db),
                 max_attempts=max_attempts,
             )
-            ack_published(db, row.id)
-            executed.append(str(row.id))
+            _retire(row_id)
+            executed.append(str(row_id))
         except TerminalError as exc:
             # The worker ledger durably owns the terminal outcome
             # (dead_letter): retire the transport row so a poisoned job can
@@ -644,33 +685,31 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
                 db.rollback()
             except Exception:
                 pass
-            ack_published(db, row.id)
+            _retire(row_id)
             logger.warning(
                 "adventure closing sweep retired terminal outbox_id=%s error=%s",
-                row.id, exc,
+                row_id, exc,
             )
-            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300], "terminal": True})
+            failed.append({"outbox_id": str(row_id), "error": str(exc)[:300], "terminal": True})
         except Exception as exc:  # noqa: BLE001 — sweep must survive bad rows
             try:
                 db.rollback()
             except Exception:
                 pass
             try:
-                mark_failed(db, row.id, str(exc)[:500])
+                _mark_failed(row_id, str(exc)[:500])
             except Exception:
                 pass
             logger.warning(
                 "adventure closing sweep failed outbox_id=%s error=%s",
-                row.id, exc,
+                row_id, exc,
             )
-            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300]})
+            failed.append({"outbox_id": str(row_id), "error": str(exc)[:300]})
     logger.info(
         "adventure closing sweep executed=%s failed=%s", len(executed), len(failed)
     )
     return {"executed": executed, "failed": failed}
 
-
-register_adventure_worker()
 
 
 # ── Derived summary/recap generation (issue #263) ────────────────────────────

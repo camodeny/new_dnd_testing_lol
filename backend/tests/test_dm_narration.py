@@ -364,7 +364,7 @@ def test_disconnect_mid_stream_reconstruct_and_resume(db):
     )
     assert not partial.completed and partial.chunk_count == 1
     # client reload reconstructs exactly what became visible
-    from app.dm_streams.service import list_chunks, reconstruct_text
+    from app.dm.streams import list_chunks, reconstruct_text
     assert reconstruct_text(s, partial.stream_id) == partial.visible_text
     assert len(list_chunks(s, partial.stream_id)) == 1
     # resume persists only the missing suffix — no duplication
@@ -608,9 +608,9 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
     attempt. Remediation marks the streaming attempt failed-visible (#206
     failure state); the input set stays locked.
     """
-    import app.dm_streams.service as stream_svc
+    import app.dm.streams as stream_svc
     from app.dm.turns import StreamBoundaryError, coordinate_turn
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
     from app.runtime.submissions import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -715,7 +715,7 @@ def test_streaming_provider_persists_chunk0_before_provider_completion(db):
 
 
 def test_incremental_gate_rejects_secret_midstream(db):
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
 
     s, camp_id, thread_id = db
     c = _respond([_narr_beat(
@@ -746,7 +746,7 @@ def test_incremental_gate_rejects_secret_midstream(db):
 
 
 def test_incremental_gate_rejects_agency_violation_midstream(db, monkeypatch):
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
     import app.dm.narration as narration_mod
     monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
     s, camp_id, thread_id = db
@@ -788,7 +788,7 @@ def test_full_validation_failure_after_partial_delivery_fails_stream(db):
     authoritative validation: the stream is failed (partial retained as
     failed-visible audit) with violations attached for the repair path.
     """
-    from app.dm_streams.service import get_stream, reconstruct_text
+    from app.dm.streams import get_stream, reconstruct_text
 
     s, camp_id, thread_id = db
     c = _respond([_narr_beat("The goblin snarls and circles.")])
@@ -817,7 +817,7 @@ def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db)
     """Orchestrator remediation: post-visibility full-gate failure reuses
     the #206 failed-visible state; the input set stays locked."""
     from app.dm.turns import StreamBoundaryError, coordinate_turn
-    from app.dm_streams.service import get_stream
+    from app.dm.streams import get_stream
     from app.runtime.submissions import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
 
@@ -862,7 +862,7 @@ def test_chunk0_and_streaming_boundary_share_single_commit(db, monkeypatch):
     realtime delivery.
     """
     import app.dm.turns as turns_mod
-    import app.dm_streams.service as stream_svc
+    import app.dm.streams as stream_svc
     import app.realtime.service as realtime_mod
 
     s, camp_id, thread_id = db

@@ -212,7 +212,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         commit_turn_with_effects,
         mark_recovered_streaming,
     )
-    from app.dm_streams.service import (
+    from app.dm.streams import (
         DMStreamStateError,
         get_stream,
         reopen_failed_stream,

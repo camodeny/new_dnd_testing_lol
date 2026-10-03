@@ -1,7 +1,7 @@
 """Shared campaign authorization — issue #335.
 
 Single home for the member/owner checks previously copy-pasted across the
-dm/runtime/realtime/dm_streams/rolls routers. No behavior change.
+dm/runtime/realtime/rolls routers. No behavior change.
 """
 
 import uuid
