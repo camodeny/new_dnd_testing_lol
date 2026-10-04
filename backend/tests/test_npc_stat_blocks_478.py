@@ -170,3 +170,14 @@ def test_damage_to_unstatted_npc_tells_the_dm_how_to_fix_it(table):
     turn, _ = _run(s, camp_id, thread_id, adjudicate)
     assert turn.status == "succeeded"
     assert "assign_stat_block" in feedbacks[-1]
+
+
+def test_provider_schema_spells_out_effect_argument_keys():
+    # Playtest 2026-10-03: with arguments as an opaque string the model wrote
+    # {"npc_id": ...} and the turn failed; the schema now names exact keys.
+    from app.dm.contract import contract_json_schema_strict
+
+    guide = contract_json_schema_strict()["$defs"]["StagedEffect"]["properties"]["arguments"]["description"]
+    assert "assign_stat_block{npc_entity_id*, monster_id*}" in guide
+    assert "update_scene{scene_patch*, reason*}" in guide
+    assert "apply_attack_damage" not in guide
