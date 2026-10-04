@@ -51,7 +51,7 @@ from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.combat.service import publish_turn_encounter_events, stage_turn_encounter_events
 from app.decisions import record_fail_soft
-from app.world.identity import promote_new_entities_from_contract
+from app.world.identity import promote_new_entities_from_contract, register_promoted_npcs_in_scene
 from app.world.semantic_index import note_turn_committed
 from models.campaigns import Campaign
 from models.dm import DmTurn
@@ -1309,6 +1309,9 @@ def commit_turn(
         if promoted:
             base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
             base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
+            # Introduced NPCs are present by construction (#459).
+            register_promoted_npcs_in_scene(
+                db, locked_campaign, promoted, attempt=attempt, turn=turn)
 
     def _adventure_event_payload() -> dict:
         """Post-mutate payload: same lifecycle fields, resolved adventure id."""

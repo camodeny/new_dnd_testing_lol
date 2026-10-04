@@ -619,3 +619,30 @@ def test_current_scene_location_is_typed_identity_authority():
     for ref in [{"type": "npc", "id": location_id}, {"type": "location", "id": cid},
                 {"type": "location", "id": "Tavern"}, {"type": "location", "id": str(uuid.uuid4())}]:
         assert not validator.validate(contract(ref), packet).passed
+
+
+def test_scene_present_npc_is_identity_authority_without_registry():
+    # Playtest 2026-10-03: the scene showed an introduced NPC's entity_id
+    # (#459) while the optional registry had been budgeted out, and every
+    # reference to that NPC was refused as unknown_canonical_id.
+    cid, npc_id = str(uuid.uuid4()), str(uuid.uuid4())
+    scene = ContextRecord(
+        record_id=f"current-scene:{cid}",
+        value={"campaign_id": cid, "location_name": "Market", "present_actors": [
+            {"kind": "pc", "name": "Wren"},
+            {"kind": "npc", "name": "Rider Captain", "entity_id": npc_id},
+        ]},
+        sources=[SourceRef(source_type="campaign_current_scene", source_id=cid, source_version="1")],
+        authorization=AuthorizationScope(campaign_id=cid),
+    )
+    packet, _, _ = _packet(campaign_id=cid, extra_records={LaneName.CURRENT_SCENE: [scene]},
+                           extra_status={LaneName.CURRENT_SCENE: "authoritative"})
+    from app.dm.validators import EntityValidator
+    validator = EntityValidator()
+    def contract(ref):
+        return _base([{"id": "b1", "type": "narration", "claims": [{
+            "text": "The captain watches.", "claim_kind": "observation",
+            "origin": "established_state", "topic_refs": [ref],
+        }]}])
+    assert validator.validate(contract({"type": "npc", "id": npc_id}), packet).passed
+    assert not validator.validate(contract({"type": "location", "id": npc_id}), packet).passed

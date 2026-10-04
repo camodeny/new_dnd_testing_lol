@@ -23,10 +23,14 @@ from app.decisions import (
     get_policy, record_fail_soft, register_policy, revalidate_for_execution, to_decision_request,
 )
 from app.visibility.policy import RESTRICTED_VISIBILITIES, normalize_visibility
-from app.world.service import create_entity, find_entity_by_idempotency, validate_entity_name
+from app.idempotency import compose_operation_id
+from app.world.knowledge import assert_knowledge
+from app.world.service import (
+    apply_scene_update, create_entity, find_entity_by_idempotency, validate_entity_name,
+)
 from models.campaigns import Campaign
 from models.dm import DmTurnAttempt
-from models.world import WorldEntity, WorldEntityAlias
+from models.world import CampaignCurrentScene, WorldEntity, WorldEntityAlias
 
 IDENTITY_DECISION_CLASS = "world_entity_identity"
 IDENTITY_QUESTION_ID = "resolve_world_entity_identity"
@@ -966,3 +970,90 @@ def promote_new_entities_from_contract(
         )
         promoted.append(entity)
     return promoted
+
+
+def register_promoted_npcs_in_scene(
+    db: Session,
+    campaign: Campaign,
+    promoted: list[WorldEntity],
+    *,
+    attempt: Any,
+    turn: Any = None,
+) -> int:
+    """Make freshly introduced NPCs present in the scene with baseline knowledge (#459).
+
+    Introduction means present by construction: each promoted NPC gains an
+    ``entity_id``-bearing ``present_actors`` entry (deduped by entity id; a
+    name-only or ``temp_id`` entry the model wrote for the same NPC in a
+    same-turn ``update_scene`` is replaced, not duplicated), and receives
+    baseline knowledge of the scene location and the PCs present, so the
+    next packet's knowledge lane covers it without perspective repair.
+    Runs inside the turn-commit revision transaction (no commit). No scene
+    row yet means no scene is established, so nothing is registered. Returns
+    the number of NPCs newly added to ``present_actors``.
+    """
+    npcs = [e for e in promoted if getattr(e, "entity_type", None) == "npc"]
+    scene = db.get(CampaignCurrentScene, campaign.id) if npcs else None
+    if scene is None:
+        return 0
+    actors = [dict(a) for a in (scene.present_actors or []) if isinstance(a, dict)]
+    attempt_id = getattr(attempt, "id", None)
+    operation_id = getattr(attempt, "commit_operation_id", None) or (str(attempt_id) if attempt_id else None)
+    turn_id = getattr(turn, "id", None)
+
+    # Baseline knowledge targets: scene location + PCs already present.
+    targets: list[uuid.UUID] = []
+    if scene.location_entity_id:
+        targets.append(scene.location_entity_id)
+    for actor in actors:
+        if actor.get("kind") != "pc":
+            continue
+        ref = actor.get("entity_id") or actor.get("name")
+        pc, _ = exact_identity_match(db, campaign.id, ref)
+        if pc is not None and pc.entity_type == "character" and pc.id not in targets:
+            targets.append(pc.id)
+
+    added = 0
+    for entity in npcs:
+        details = entity.details or {}
+        temp_id = str(details.get("temp_id") or "").strip()
+        eid = str(entity.id)
+        entry = {"entity_id": eid, "name": entity.name, "kind": "npc"}
+        if details.get("role"):
+            entry["role"] = str(details["role"])[:160]
+        aliases = {normalize_alias(entity.name)}
+        if temp_id:
+            aliases.add(normalize_alias(temp_id))
+        replaced = False
+        deduped: list[dict] = []
+        for actor in actors:
+            by_id = str(actor.get("entity_id") or "") == eid
+            by_name = not actor.get("entity_id") and normalize_alias(str(actor.get("name") or "")) in aliases
+            if not (by_id or by_name):
+                deduped.append(actor)
+            elif not replaced:
+                replaced = True
+                deduped.append(entry)
+        actors = deduped
+        if not replaced:
+            actors.append(entry)
+            added += 1
+        jit_key = stable_jit_key(attempt_id, temp_id or eid)
+        for target_id in targets:
+            assert_knowledge(
+                db, campaign, subject_kind="npc", subject_entity_id=entity.id,
+                target_kind="entity", target_entity_id=target_id,
+                knowledge_state="knows", acquisition_source="co_presence",
+                visibility="dm_only",
+                provenance={"source": "npc_introduction", "temp_id": temp_id or None},
+                source_turn_id=turn_id, source_attempt_id=attempt_id,
+                operation_id=operation_id,
+                idempotency_key=compose_operation_id(jit_key, "know", target_id),
+            )
+    apply_scene_update(
+        db, campaign, new_revision=int(campaign.revision or 0) + 1,
+        present_actors=actors,
+        source_turn_id=turn_id, source_attempt_id=attempt_id,
+        operation_id=operation_id,
+    )
+    return added

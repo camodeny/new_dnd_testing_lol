@@ -654,3 +654,81 @@ def test_same_name_keep_distinct_narrates_then_commits_with_one_decision():
     assert {row.id for row in rows} != {north_guard.id}
     south = next(row for row in rows if row.id != north_guard.id)
     assert south.details["identity_resolution"]["outcome"] == KEEP_DISTINCT
+
+
+# ── Introduced NPCs become scene-present with baseline knowledge (#459) ───────
+
+def _scene_with_pc(db, campaign):
+    from app.world.service import apply_scene_update
+    place = make_entity(db, campaign, "The Rusty Anchor", kind="location")
+    pc = make_entity(db, campaign, "Oneshot Hero", kind="character")
+    apply_scene_update(
+        db, campaign, new_revision=8, location_entity_id=place.id,
+        location_name="The Rusty Anchor",
+        present_actors=[{"kind": "pc", "name": "Oneshot Hero"}])
+    return place, pc
+
+
+def _promote_hooded(db, campaign):
+    attempt = _attempt_fake({"new_entities": [{
+        "temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Hooded Traveler",
+        "role": "stranger"}]})
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": NEW_ENTITY}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=service)
+    return promoted, attempt, turn
+
+
+def test_promoted_npc_joins_scene_present_actors_with_entity_id():
+    from app.world.identity import register_promoted_npcs_in_scene
+    from models.world import CampaignCurrentScene
+    db, campaign = setup_db()
+    _scene_with_pc(db, campaign)
+    promoted, attempt, turn = _promote_hooded(db, campaign)
+    assert register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn) == 1
+    actors = db.get(CampaignCurrentScene, campaign.id).present_actors
+    assert actors[0] == {"kind": "pc", "name": "Oneshot Hero"}
+    assert actors[1] == {
+        "entity_id": str(promoted[0].id), "name": "Hooded Traveler",
+        "kind": "npc", "role": "stranger"}
+    # Retry is idempotent: no duplicate entry.
+    assert register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn) == 0
+    assert len(db.get(CampaignCurrentScene, campaign.id).present_actors) == 2
+
+
+@pytest.mark.parametrize("model_entry", [
+    {"name": "Hooded Traveler", "kind": "npc"},
+    {"name": "tmp_npc_1"},
+    "hooded traveler",
+])
+def test_same_turn_update_scene_entry_is_replaced_not_duplicated(model_entry):
+    from app.world.identity import register_promoted_npcs_in_scene
+    from app.world.service import apply_scene_update
+    from models.world import CampaignCurrentScene
+    db, campaign = setup_db()
+    _scene_with_pc(db, campaign)
+    apply_scene_update(db, campaign, new_revision=9, present_actors=[
+        {"kind": "pc", "name": "Oneshot Hero"}, model_entry])
+    promoted, attempt, turn = _promote_hooded(db, campaign)
+    assert register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn) == 0
+    actors = db.get(CampaignCurrentScene, campaign.id).present_actors
+    assert [a["name"] for a in actors] == ["Oneshot Hero", "Hooded Traveler"]
+    assert actors[1]["entity_id"] == str(promoted[0].id)
+
+
+def test_promoted_npc_gets_baseline_knowledge_and_lane_covers_it():
+    from app.world.identity import register_promoted_npcs_in_scene
+    from app.world.knowledge import build_knowledge_visibility_values
+    db, campaign = setup_db()
+    place, pc = _scene_with_pc(db, campaign)
+    promoted, attempt, turn = _promote_hooded(db, campaign)
+    register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn)
+    register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn)
+    (value,) = build_knowledge_visibility_values(
+        db, campaign, [], npc_entity_ids=[promoted[0].id])
+    assert value["subject_resolved"] is True
+    # Retry must not duplicate rows (idempotency per attempt/temp_id/target).
+    assert {e["target_id"] for e in value["entries"]} == {str(place.id), str(pc.id)}
+    assert len(value["entries"]) == 2
