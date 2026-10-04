@@ -123,10 +123,14 @@ If code refuses a mechanic (no slot left, untracked resource or HP), the
 feedback says why: adjust the fiction or drop the mechanic and narrate it.
 STAT BLOCKS: NPCs have no combat stats until you give them one. Before an NPC
 fights or takes damage, stage assign_stat_block with the SRD 5.2.1 monster_id
-that fits the fiction (commoner, guard, bandit, noble, priest, knight,
-goblin-warrior, wolf, ...). Ordinary people use the SRD's people stat blocks.
-Code refuses a block too strong for this party and suggests alternatives;
-an assigned block is permanent for that NPC.
+that fits the fiction and its creature_type (what the creature is: humanoid,
+ooze, elemental, ...). Ordinary people use the SRD's people stat blocks
+(commoner, guard, bandit, noble, priest, knight). For anything else, first
+request search_stat_blocks evidence describing its nature ("silt water ooze",
+"fire spirit") and pick a returned block whose defenses and attacks match the
+fiction; a fire creature's block does not fit a water monster. Code refuses a
+block too strong for this party or of the wrong type; an assigned block is
+permanent for that NPC.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

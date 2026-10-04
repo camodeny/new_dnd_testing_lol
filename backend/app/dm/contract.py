@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import re
+import typing
 import uuid
 from typing import Any, Literal
 
@@ -618,6 +619,10 @@ class AssignStatBlockArgs(StrictModel):
     """
     npc_entity_id: str = Field(min_length=1, max_length=160, description="Durable NPC world-entity UUID from the packet")
     monster_id: str = Field(min_length=1, max_length=80, description="SRD 5.2.1 stat block id, e.g. bandit, guard, commoner, goblin-warrior")
+    creature_type: Literal[
+        "aberration", "beast", "celestial", "construct", "dragon", "elemental", "fey",
+        "fiend", "giant", "humanoid", "monstrosity", "ooze", "plant", "undead",
+    ] = Field(description="What the creature is in the fiction; the block must be this SRD type")
 
     @field_validator("npc_entity_id")
     @classmethod
@@ -914,7 +919,7 @@ class StagedEffect(StrictModel):
 
 class EvidenceRequest(StrictModel):
     id: str = Field(min_length=1, max_length=48)
-    tool: Literal["ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
+    tool: Literal["ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules", "search_stat_blocks", "lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "query_world_timeline", "lookup_source_turn", "query_character_knowledge"] = Field(description="Read-only evidence tool")
     question: str | None = Field(default=None, max_length=600)
     scope: Literal["current_player", "party", "character_id"] | None = None
     character_id: str | int | None = None
@@ -947,6 +952,9 @@ class EvidenceRequest(StrictModel):
         elif self.tool == "search_rules":
             if not (self.query and self.query.strip()) and not (self.question and self.question.strip()):
                 raise ValueError("search_rules requires query")
+        elif self.tool == "search_stat_blocks":
+            if not (self.query and self.query.strip()):
+                raise ValueError("search_stat_blocks requires query (the creature's nature, e.g. 'silt water ooze')")
         elif self.tool in ("lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "lookup_source_turn"):
             if not (self.query and self.query.strip()):
                 raise ValueError(f"{self.tool} requires query (stable record id)")
@@ -1349,7 +1357,13 @@ def _effect_argument_guide() -> str:
     for effect_type, model in EFFECT_ARGS_MODELS.items():
         if effect_type in _CODE_BUILT_EFFECTS:
             continue
-        keys = [f"{name}*" if info.is_required() else name for name, info in model.model_fields.items()]
+        keys = []
+        for name, info in model.model_fields.items():
+            key = f"{name}*" if info.is_required() else name
+            # Closed vocabularies (creature_type, outcome, op) list their values.
+            if typing.get_origin(info.annotation) is Literal:
+                key += "=" + "|".join(str(v) for v in typing.get_args(info.annotation))
+            keys.append(key)
         parts.append(f"{effect_type}{{{', '.join(keys)}}}")
     return "; ".join(parts)
 

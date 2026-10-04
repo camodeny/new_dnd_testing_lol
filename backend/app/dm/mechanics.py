@@ -75,7 +75,9 @@ class MechanicsResolution:
     issues: list[MechanicIssue] = field(default_factory=list)
 
 
-def check_stat_block_assignment(db: Session, campaign: Any, npc_entity_id: Any, monster_id: str) -> tuple[Any, dict[str, Any]]:
+def check_stat_block_assignment(
+    db: Session, campaign: Any, npc_entity_id: Any, monster_id: str, creature_type: str | None = None,
+) -> tuple[Any, dict[str, Any]]:
     """``(npc_entity, block)`` an ``assign_stat_block`` effect may apply (#478).
 
     Shared by pre-narration validation and the commit handler: the target
@@ -98,6 +100,7 @@ def check_stat_block_assignment(db: Session, campaign: Any, npc_entity_id: Any, 
         )
     block = check_assignable(
         monster_id, party_levels=roster_levels(db, campaign.id), difficulty=getattr(campaign, "difficulty", "medium"),
+        declared_type=creature_type,
     )
     return target.row, block
 
@@ -110,7 +113,8 @@ def stat_block_issues(db: Session, campaign: Any, contract: DmTurnContractV1) ->
             continue
         args = effect.arguments
         try:
-            check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"))
+            check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"),
+                                        args.get("creature_type"))
         except StatBlockError as exc:
             issues.append(MechanicIssue(effect.id, exc.code, str(exc)))
     return issues
@@ -136,10 +140,10 @@ def reveal_issues(db: Session, campaign: Any, turn: Any, contract: DmTurnContrac
     return issues
 
 
-def _pending_stat_blocks(contract: DmTurnContractV1) -> dict[str, str]:
-    """``npc_entity_id -> monster_id`` assigned earlier in this same contract."""
+def _pending_stat_blocks(contract: DmTurnContractV1) -> dict[str, tuple[str, str | None]]:
+    """``npc_entity_id -> (monster_id, creature_type)`` assigned in this same contract."""
     return {
-        str(e.arguments.get("npc_entity_id")): str(e.arguments.get("monster_id"))
+        str(e.arguments.get("npc_entity_id")): (str(e.arguments.get("monster_id")), e.arguments.get("creature_type"))
         for e in contract.staged_effects
         if e.effect_type == "assign_stat_block"
     }
@@ -165,7 +169,7 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
             if key not in targets:
                 targets[key] = load_state_target(db, campaign, kind, intent.target.id, label=f"mechanic {intent.id!r}")
                 if kind == "npc" and key[1] in pending:
-                    _overlay_stat_block(db, campaign, targets[key], pending[key[1]])
+                    _overlay_stat_block(db, campaign, targets[key], *pending[key[1]])
             target = targets[key]
         except (ValueError, StatBlockError) as exc:
             resolution.issues.append(MechanicIssue(intent.id, getattr(exc, "code", "unknown_target"), str(exc)))
@@ -192,9 +196,9 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
     return resolution
 
 
-def _overlay_stat_block(db: Session, campaign: Any, target: Any, monster_id: str) -> None:
+def _overlay_stat_block(db: Session, campaign: Any, target: Any, monster_id: str, creature_type: str | None) -> None:
     """Show a pending same-turn assignment on the in-memory target view only."""
-    _, block = check_stat_block_assignment(db, campaign, target.row.id, monster_id)
+    _, block = check_stat_block_assignment(db, campaign, target.row.id, monster_id, creature_type)
     target.details.update(stat_block_details(block))
     target.hp_current = block["hit_points"]
 
