@@ -788,7 +788,7 @@ class MechanicIntent(StrictModel):
     id: str = Field(min_length=1, max_length=40, description="Stable id within this contract, e.g. mech_1")
     kind: MechanicKind
     target: EntityRef = Field(description="PC (type=character) or NPC (type=npc) affected; for spend, who spends")
-    source: str = Field(min_length=1, max_length=160, description="What causes it in the fiction, e.g. 'collapsing ceiling', 'Hold Person'")
+    source: str = Field(min_length=1, max_length=160, description="Short noun phrase, read inside a sentence: the cause for damage/heal/condition ('the collapsing ceiling', 'a spider bite', 'Hold Person'), or for spend what it is spent on ('Healing Word', 'inspiring Brannoc')")
     damage_dice: str | None = Field(default=None, max_length=32, description="damage only: dice expression like 2d6 or 1d8+2")
     damage_type: str | None = Field(default=None, max_length=32, description="damage only: e.g. fire, bludgeoning")
     heal_dice: str | None = Field(default=None, max_length=32, description="heal only: dice expression like 2d4+3 or 1d10+3")

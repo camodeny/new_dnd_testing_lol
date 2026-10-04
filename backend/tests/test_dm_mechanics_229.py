@@ -263,3 +263,29 @@ def test_healing_a_downed_pc_resets_death_saves(table):
     assert not resolution.issues
     assert [e["effect_type"] for e in resolution.effects] == ["apply_death_save", "apply_healing"]
     assert resolution.effects[0]["arguments"]["op"] == "reset"
+
+
+@pytest.mark.parametrize("resource, amount, source, expected", [
+    # Playtest 2026-10-03 produced "spends 1 Bardic Inspiration (Bardic Inspiration to Brannoc)".
+    ("Bardic Inspiration", 1, "Bardic Inspiration to Brannoc", "Mira uses Bardic Inspiration to Brannoc."),
+    ("Second Wind", 1, "Second Wind", "Mira uses Second Wind."),
+    ("Bardic Inspiration", 1, "inspiring Tamsin", "Mira uses Bardic Inspiration for inspiring Tamsin."),
+    ("Ki", 2, "Flurry of Blows", "Mira spends 2 uses of Ki for Flurry of Blows."),
+])
+def test_spend_outcome_reads_as_a_sentence(resource, amount, source, expected):
+    from app.dm.mechanics import _spend_text
+
+    assert _spend_text("Mira", resource, amount, source) == expected
+
+
+def test_condition_and_slot_outcomes_read_as_sentences(table):
+    s, camp_id, thread_id, char_id = table
+    contract = normalize_contract(_contract([
+        _mech(char_id, kind="condition", condition="poisoned", condition_op="add", source="a spider bite"),
+        _mech(char_id, "mech_2", kind="spend", spell_slot_level=1, source="Healing Word"),
+    ]))
+    turn = s.get(DmTurn, _submit(s, camp_id, thread_id)[0].id)
+
+    outcomes = [text for _, text in resolve_mechanics(s, s.get(Campaign, camp_id), turn, contract).outcomes]
+
+    assert outcomes == ["A spider bite leaves Mira poisoned.", "Mira expends a level 1 spell slot on Healing Word."]
