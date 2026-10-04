@@ -917,6 +917,7 @@ def promote_new_entities_from_contract(
     stored = stored_identity_outcomes(attempt)
 
     promoted: list[WorldEntity] = []
+    reused_names: list[tuple[WorldEntity, str]] = []
     turn_id = getattr(turn, "id", None)
     attempt_id = getattr(attempt, "id", None)
     operation_id = getattr(attempt, "commit_operation_id", None) or (str(attempt_id) if attempt_id else None)
@@ -935,11 +936,13 @@ def promote_new_entities_from_contract(
         if outcome is not None:
             # Pre-narration decision: revalidate against fresh state and
             # apply with no second model call.
-            promoted.append(_apply_stored_identity_outcome(
+            entity = _apply_stored_identity_outcome(
                 db, campaign, proposal=proposal, outcome=outcome,
                 jit_key=jit_key, turn_id=turn_id, attempt_id=attempt_id,
                 operation_id=operation_id,
-            ))
+            )
+            promoted.append(entity)
+            reused_names.append((entity, proposal["public_name"]))
             continue
         # Fallback for direct commit callers without a pre-narration step.
         frame, selected_id, reused, service, _runner_up = _resolve_identity_proposal(
@@ -952,6 +955,7 @@ def promote_new_entities_from_contract(
         )
         if reused is not None:
             promoted.append(reused)
+            reused_names.append((reused, proposal["public_name"]))
             continue
         entity, _ = create_entity_after_resolution(
             db, campaign, frame, selected_id,
@@ -969,7 +973,83 @@ def promote_new_entities_from_contract(
             },
         )
         promoted.append(entity)
+        reused_names.append((entity, proposal["public_name"]))
+    for entity, used_name in reused_names:
+        remember_reused_name(db, entity, used_name, source_turn_id=turn_id)
     return promoted
+
+
+def remember_reused_name(db: Session, entity: WorldEntity, used_name: Any, *, source_turn_id: Any = None) -> bool:
+    """Keep the name the DM used for a reused entity as an alias (#469).
+
+    Identity resolution can reuse an existing entity under a different
+    public name; recording it lets the next turn resolve that name by exact
+    match, with no decision call. A name already canonical for this entity,
+    or owned by another entity, is left alone: this never fails a commit.
+    """
+    try:
+        name = validate_entity_name(used_name)
+    except ValueError:
+        return False
+    if normalize_alias(name) == normalize_alias(entity.name):
+        return False
+    try:
+        add_alias(db, entity, name, visibility=entity.visibility or "campaign",
+                  provenance={"source": "identity_reuse", "source_turn_id": str(source_turn_id) if source_turn_id else None})
+    except ValueError:
+        return False
+    return True
+
+
+def check_entity_rename(db: Session, campaign_id: uuid.UUID, entity_id: Any, new_name: Any) -> tuple[WorldEntity, str]:
+    """``(entity, validated name)`` a reveal may apply, or raise ``ValueError``.
+
+    The entity must be a live entity of this campaign, the name must differ
+    from its current one, and no other entity may already hold that name or
+    alias (that would merge two people into one name).
+    """
+    try:
+        eid = uuid.UUID(str(entity_id))
+    except ValueError:
+        raise ValueError("entity_id must be a UUID")
+    entity = db.get(WorldEntity, eid)
+    if entity is None or entity.campaign_id != campaign_id or entity.superseded_by_id:
+        raise ValueError(f"entity {entity_id} is not a live entity of this campaign")
+    name = validate_entity_name(new_name)
+    if normalize_alias(name) == normalize_alias(entity.name):
+        raise ValueError(f"{entity.name!r} already carries that name")
+    owner, _ = exact_identity_match(db, campaign_id, name)
+    if owner is not None and owner.id != entity.id:
+        raise ValueError(f"the name {name!r} already belongs to another entity ({owner.name}); "
+                         "introduce a different person as a new entity instead")
+    return entity, name
+
+
+def reveal_entity_name(db: Session, campaign_id: uuid.UUID, entity_id: Any, new_name: Any, *, source_turn_id: Any = None) -> WorldEntity:
+    """Rename an entity to a name learned in play; the old name stays an alias.
+
+    "The Hooded Door-Warder" says "they call me Pell": the canonical name
+    becomes Pell, the placeholder still resolves to him, and the scene's
+    present actor entry follows. Runs inside the turn commit (no commit here).
+    """
+    entity, name = check_entity_rename(db, campaign_id, entity_id, new_name)
+    old_name = entity.name
+    entity.name = name
+    entity.revision = int(entity.revision or 1) + 1
+    db.flush()
+    remember_reused_name(db, entity, old_name, source_turn_id=source_turn_id)
+    scene = db.get(CampaignCurrentScene, campaign_id)
+    if scene is not None and scene.present_actors:
+        actors = [dict(a) if isinstance(a, dict) else a for a in scene.present_actors]
+        changed = False
+        for actor in actors:
+            if isinstance(actor, dict) and str(actor.get("entity_id") or "") == str(entity.id):
+                actor["name"] = name
+                changed = True
+        if changed:
+            scene.present_actors = actors
+            db.flush()
+    return entity
 
 
 def register_promoted_npcs_in_scene(

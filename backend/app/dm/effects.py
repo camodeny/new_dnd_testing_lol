@@ -101,6 +101,9 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "apply_healing": "dm_private",
     # NPC stat blocks (#478) are DM-only: players learn AC/HP through play.
     "assign_stat_block": "dm_private",
+    # A revealed name (#469) becomes the entity's canonical, campaign-wide
+    # name; private-thread reveals are refused before staging.
+    "reveal_entity_name": "public",
     # DM-authored map terrain (#232) defaults to dm_private (fail-closed):
     # hidden trap/stranded geometry must never widen to a shared audience
     # unless the staged effect explicitly says so.
@@ -1035,6 +1038,19 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
         "effect apply_resource effect_id=%s target=%s:%s op=%s resource=%s slot=%s",
         effect.get("id"), args.get("target_kind"), args.get("target_id"), op, resource, slot_level,
     )
+
+
+@register("reveal_entity_name")
+def _handle_reveal_entity_name(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Rename an entity to a name learned in play; the old name stays an alias (#469)."""
+    from app.world.identity import reveal_entity_name
+
+    args = effect.get("arguments") or {}
+    try:
+        entity = reveal_entity_name(db, campaign.id, args.get("entity_id"), args.get("name"), source_turn_id=turn.id)
+    except ValueError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} reveal_entity_name refused: {exc}") from exc
+    logger.info("effect reveal_entity_name effect_id=%s entity_id=%s", effect.get("id"), entity.id)
 
 
 @register("assign_stat_block")
