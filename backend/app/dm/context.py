@@ -1641,7 +1641,7 @@ IDENTITY_DEFERRAL_RECORD_ID = "identity-deferral:advisory"
 
 
 def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
-    """Advisory note from abandoned-parent identity deferrals, or ``None``.
+    """Advisory note from the attempt's own and abandoned-parent identity deferrals, or ``None``.
 
     Walks the explicit-retry parent chain (abandoned ``explicit_retry``
     attempts) collecting ``via == "deferred"`` identity-resolution memos left
@@ -1654,6 +1654,15 @@ def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
     try:
         memos: list[dict[str, Any]] = []
         current = attempt
+        # The attempt's own memo comes first: an in-attempt re-adjudication
+        # after a deferral reads the memo the resolver just persisted.
+        for item in getattr(attempt, "identity_resolutions", None) or []:
+            if (
+                isinstance(item, dict)
+                and item.get("outcome") == "DEFER"
+                and item.get("via") == "deferred"
+            ):
+                memos.append(item)
         for _ in range(_DEFERRAL_MAX_LEVELS):
             parent_id = getattr(current, "parent_attempt_id", None)
             if not parent_id:
