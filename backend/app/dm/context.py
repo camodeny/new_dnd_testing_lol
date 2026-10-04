@@ -25,6 +25,7 @@ from pydantic import Field, field_validator, model_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.adventures.service import get_current_adventure
 from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics_for_sheet
@@ -56,6 +57,7 @@ class LaneName(str, Enum):
     PLAYER_INPUTS = "player_inputs"
     PROTECTED_PCS = "protected_pcs"
     CURRENT_SCENE = "current_scene"
+    ACTIVE_ADVENTURE = "active_adventure"
     CHARACTER_STATE = "character_state"
     RELEVANT_CANON = "relevant_canon_relations"
     KNOWLEDGE_VISIBILITY = "knowledge_visibility"
@@ -1264,6 +1266,40 @@ def assemble_attempt_context(
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
 
+    # Active adventure (issue #458): lets the model see the arc it may close
+    # via ``complete_adventure``. Optional lane -- a campaign between
+    # adventures (or in an epilogue) legitimately has none. Adjudication-only:
+    # the premise comes from owner-supplied adventure metadata, which is not
+    # a player-safe projection.
+    lane_started = time.monotonic()
+    adventure = get_current_adventure(db, campaign.id)
+    if adventure is not None:
+        premise = (adventure.adventure_metadata or {}).get("premise")
+        records[LaneName.ACTIVE_ADVENTURE].append(
+            ContextRecord(
+                record_id=f"active-adventure:{adventure.id}",
+                required=False,
+                priority=80,
+                value={
+                    "adventure_id": str(adventure.id),
+                    "title": adventure.title,
+                    "premise": premise[:1000] if isinstance(premise, str) and premise.strip() else None,
+                    "status": adventure.status,
+                },
+                sources=[
+                    _source(
+                        "adventure",
+                        adventure.id,
+                        adventure.updated_at.isoformat() if adventure.updated_at else adventure.status,
+                        attempt.source_revision,
+                    )
+                ],
+                authorization=scope,
+                use="adjudication_only",
+            )
+        )
+    timings[LaneName.ACTIVE_ADVENTURE] = (time.monotonic() - lane_started) * 1000
+
     # Complete entity registry (experiment): every live NPC/location-style
     # entity with id + name + one-line summary, so the adjudicator can
     # reference exact canonical IDs instead of proposing near-duplicate
@@ -1641,7 +1677,7 @@ IDENTITY_DEFERRAL_RECORD_ID = "identity-deferral:advisory"
 
 
 def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
-    """Advisory note from abandoned-parent identity deferrals, or ``None``.
+    """Advisory note from the attempt's own and abandoned-parent identity deferrals, or ``None``.
 
     Walks the explicit-retry parent chain (abandoned ``explicit_retry``
     attempts) collecting ``via == "deferred"`` identity-resolution memos left
@@ -1654,6 +1690,15 @@ def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
     try:
         memos: list[dict[str, Any]] = []
         current = attempt
+        # The attempt's own memo comes first: an in-attempt re-adjudication
+        # after a deferral reads the memo the resolver just persisted.
+        for item in getattr(attempt, "identity_resolutions", None) or []:
+            if (
+                isinstance(item, dict)
+                and item.get("outcome") == "DEFER"
+                and item.get("via") == "deferred"
+            ):
+                memos.append(item)
         for _ in range(_DEFERRAL_MAX_LEVELS):
             parent_id = getattr(current, "parent_attempt_id", None)
             if not parent_id:

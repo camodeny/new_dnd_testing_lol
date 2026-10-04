@@ -203,6 +203,15 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                     # treat campaign IDs or names as entity authority.
                     if lane.name == LaneName.CURRENT_SCENE and v.get("location_entity_id"):
                         out[str(v["location_entity_id"]).strip().lower()] = "location"
+                    # Present actors carrying a durable entity_id (#459) are
+                    # identity authority too: the scene is a required lane,
+                    # while the entity registry is optional and is the first
+                    # record budget trimming drops. Without this the model
+                    # reuses an NPC id the scene shows it and is refused.
+                    if lane.name == LaneName.CURRENT_SCENE:
+                        for actor in v.get("present_actors") or []:
+                            if isinstance(actor, dict) and actor.get("entity_id") and actor.get("kind") == "npc":
+                                out[str(actor["entity_id"]).strip().lower()] = "npc"
                     # A code-owned identity repair can name a canonical
                     # entity even when the optional registry was budgeted
                     # out. Its required record is identity authority for the

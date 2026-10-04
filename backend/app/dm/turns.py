@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -51,7 +51,7 @@ from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.combat.service import publish_turn_encounter_events, stage_turn_encounter_events
 from app.decisions import record_fail_soft
-from app.world.identity import promote_new_entities_from_contract
+from app.world.identity import promote_new_entities_from_contract, register_promoted_npcs_in_scene
 from app.world.semantic_index import note_turn_committed
 from models.campaigns import Campaign
 from models.dm import DmTurn
@@ -163,6 +163,63 @@ def _collect_unresolved_submissions(
         .order_by(PlayerSubmission.sequence.asc())
     ).scalars().all()
     return list(rows)
+
+
+#: Grace period before the sweep treats an ``accepted`` submission as stranded
+#: (the submission endpoint coordinates inline; this only covers input that
+#: coordination deferred, e.g. while another turn was streaming).
+STRANDED_SUBMISSION_DELAY_SECONDS = 5
+
+
+def find_stranded_submission_threads(
+    db: Session, *, limit: int = 5, min_age_seconds: float = STRANDED_SUBMISSION_DELAY_SECONDS
+) -> list[tuple[uuid.UUID, str, str]]:
+    """Oldest ``(campaign_id, thread_id, audience)`` with accepted input and no active turn.
+
+    Excludes archived campaigns, lobby threads (never assembled into turns) and
+    direct player-to-player threads (never invoke the AI DM; their submissions
+    stay ``accepted`` by design).
+    """
+    from models.threads import CampaignThread
+
+    cutoff = utcnow() - timedelta(seconds=min_age_seconds)
+    # Direct/lobby thread ids are stringified because PlayerSubmission.thread_id
+    # is a string column (same pattern as billing/resolution_guarantee.py);
+    # non-UUID ids like "main" are never in the excluded set. Grouping and the
+    # LIMIT stay in SQL so perpetually-accepted direct chat never inflates the scan.
+    excluded = [
+        str(v)
+        for v in db.execute(
+            select(CampaignThread.id).where(
+                (CampaignThread.thread_type == "lobby") | (CampaignThread.private_kind == "direct")
+            )
+        ).scalars().all()
+    ]
+    oldest = func.min(PlayerSubmission.accepted_at)
+    q = (
+        select(PlayerSubmission.campaign_id, PlayerSubmission.thread_id, func.min(PlayerSubmission.audience))
+        .join(Campaign, Campaign.id == PlayerSubmission.campaign_id)
+        .where(
+            PlayerSubmission.resolution_status == "accepted",
+            PlayerSubmission.accepted_at <= cutoff,
+            PlayerSubmission.audience != "lobby",
+            Campaign.status != "archived",
+        )
+        .group_by(PlayerSubmission.campaign_id, PlayerSubmission.thread_id)
+        .order_by(oldest.asc())
+        .limit(max(1, limit) * 4)
+    )
+    if excluded:
+        q = q.where(PlayerSubmission.thread_id.not_in(excluded))
+    out: list[tuple[uuid.UUID, str, str]] = []
+    for campaign_id, tid, audience in db.execute(q).all():
+        tid = str(tid)
+        if get_active_turn(db, campaign_id, tid) is not None:
+            continue
+        out.append((campaign_id, tid, audience))
+        if len(out) >= max(1, limit):
+            break
+    return out
 
 
 def get_active_turn(db: Session, campaign_id: uuid.UUID, thread_id: str) -> DmTurn | None:
@@ -1315,6 +1372,9 @@ def commit_turn(
         if promoted:
             base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
             base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
+            # Introduced NPCs are present by construction (#459).
+            register_promoted_npcs_in_scene(
+                db, locked_campaign, promoted, attempt=attempt, turn=turn)
 
     def _adventure_event_payload() -> dict:
         """Post-mutate payload: same lifecycle fields, resolved adventure id."""

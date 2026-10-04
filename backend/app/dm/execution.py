@@ -38,8 +38,8 @@ from app.campaigns.service import CampaignArchivedError
 from app.clock import utcnow
 from app.observability.tracing import structured_log
 from app.providers import policy as role_policy
-from app.worker.executor import RETRIABLE, TERMINAL, classify_error
-from app.world.identity import IdentityReuseRequiresReadjudication
+from app.worker.executor import RETRIABLE, TERMINAL, RetriableError, classify_error
+from app.world.identity import IdentityDeferredError, IdentityReuseRequiresReadjudication
 
 logger = logging.getLogger(__name__)
 
@@ -499,6 +499,7 @@ def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, ca
 
     db = run.db
     repaired = False
+    deferred = False
     while True:
         try:
             result = execute_validated_turn(
@@ -548,6 +549,36 @@ def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, ca
                 turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
                 canonical_id=conflict.canonical_id, trace_id=run.trace_id,
             )
+            contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
+        except IdentityDeferredError as exc:
+            db.rollback()
+            current = db.get(DmTurnAttempt, run.attempt_id)
+            if current is not None:
+                # Keep the DEFER memo (the advisory and the runner-up
+                # fallback read it); drop everything else staged.
+                current.contract_snapshot = None
+                current.staged_effects = []
+                current.identity_resolutions = [
+                    item for item in (current.identity_resolutions or [])
+                    if isinstance(item, dict) and item.get("via") == "deferred"
+                ] or None
+                db.add(current)
+                db.commit()
+            if deferred or not can_readjudicate:
+                # Deferral is a normal pipeline outcome, not a poison turn:
+                # requeue instead of a terminal visible failure.
+                raise RetriableError(str(exc)) from exc
+            deferred = True
+            structured_log(
+                logger, logging.INFO, "dm_execute_identity_deferral_readjudication",
+                turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+                temp_id=exc.temp_id, trace_id=run.trace_id,
+            )
+            from app.dm.context import attach_retry_deferral_advisory, build_retry_deferral_advisory
+
+            note = build_retry_deferral_advisory(db, current) if current is not None else None
+            if note is not None:
+                packet = attach_retry_deferral_advisory(packet, note)
             contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
 
 
@@ -1052,6 +1083,53 @@ def find_prepared_attempts(db: Session, *, limit: int = 5):
         return []
 
 
+def coordinate_stranded_submissions(db: Session, *, limit: int = 5) -> list[dict]:
+    """Coordinate ``accepted`` submissions that never became a turn (#456).
+
+    The submission endpoint coordinates once and defers on stream-boundary /
+    turn-conflict; nothing else retries. Each thread is isolated so one failure
+    never blocks the others. Returned turns' prepared attempts are picked up by
+    the same sweep.
+    """
+    from app.billing.resolution_guarantee import CapacityPausedError
+    from app.dm.turns import (
+        StreamBoundaryError,
+        TurnConflictError,
+        coordinate_turn,
+        find_stranded_submission_threads,
+    )
+
+    try:
+        targets = find_stranded_submission_threads(db, limit=limit)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("dm_execute_sweep stranded_lookup failed error=%s", exc)
+        return []
+    coordinated: list[dict] = []
+    for campaign_id, thread_id, audience in targets:
+        try:
+            coord = coordinate_turn(db, campaign_id, thread_id, audience=audience, commit=True)
+        except (StreamBoundaryError, TurnConflictError, CapacityPausedError) as exc:
+            db.rollback()
+            logger.info(
+                "dm_execute_sweep stranded_deferred campaign_id=%s thread_id=%s reason=%s",
+                campaign_id, thread_id, exc,
+            )
+            continue
+        except Exception as exc:
+            db.rollback()
+            logger.warning(
+                "dm_execute_sweep stranded_failed campaign_id=%s thread_id=%s error=%s",
+                campaign_id, thread_id, exc,
+            )
+            continue
+        if coord is not None:
+            coordinated.append(
+                {"campaign_id": str(campaign_id), "thread_id": thread_id, "turn_id": str(coord[0].id)}
+            )
+    return coordinated
+
+
 def run_dm_execute_sweep(
     db: Session,
     *,
@@ -1060,7 +1138,7 @@ def run_dm_execute_sweep(
     adjudicate=None,
     narrator=None,
 ) -> dict:
-    """Recover stuck claims, then execute oldest prepared attempts.
+    """Recover stuck claims, coordinate stranded input, then execute prepared attempts.
 
     Returns ``{"executed": [...], "failed": [...], "skipped": [...]}`` with
     string attempt ids. One attempt's failure never blocks the rest.
@@ -1074,6 +1152,7 @@ def run_dm_execute_sweep(
         logger.warning("dm_execute_sweep recover failed error=%s", exc)
         recovered = 0
     outcome: dict = {"executed": [], "failed": [], "skipped": [], "recovered": recovered}
+    outcome["coordinated"] = coordinate_stranded_submissions(db, limit=limit)
     for attempt in find_prepared_attempts(db, limit=limit):
         aid = str(attempt.id)
         try:

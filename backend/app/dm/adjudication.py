@@ -77,6 +77,13 @@ impossible, moot, or uninformed in a way the player would reconsider, do NOT
 emit beats for an action that never happens: use clarify mode with the answer
 and let the player redeclare.
 
+ADVENTURE COMPLETION:
+The active_adventure lane names the current adventure. When the played fiction
+has resolved its arc (victory, failure, retreat, capture, or any other
+conclusive outcome), stage complete_adventure with the outcome and reason;
+omit adventure_id to close the active one. Do not stage it while the arc is
+still open.
+
 REFERENCES:
 EntityRef.id is the exact durable character/entity UUID in the packet, never
 a record_id, display name, submission ID, or temporary proposal ID. The current

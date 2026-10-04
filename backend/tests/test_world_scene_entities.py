@@ -254,6 +254,47 @@ def test_jit_promotion_from_committed_turn_exactly_once():
     assert str(event2.id) == str(event.id)
 
 
+def test_committed_turn_introducing_npc_registers_it_in_scene_once():
+    """#459: promotion in commit_turn makes the NPC scene-present by entity_id."""
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="We enter",
+        segments=[{"type": "ic", "text": "We enter."}], thread_id=tid,
+    )
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, tid)
+    attempt.contract_snapshot = {
+        "contract_version": "dm_turn_contract_v1",
+        "new_entities": [{
+            "temp_id": "tmp_npc_1", "kind": "npc",
+            "public_name": "Mira the Guide", "role": "guide",
+        }],
+        "staged_effects": [],
+    }
+    attempt.staged_effects = [{
+        "id": "e1", "effect_type": "update_scene",
+        "arguments": {"scene_patch": {
+            "location_name": "Gate", "present_actors": [{"name": "Mira the Guide"}]}},
+    }]
+    db.flush()
+    db.commit()
+    stream = _stream(db, turn, attempt)
+    db.commit()
+    mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+    commit_turn(db, turn.id, attempt.id)
+    (mira,) = list_entities(db, cid, entity_type="npc")
+    scene = db.get(CampaignCurrentScene, cid)
+    assert scene.present_actors == [{
+        "entity_id": str(mira.id), "name": "Mira the Guide", "kind": "npc", "role": "guide"}]
+    commit_turn(db, turn.id, attempt.id)
+    db.expire_all()
+    assert len(db.get(CampaignCurrentScene, cid).present_actors) == 1
+
+
 def test_failed_entity_commit_leaves_no_half_created_authority():
     Fac, cid, _owner = _setup()
     db = Fac()
