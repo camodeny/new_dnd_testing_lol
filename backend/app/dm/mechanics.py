@@ -120,6 +120,26 @@ def stat_block_issues(db: Session, campaign: Any, contract: DmTurnContractV1) ->
     return issues
 
 
+def reveal_issues(db: Session, campaign: Any, turn: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
+    """Refusals for the contract's ``reveal_entity_name`` effects (#469)."""
+    from app.world.identity import check_entity_rename
+
+    issues: list[MechanicIssue] = []
+    for effect in contract.staged_effects:
+        if effect.effect_type != "reveal_entity_name":
+            continue
+        if (getattr(turn, "audience", None) or "campaign") != "campaign":
+            issues.append(MechanicIssue(effect.id, "private_reveal",
+                                        "a name revealed in a private thread cannot become the entity's public name; "
+                                        "say it in the narration only"))
+            continue
+        try:
+            check_entity_rename(db, campaign.id, effect.arguments.get("entity_id"), effect.arguments.get("name"))
+        except ValueError as exc:
+            issues.append(MechanicIssue(effect.id, "invalid_reveal", str(exc)))
+    return issues
+
+
 def _pending_stat_blocks(contract: DmTurnContractV1) -> dict[str, tuple[str, str | None]]:
     """``npc_entity_id -> (monster_id, creature_type)`` assigned in this same contract."""
     return {

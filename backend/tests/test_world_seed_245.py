@@ -151,7 +151,9 @@ def test_world_seed_solo_happy_path(api):
         clock = clocks[0]
         assert clock.status == "active"
         assert clock.threshold >= 1
-        assert clock.advancement_criteria["kind"] == "deterministic"
+        # Fiction-driven: the pressure advances when the story lets it, not per turn.
+        assert clock.advancement_criteria["kind"] == "semantic"
+        assert "Do not advance on turns where the party directly resists" in clock.advancement_criteria["description"]
         assert "dm.turn_resolved" in clock.advancement_criteria["event_types"]
 
 

@@ -92,7 +92,11 @@ record_id or source_id from the relevant context record. Player declarations
 must cite their originating submission in evidence_refs or trigger_refs.
 Do not retell player declarations unless necessary; focus on the world's reply.
 Introduce new NPCs through new_entities and a narrated introduction, without
-using their temp_id as an EntityRef. They can speak as canonical NPCs on later
+using their temp_id as an EntityRef. When a known NPC reveals a true name
+("they call me Pell"), stage reveal_entity_name so the registry carries it from
+then on. Each entity id is one person: never voice a different person (a new
+Ledger agent, a second guard) through an existing NPC's id; introduce them as
+new_entities. They can speak as canonical NPCs on later
 turns once their durable identity is in context.
 REGISTRY FIRST: the packet carries a complete entity registry (id, name, kind,
 one-line summary for every known NPC/location). Before proposing a new entity,

@@ -1017,11 +1017,11 @@ class MechanicsValidator:
         self.turn = turn
 
     def validate(self, contract, packet) -> ValidatorResult:
-        from app.dm.mechanics import resolve_mechanics, stat_block_issues
+        from app.dm.mechanics import resolve_mechanics, reveal_issues, stat_block_issues
 
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
-        issues = stat_block_issues(self.db, self.campaign, contract)
+        issues = stat_block_issues(self.db, self.campaign, contract) + reveal_issues(self.db, self.campaign, self.turn, contract)
         if contract.mechanics:
             issues += resolve_mechanics(self.db, self.campaign, self.turn, contract).issues
         for issue in issues:

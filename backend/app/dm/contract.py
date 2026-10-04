@@ -286,6 +286,7 @@ STAGED_EFFECT_TYPES = (
     "apply_death_save",
     "apply_healing",
     "assign_stat_block",
+    "reveal_entity_name",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -633,6 +634,27 @@ class AssignStatBlockArgs(StrictModel):
         return str(v)
 
 
+class RevealEntityNameArgs(StrictModel):
+    """An existing NPC/entity's true name, learned in play — issue #469.
+
+    "The Hooded Door-Warder" says "they call me Pell": the entity is renamed
+    and its old label kept as an alias, so the DM and narration use the
+    real name from then on. Never use this to voice a different person
+    through an existing entity: introduce new people as new_entities.
+    """
+    entity_id: str = Field(min_length=1, max_length=160, description="Durable entity UUID from the packet")
+    name: str = Field(min_length=1, max_length=160, description="The name just revealed, e.g. Pell")
+
+    @field_validator("entity_id")
+    @classmethod
+    def _valid_entity_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("entity_id must be a UUID") from exc
+        return str(v)
+
+
 class UpdateMapTerrainArgs(StrictModel):
     """DM-authored terrain change — issue #232.
 
@@ -819,7 +841,7 @@ class MechanicIntent(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | RevealEntityNameArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 #: Typed argument model per effect type: validation and the provider-facing
@@ -840,6 +862,7 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
     "apply_death_save": ApplyDeathSaveArgs,
     "apply_healing": ApplyHealingArgs,
     "assign_stat_block": AssignStatBlockArgs,
+    "reveal_entity_name": RevealEntityNameArgs,
     "update_map_terrain": UpdateMapTerrainArgs,
     "update_map_placement": UpdateMapPlacementArgs,
     "transfer_knowledge": TransferKnowledgeArgs,
@@ -849,7 +872,7 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "reveal_entity_name", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
