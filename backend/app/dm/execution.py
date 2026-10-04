@@ -38,8 +38,8 @@ from app.campaigns.service import CampaignArchivedError
 from app.clock import utcnow
 from app.observability.tracing import structured_log
 from app.providers import policy as role_policy
-from app.worker.executor import RETRIABLE, TERMINAL, classify_error
-from app.world.identity import IdentityReuseRequiresReadjudication
+from app.worker.executor import RETRIABLE, TERMINAL, RetriableError, classify_error
+from app.world.identity import IdentityDeferredError, IdentityReuseRequiresReadjudication
 
 logger = logging.getLogger(__name__)
 
@@ -496,6 +496,7 @@ def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, ca
 
     db = run.db
     repaired = False
+    deferred = False
     while True:
         try:
             result = execute_validated_turn(
@@ -545,6 +546,36 @@ def _narrate_and_commit(run: _Run, contract, packet, *, narrator, adjudicate, ca
                 turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
                 canonical_id=conflict.canonical_id, trace_id=run.trace_id,
             )
+            contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
+        except IdentityDeferredError as exc:
+            db.rollback()
+            current = db.get(DmTurnAttempt, run.attempt_id)
+            if current is not None:
+                # Keep the DEFER memo (the advisory and the runner-up
+                # fallback read it); drop everything else staged.
+                current.contract_snapshot = None
+                current.staged_effects = []
+                current.identity_resolutions = [
+                    item for item in (current.identity_resolutions or [])
+                    if isinstance(item, dict) and item.get("via") == "deferred"
+                ] or None
+                db.add(current)
+                db.commit()
+            if deferred or not can_readjudicate:
+                # Deferral is a normal pipeline outcome, not a poison turn:
+                # requeue instead of a terminal visible failure.
+                raise RetriableError(str(exc)) from exc
+            deferred = True
+            structured_log(
+                logger, logging.INFO, "dm_execute_identity_deferral_readjudication",
+                turn_id=str(run.turn_id), attempt_id=str(run.attempt_id),
+                temp_id=exc.temp_id, trace_id=run.trace_id,
+            )
+            from app.dm.context import attach_retry_deferral_advisory, build_retry_deferral_advisory
+
+            note = build_retry_deferral_advisory(db, current) if current is not None else None
+            if note is not None:
+                packet = attach_retry_deferral_advisory(packet, note)
             contract, packet = _adjudicate_and_validate(run, adjudicate, packet)
 
 

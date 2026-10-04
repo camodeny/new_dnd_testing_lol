@@ -356,6 +356,118 @@ def test_repeated_existing_npc_proposal_never_streams(db):
     assert s.get(DmTurn, turn.id).status != "succeeded"
 
 
+def _new_npc_contract():
+    return normalize_contract({
+        "contract_version": CONTRACT_VERSION,
+        "mode": "respond",
+        "reason": "introduces a new NPC",
+        "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+            "text": "A stranger named Orsa Pell steps out of the fog.",
+            "claim_kind": "observation", "origin": "dm_adjudication",
+        }]}],
+        "new_entities": [{
+            "temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Orsa Pell",
+        }],
+    })
+
+
+def _stub_identity_decisions(monkeypatch, outcomes):
+    """Stub the bounded identity decision; records prior_deferrals per call."""
+    from types import SimpleNamespace
+
+    from app.world import identity
+
+    seen = []
+    queue = list(outcomes)
+
+    def fake_decide(db, campaign, frame, service, *, prior_deferrals=0, **kw):
+        seen.append(prior_deferrals)
+        selected = queue.pop(0)
+        if selected == identity.DEFER and prior_deferrals > 0:
+            return SimpleNamespace(selected_id=identity.NEW_ENTITY, runner_up_applied=True)
+        return SimpleNamespace(selected_id=selected, runner_up_applied=False)
+
+    monkeypatch.setattr(identity, "decide_identity", fake_decide)
+    return seen
+
+
+def _near_tie_npc(s, camp_id):
+    from app.world.service import create_entity
+
+    create_entity(s, s.get(Campaign, camp_id), entity_type="npc", name="Orsa Pelle")
+    s.commit()
+
+
+def test_identity_defer_then_new_entity_commits_in_one_attempt(db, monkeypatch):
+    from app.world import identity
+
+    s, camp_id, thread_id, _ = db
+    _near_tie_npc(s, camp_id)
+    turn, attempt = _submit(s, camp_id, thread_id, "I look into the fog.")
+    seen = _stub_identity_decisions(monkeypatch, [identity.DEFER, identity.NEW_ENTITY])
+    packets = []
+
+    def adjudicate(packet, feedback=None):
+        packets.append(packet)
+        return _new_npc_contract()
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=adjudicate, narrator="deterministic",
+    )
+    assert result.attempt.status == "succeeded"
+    assert len(packets) == 2
+    from app.dm.context import IDENTITY_DEFERRAL_RECORD_ID
+
+    assert any(
+        r.record_id == IDENTITY_DEFERRAL_RECORD_ID
+        for lane in packets[1].lanes for r in lane.records
+    )
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+    assert seen == [0, 1]
+
+
+def test_identity_repeat_defer_takes_runner_up_fallback(db, monkeypatch):
+    from app.world import identity
+
+    s, camp_id, thread_id, _ = db
+    _near_tie_npc(s, camp_id)
+    turn, attempt = _submit(s, camp_id, thread_id, "I look into the fog.")
+    seen = _stub_identity_decisions(monkeypatch, [identity.DEFER, identity.DEFER])
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=lambda p, feedback=None: _new_npc_contract(),
+        narrator="deterministic",
+    )
+    assert result.attempt.status == "succeeded"
+    assert seen == [0, 1]
+    resolutions = s.get(DmTurnAttempt, attempt.id).identity_resolutions
+    assert resolutions[0]["runner_up_fallback"] is True
+
+
+def test_identity_defer_without_readjudication_is_retriable_not_visible_failure(db, monkeypatch):
+    from types import SimpleNamespace
+
+    from app.world import identity
+
+    s, camp_id, thread_id, _ = db
+    _near_tie_npc(s, camp_id)
+    turn, attempt = _submit(s, camp_id, thread_id, "I look into the fog.")
+    # A decision that keeps deferring even past the runner-up fallback.
+    monkeypatch.setattr(
+        identity, "decide_identity",
+        lambda *a, **k: SimpleNamespace(selected_id=identity.DEFER, runner_up_applied=False),
+    )
+    with pytest.raises(Exception) as err:
+        execute_dm_attempt(
+            s, attempt.id, adjudicate=lambda p, feedback=None: _new_npc_contract(),
+            narrator="deterministic",
+        )
+    assert "deferred" in str(err.value)
+    row = s.get(DmTurnAttempt, attempt.id)
+    assert row.status == "prepared" and row.error_class == "retriable"
+    assert s.get(DmTurn, turn.id).status != "failed_visible"
+
+
 def test_terminal_model_execution_leaves_visible_failure_not_stuck_thinking(db):
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)
