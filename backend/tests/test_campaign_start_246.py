@@ -258,3 +258,46 @@ def test_campaign_start_multiplayer_opens_shared_table(api):
         names = json.dumps(scene.to_dict())
         # Both PCs are introduced in the seeded opening scene.
         assert "Hero" in names
+
+
+def test_campaign_start_opens_first_adventure_with_seed_premise_458(api):
+    client, factory, actor, owner_id, _, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+    assert _seed(client, campaign["id"], "op-seed-458").status_code == 200
+    first = _start(client, campaign["id"], "op-start-458")
+    assert first.status_code == 200, first.text
+    # Replays (same key and different key) never open a second adventure.
+    assert _start(client, campaign["id"], "op-start-458").status_code == 200
+    assert _start(client, campaign["id"], "op-start-458-b").status_code == 200
+
+    from app.dm.context import LaneName, assemble_attempt_context
+    from models.campaigns import Adventure
+    from models.world import CampaignCurrentScene
+
+    cid = uuid.UUID(campaign["id"])
+    with factory() as db:
+        adventures = db.execute(select(Adventure).where(Adventure.campaign_id == cid)).scalars().all()
+        assert len(adventures) == 1
+        adventure = adventures[0]
+        assert adventure.status == "active"
+        scene = db.get(CampaignCurrentScene, cid)
+        premise = scene.environment["premise"]
+        assert adventure.adventure_metadata["premise"] == premise
+        assert adventure.title
+
+        packet = assemble_attempt_context(
+            db, uuid.UUID(first.json()["dm_attempt"]["id"]),
+            supplemental_status={
+                LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
+                LaneName.RELEVANT_CANON: "not_applicable",
+                LaneName.REPAIR_DIRECTIVES: "not_applicable",
+            },
+        )
+        lane = next(l for l in packet.lanes if l.name == LaneName.ACTIVE_ADVENTURE)
+        assert [r.value for r in lane.records] == [{
+            "adventure_id": str(adventure.id),
+            "title": adventure.title,
+            "premise": premise,
+            "status": "active",
+        }]
