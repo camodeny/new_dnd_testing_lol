@@ -387,8 +387,12 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     from app.dm.contract import ContractValidationError
     from app.dm.evidence import run_bounded_evidence_loop
     from app.dm.rules_guidance import enrich_rules_context, check_rules_advisory
-    from app.dm.validators import default_pipeline, run_with_bounded_regeneration
+    from app.dm.validators import attempt_pipeline, run_with_bounded_regeneration
     from app.observability.tracing import trace_context
+    from models.campaigns import Campaign
+    from models.dm import DmTurn
+
+    pipeline = attempt_pipeline(run.db, run.db.get(Campaign, run.campaign_id), run.db.get(DmTurn, run.turn_id))
 
     # Retrieve once for this attempt. Evidence rounds, validation regeneration,
     # and identity readjudication reuse the same bounded rules references.
@@ -420,7 +424,6 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
         try:
             from app.dm.context import repair_packet_missing_perspectives
             from app.dm.validators import missing_perspective_subjects
-            from models.campaigns import Campaign
 
             if pkt is None:
                 return None
@@ -442,7 +445,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
                 repaired_packets.append(repaired)
             return repaired
 
-        contract, _ = run_with_bounded_regeneration(adjudicate, pkt, packet_repair=repair_hook)
+        contract, _ = run_with_bounded_regeneration(adjudicate, pkt, packet_repair=repair_hook, pipeline=pipeline)
         return contract, (repaired_packets[-1] if repaired_packets else pkt)
 
     validation_packet = start_packet
@@ -459,7 +462,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     final_contract, _bundle = run_bounded_evidence_loop(
         initial_packet=start_packet, adjudicate=evidence_adjudicate, db=run.db,
     )
-    if default_pipeline.validate(final_contract, validation_packet).passed:
+    if pipeline.validate(final_contract, validation_packet).passed:
         return checked(final_contract, validation_packet)
     regenerated, repaired_packet = regenerate(validation_packet)
     return checked(regenerated, repaired_packet)

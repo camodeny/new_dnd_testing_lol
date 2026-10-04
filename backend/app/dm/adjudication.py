@@ -101,6 +101,23 @@ reference its exact ID instead. Propose new_entities only for genuinely new
 faces, described with distinguishing detail so they cannot be confused with
 registry entries.
 
+MECHANICS:
+When the resolved fiction changes hit points, conditions, or resources, add
+respond-mode mechanics entries stating WHAT happens; code rolls the dice, checks
+legality against character_state, applies it, and appends the outcome to your
+beats. Never write damage totals, remaining HP, or slot counts yourself, and do
+not narrate those numbers in your beats.
+- damage: harm that has already landed (failed save, trap, fall, hazard) with
+  damage_dice like "2d6" and a damage_type. Not for attacks that still need a
+  hit roll; request the roll first.
+- heal: heal_dice restored to the target (Healing Word 2d4+mod, Second Wind
+  1d10+level, a potion 2d4+2); code rolls it and caps at maximum HP.
+- condition: condition_op add/remove a named condition with its source.
+- spend: the target spends a tracked resource (by its character_state name)
+  or one spell_slot_level slot, e.g. when a PC casts a leveled spell.
+If code refuses a mechanic (no slot left, untracked resource or HP), the
+feedback says why: adjust the fiction or drop the mechanic and narrate it.
+
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that
 instruction actor_ref is null and the PC may be a target_ref; it is not an
