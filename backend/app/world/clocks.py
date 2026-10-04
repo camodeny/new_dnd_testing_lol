@@ -232,13 +232,18 @@ def validate_advancement_criteria(value: Any) -> dict[str, Any]:
     match = _match_map(value.get("match"), "advancement_criteria.match")
     required_count = value.get("required_count", 1)
     max_advance = value.get("max_advance", 1)
-    return {
+    criteria = {
         "kind": kind,
         "event_types": list(event_types),
         "match": match,
         "required_count": _positive_int(required_count, "advancement_criteria.required_count"),
         "max_advance": _positive_int(max_advance, "advancement_criteria.max_advance"),
     }
+    # Semantic advancement says what counts as the pressure gaining ground,
+    # so the judge weighs the fiction rather than counting events.
+    if value.get("description") is not None:
+        criteria["description"] = _non_empty_str(value.get("description"), "advancement_criteria.description", limit=2000)
+    return criteria
 
 
 def validate_completion_criteria(value: Any) -> dict[str, Any] | None:
@@ -463,6 +468,59 @@ def evidence_refs(matching: list[CampaignDomainEvent]) -> list[dict[str, Any]]:
         for e in sorted(matching, key=lambda e: int(e.sequence))
     ]
     return refs[:MAX_EVIDENCE_REFS]
+
+
+#: Bounds on the story text a semantic frame carries per evidence event and
+#: in total, so long ranges stay a small decision input.
+STORY_CHARS_PER_EVENT = 500
+STORY_CHARS_TOTAL = 6000
+
+
+def _turn_story(db: Session, payload: dict[str, Any]) -> str:
+    """Public beat claims and player words for one ``dm.turn_resolved`` event."""
+    from models.dm import DmTurnAttempt
+    from models.threads import PlayerSubmission
+
+    parts: list[str] = []
+    for raw_id in payload.get("submission_ids") or []:
+        sub = db.get(PlayerSubmission, coerce_uuid(raw_id, field="submission_id"))
+        if sub is not None and sub.raw_content:
+            parts.append(f"Player: {sub.raw_content}")
+    attempt_id = payload.get("attempt_id")
+    attempt = db.get(DmTurnAttempt, coerce_uuid(attempt_id, field="attempt_id")) if attempt_id else None
+    for beat in ((attempt.contract_snapshot or {}).get("beats") if attempt is not None else None) or []:
+        for claim in beat.get("claims") or []:
+            if claim.get("visibility", "public") == "public" and claim.get("text"):
+                parts.append(f"DM: {claim['text']}")
+    return " | ".join(parts)
+
+
+def story_evidence(db: Session, events: list[CampaignDomainEvent]) -> list[dict[str, Any]]:
+    """Evidence refs plus what happened, for a semantic judge to weigh.
+
+    Plain refs (sequence, id, type) say nothing about the fiction, so a
+    criterion like "the party decisively ends the pressure" could never be
+    judged. Each ref gains its event visibility and a bounded ``story``:
+    public beat claims and player words for DM turns, or a payload summary
+    for world events. Newest events keep their story when the total bound
+    bites. Refs stay the identifiers; stories never become evidence ids.
+    """
+    refs = evidence_refs(events)
+    by_id = {str(e.id): e for e in events}
+    budget = STORY_CHARS_TOTAL
+    for ref in reversed(refs):
+        event = by_id[ref["event_id"]]
+        ref["visibility"] = str(event.visibility or "public")
+        payload = event.payload or {}
+        try:
+            story = _turn_story(db, payload) if payload.get("attempt_id") else str(payload.get("summary") or "")
+        except Exception:  # story is context, never a reason to fail evaluation
+            story = ""
+        story = story[:min(STORY_CHARS_PER_EVENT, budget)]
+        if story:
+            ref["story"] = story
+            budget -= len(story)
+    return refs
 
 
 def _validate_evidence_refs(
@@ -1001,7 +1059,7 @@ def evaluate_clock_for_range(
             window, dict(completion_criteria))
     seen_ids = {str(e.id) for e in matching}
     frame_events = list(matching) + [e for e in completion_matching if str(e.id) not in seen_ids]
-    frame_refs = evidence_refs(frame_events)
+    frame_refs = story_evidence(db, frame_events)
     frame_total = total + sum(1 for e in completion_matching if str(e.id) not in seen_ids)
     completion_refs = evidence_refs(completion_matching)
     frame = build_clock_frame(

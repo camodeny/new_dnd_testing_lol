@@ -604,17 +604,28 @@ def run_world_seed(
         threshold = int(spec["pressure"]["threshold"])
         clock, _ = create_clock(
             db, locked, name=spec["pressure"]["name"], threshold=threshold,
+            # Fiction-driven pressure: it gains ground when the story lets
+            # it, not by turn count. Players resisting or undoing it hold it
+            # in place; decisively ending it completes it.
             advancement_criteria={
-                "kind": "deterministic",
+                "kind": "semantic",
+                "description": (
+                    f"{spec['pressure']['name']} gains ground: its agents act, or the situation it "
+                    "represents worsens, while the party ignores, delays, or fails to check it. "
+                    "Do not advance on turns where the party directly resists, exposes, or undoes it."
+                ),
                 "event_types": [DM_TURN_RESOLVED],
-                "required_count": 2,
+                "required_count": 1,
                 "max_advance": 1,
             },
             status="active", progress=0,
             stages=[{"at": max(1, threshold - 1), "label": f"{spec['pressure']['name']} escalates"}],
             completion_criteria={
                 "kind": "semantic",
-                "description": f"Decisively end {spec['pressure']['name']} through play",
+                "description": (
+                    f"The party decisively ends {spec['pressure']['name']} through play: its hold "
+                    "is broken, its agents defeated or driven off, or the harm it causes undone"
+                ),
                 "event_types": [DM_TURN_RESOLVED],
             },
             visibility="campaign", provenance=prov,
