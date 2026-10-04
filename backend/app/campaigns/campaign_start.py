@@ -178,6 +178,41 @@ def _started_snapshot(db: Session, campaign, *, replayed: bool) -> dict:
     return body
 
 
+def _open_first_adventure(db: Session, campaign) -> None:
+    """Open the seeded campaign's first adventure (flush-only).
+
+    Title, premise and situation come from the already-committed world seed
+    (clock/scene rows) -- no new model call. A pre-existing active adventure
+    is respected (checked up front: ``start_adventure`` rolls back the
+    session on a lost race, which would discard the whole start).
+    """
+    from app.adventures.service import get_current_adventure, start_adventure
+    from models.world import CampaignClock, CampaignCurrentScene
+
+    if get_current_adventure(db, campaign.id) is not None:
+        return
+    scene = db.execute(
+        _select(CampaignCurrentScene).where(CampaignCurrentScene.campaign_id == campaign.id)
+    ).scalars().first()
+    clock = db.execute(
+        _select(CampaignClock)
+        .where(CampaignClock.campaign_id == campaign.id)
+        .order_by(CampaignClock.created_at.asc())
+    ).scalars().first()
+    environment = (scene.environment or {}) if scene is not None else {}
+    title = (
+        (clock.name if clock is not None else None)
+        or (scene.location_name if scene is not None else None)
+        or "The First Adventure"
+    )
+    metadata = {"seed": environment.get("seed")}
+    if environment.get("premise"):
+        metadata["premise"] = environment["premise"]
+    start_adventure(
+        db, campaign.id, str(title)[:160], adventure_metadata=metadata, commit=False,
+    )
+
+
 def run_campaign_start(
     db: Session,
     campaign_id,
@@ -293,6 +328,10 @@ def run_campaign_start(
         commit=False,
     )
     db.refresh(campaign_after)
+    # The first adventure opens with the table (issue #458) so the DM has an
+    # arc it can close with ``complete_adventure``. Same transaction: a retry
+    # converges via the start-event replay above and never opens a second one.
+    _open_first_adventure(db, campaign_after)
     # Same outer idempotent transaction: a turn-staging failure rolls back
     # the activation above, so a retried start can never duplicate the seed,
     # the activation, or the opening narration.
