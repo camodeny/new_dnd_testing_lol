@@ -283,6 +283,7 @@ STAGED_EFFECT_TYPES = (
     "apply_resource",
     "apply_concentration",
     "apply_death_save",
+    "apply_healing",
     "assign_stat_block",
 )
 
@@ -450,6 +451,29 @@ class ApplyAttackDamageArgs(StrictModel):
     mitigation: Literal["none", "resistance", "vulnerability", "immunity", "resistance+vulnerability"] = "none"
     damage_id: str = Field(min_length=1, max_length=128)
     attack_id: str | None = Field(default=None, max_length=128)
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("target_id")
+    @classmethod
+    def _valid_target_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("target_id must be a UUID") from exc
+        return str(v)
+
+
+class ApplyHealingArgs(StrictModel):
+    """Deterministic healing application — issue #229.
+
+    Code-built only: ``heal_total`` was rolled server-side from a mechanics
+    intent; promotion caps restored HP at maximum. No model arithmetic.
+    """
+    target_kind: Literal["pc", "npc"]
+    target_id: str = Field(min_length=1, max_length=160, description="Durable character (pc) or world-entity (npc) UUID")
+    heal_total: int = Field(ge=0, le=100000)
+    heal_id: str = Field(min_length=1, max_length=128)
     visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
     idempotency_key: str | None = Field(default=None, max_length=128)
 
@@ -714,7 +738,7 @@ class TransferKnowledgeArgs(StrictModel):
 
 # ── Mechanics intents (code builds the rules effects) ───────────────────────
 
-MechanicKind = Literal["damage", "condition", "spend"]
+MechanicKind = Literal["damage", "heal", "condition", "spend"]
 
 
 class MechanicIntent(StrictModel):
@@ -728,6 +752,8 @@ class MechanicIntent(StrictModel):
     - ``damage``: already-landed harm (failed save, trap, fall, hazard) as a
       ``damage_dice`` expression plus ``damage_type``; code rolls it and
       applies resistances. Attack rolls are not decided here.
+    - ``heal``: ``heal_dice`` restored to the target (Healing Word,
+      Second Wind, a potion); code rolls it and caps at maximum HP.
     - ``condition``: ``condition_op`` add/remove of a named 2024 condition.
     - ``spend``: the target spends a tracked ``resource`` (``amount``) or one
       ``spell_slot_level`` slot.
@@ -738,6 +764,7 @@ class MechanicIntent(StrictModel):
     source: str = Field(min_length=1, max_length=160, description="What causes it in the fiction, e.g. 'collapsing ceiling', 'Hold Person'")
     damage_dice: str | None = Field(default=None, max_length=32, description="damage only: dice expression like 2d6 or 1d8+2")
     damage_type: str | None = Field(default=None, max_length=32, description="damage only: e.g. fire, bludgeoning")
+    heal_dice: str | None = Field(default=None, max_length=32, description="heal only: dice expression like 2d4+3 or 1d10+3")
     condition: str | None = Field(default=None, max_length=64, description="condition only: e.g. poisoned, prone")
     condition_op: Literal["add", "remove"] | None = None
     duration_rounds: int | None = Field(default=None, ge=1, le=1000, description="condition add only; null when open-ended")
@@ -757,31 +784,37 @@ class MechanicIntent(StrictModel):
         if self.target.type not in ("character", "npc"):
             raise ValueError("mechanic target must be type=character or type=npc")
         damage = (self.damage_dice, self.damage_type)
+        heal = (self.heal_dice,)
         condition = (self.condition, self.condition_op, self.duration_rounds)
         spend = (self.resource, self.spell_slot_level, self.amount)
         if self.kind == "damage":
             if not self.damage_dice or not self.damage_type:
                 raise ValueError("damage mechanic requires damage_dice and damage_type")
-            if any(v is not None for v in condition + spend):
-                raise ValueError("damage mechanic must not set condition/spend fields")
+            if any(v is not None for v in heal + condition + spend):
+                raise ValueError("damage mechanic must not set heal/condition/spend fields")
+        elif self.kind == "heal":
+            if not self.heal_dice:
+                raise ValueError("heal mechanic requires heal_dice")
+            if any(v is not None for v in damage + condition + spend):
+                raise ValueError("heal mechanic must not set damage/condition/spend fields")
         elif self.kind == "condition":
             if not self.condition or self.condition_op is None:
                 raise ValueError("condition mechanic requires condition and condition_op")
             if self.condition_op == "remove" and self.duration_rounds is not None:
                 raise ValueError("condition remove must not set duration_rounds")
-            if any(v is not None for v in damage + spend):
-                raise ValueError("condition mechanic must not set damage/spend fields")
+            if any(v is not None for v in damage + heal + spend):
+                raise ValueError("condition mechanic must not set damage/heal/spend fields")
         else:
             if (self.resource is None) == (self.spell_slot_level is None):
                 raise ValueError("spend mechanic requires exactly one of resource or spell_slot_level")
             if self.spell_slot_level is not None and self.amount not in (None, 1):
                 raise ValueError("spend of a spell slot spends exactly one slot")
-            if any(v is not None for v in damage + condition):
-                raise ValueError("spend mechanic must not set damage/condition fields")
+            if any(v is not None for v in damage + heal + condition):
+                raise ValueError("spend mechanic must not set damage/heal/condition fields")
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | AssignStatBlockArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 #: Typed argument model per effect type: validation and the provider-facing
@@ -800,6 +833,7 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
     "apply_resource": ApplyResourceArgs,
     "apply_concentration": ApplyConcentrationArgs,
     "apply_death_save": ApplyDeathSaveArgs,
+    "apply_healing": ApplyHealingArgs,
     "assign_stat_block": AssignStatBlockArgs,
     "update_map_terrain": UpdateMapTerrainArgs,
     "update_map_placement": UpdateMapPlacementArgs,
@@ -810,7 +844,7 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "assign_stat_block", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -1277,6 +1311,7 @@ _CODE_BUILT_EFFECTS = (
     "apply_resource",
     "apply_concentration",
     "apply_death_save",
+    "apply_healing",
 )
 
 

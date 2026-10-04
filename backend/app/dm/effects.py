@@ -38,6 +38,7 @@ from app.rules.attacks import (
     AttackError as _AttackError,
     HitPoints as _HitPoints,
     apply_damage as _apply_damage,
+    heal_damage as _heal_damage,
 )
 from app.rules.state import (
     CONCENTRATION_BREAKING_CONDITIONS as _BREAKING,
@@ -97,6 +98,7 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "apply_resource": "dm_private",
     "apply_concentration": "dm_private",
     "apply_death_save": "dm_private",
+    "apply_healing": "dm_private",
     # NPC stat blocks (#478) are DM-only: players learn AC/HP through play.
     "assign_stat_block": "dm_private",
     # DM-authored map terrain (#232) defaults to dm_private (fail-closed):
@@ -673,93 +675,83 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
     commit per attempt/effect key); the write itself is a pure function of
     the staged total, so replaying the same staged effect converges.
     """
-    import uuid as _uuid
+    total = _staged_hp_amount(effect, "damage_total")
+    change = _apply_hp_change(db, campaign, effect, attempt, lambda hp, cid: _apply_damage(hp, total, change_id=cid))
+    logger.info(
+        "effect apply_attack_damage effect_id=%s target=%s:%s total=%s absorbed=%s applied=%s",
+        effect.get("id"), (effect.get("arguments") or {}).get("target_kind"), (effect.get("arguments") or {}).get("target_id"),
+        total, change.absorbed_by_temp, change.applied_to_current,
+    )
 
-    from sqlalchemy import select as _select
 
-    args = effect.get("arguments") or {}
-    target_kind = args.get("target_kind")
-    if target_kind not in ("pc", "npc"):
-        raise ValueError(f"Staged effect {effect.get('id')!r} target_kind must be pc/npc")
+@register("apply_healing")
+def _handle_apply_healing(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Restore resolved healing to PC sheet HP or NPC entity HP (issue #229).
+
+    Code-built only, like damage: the healed total was rolled before
+    staging; promotion caps it at maximum via ``rules.attacks.heal_damage``.
+    """
+    total = _staged_hp_amount(effect, "heal_total")
+    change = _apply_hp_change(db, campaign, effect, attempt, lambda hp, cid: _heal_damage(hp, total, change_id=cid))
+    logger.info(
+        "effect apply_healing effect_id=%s target=%s:%s total=%s restored=%s",
+        effect.get("id"), (effect.get("arguments") or {}).get("target_kind"), (effect.get("arguments") or {}).get("target_id"),
+        total, change.after.current - change.before.current,
+    )
+
+
+def _staged_hp_amount(effect: dict[str, Any], key: str) -> int:
     try:
-        target_id = _uuid.UUID(str(args.get("target_id") or ""))
-    except ValueError:
-        raise ValueError(f"Staged effect {effect.get('id')!r} target_id must be a UUID")
-    try:
-        total = int(args.get("damage_total"))
+        total = int((effect.get("arguments") or {}).get(key))
     except (TypeError, ValueError):
-        raise ValueError(f"Staged effect {effect.get('id')!r} damage_total must be an integer")
+        raise ValueError(f"Staged effect {effect.get('id')!r} {key} must be an integer")
     if total < 0:
-        raise ValueError(f"Staged effect {effect.get('id')!r} damage_total must be >= 0")
-    change_id = _resolve_effect_key(attempt, effect)
+        raise ValueError(f"Staged effect {effect.get('id')!r} {key} must be >= 0")
+    return total
 
-    if target_kind == "pc":
-        from models.campaigns import CampaignMember
-        from models.characters import Character
 
-        character = db.get(Character, target_id)
-        if character is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} not found")
-        # Roster scoping (#266 canonical, same pattern as combat participant
-        # validation): the character must be on this campaign's active roster.
-        # Without this, a staged effect committed for campaign A could reduce
-        # HP on an unrelated campaign/user character.
-        roster = db.execute(
-            _select(CampaignMember).where(
-                CampaignMember.campaign_id == campaign.id,
-                CampaignMember.selected_character_id == character.id,
-            )
-        ).scalars().first()
-        if roster is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
-        sheet = latest_sheet(db, character.id)
-        if sheet is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
+def _apply_hp_change(db: Session, campaign: Campaign, effect: dict[str, Any], attempt: DmTurnAttempt, compute):
+    """Load scoped PC/NPC HP, apply ``compute(before, change_id)``, write back.
+
+    PCs must be on this campaign's active roster (#266 canonical scoping:
+    a staged effect for campaign A can never touch another campaign's
+    character); NPCs must belong to this campaign and carry hit points.
+    """
+    target = load_state_target(
+        db, campaign, (effect.get("arguments") or {}).get("target_kind"),
+        (effect.get("arguments") or {}).get("target_id"), label=f"Staged effect {effect.get('id')!r}",
+    )
+    if target.kind == "pc":
+        sheet = target.row
         try:
             before = _HitPoints(current=int(sheet.hit_points_current), maximum=int(sheet.hit_points_max), temporary=int(sheet.hit_points_temp or 0))
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Staged effect {effect.get('id')!r} sheet HP is malformed: {exc}") from exc
+    else:
+        nested = (target.row.details or {}).get("hit_points")
+        if not isinstance(nested, dict):
+            raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target.row.id} has no hit_points in details")
         try:
-            change = _apply_damage(before, total, change_id=change_id)
-        except _AttackError as exc:
-            raise ValueError(f"Staged effect {effect.get('id')!r} HP application failed: {exc}") from exc
-        sheet.hit_points_current = change.after.current
-        sheet.hit_points_temp = change.after.temporary
-        db.flush()
-        logger.info(
-            "effect apply_attack_damage pc effect_id=%s character_id=%s total=%s absorbed=%s applied=%s",
-            effect.get("id"), target_id, total, change.absorbed_by_temp, change.applied_to_current,
-        )
-        return
-
-    from models.world import WorldEntity
-
-    entity = db.get(WorldEntity, target_id)
-    if entity is None or str(entity.campaign_id) != str(campaign.id):
-        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} not found in this campaign")
-    details = dict(entity.details or {})
-    nested = details.get("hit_points")
-    if not isinstance(nested, dict):
-        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} has no hit_points in details")
+            before = _HitPoints(
+                current=int(nested.get("current", nested.get("current_hp"))),
+                maximum=int(nested.get("maximum", nested.get("max_hp", nested.get("max")))),
+                temporary=int(nested.get("temporary", nested.get("temp_hp", 0)) or 0),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Staged effect {effect.get('id')!r} NPC HP is malformed: {exc}") from exc
     try:
-        before = _HitPoints(
-            current=int(nested.get("current", nested.get("current_hp"))),
-            maximum=int(nested.get("maximum", nested.get("max_hp", nested.get("max")))),
-            temporary=int(nested.get("temporary", nested.get("temp_hp", 0)) or 0),
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Staged effect {effect.get('id')!r} NPC HP is malformed: {exc}") from exc
-    try:
-        change = _apply_damage(before, total, change_id=change_id)
+        change = compute(before, _resolve_effect_key(attempt, effect))
     except _AttackError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} HP application failed: {exc}") from exc
-    details["hit_points"] = {"current": change.after.current, "maximum": change.after.maximum, "temporary": change.after.temporary}
-    entity.details = details
+    if target.kind == "pc":
+        target.row.hit_points_current = change.after.current
+        target.row.hit_points_temp = change.after.temporary
+    else:
+        details = dict(target.row.details or {})
+        details["hit_points"] = {"current": change.after.current, "maximum": change.after.maximum, "temporary": change.after.temporary}
+        target.row.details = details
     db.flush()
-    logger.info(
-        "effect apply_attack_damage npc effect_id=%s entity_id=%s total=%s absorbed=%s applied=%s",
-        effect.get("id"), target_id, total, change.absorbed_by_temp, change.applied_to_current,
-    )
+    return change
 
 
 # ── Rules-state targets (#227) ────────────────────────────────────────────

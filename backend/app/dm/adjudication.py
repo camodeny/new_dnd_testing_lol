@@ -103,6 +103,8 @@ not narrate those numbers in your beats.
 - damage: harm that has already landed (failed save, trap, fall, hazard) with
   damage_dice like "2d6" and a damage_type. Not for attacks that still need a
   hit roll; request the roll first.
+- heal: heal_dice restored to the target (Healing Word 2d4+mod, Second Wind
+  1d10+level, a potion 2d4+2); code rolls it and caps at maximum HP.
 - condition: condition_op add/remove a named condition with its source.
 - spend: the target spends a tracked resource (by its character_state name)
   or one spell_slot_level slot, e.g. when a PC casts a leveled spell.

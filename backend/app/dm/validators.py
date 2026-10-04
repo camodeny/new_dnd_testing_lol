@@ -966,6 +966,7 @@ class RulesValidator:
                     )
                 )
             elif getattr(eff, "effect_type", None) in (
+                "apply_healing",
                 "apply_condition",
                 "apply_resource",
                 "apply_concentration",

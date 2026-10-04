@@ -93,7 +93,7 @@ def _mech(char_id, mech_id="mech_1", **fields):
         "kind": "damage",
         "target": {"type": "character", "id": str(char_id)},
         "source": "pit trap",
-        "damage_dice": None, "damage_type": None,
+        "damage_dice": None, "damage_type": None, "heal_dice": None,
         "condition": None, "condition_op": None, "duration_rounds": None,
         "resource": None, "spell_slot_level": None, "amount": None,
     }
@@ -208,7 +208,7 @@ def test_damage_dice_are_stable_per_turn_and_outcome_beat_is_idempotent(table):
 @pytest.mark.parametrize("mutate, message", [
     (lambda c: c.update(mode="clarify", clarify_question="Which lever?"), "mechanics only valid in respond"),
     (lambda c: c["mechanics"][0].update(damage_dice=None), "requires damage_dice"),
-    (lambda c: c["mechanics"][0].update(condition="prone"), "must not set condition"),
+    (lambda c: c["mechanics"][0].update(condition="prone"), "must not set heal/condition"),
     (lambda c: c["mechanics"][0]["target"].update(type="location"), "type=character or type=npc"),
 ])
 def test_contract_rejects_malformed_mechanics(mutate, message):
@@ -226,3 +226,40 @@ def test_model_cannot_author_rules_effects():
     effect_types = schema["$defs"]["StagedEffect"]["properties"]["effect_type"]["enum"]
     assert not {t for t in effect_types if t.startswith("apply_")}
     assert "MechanicIntent" in schema["$defs"]
+
+
+def test_healing_is_rolled_capped_and_applied_by_code(table):
+    s, camp_id, thread_id, char_id = table
+    sheet = _sheet(s, char_id)
+    sheet.hit_points_current = 15
+    s.commit()
+    contract = _contract(
+        [_mech(char_id, kind="heal", heal_dice="2d4+3", source="Healing Word"),
+         _mech(char_id, "mech_2", kind="spend", spell_slot_level=1, source="Healing Word")],
+        text="Mira whispers a word of healing.",
+    )
+    turn, attempt = _run(s, camp_id, thread_id, lambda packet, feedback=None: normalize_contract(contract))
+
+    assert turn.status == "succeeded"
+    [heal] = [e for e in attempt.staged_effects if e["effect_type"] == "apply_healing"]
+    assert 5 <= heal["arguments"]["heal_total"] <= 11
+    # Capped at max HP 20 even when the roll would overshoot.
+    assert _sheet(s, char_id).hit_points_current == min(20, 15 + heal["arguments"]["heal_total"])
+    assert _sheet(s, char_id).spell_slots["1"]["used"] == 1
+    assert "regains" in reconstruct_text(s, attempt.stream_id)
+
+
+def test_healing_a_downed_pc_resets_death_saves(table):
+    s, camp_id, thread_id, char_id = table
+    sheet = _sheet(s, char_id)
+    sheet.hit_points_current = 0
+    sheet.death_save_failures = 2
+    s.commit()
+    contract = normalize_contract(_contract([_mech(char_id, kind="heal", heal_dice="1d4+1", source="potion")]))
+    turn = s.get(DmTurn, _submit(s, camp_id, thread_id)[0].id)
+
+    resolution = resolve_mechanics(s, s.get(Campaign, camp_id), turn, contract)
+
+    assert not resolution.issues
+    assert [e["effect_type"] for e in resolution.effects] == ["apply_death_save", "apply_healing"]
+    assert resolution.effects[0]["arguments"]["op"] == "reset"
