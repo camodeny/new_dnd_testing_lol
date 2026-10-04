@@ -770,10 +770,11 @@ def _handle_apply_attack_damage(db: Session, campaign: Campaign, effect: dict[st
 class _StateTarget:
     """Mutable view of one combatant's rules state with a single commit."""
 
-    def __init__(self, *, kind: str, row: Any, campaign_id: Any):
+    def __init__(self, *, kind: str, row: Any, campaign_id: Any, name: str = ""):
         self.kind = kind
         self.row = row
         self.campaign_id = campaign_id
+        self.name = name
         if kind == "pc":
             self.conditions: list[dict[str, Any]] = [dict(i) for i in (row.conditions or []) if isinstance(i, dict)]
             self.resources: list[dict[str, Any]] = [dict(i) for i in (row.resources or []) if isinstance(i, dict)]
@@ -841,26 +842,38 @@ def _mark_npc_section(target: _StateTarget, section: str, visibility: Any) -> No
 
 def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) -> _StateTarget:
     """Load + scope-check the PC sheet or NPC entity for a rules-state effect."""
+    args = effect.get("arguments") or {}
+    return load_state_target(
+        db, campaign, args.get("target_kind"), args.get("target_id"),
+        label=f"Staged effect {effect.get('id')!r}",
+    )
+
+
+def load_state_target(db: Session, campaign: Campaign, target_kind: Any, target_id: Any, *, label: str) -> _StateTarget:
+    """Load + scope-check one PC sheet (active roster) or campaign NPC entity.
+
+    Shared by commit-time effect handlers and pre-narration mechanics
+    resolution (#229) so legality is checked against the same scoped rows
+    that promotion later mutates.
+    """
     import uuid as _uuid
 
     from sqlalchemy import select as _select
 
-    args = effect.get("arguments") or {}
-    target_kind = args.get("target_kind")
     if target_kind not in ("pc", "npc"):
-        raise ValueError(f"Staged effect {effect.get('id')!r} target_kind must be pc/npc")
+        raise ValueError(f"{label} target_kind must be pc/npc")
     try:
-        target_id = _uuid.UUID(str(args.get("target_id") or ""))
+        target_uuid = _uuid.UUID(str(target_id or ""))
     except ValueError:
-        raise ValueError(f"Staged effect {effect.get('id')!r} target_id must be a UUID")
+        raise ValueError(f"{label} target_id must be a UUID")
 
     if target_kind == "pc":
         from models.campaigns import CampaignMember
         from models.characters import Character
 
-        character = db.get(Character, target_id)
+        character = db.get(Character, target_uuid)
         if character is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} not found")
+            raise ValueError(f"{label} character {target_uuid} not found")
         roster = db.execute(
             _select(CampaignMember).where(
                 CampaignMember.campaign_id == campaign.id,
@@ -868,18 +881,18 @@ def _load_state_target(db: Session, campaign: Campaign, effect: dict[str, Any]) 
             )
         ).scalars().first()
         if roster is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} character {target_id} is not on this campaign's active roster")
+            raise ValueError(f"{label} character {target_uuid} is not on this campaign's active roster")
         sheet = latest_sheet(db, character.id)
         if sheet is None:
-            raise ValueError(f"Staged effect {effect.get('id')!r} has no sheet for character {target_id}")
-        return _StateTarget(kind="pc", row=sheet, campaign_id=campaign.id)
+            raise ValueError(f"{label} has no sheet for character {target_uuid}")
+        return _StateTarget(kind="pc", row=sheet, campaign_id=campaign.id, name=character.name)
 
     from models.world import WorldEntity
 
-    entity = db.get(WorldEntity, target_id)
+    entity = db.get(WorldEntity, target_uuid)
     if entity is None or str(entity.campaign_id) != str(campaign.id):
-        raise ValueError(f"Staged effect {effect.get('id')!r} NPC entity {target_id} not found in this campaign")
-    return _StateTarget(kind="npc", row=entity, campaign_id=campaign.id)
+        raise ValueError(f"{label} NPC entity {target_uuid} not found in this campaign")
+    return _StateTarget(kind="npc", row=entity, campaign_id=campaign.id, name=entity.name)
 
 
 @register("apply_condition")
