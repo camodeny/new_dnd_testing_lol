@@ -1049,6 +1049,53 @@ def find_prepared_attempts(db: Session, *, limit: int = 5):
         return []
 
 
+def coordinate_stranded_submissions(db: Session, *, limit: int = 5) -> list[dict]:
+    """Coordinate ``accepted`` submissions that never became a turn (#456).
+
+    The submission endpoint coordinates once and defers on stream-boundary /
+    turn-conflict; nothing else retries. Each thread is isolated so one failure
+    never blocks the others. Returned turns' prepared attempts are picked up by
+    the same sweep.
+    """
+    from app.billing.resolution_guarantee import CapacityPausedError
+    from app.dm.turns import (
+        StreamBoundaryError,
+        TurnConflictError,
+        coordinate_turn,
+        find_stranded_submission_threads,
+    )
+
+    try:
+        targets = find_stranded_submission_threads(db, limit=limit)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("dm_execute_sweep stranded_lookup failed error=%s", exc)
+        return []
+    coordinated: list[dict] = []
+    for campaign_id, thread_id, audience in targets:
+        try:
+            coord = coordinate_turn(db, campaign_id, thread_id, audience=audience, commit=True)
+        except (StreamBoundaryError, TurnConflictError, CapacityPausedError) as exc:
+            db.rollback()
+            logger.info(
+                "dm_execute_sweep stranded_deferred campaign_id=%s thread_id=%s reason=%s",
+                campaign_id, thread_id, exc,
+            )
+            continue
+        except Exception as exc:
+            db.rollback()
+            logger.warning(
+                "dm_execute_sweep stranded_failed campaign_id=%s thread_id=%s error=%s",
+                campaign_id, thread_id, exc,
+            )
+            continue
+        if coord is not None:
+            coordinated.append(
+                {"campaign_id": str(campaign_id), "thread_id": thread_id, "turn_id": str(coord[0].id)}
+            )
+    return coordinated
+
+
 def run_dm_execute_sweep(
     db: Session,
     *,
@@ -1057,7 +1104,7 @@ def run_dm_execute_sweep(
     adjudicate=None,
     narrator=None,
 ) -> dict:
-    """Recover stuck claims, then execute oldest prepared attempts.
+    """Recover stuck claims, coordinate stranded input, then execute prepared attempts.
 
     Returns ``{"executed": [...], "failed": [...], "skipped": [...]}`` with
     string attempt ids. One attempt's failure never blocks the rest.
@@ -1071,6 +1118,7 @@ def run_dm_execute_sweep(
         logger.warning("dm_execute_sweep recover failed error=%s", exc)
         recovered = 0
     outcome: dict = {"executed": [], "failed": [], "skipped": [], "recovered": recovered}
+    outcome["coordinated"] = coordinate_stranded_submissions(db, limit=limit)
     for attempt in find_prepared_attempts(db, limit=limit):
         aid = str(attempt.id)
         try:

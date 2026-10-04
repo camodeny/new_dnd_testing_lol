@@ -165,6 +165,66 @@ def _collect_unresolved_submissions(
     return list(rows)
 
 
+#: Grace period before the sweep treats an ``accepted`` submission as stranded
+#: (the submission endpoint coordinates inline; this only covers input that
+#: coordination deferred, e.g. while another turn was streaming).
+STRANDED_SUBMISSION_DELAY_SECONDS = 5
+
+
+def find_stranded_submission_threads(
+    db: Session, *, limit: int = 5, min_age_seconds: float = STRANDED_SUBMISSION_DELAY_SECONDS
+) -> list[tuple[uuid.UUID, str, str]]:
+    """Oldest ``(campaign_id, thread_id, audience)`` with accepted input and no active turn.
+
+    Excludes archived campaigns, lobby threads (never assembled into turns) and
+    direct player-to-player threads (never invoke the AI DM; their submissions
+    stay ``accepted`` by design).
+    """
+    from models.threads import CampaignThread
+
+    cutoff = utcnow() - timedelta(seconds=min_age_seconds)
+    rows = db.execute(
+        select(PlayerSubmission.campaign_id, PlayerSubmission.thread_id, PlayerSubmission.audience)
+        .join(Campaign, Campaign.id == PlayerSubmission.campaign_id)
+        .where(
+            PlayerSubmission.resolution_status == "accepted",
+            PlayerSubmission.accepted_at <= cutoff,
+            PlayerSubmission.audience != "lobby",
+            Campaign.status != "archived",
+        )
+        .order_by(PlayerSubmission.accepted_at.asc())
+    ).all()
+    pairs: dict[tuple[uuid.UUID, str], str] = {}
+    for campaign_id, thread_id, audience in rows:
+        pairs.setdefault((campaign_id, str(thread_id)), audience)
+    thread_uuids: dict[str, uuid.UUID] = {}
+    for _cid, tid in pairs:
+        try:
+            thread_uuids[tid] = uuid.UUID(tid)
+        except (ValueError, AttributeError, TypeError):
+            continue
+    excluded: set[uuid.UUID] = set()
+    if thread_uuids:
+        excluded = set(
+            db.execute(
+                select(CampaignThread.id).where(
+                    CampaignThread.id.in_(list(thread_uuids.values())),
+                    (CampaignThread.thread_type == "lobby") | (CampaignThread.private_kind == "direct"),
+                )
+            ).scalars().all()
+        )
+    out: list[tuple[uuid.UUID, str, str]] = []
+    for (campaign_id, tid), audience in pairs.items():
+        if tid in thread_uuids and thread_uuids[tid] in excluded:
+            continue
+        if get_active_turn(db, campaign_id, tid) is not None:
+            continue
+        out.append((campaign_id, tid, audience))
+        if len(out) >= max(1, limit):
+            break
+    return out
+
+
 def get_active_turn(db: Session, campaign_id: uuid.UUID, thread_id: str) -> DmTurn | None:
     """Most recent turn in blocking/pending state for this campaign+thread."""
     tid = str(thread_id)
