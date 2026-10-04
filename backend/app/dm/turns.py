@@ -634,6 +634,8 @@ def stage_validated_attempt(
     db: Session,
     attempt_id: uuid.UUID,
     contract: Any,
+    *,
+    code_built_effects: list[dict[str, Any]] | None = None,
 ) -> DmTurnAttempt:
     """Persist typed staged effects attach to one attempt without mutating authoritative state.
 
@@ -645,6 +647,9 @@ def stage_validated_attempt(
         db: Session
         attempt_id: DmTurnAttempt id (must be prepared/running)
         contract: DmTurnContractV1 instance or dict with staged_effects
+        code_built_effects: rules effects resolved by code from the contract's
+            mechanics intents (#229); staged after the model's effects and
+            never part of the contract snapshot (re-resolved on retry).
 
     Returns:
         Updated DmTurnAttempt with staged_effects + contract_snapshot persisted.
@@ -668,6 +673,7 @@ def stage_validated_attempt(
         staged_list = contract.get("staged_effects") or []
     else:
         raise ValueError("contract must be DmTurnContractV1 or dict")
+    staged_list = [*staged_list, *(code_built_effects or [])]
 
     # Validate staged_effects against contract invariants (no generic SQLalready validated by contract)
     # Ensure staged_effects only in respond mode is enforced by contract; here we just persist

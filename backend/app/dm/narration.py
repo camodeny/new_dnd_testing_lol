@@ -68,6 +68,7 @@ from sqlalchemy.orm import Session
 
 from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 from app.dm.contract import DmTurnContractV1, public_projection
+from app.dm.mechanics import issue_summary, resolve_mechanics, with_outcome_beat
 from app.observability.tracing import structured_log
 from app.realtime.service import publish_dm_chunk_created, publish_dm_status
 from app.world.identity import resolve_new_entity_identities_pre_narration
@@ -1297,7 +1298,8 @@ def execute_validated_turn(
     through the narration + durable-stream path:
 
     1. ``stage_validated_attempt`` — persist staged effects attempt-local
-       (no campaign-truth mutation).
+       (no campaign-truth mutation), including rules effects code resolves
+       from the contract's mechanics intents (#229).
     2. Pre-narration identity resolution (issue #214) — decide ambiguous
        ``new_entities`` identity AFTER contract normalization but BEFORE
        the first visible chunk, and persist the attempt-local outcomes.
@@ -1343,7 +1345,20 @@ def execute_validated_turn(
     except (ValueError, TypeError) as exc:
         raise ValueError(f"Turn {turn_id} has non-UUID thread_id {turn.thread_id!r}") from exc
 
-    staged = stage_validated_attempt(db, attempt_id, contract)
+    # Issue #229 — mechanics intents resolve to code-built rules effects and
+    # one outcome beat the narrator must honor. Validation already refused
+    # illegal intents; an issue here fails closed with nothing visible.
+    code_built_effects: list[dict[str, Any]] = []
+    if contract.mechanics:
+        from models.campaigns import Campaign as _Campaign
+
+        resolution = resolve_mechanics(db, db.get(_Campaign, turn.campaign_id), turn, contract)
+        if resolution.issues:
+            raise ValueError(f"mechanics refused at staging: {issue_summary(resolution.issues)}")
+        contract = with_outcome_beat(contract, resolution)
+        code_built_effects = resolution.effects
+
+    staged = stage_validated_attempt(db, attempt_id, contract, code_built_effects=code_built_effects)
 
     # Issue #214 — pre-narration bounded identity resolution. Decided here
     # (after normalization/staging, before any visible chunk) so an

@@ -34,7 +34,7 @@ cycles are listed at the end.
 - `rolls/`: player-owned roll requests and fulfillment.
 - `adventures/`: adventure lifecycle, summaries/recaps, epilogues, closing jobs.
 - `submissions/`: player submission acceptance and DM turn coordination entry.
-- `dm/`: the turn spine. Covers turns/attempts, context, contract, adjudication, evidence (+ `tools/`), validators, narration, streams, effects, recovery, and the cron sweep.
+- `dm/`: the turn spine. Covers turns/attempts, context, contract, adjudication, evidence (+ `tools/`), validators, mechanics, narration, streams, effects, recovery, and the cron sweep.
 - `post_turn/`: the durable post-turn checkpoint, materialization, consistency incidents, and backpressure.
 
 **Transport / read models**
@@ -60,7 +60,9 @@ The authoritative walkthrough is the module docstring of `dm/execution.py`. In s
    A Jev rules assessment of the validated proposal is recorded in advisory mode;
    it never changes the contract, overrides validators, or blocks commit.
    Next it dispatches on the contract mode: `await_roll` goes to `rolls.service`, `silent` commits.
-4. For `respond`, `dm.narration.execute_validated_turn` streams durable narration chunks.
+4. For `respond`, `dm.narration.execute_validated_turn` first resolves the contract's
+   mechanics intents through `dm.mechanics` into code-built `apply_*` effects plus an
+   outcome beat (validation already refused illegal ones), then streams durable narration chunks.
    It then calls `dm.turns.commit_turn`, which applies `dm.effects` inside
    `campaigns.events.commit_campaign_mutation` (revision bump + domain event).
 5. The same mutation stages a `PostTurnRun` via `post_turn.service.maybe_trigger_post_turn`.
@@ -99,6 +101,8 @@ That gives them idempotency, leases, and bounded retries.
   - `rolls.service` recomputes `total == kept dice + modifier`.
   - `combat.service` recomputes initiative totals.
   - `rules/` computes checks, attacks and damage.
+  - The DM states mechanics intents (damage, condition, spend); `dm.mechanics` rolls,
+    checks legality, and builds the HP/condition/resource effects.
   - Decision and DM models never compute outcomes.
 - **Ordering**: every authoritative mutation goes through `campaigns.events.commit_campaign_mutation`.
   That means expected-revision optimistic concurrency and a domain event per revision.

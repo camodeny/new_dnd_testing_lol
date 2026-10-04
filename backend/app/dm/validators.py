@@ -987,6 +987,44 @@ class RulesValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
+class MechanicsValidator:
+    """Mechanics intents must resolve legally against current state (#229).
+
+    Bound to one attempt's session/campaign/turn (``attempt_pipeline``):
+    legality reads authoritative sheet/NPC rows, which a packet-only
+    validator cannot. A refused intent (no slot left, unknown condition,
+    target without tracked HP) becomes regeneration feedback; nothing is
+    consumed before commit.
+    """
+
+    name = "mechanics_validator"
+    category = "mechanics"
+
+    def __init__(self, db, campaign, turn):
+        self.db = db
+        self.campaign = campaign
+        self.turn = turn
+
+    def validate(self, contract, packet) -> ValidatorResult:
+        from app.dm.mechanics import resolve_mechanics
+
+        t0 = time.monotonic()
+        violations: list[ValidationViolation] = []
+        if contract.mechanics:
+            for issue in resolve_mechanics(self.db, self.campaign, self.turn, contract).issues:
+                violations.append(
+                    ValidationViolation(
+                        validator=self.name,
+                        category=self.category,
+                        code=f"mechanic_{issue.code}",
+                        message=f"mechanic {issue.intent_id!r} refused: {issue.message}",
+                        details={"mechanic_id": issue.intent_id},
+                    )
+                )
+        latency = (time.monotonic() - t0) * 1000
+        return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
+
+
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 DEFAULT_VALIDATORS: list[Validator] = [
@@ -1066,6 +1104,11 @@ class ValidatorPipeline:
 default_pipeline = ValidatorPipeline()
 
 
+def attempt_pipeline(db, campaign, turn) -> ValidatorPipeline:
+    """Default validators plus the state-reading mechanics check for one attempt."""
+    return ValidatorPipeline([*DEFAULT_VALIDATORS, MechanicsValidator(db, campaign, turn)])
+
+
 def validate_contract(
     contract: DmTurnContractV1,
     packet: ForwardDmContextPacket | None = None,
@@ -1115,6 +1158,7 @@ def run_with_bounded_regeneration(
     *,
     max_regenerations: int = 3,
     packet_repair: Callable[[ValidationReport, ForwardDmContextPacket | None], ForwardDmContextPacket | None] | None = None,
+    pipeline: ValidatorPipeline | None = None,
 ) -> tuple[DmTurnContractV1, ValidationReport]:
     """Bounded retry: adjudicate → validate → on rejection, adjudicate again with feedback.
 
@@ -1141,7 +1185,7 @@ def run_with_bounded_regeneration(
     """
     from app.dm.contract import normalize_contract
 
-    pipe = default_pipeline
+    pipe = pipeline or default_pipeline
     last_report: ValidationReport | None = None
     current_packet = packet
     repair_attempted = False
