@@ -712,13 +712,31 @@ def _apply_stored_identity_outcome(
 
 def _count_prior_deferrals(db: Session, attempt: Any, *, temp_id: str,
                            public_name: Any, max_levels: int = 5) -> int:
-    """Count DEFER memos for the same proposal up the abandoned-retry chain.
+    """Count DEFER memos for the same proposal on this attempt and up the abandoned-retry chain.
 
     Never raises: unreadable ancestry means zero, never a blocked turn.
     """
+    def _memos(row: Any) -> int:
+        n = 0
+        for item in getattr(row, "identity_resolutions", None) or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("outcome") != DEFER or item.get("via") != "deferred":
+                continue
+            if str(item.get("temp_id") or "") != str(temp_id or ""):
+                continue
+            proposal = item.get("proposal") if isinstance(item.get("proposal"), dict) else {}
+            if str(proposal.get("public_name") or "") != str(public_name or ""):
+                continue
+            n += 1
+        return n
+
+    # The attempt's own memo counts too: an in-attempt re-adjudication that
+    # re-defers the same proposal must take the runner-up, not loop.
     count = 0
     current = attempt
     try:
+        count += _memos(current)
         for _ in range(max_levels):
             parent_id = getattr(current, "parent_attempt_id", None)
             if not parent_id:
@@ -726,17 +744,7 @@ def _count_prior_deferrals(db: Session, attempt: Any, *, temp_id: str,
             parent = db.get(DmTurnAttempt, parent_id)
             if parent is None:
                 break
-            for item in getattr(parent, "identity_resolutions", None) or []:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("outcome") != DEFER or item.get("via") != "deferred":
-                    continue
-                if str(item.get("temp_id") or "") != str(temp_id or ""):
-                    continue
-                proposal = item.get("proposal") if isinstance(item.get("proposal"), dict) else {}
-                if str(proposal.get("public_name") or "") != str(public_name or ""):
-                    continue
-                count += 1
+            count += _memos(parent)
             if getattr(parent, "status", None) != "abandoned":
                 break
             current = parent
