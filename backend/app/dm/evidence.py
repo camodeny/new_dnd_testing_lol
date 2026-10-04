@@ -64,7 +64,7 @@ MAX_REQUESTS_PER_ROUND: int = 3
 MAX_TOTAL_REQUESTS: int = 9
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(
-    {"ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules",
+    {"ask_character_sheet", "search_campaign_memory", "lookup_rule", "search_rules", "search_stat_blocks",
      "lookup_world_entity", "traverse_world_relations", "lookup_world_fact",
      "query_world_timeline", "lookup_source_turn", "query_character_knowledge"}
 )
@@ -214,8 +214,10 @@ def _tool_registry() -> dict[str, Callable[..., Any]]:
     Imported lazily: the handler modules import this module's result types.
     """
     from app.dm.tools import handle_ask_character_sheet
+    from app.dm.tools.bestiary import handle_search_stat_blocks
     from app.dm.tools.rules import TOOL_HANDLERS as rules_handlers
     return {
+        "search_stat_blocks": handle_search_stat_blocks,
         "ask_character_sheet": handle_ask_character_sheet,
         "search_campaign_memory": handle_search_campaign_memory,
         **rules_handlers,

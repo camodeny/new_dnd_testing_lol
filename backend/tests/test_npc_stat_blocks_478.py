@@ -104,9 +104,12 @@ def _npc(s, camp_id, name="Gate Thug"):
     return npc
 
 
-def _assign(npc, monster_id, effect_id="stat_1"):
+def _assign(npc, monster_id, effect_id="stat_1", creature_type=None):
+    from app.rules.bestiary import creature_type as type_of
+
+    kind = creature_type or type_of(get_stat_block(monster_id))
     return {"id": effect_id, "effect_type": "assign_stat_block",
-            "arguments": {"npc_entity_id": str(npc.id), "monster_id": monster_id}}
+            "arguments": {"npc_entity_id": str(npc.id), "monster_id": monster_id, "creature_type": kind}}
 
 
 def test_assign_and_damage_an_npc_in_one_turn(table):
@@ -178,6 +181,64 @@ def test_provider_schema_spells_out_effect_argument_keys():
     from app.dm.contract import contract_json_schema_strict
 
     guide = contract_json_schema_strict()["$defs"]["StagedEffect"]["properties"]["arguments"]["description"]
-    assert "assign_stat_block{npc_entity_id*, monster_id*}" in guide
+    assert "assign_stat_block{npc_entity_id*, monster_id*, creature_type*=aberration|beast|" in guide
     assert "update_scene{scene_patch*, reason*}" in guide
     assert "apply_attack_damage" not in guide
+
+
+
+# ── Creature type and nature (playtest 2026-10-04: a water monster got a fire construct) ──
+
+
+def test_wrong_creature_type_is_refused_with_same_type_options():
+    from app.rules.bestiary import describe
+
+    with pytest.raises(StatBlockError) as exc:
+        check_assignable("bandit", party_levels=[3, 3, 3], difficulty="medium", declared_type="ooze")
+    assert exc.value.code == "stat_block_type_mismatch"
+    assert "gray-ooze (Ooze" in str(exc.value)
+    assert describe(get_stat_block("azer-sentinel")).endswith("immune fire/poison)")
+
+
+def test_search_ranks_blocks_by_nature_within_budget():
+    from app.rules.bestiary import search_blocks
+
+    ids = [b["id"] for b in search_blocks("silt water ooze", max_xp=675, limit=5)]
+    assert {"gray-ooze", "ochre-jelly"} <= set(ids)
+    assert all(get_stat_block(i)["xp"] <= 675 for i in ids)
+    assert "azer-sentinel" not in ids
+
+
+def test_dm_turn_refuses_mismatched_type_then_accepts_a_fit(table):
+    s, camp_id, thread_id, _ = table
+    npc = _npc(s, camp_id, "Silt-Maw")
+    feedbacks = []
+
+    def adjudicate(packet, feedback=None):
+        feedbacks.append(feedback)
+        pick = ("gray-ooze", "ooze") if feedback and "stat_block_type_mismatch" in feedback else ("azer-sentinel", "ooze")
+        raw = _contract([], text="Black water heaves.")
+        raw["staged_effects"] = [_assign(npc, pick[0], creature_type=pick[1])]
+        return normalize_contract(raw)
+
+    turn, _ = _run(s, camp_id, thread_id, adjudicate)
+
+    assert turn.status == "succeeded"
+    assert "In-budget ooze blocks" in feedbacks[-1]
+    assert s.get(WorldEntity, npc.id).details[STAT_BLOCK_SECTION]["monster_id"] == "gray-ooze"
+
+
+def test_search_stat_blocks_evidence_tool(table):
+    from app.dm.context import ContextAudience
+    from app.dm.contract import EvidenceRequest
+    from app.dm.tools.bestiary import handle_search_stat_blocks
+
+    s, camp_id, thread_id, _ = table
+    result = handle_search_stat_blocks(
+        EvidenceRequest(id="sb1", tool="search_stat_blocks", query="silt water ooze"),
+        ContextAudience(campaign_id=str(camp_id), thread_id=str(thread_id), audience="campaign", user_ids=[]),
+        db=s,
+    )
+    assert result.status == "ok" and result.visibility == "dm_only"
+    assert result.payload["creature_type_filter"] == "ooze"
+    assert all("(Ooze," in line for line in result.payload["blocks"])

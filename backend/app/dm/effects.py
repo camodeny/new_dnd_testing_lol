@@ -1050,7 +1050,8 @@ def _handle_assign_stat_block(db: Session, campaign: Campaign, effect: dict[str,
 
     args = effect.get("arguments") or {}
     try:
-        entity, block = check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"))
+        entity, block = check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"),
+                                                    args.get("creature_type"))
     except _StatBlockError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} assign_stat_block refused ({exc.code}): {exc}") from exc
     details = dict(entity.details or {})
