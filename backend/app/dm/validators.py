@@ -993,8 +993,9 @@ class MechanicsValidator:
     Bound to one attempt's session/campaign/turn (``attempt_pipeline``):
     legality reads authoritative sheet/NPC rows, which a packet-only
     validator cannot. A refused intent (no slot left, unknown condition,
-    target without tracked HP) becomes regeneration feedback; nothing is
-    consumed before commit.
+    target without tracked HP) or stat-block pick (#478: unknown id, over
+    the party's encounter budget, NPC already statted) becomes regeneration
+    feedback; nothing is consumed before commit.
     """
 
     name = "mechanics_validator"
@@ -1006,21 +1007,23 @@ class MechanicsValidator:
         self.turn = turn
 
     def validate(self, contract, packet) -> ValidatorResult:
-        from app.dm.mechanics import resolve_mechanics
+        from app.dm.mechanics import resolve_mechanics, stat_block_issues
 
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
+        issues = stat_block_issues(self.db, self.campaign, contract)
         if contract.mechanics:
-            for issue in resolve_mechanics(self.db, self.campaign, self.turn, contract).issues:
-                violations.append(
-                    ValidationViolation(
-                        validator=self.name,
-                        category=self.category,
-                        code=f"mechanic_{issue.code}",
-                        message=f"mechanic {issue.intent_id!r} refused: {issue.message}",
-                        details={"mechanic_id": issue.intent_id},
-                    )
+            issues += resolve_mechanics(self.db, self.campaign, self.turn, contract).issues
+        for issue in issues:
+            violations.append(
+                ValidationViolation(
+                    validator=self.name,
+                    category=self.category,
+                    code=f"mechanic_{issue.code}",
+                    message=f"{issue.intent_id!r} refused: {issue.message}",
+                    details={"mechanic_id": issue.intent_id},
                 )
+            )
         latency = (time.monotonic() - t0) * 1000
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 

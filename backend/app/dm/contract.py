@@ -283,6 +283,7 @@ STAGED_EFFECT_TYPES = (
     "apply_resource",
     "apply_concentration",
     "apply_death_save",
+    "assign_stat_block",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -583,6 +584,26 @@ class ApplyDeathSaveArgs(StrictModel):
         return str(v)
 
 
+class AssignStatBlockArgs(StrictModel):
+    """Give an NPC an SRD stat block — issue #478.
+
+    The DM picks *which* block fits the fiction (``bandit``, ``guard``,
+    ``commoner``); code checks it against the party's encounter budget and
+    copies the SRD numbers into the NPC's details. Assigned stats are canon.
+    """
+    npc_entity_id: str = Field(min_length=1, max_length=160, description="Durable NPC world-entity UUID from the packet")
+    monster_id: str = Field(min_length=1, max_length=80, description="SRD 5.2.1 stat block id, e.g. bandit, guard, commoner, goblin-warrior")
+
+    @field_validator("npc_entity_id")
+    @classmethod
+    def _valid_npc_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("npc_entity_id must be a UUID") from exc
+        return str(v)
+
+
 class UpdateMapTerrainArgs(StrictModel):
     """DM-authored terrain change — issue #232.
 
@@ -760,13 +781,13 @@ class MechanicIntent(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | AssignStatBlockArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "assign_stat_block", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -824,6 +845,8 @@ class StagedEffect(StrictModel):
                 ApplyConcentrationArgs.model_validate(args)
             elif t == "apply_death_save":
                 ApplyDeathSaveArgs.model_validate(args)
+            elif t == "assign_stat_block":
+                AssignStatBlockArgs.model_validate(args)
             elif t == "update_map_terrain":
                 UpdateMapTerrainArgs.model_validate(args)
             elif t == "update_map_placement":

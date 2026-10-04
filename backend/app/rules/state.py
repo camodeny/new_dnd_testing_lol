@@ -46,6 +46,7 @@ from pydantic import Field
 
 from app.idempotency import execute_idempotent_command
 from app.observability.tracing import structured_log
+from app.rules.bestiary import STAT_BLOCK_KEYS
 from app.rules.mechanics import RULES_REVISION
 from app.schema import StrictModel
 
@@ -271,14 +272,18 @@ def project_npc_details_for_viewer(details: dict[str, Any] | None, is_authority:
     Ordinary members see member-visible state only: DM-private conditions
     are filtered, private concentration projects as inactive, and
     DM-private resource/slot/death-save/exhaustion sections project as
-    empty/zeroed. The marker map itself never leaves the authority lane
-    (its presence would disclose that hidden state exists).
+    empty/zeroed, and combat stat-block keys are dropped. The marker map
+    itself never leaves the authority lane (its presence would disclose that
+    hidden state exists).
     """
     if not isinstance(details, dict):
         return {}
     if is_authority:
         return {k: v for k, v in details.items()}
-    projected: dict[str, Any] = {k: v for k, v in details.items() if k != RULES_STATE_VISIBILITY_KEY}
+    # Combat stats (HP, AC, attacks, defenses; issue #478) never leave the
+    # authority lane: players learn them through play, not entity reads.
+    hidden = {RULES_STATE_VISIBILITY_KEY, *STAT_BLOCK_KEYS}
+    projected: dict[str, Any] = {k: v for k, v in details.items() if k not in hidden}
     conditions = projected.get("conditions")
     if isinstance(conditions, list):
         projected["conditions"] = [

@@ -108,6 +108,12 @@ not narrate those numbers in your beats.
   or one spell_slot_level slot, e.g. when a PC casts a leveled spell.
 If code refuses a mechanic (no slot left, untracked resource or HP), the
 feedback says why: adjust the fiction or drop the mechanic and narrate it.
+STAT BLOCKS: NPCs have no combat stats until you give them one. Before an NPC
+fights or takes damage, stage assign_stat_block with the SRD 5.2.1 monster_id
+that fits the fiction (commoner, guard, bandit, noble, priest, knight,
+goblin-warrior, wolf, ...). Ordinary people use the SRD's people stat blocks.
+Code refuses a block too strong for this party and suggests alternatives;
+an assigned block is permanent for that NPC.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

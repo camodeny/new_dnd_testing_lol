@@ -16,6 +16,24 @@ def latest_sheet(db: Session, character_id) -> Dnd5eCharacterSheet | None:
     ).scalars().first()
 
 
+def roster_levels(db: Session, campaign_id) -> list[int]:
+    """Levels of the PCs on a campaign's active roster (one per member with a sheet)."""
+    from models.campaigns import CampaignMember
+
+    ids = db.execute(
+        select(CampaignMember.selected_character_id).where(
+            CampaignMember.campaign_id == campaign_id,
+            CampaignMember.selected_character_id.is_not(None),
+        )
+    ).scalars().all()
+    levels = []
+    for character_id in ids:
+        sheet = latest_sheet(db, character_id)
+        if sheet is not None:
+            levels.append(int(sheet.level or 1))
+    return levels
+
+
 def character_with_sheet(db: Session, char: Character):
     sheet = latest_sheet(db, char.id)
     data = char.to_dict()

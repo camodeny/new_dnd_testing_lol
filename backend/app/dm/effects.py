@@ -33,6 +33,7 @@ from app.combat.maps import (
     update_terrain_inline as _update_terrain_inline,
 )
 from app.combat.service import start_encounter_inline
+from app.rules.bestiary import StatBlockError as _StatBlockError, stat_block_details as _stat_block_details
 from app.rules.attacks import (
     AttackError as _AttackError,
     HitPoints as _HitPoints,
@@ -96,6 +97,8 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "apply_resource": "dm_private",
     "apply_concentration": "dm_private",
     "apply_death_save": "dm_private",
+    # NPC stat blocks (#478) are DM-only: players learn AC/HP through play.
+    "assign_stat_block": "dm_private",
     # DM-authored map terrain (#232) defaults to dm_private (fail-closed):
     # hidden trap/stranded geometry must never widen to a shared audience
     # unless the staged effect explicitly says so.
@@ -800,6 +803,11 @@ class _StateTarget:
             self.hp_current = int(nested_hp.get("current")) if isinstance(nested_hp, dict) and nested_hp.get("current") is not None else None
             self.exhaustion = int(details.get("exhaustion_level", 0) or 0)
 
+    @property
+    def details(self) -> dict[str, Any]:
+        """Mutable NPC details view (empty for PCs, whose stats live on the sheet)."""
+        return self._details if self.kind == "npc" else {}
+
     def commit(self, db: Session) -> None:
         if self.kind == "pc":
             self.row.conditions = self.conditions
@@ -1034,6 +1042,32 @@ def _handle_apply_resource(db: Session, campaign: Campaign, effect: dict[str, An
     logger.info(
         "effect apply_resource effect_id=%s target=%s:%s op=%s resource=%s slot=%s",
         effect.get("id"), args.get("target_kind"), args.get("target_id"), op, resource, slot_level,
+    )
+
+
+@register("assign_stat_block")
+def _handle_assign_stat_block(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Copy an SRD stat block into an NPC's details (issue #478).
+
+    Re-checked under the commit lock with the same rules as validation
+    (NPC of this campaign, no stats yet, within the party's encounter
+    budget). Runs inside ``commit_campaign_mutation``: a failed commit rolls
+    the write back.
+    """
+    from app.dm.mechanics import check_stat_block_assignment
+
+    args = effect.get("arguments") or {}
+    try:
+        entity, block = check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"))
+    except _StatBlockError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} assign_stat_block refused ({exc.code}): {exc}") from exc
+    details = dict(entity.details or {})
+    details.update(_stat_block_details(block))
+    entity.details = details
+    db.flush()
+    logger.info(
+        "effect assign_stat_block effect_id=%s entity_id=%s monster_id=%s cr=%s",
+        effect.get("id"), entity.id, block["id"], block["challenge_rating"],
     )
 
 
