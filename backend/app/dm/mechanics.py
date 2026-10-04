@@ -331,7 +331,7 @@ def _resolve_condition(intent: MechanicIntent, target, kind: str, effect_id: str
             duration_rounds=intent.duration_rounds, visibility=visibility,
             mutation_id=mutation_id,
         )
-        text = f"{target.name} is now {name} ({intent.source})."
+        text = f"{_sentence_start(intent.source)} leaves {target.name} {name}."
     else:
         target.conditions, _ = remove_condition(target.conditions, name=name, mutation_id=mutation_id)
         text = f"{target.name} is no longer {name}."
@@ -358,7 +358,7 @@ def _resolve_spend(intent: MechanicIntent, target, kind: str, effect_id: str, mu
             target_id=str(intent.target.id), op="spend", slot_level=level,
             visibility=visibility,
         )
-        return effect, f"{target.name} expends a level {level} spell slot ({intent.source})."
+        return effect, f"{target.name} expends a level {level} spell slot on {intent.source}."
     amount = intent.amount or 1
     target.resources, _ = spend_resource(
         target.resources, name=intent.resource, amount=amount, mutation_id=mutation_id,
@@ -368,4 +368,22 @@ def _resolve_spend(intent: MechanicIntent, target, kind: str, effect_id: str, mu
         target_id=str(intent.target.id), op="spend", resource=intent.resource,
         amount=amount, visibility=visibility,
     )
-    return effect, f"{target.name} spends {amount} {intent.resource} ({intent.source})."
+    return effect, _spend_text(target.name, intent.resource, amount, intent.source)
+
+
+def _spend_text(name: str, resource: str, amount: int, source: str) -> str:
+    """One sentence a narrator can keep verbatim, without repeating the resource.
+
+    The model often restates the resource in ``source`` ("Bardic Inspiration
+    to Brannoc"); the old "spends 1 X (X to Y)" template read as a log line.
+    """
+    verb = f"uses {resource}" if amount == 1 else f"spends {amount} uses of {resource}"
+    if source.strip().lower().startswith(resource.strip().lower()):
+        rest = source.strip()[len(resource.strip()):].strip()
+        return f"{name} {verb} {rest}." if rest else f"{name} {verb}."
+    return f"{name} {verb} for {source}."
+
+
+def _sentence_start(text: str) -> str:
+    text = text.strip()
+    return text[:1].upper() + text[1:]
