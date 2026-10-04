@@ -35,6 +35,7 @@ from app.rules.attacks import (
     CombatantDefense,
     HitPoints,
     apply_damage,
+    heal_damage,
     build_damage_effect,
     hp_from_npc,
     parse_damage_expression,
@@ -44,6 +45,7 @@ from app.rules.state import (
     StateError,
     add_condition,
     build_condition_effect,
+    build_death_save_effect,
     build_resource_effect,
     normalize_condition_name,
     remove_condition,
@@ -96,6 +98,8 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
         try:
             if intent.kind == "damage":
                 effect, outcome = _resolve_damage(turn, intent, target, kind, effect_id, visibility)
+            elif intent.kind == "heal":
+                effect, outcome = _resolve_heal(turn, intent, target, kind, effect_id, mutation_id, visibility, resolution)
             elif intent.kind == "condition":
                 effect, outcome = _resolve_condition(intent, target, kind, effect_id, mutation_id, visibility)
             else:
@@ -185,6 +189,49 @@ def _resolve_damage(turn, intent: MechanicIntent, target, kind: str, effect_id: 
     if change.after.current == 0 and hp.current > 0:
         text += f" {target.name} drops to 0 hit points."
     return effect, text
+
+
+def _resolve_heal(turn, intent: MechanicIntent, target, kind: str, effect_id: str, mutation_id: str, visibility: str, resolution):
+    hp = _target_hp(target, kind)
+    spec = parse_damage_expression(intent.heal_dice or "")
+    rng = random.Random(f"{turn.id}:{json.dumps(intent.model_dump(mode='json'), sort_keys=True)}")
+    total = max(0, sum(rng.randint(1, spec.die_size) for _ in range(spec.num_dice)) + spec.modifier)
+    change = heal_damage(hp, total, change_id=effect_id)
+    target.hp_current = change.after.current
+    effect = {
+        "id": effect_id,
+        "effect_type": "apply_healing",
+        "arguments": {
+            "target_kind": kind,
+            "target_id": str(intent.target.id),
+            "heal_total": total,
+            "heal_id": effect_id,
+            "visibility": visibility,
+        },
+    }
+    restored = change.after.current - hp.current
+    text = f"{target.name} regains {restored} hit points from {intent.source}."
+    # 2024: regaining any HP at 0 ends dying, so the death-save counters reset.
+    if kind == "pc" and hp.current == 0 and restored > 0 and (target.successes or target.failures):
+        resolution.effects.append(build_death_save_effect(
+            effect_id=f"{effect_id}-ds", mutation_id=f"{mutation_id}:ds", target_kind=kind,
+            target_id=str(intent.target.id), op="reset", reset_reason="healed", visibility=visibility,
+        ))
+        target.successes = target.failures = 0
+    return effect, text
+
+
+def _target_hp(target, kind: str) -> HitPoints:
+    if kind == "pc":
+        row = target.row
+        return HitPoints(current=target.hp_current, maximum=int(row.hit_points_max), temporary=int(row.hit_points_temp or 0))
+    if target.hp_current is None:
+        raise AttackError(
+            "missing_stat",
+            f"{target.name} has no tracked hit points, so code cannot change them: narrate it instead",
+            field="hit_points",
+        )
+    return hp_from_npc(current=target.hp_current, details=dict(target.row.details or {}))
 
 
 def _damage_defense(details: dict[str, Any]) -> CombatantDefense:
