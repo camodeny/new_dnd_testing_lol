@@ -50,6 +50,37 @@ def _strip_provider_env() -> None:
 _strip_provider_env()
 
 
+# ── Database hermeticity (issue #481) ──────────────────────────────────────
+#
+# ``database.py`` calls ``load_dotenv()`` and prefers ``POSTGRES_URL``; a
+# developer ``backend/.env`` points that at the hosted Supabase database.
+# App code opens its own ``SessionLocal()`` in fallback paths (telemetry,
+# rules guidance, recovery), so sqlite-fixture tests could reach it. Every DB
+# variable is pinned before anything imports ``database``: to the disposable
+# test database when one is configured (URL contains ``ci_test``, the existing
+# convention), else to empty. Empty still blocks dotenv, which never
+# overrides a variable that is already set, so fallbacks become inert.
+
+_DB_ENV_VARS = (
+    "POSTGRES_URL",
+    "POSTGRES_PRISMA_URL",
+    "POSTGRES_URL_NON_POOLING",
+    "DATABASE_URL",
+    "SUPABASE_DB_URL",
+)
+
+
+def pin_test_database(environ) -> str:
+    """Point every DB variable at the disposable test DB (or nothing); return it."""
+    disposable = next((environ[v] for v in _DB_ENV_VARS if "ci_test" in (environ.get(v) or "")), "")
+    for var in _DB_ENV_VARS:
+        environ[var] = disposable
+    return disposable
+
+
+pin_test_database(os.environ)
+
+
 @pytest.fixture(autouse=True)
 def _pin_stub_embeddings(monkeypatch: pytest.MonkeyPatch):
     """Delete provider vars for each test (undoes to prior state after)."""
