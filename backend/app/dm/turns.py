@@ -40,7 +40,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -183,8 +183,21 @@ def find_stranded_submission_threads(
     from models.threads import CampaignThread
 
     cutoff = utcnow() - timedelta(seconds=min_age_seconds)
-    rows = db.execute(
-        select(PlayerSubmission.campaign_id, PlayerSubmission.thread_id, PlayerSubmission.audience)
+    # Direct/lobby thread ids are stringified because PlayerSubmission.thread_id
+    # is a string column (same pattern as billing/resolution_guarantee.py);
+    # non-UUID ids like "main" are never in the excluded set. Grouping and the
+    # LIMIT stay in SQL so perpetually-accepted direct chat never inflates the scan.
+    excluded = [
+        str(v)
+        for v in db.execute(
+            select(CampaignThread.id).where(
+                (CampaignThread.thread_type == "lobby") | (CampaignThread.private_kind == "direct")
+            )
+        ).scalars().all()
+    ]
+    oldest = func.min(PlayerSubmission.accepted_at)
+    q = (
+        select(PlayerSubmission.campaign_id, PlayerSubmission.thread_id, func.min(PlayerSubmission.audience))
         .join(Campaign, Campaign.id == PlayerSubmission.campaign_id)
         .where(
             PlayerSubmission.resolution_status == "accepted",
@@ -192,31 +205,15 @@ def find_stranded_submission_threads(
             PlayerSubmission.audience != "lobby",
             Campaign.status != "archived",
         )
-        .order_by(PlayerSubmission.accepted_at.asc())
-    ).all()
-    pairs: dict[tuple[uuid.UUID, str], str] = {}
-    for campaign_id, thread_id, audience in rows:
-        pairs.setdefault((campaign_id, str(thread_id)), audience)
-    thread_uuids: dict[str, uuid.UUID] = {}
-    for _cid, tid in pairs:
-        try:
-            thread_uuids[tid] = uuid.UUID(tid)
-        except (ValueError, AttributeError, TypeError):
-            continue
-    excluded: set[uuid.UUID] = set()
-    if thread_uuids:
-        excluded = set(
-            db.execute(
-                select(CampaignThread.id).where(
-                    CampaignThread.id.in_(list(thread_uuids.values())),
-                    (CampaignThread.thread_type == "lobby") | (CampaignThread.private_kind == "direct"),
-                )
-            ).scalars().all()
-        )
+        .group_by(PlayerSubmission.campaign_id, PlayerSubmission.thread_id)
+        .order_by(oldest.asc())
+        .limit(max(1, limit) * 4)
+    )
+    if excluded:
+        q = q.where(PlayerSubmission.thread_id.not_in(excluded))
     out: list[tuple[uuid.UUID, str, str]] = []
-    for (campaign_id, tid), audience in pairs.items():
-        if tid in thread_uuids and thread_uuids[tid] in excluded:
-            continue
+    for campaign_id, tid, audience in db.execute(q).all():
+        tid = str(tid)
         if get_active_turn(db, campaign_id, tid) is not None:
             continue
         out.append((campaign_id, tid, audience))
