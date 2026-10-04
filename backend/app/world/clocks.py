@@ -833,16 +833,20 @@ def apply_clock_outcome(
             raise ClockStaleError(fresh.id, expected_revision, fresh.revision)
         if fresh.status not in CLOCK_EVALUABLE_STATUSES:
             raise ClockStaleError(fresh.id, expected_revision, fresh.revision)
-        new_progress = int(fresh.threshold) if completing else int(fresh.progress or 0) + int(amount or 0)
+        prior_progress = int(fresh.progress or 0)
+        new_progress = int(fresh.threshold) if completing else prior_progress + int(amount or 0)
         if new_progress > int(fresh.threshold):
             raise ValueError(f"clock {fresh.id} advancement overshoots its threshold")
         fresh.progress = new_progress
         fresh.revision = expected_revision + 1
         fresh.evaluated_through_sequence = max(int(fresh.evaluated_through_sequence or 0), to_sequence)
         holder["completed"] = new_progress >= int(fresh.threshold)
-        holder["reason"] = "criteria_met" if completing else (
-            "threshold_reached" if holder["completed"] else "criteria_met"
-        )
+        # "threshold_reached": the pressure filled (advanced to, or already
+        # sat at, its threshold). "criteria_met": judged completion ended it
+        # early. The forward-DM pressure lane tells these apart.
+        holder["reason"] = "threshold_reached" if (
+            (not completing and holder["completed"]) or (completing and prior_progress >= int(fresh.threshold))
+        ) else "criteria_met"
         if holder["completed"]:
             fresh.status = "completed"
             fresh.completed_at = datetime.now(timezone.utc)
@@ -1191,4 +1195,89 @@ def project_clocks_for_viewer(
         result["hidden_count"] = hidden
     return result
 
+
+# ── Forward-DM pressure view (post-turn writes, the DM reacts) ────────────
+
+
+def _stage_index(stages: list[dict[str, Any]], progress: int) -> int:
+    """How many stages ``progress`` has reached (0 = none)."""
+    return sum(1 for stage in stages if int(stage["at"]) <= progress)
+
+
+def _clock_directive(clock: CampaignClock, event: CampaignDomainEvent, crossed: dict[str, Any] | None) -> str:
+    name = clock.name
+    payload = event.payload or {}
+    if event.event_type == CLOCK_COMPLETED_EVENT:
+        effect = payload.get("completion_effect") or {}
+        effect_text = f" Consequence on record: {effect.get('description') or effect}." if effect else ""
+        if payload.get("reason") == "threshold_reached":
+            return (f"'{name}' has filled ({clock.threshold}/{clock.threshold}): this pressure comes to a head now. "
+                    f"Show its consequence in the world this turn.{effect_text}")
+        ended = (clock.completion_criteria or {}).get("description") or "its completion criteria were met"
+        return (f"'{name}' has ended ({ended}). Show the aftermath and how the world responds to it "
+                f"this turn.{effect_text}")
+    return (f"'{name}' reached its '{crossed['label']}' stage ({payload.get('progress')}/{clock.threshold}). "
+            "Show this escalation in the world this turn, through NPC action, a new threat, or a visible "
+            "change, consistent with the scene.")
+
+
+def dm_pressure_view(
+    db: Session, campaign_id: Any, *, through_sequence: int, turn_event_type: str,
+) -> list[dict[str, Any]]:
+    """Clock state the forward DM should play to, plus any owed directive.
+
+    Post-turn evaluation stays the only writer of clock state; this is a
+    read-only projection as of ``through_sequence``. A stage crossing or a
+    completion owes the DM one directive, derived from the clock's own
+    lifecycle events: it stays pending until a DM turn (``turn_event_type``)
+    has committed after it, so it needs no extra bookkeeping. Active clocks
+    are always listed; a finished clock is listed only while its directive
+    is still owed.
+    """
+    cid = coerce_uuid(campaign_id, field="campaign_id")
+    clocks = list(db.execute(select(CampaignClock).where(
+        CampaignClock.campaign_id == cid,
+    ).order_by(CampaignClock.created_at.asc())).scalars().all())
+    if not clocks:
+        return []
+    events = list(db.execute(select(CampaignDomainEvent).where(
+        CampaignDomainEvent.campaign_id == cid,
+        CampaignDomainEvent.sequence <= int(through_sequence),
+        CampaignDomainEvent.event_type.in_([CLOCK_ADVANCED_EVENT, CLOCK_COMPLETED_EVENT, turn_event_type]),
+    ).order_by(CampaignDomainEvent.sequence.asc())).scalars().all())
+    last_turn_sequence = max((int(e.sequence) for e in events if e.event_type == turn_event_type), default=-1)
+
+    view: list[dict[str, Any]] = []
+    for clock in clocks:
+        stages = list(clock.stages or [])
+        latest: tuple[CampaignDomainEvent, dict[str, Any] | None] | None = None
+        for event in events:
+            if event.event_type == turn_event_type or str((event.payload or {}).get("clock_id")) != str(clock.id):
+                continue
+            after = int((event.payload or {}).get("progress") or 0)
+            if event.event_type == CLOCK_COMPLETED_EVENT:
+                latest = (event, None)
+                continue
+            before = after - (advance_amount(str((event.payload or {}).get("outcome"))) or 0)
+            if _stage_index(stages, after) > _stage_index(stages, before):
+                latest = (event, stages[_stage_index(stages, after) - 1])
+        owed = latest is not None and int(latest[0].sequence) > last_turn_sequence
+        if clock.status not in CLOCK_EVALUABLE_STATUSES and not owed:
+            continue
+        progress = int(clock.progress or 0)
+        reached = _stage_index(stages, progress)
+        view.append({
+            "clock_id": str(clock.id),
+            "name": clock.name,
+            "status": clock.status,
+            "progress": progress,
+            "threshold": int(clock.threshold),
+            "current_stage": stages[reached - 1]["label"] if reached else None,
+            "next_stage": stages[reached] if reached < len(stages) else {"at": int(clock.threshold), "label": "fills"},
+            "ends_when": (clock.completion_criteria or {}).get("description"),
+            "evaluated_through_sequence": int(clock.evaluated_through_sequence or 0),
+            "visibility": clock.visibility,
+            "directive": _clock_directive(clock, latest[0], latest[1]) if owed else None,
+        })
+    return view
 

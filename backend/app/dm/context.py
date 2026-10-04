@@ -26,10 +26,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.adventures.service import get_current_adventure
+from app.dm.turns import DM_TURN_RESOLVED
 from app.characters.service import latest_sheet
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics_for_sheet
 from app.schema import StrictModel
+from app.world.clocks import dm_pressure_view
 from app.world.identity import exact_identity
 from app.world.knowledge import build_knowledge_visibility_values
 from app.world.service import build_current_scene_context_record
@@ -58,6 +60,7 @@ class LaneName(str, Enum):
     PROTECTED_PCS = "protected_pcs"
     CURRENT_SCENE = "current_scene"
     ACTIVE_ADVENTURE = "active_adventure"
+    PRESSURES = "pressures"
     CHARACTER_STATE = "character_state"
     RELEVANT_CANON = "relevant_canon_relations"
     KNOWLEDGE_VISIBILITY = "knowledge_visibility"
@@ -70,6 +73,9 @@ class LaneName(str, Enum):
 
 
 LANE_ORDER = tuple(LaneName)
+
+#: Clock visibility -> context-record visibility; anything else stays DM-only.
+_PRESSURE_VISIBILITY = {"public": "public", "campaign": "campaign"}
 REQUIRED_LANES = {
     LaneName.TURN_IDENTITY,
     LaneName.PLAYER_INPUTS,
@@ -1299,6 +1305,37 @@ def assemble_attempt_context(
             )
         )
     timings[LaneName.ACTIVE_ADVENTURE] = (time.monotonic() - lane_started) * 1000
+
+    # Pressures: campaign clocks the forward DM plays to. Post-turn
+    # evaluation advances them; this lane closes the loop by showing their
+    # state and, when a stage was crossed or a clock finished since the last
+    # DM turn, a directive to show it in the world. Directive records are
+    # required (never budget-trimmed); state-only records are optional.
+    lane_started = time.monotonic()
+    for pressure in dm_pressure_view(
+        db, campaign.id, through_sequence=attempt.source_revision, turn_event_type=DM_TURN_RESOLVED,
+    ):
+        owed = pressure["directive"] is not None
+        records[LaneName.PRESSURES].append(
+            ContextRecord(
+                record_id=f"pressure:{pressure['clock_id']}",
+                required=owed,
+                priority=90 if owed else 70,
+                value={k: v for k, v in pressure.items() if k != "visibility"},
+                sources=[
+                    _source(
+                        "campaign_clock",
+                        pressure["clock_id"],
+                        str(pressure["evaluated_through_sequence"]),
+                        attempt.source_revision,
+                    )
+                ],
+                authorization=scope,
+                visibility=_PRESSURE_VISIBILITY.get(pressure["visibility"], "dm_only"),  # type: ignore[arg-type]
+                use="adjudication_only",
+            )
+        )
+    timings[LaneName.PRESSURES] = (time.monotonic() - lane_started) * 1000
 
     # Complete entity registry (experiment): every live NPC/location-style
     # entity with id + name + one-line summary, so the adjudicator can

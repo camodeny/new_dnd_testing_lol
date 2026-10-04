@@ -77,6 +77,15 @@ impossible, moot, or uninformed in a way the player would reconsider, do NOT
 emit beats for an action that never happens: use clarify mode with the answer
 and let the player redeclare.
 
+PRESSURES:
+The pressures lane lists campaign clocks: threats and schemes that advance
+between turns whether or not the players engage them. Let them shape the
+world: NPCs pursue them, scenes show their progress. You never advance a
+clock yourself; code does that from what happens in play. When a pressure
+carries a directive, the clock just reached a stage or ended: show it in this
+turn's beats (an NPC acts, a threat arrives, the scene visibly changes),
+woven into the response to the players rather than replacing it.
+
 ADVENTURE COMPLETION:
 The active_adventure lane names the current adventure. When the played fiction
 has resolved its arc (victory, failure, retreat, capture, or any other
