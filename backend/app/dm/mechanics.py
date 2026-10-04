@@ -29,6 +29,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.characters.service import roster_levels
 from app.dm.contract import Beat, Claim, DmTurnContractV1, EntityRef, MechanicIntent
 from app.rules.attacks import (
     AttackError,
@@ -41,6 +42,7 @@ from app.rules.attacks import (
     parse_damage_expression,
     resolve_damage,
 )
+from app.rules.bestiary import STAT_BLOCK_SECTION, StatBlockError, check_assignable, stat_block_details
 from app.rules.state import (
     StateError,
     add_condition,
@@ -73,12 +75,68 @@ class MechanicsResolution:
     issues: list[MechanicIssue] = field(default_factory=list)
 
 
+def check_stat_block_assignment(db: Session, campaign: Any, npc_entity_id: Any, monster_id: str) -> tuple[Any, dict[str, Any]]:
+    """``(npc_entity, block)`` an ``assign_stat_block`` effect may apply (#478).
+
+    Shared by pre-narration validation and the commit handler: the target
+    must be an NPC of this campaign without assigned stats (stats are canon),
+    and the block must fit the party's encounter budget.
+    """
+    from app.dm.effects import load_state_target
+
+    try:
+        target = load_state_target(db, campaign, "npc", npc_entity_id, label="assign_stat_block")
+    except ValueError as exc:
+        raise StatBlockError("unknown_target", str(exc)) from exc
+    if target.row.entity_type != "npc":
+        raise StatBlockError("not_an_npc", f"{target.name} is a {target.row.entity_type}, not an NPC")
+    if (target.row.details or {}).get(STAT_BLOCK_SECTION):
+        existing = target.row.details[STAT_BLOCK_SECTION]
+        raise StatBlockError(
+            "stat_block_already_assigned",
+            f"{target.name} already uses the {existing.get('name')} stat block; assigned stats are canon",
+        )
+    block = check_assignable(
+        monster_id, party_levels=roster_levels(db, campaign.id), difficulty=getattr(campaign, "difficulty", "medium"),
+    )
+    return target.row, block
+
+
+def stat_block_issues(db: Session, campaign: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
+    """Refusals for the contract's ``assign_stat_block`` effects."""
+    issues: list[MechanicIssue] = []
+    for effect in contract.staged_effects:
+        if effect.effect_type != "assign_stat_block":
+            continue
+        args = effect.arguments
+        try:
+            check_stat_block_assignment(db, campaign, args.get("npc_entity_id"), args.get("monster_id"))
+        except StatBlockError as exc:
+            issues.append(MechanicIssue(effect.id, exc.code, str(exc)))
+    return issues
+
+
+def _pending_stat_blocks(contract: DmTurnContractV1) -> dict[str, str]:
+    """``npc_entity_id -> monster_id`` assigned earlier in this same contract."""
+    return {
+        str(e.arguments.get("npc_entity_id")): str(e.arguments.get("monster_id"))
+        for e in contract.staged_effects
+        if e.effect_type == "assign_stat_block"
+    }
+
+
 def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnContractV1) -> MechanicsResolution:
-    """Resolve every intent; pure with respect to stored state (no writes)."""
+    """Resolve every intent; pure with respect to stored state (no writes).
+
+    A same-contract ``assign_stat_block`` is overlaid onto its NPC first, so
+    "this bandit is a Bandit; it takes 2d6 fire" resolves in one turn. The
+    commit applies the assignment before the code-built effects.
+    """
     from app.dm.effects import load_state_target
 
     resolution = MechanicsResolution()
     targets: dict[tuple[str, str], Any] = {}
+    pending = _pending_stat_blocks(contract)
     shared = (getattr(turn, "audience", None) or "campaign") == "campaign"
     for intent in contract.mechanics:
         kind = "pc" if intent.target.type == "character" else "npc"
@@ -86,9 +144,11 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
         try:
             if key not in targets:
                 targets[key] = load_state_target(db, campaign, kind, intent.target.id, label=f"mechanic {intent.id!r}")
+                if kind == "npc" and key[1] in pending:
+                    _overlay_stat_block(db, campaign, targets[key], pending[key[1]])
             target = targets[key]
-        except ValueError as exc:
-            resolution.issues.append(MechanicIssue(intent.id, "unknown_target", str(exc)))
+        except (ValueError, StatBlockError) as exc:
+            resolution.issues.append(MechanicIssue(intent.id, getattr(exc, "code", "unknown_target"), str(exc)))
             continue
         # A PC's own state is table-visible on a shared turn; NPC rules state
         # stays DM-only (the outcome claim carries the public part).
@@ -110,6 +170,13 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
         resolution.effects.append(effect)
         resolution.outcomes.append((intent, outcome))
     return resolution
+
+
+def _overlay_stat_block(db: Session, campaign: Any, target: Any, monster_id: str) -> None:
+    """Show a pending same-turn assignment on the in-memory target view only."""
+    _, block = check_stat_block_assignment(db, campaign, target.row.id, monster_id)
+    target.details.update(stat_block_details(block))
+    target.hp_current = block["hit_points"]
 
 
 def with_outcome_beat(contract: DmTurnContractV1, resolution: MechanicsResolution) -> DmTurnContractV1:
@@ -159,11 +226,11 @@ def _resolve_damage(turn, intent: MechanicIntent, target, kind: str, effect_id: 
         if target.hp_current is None:
             raise AttackError(
                 "missing_stat",
-                f"{target.name} has no tracked hit points, so code cannot apply damage to it: "
-                "drop this mechanic and narrate the harm instead",
+                f"{target.name} has no stat block, so code cannot apply damage to it: stage "
+                "assign_stat_block with a fitting SRD monster_id in this contract, or narrate the harm instead",
                 field="hit_points",
             )
-        details = dict(target.row.details or {})
+        details = dict(target.details)
         hp = hp_from_npc(current=target.hp_current, details=details)
         defense = _damage_defense(details)
     # Seeded per turn + intent: validation, staging, and a narration-only
@@ -228,10 +295,11 @@ def _target_hp(target, kind: str) -> HitPoints:
     if target.hp_current is None:
         raise AttackError(
             "missing_stat",
-            f"{target.name} has no tracked hit points, so code cannot change them: narrate it instead",
+            f"{target.name} has no stat block, so code cannot change its hit points: stage "
+            "assign_stat_block with a fitting SRD monster_id in this contract, or narrate it instead",
             field="hit_points",
         )
-    return hp_from_npc(current=target.hp_current, details=dict(target.row.details or {}))
+    return hp_from_npc(current=target.hp_current, details=dict(target.details))
 
 
 def _damage_defense(details: dict[str, Any]) -> CombatantDefense:

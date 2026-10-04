@@ -284,6 +284,7 @@ STAGED_EFFECT_TYPES = (
     "apply_concentration",
     "apply_death_save",
     "apply_healing",
+    "assign_stat_block",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -607,6 +608,26 @@ class ApplyDeathSaveArgs(StrictModel):
         return str(v)
 
 
+class AssignStatBlockArgs(StrictModel):
+    """Give an NPC an SRD stat block — issue #478.
+
+    The DM picks *which* block fits the fiction (``bandit``, ``guard``,
+    ``commoner``); code checks it against the party's encounter budget and
+    copies the SRD numbers into the NPC's details. Assigned stats are canon.
+    """
+    npc_entity_id: str = Field(min_length=1, max_length=160, description="Durable NPC world-entity UUID from the packet")
+    monster_id: str = Field(min_length=1, max_length=80, description="SRD 5.2.1 stat block id, e.g. bandit, guard, commoner, goblin-warrior")
+
+    @field_validator("npc_entity_id")
+    @classmethod
+    def _valid_npc_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("npc_entity_id must be a UUID") from exc
+        return str(v)
+
+
 class UpdateMapTerrainArgs(StrictModel):
     """DM-authored terrain change — issue #232.
 
@@ -793,13 +814,37 @@ class MechanicIntent(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+
+
+#: Typed argument model per effect type: validation and the provider-facing
+#: argument documentation (``contract_json_schema_strict``) share it.
+EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
+    "record_world_event": RecordWorldEventArgs,
+    "update_scene": UpdateSceneArgs,
+    "reveal_fact": RevealFactArgs,
+    "assert_fact": AssertFactArgs,
+    "upsert_relation": UpsertRelationArgs,
+    "complete_adventure": CompleteAdventureArgs,
+    "start_encounter": StartEncounterArgs,
+    "end_encounter": EndEncounterArgs,
+    "apply_attack_damage": ApplyAttackDamageArgs,
+    "apply_condition": ApplyConditionArgs,
+    "apply_resource": ApplyResourceArgs,
+    "apply_concentration": ApplyConcentrationArgs,
+    "apply_death_save": ApplyDeathSaveArgs,
+    "apply_healing": ApplyHealingArgs,
+    "assign_stat_block": AssignStatBlockArgs,
+    "update_map_terrain": UpdateMapTerrainArgs,
+    "update_map_placement": UpdateMapPlacementArgs,
+    "transfer_knowledge": TransferKnowledgeArgs,
+}
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -831,40 +876,7 @@ class StagedEffect(StrictModel):
         args = self.arguments
         # Dispatch validation: coerce through the typed model for stricter checks
         try:
-            if t == "record_world_event":
-                RecordWorldEventArgs.model_validate(args)
-            elif t == "update_scene":
-                UpdateSceneArgs.model_validate(args)
-            elif t == "reveal_fact":
-                RevealFactArgs.model_validate(args)
-            elif t == "assert_fact":
-                AssertFactArgs.model_validate(args)
-            elif t == "upsert_relation":
-                UpsertRelationArgs.model_validate(args)
-            elif t == "complete_adventure":
-                CompleteAdventureArgs.model_validate(args)
-            elif t == "start_encounter":
-                StartEncounterArgs.model_validate(args)
-            elif t == "end_encounter":
-                EndEncounterArgs.model_validate(args)
-            elif t == "apply_attack_damage":
-                ApplyAttackDamageArgs.model_validate(args)
-            elif t == "apply_condition":
-                ApplyConditionArgs.model_validate(args)
-            elif t == "apply_resource":
-                ApplyResourceArgs.model_validate(args)
-            elif t == "apply_concentration":
-                ApplyConcentrationArgs.model_validate(args)
-            elif t == "apply_death_save":
-                ApplyDeathSaveArgs.model_validate(args)
-            elif t == "apply_healing":
-                ApplyHealingArgs.model_validate(args)
-            elif t == "update_map_terrain":
-                UpdateMapTerrainArgs.model_validate(args)
-            elif t == "update_map_placement":
-                UpdateMapPlacementArgs.model_validate(args)
-            elif t == "transfer_knowledge":
-                TransferKnowledgeArgs.model_validate(args)
+            EFFECT_ARGS_MODELS[t].model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation
@@ -1293,6 +1305,32 @@ def contract_json_schema() -> dict[str, Any]:
     return DmTurnContractV1.model_json_schema()
 
 
+_CODE_BUILT_EFFECTS = (
+    "apply_attack_damage",
+    "apply_condition",
+    "apply_resource",
+    "apply_concentration",
+    "apply_death_save",
+    "apply_healing",
+)
+
+
+def _effect_argument_guide() -> str:
+    """``type{key*, key}`` per model-authorable effect.
+
+    The strict dialect carries ``arguments`` as an opaque string, so without
+    this the model guesses keys (playtest 2026-10-03: ``npc_id`` for
+    ``npc_entity_id`` failed a turn).
+    """
+    parts = []
+    for effect_type, model in EFFECT_ARGS_MODELS.items():
+        if effect_type in _CODE_BUILT_EFFECTS:
+            continue
+        keys = [f"{name}*" if info.is_required() else name for name, info in model.model_fields.items()]
+        parts.append(f"{effect_type}{{{', '.join(keys)}}}")
+    return "; ".join(parts)
+
+
 def contract_json_schema_strict() -> dict[str, Any]:
     """Provider-facing strict schema for structured-output APIs.
 
@@ -1312,7 +1350,10 @@ def contract_json_schema_strict() -> dict[str, Any]:
     if isinstance(staged_props.get("arguments"), dict):
         staged_props["arguments"] = {
             "type": "string",
-            "description": "JSON-encoded effect arguments object (parsed and validated locally per effect_type)",
+            "description": (
+                "JSON-encoded effect arguments object, validated locally per effect_type. "
+                "Exact keys per effect_type (* = required): " + _effect_argument_guide()
+            ),
         }
     # apply_attack_damage is code-built only (#226): the model must never
     # author HP damage totals, so it is removed from the provider-facing
@@ -1322,14 +1363,6 @@ def contract_json_schema_strict() -> dict[str, Any]:
     # resource / concentration / death-save transitions. Local validation
     # still accepts them for server-built effects, and RulesValidator
     # rejects them in provider output as defense-in-depth.
-    _CODE_BUILT_EFFECTS = (
-        "apply_attack_damage",
-        "apply_condition",
-        "apply_resource",
-        "apply_concentration",
-        "apply_death_save",
-        "apply_healing",
-    )
     effect_type_schema = staged_props.get("effect_type", {})
     if isinstance(effect_type_schema.get("enum"), list):
         effect_type_schema["enum"] = [e for e in effect_type_schema["enum"] if e not in _CODE_BUILT_EFFECTS]
