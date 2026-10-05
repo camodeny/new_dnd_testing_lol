@@ -563,10 +563,26 @@ def test_mixed_violations_still_retry_model_then_narrow():
     assert contract.beats[0].type == "narration"
 
 
-def test_perspective_repair_hook_retries_once_and_passes():
-    # Issue #455 resolve-then-retry: the hook supplies the missing lane
-    # entry, the model retries once against the repaired packet, and the
-    # NPC keeps their dialogue — 2 calls, zero narrowing.
+def _newcomer_perspective_repair(repairs, known_target):
+    """Repair hook supplying the newcomer's stored perspective (knows ``known_target``)."""
+    def repair(report, packet):
+        repairs.append(packet)
+        value = {"character_id": "", "subject_entity_id": "npc:newcomer", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k9", "target_kind": "entity", "target_id": known_target, "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}
+        rec = ContextRecord(record_id="knowledge:npc:newcomer", value=value, sources=[SourceRef(source_type="world_entity", source_id="npc:newcomer", source_version="1")], authorization=AuthorizationScope(campaign_id=packet.audience.campaign_id), visibility="dm_only", use="adjudication_only")
+        if any(r.record_id == rec.record_id for lane in packet.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY for r in lane.records):
+            return None
+        new_packet = packet.model_copy(deep=True)
+        for lane in new_packet.lanes:
+            if lane.name == LaneName.KNOWLEDGE_VISIBILITY:
+                lane.records.append(rec)
+        return new_packet
+    return repair
+
+
+def test_perspective_repair_revalidates_same_contract_without_model_call():
+    # An NPC the DM brought into the turn: the hook supplies its stored
+    # perspective, which covers the claim, so the same contract passes and
+    # the NPC keeps their dialogue — 1 call, zero narrowing.
     from app.dm.validators import KnowledgeValidator
     pkt = _knowledge_packet_newcomer_without_perspective()
     pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
@@ -578,23 +594,57 @@ def test_perspective_repair_hook_retries_once_and_passes():
         calls.append(feedback)
         return bad
 
-    def repair(report, packet):
-        repairs.append(packet)
-        value = {"character_id": "", "subject_entity_id": "npc:newcomer", "subject_resolved": True, "perspective": "npc", "entries": [{"knowledge_id": "k9", "target_kind": "entity", "target_id": "well:1", "knowledge_state": "knows", "acquisition_source": "direct_observation", "visibility": "dm_only"}], "total": 1, "truncated": False}
-        rec = ContextRecord(record_id="knowledge:npc:newcomer", value=value, sources=[SourceRef(source_type="world_entity", source_id="npc:newcomer", source_version="1")], authorization=AuthorizationScope(campaign_id=packet.audience.campaign_id), visibility="dm_only", use="adjudication_only")
-        if any(r.record_id == rec.record_id for lane in packet.lanes if lane.name == LaneName.KNOWLEDGE_VISIBILITY for r in lane.records):
-            return None
-        new_packet = packet.model_copy(deep=True)
-        for lane in new_packet.lanes:
-            if lane.name == LaneName.KNOWLEDGE_VISIBILITY:
-                lane.records.append(rec)
-        return new_packet
+    repair = _newcomer_perspective_repair(repairs, "well:1")
+    contract, report = _regen_with(pipe, adjudicate, pkt, packet_repair=repair, max_regenerations=3)
+    assert report.passed
+    assert len(calls) == 1
+    assert len(repairs) == 1
+    assert len(contract.beats) == 1
+    assert contract.beats[0].type == "npc_dialogue"
 
+
+def test_perspective_repair_retries_when_perspective_does_not_cover_claim():
+    # The repaired perspective resolves the NPC but not the claim's topic:
+    # the model retries once against the repaired packet, with the specific
+    # rejection as feedback.
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    bad = _base([_newcomer_dialogue_beat()])
+    good = _base([_quiet_narration_beat()])
+    calls = []
+    repairs = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return bad if len(calls) == 1 else good
+
+    repair = _newcomer_perspective_repair(repairs, "other:1")
     contract, report = _regen_with(pipe, adjudicate, pkt, packet_repair=repair, max_regenerations=3)
     assert report.passed
     assert len(calls) == 2
     assert len(repairs) == 1
-    assert len(contract.beats) == 1
+    assert "npc_utterance_without_knowledge" in calls[1]
+    assert contract.beats[0].type == "narration"
+
+
+def test_initial_contract_is_validated_before_any_model_call():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _knowledge_packet_newcomer_without_perspective()
+    pipe = ValidatorPipeline(validators=[KnowledgeValidator()])
+    calls = []
+
+    def adjudicate(packet, feedback):
+        calls.append(feedback)
+        return _base([_quiet_narration_beat()])
+
+    initial = _base([_newcomer_dialogue_beat()])
+    repair = _newcomer_perspective_repair([], "well:1")
+    contract, report = _regen_with(
+        pipe, adjudicate, pkt, packet_repair=repair, max_regenerations=3, initial_contract=initial,
+    )
+    assert report.passed
+    assert calls == []
     assert contract.beats[0].type == "npc_dialogue"
 
 
@@ -646,3 +696,100 @@ def test_scene_present_npc_is_identity_authority_without_registry():
         }]}])
     assert validator.validate(contract({"type": "npc", "id": npc_id}), packet).passed
     assert not validator.validate(contract({"type": "location", "id": npc_id}), packet).passed
+
+
+def _scene_npc_observation_packet(location_id, perspective_entries, acting_character_id=None):
+    cid = str(uuid.uuid4())
+    knowledge = ContextRecord(
+        record_id="knowledge:npc:traveler",
+        value={"character_id": "", "subject_entity_id": "npc:traveler", "subject_resolved": True,
+               "perspective": "npc", "entries": perspective_entries, "total": len(perspective_entries),
+               "truncated": False},
+        sources=[SourceRef(source_type="world_entity", source_id="npc:traveler", source_version="1")],
+        authorization=AuthorizationScope(campaign_id=cid), visibility="dm_only", use="adjudication_only",
+    )
+    scene = ContextRecord(
+        record_id=f"current-scene:{cid}",
+        value={"campaign_id": cid, "location_entity_id": location_id, "location_name": "Cinderfell Chapel"},
+        sources=[SourceRef(source_type="campaign_current_scene", source_id=cid, source_version="1")],
+        authorization=AuthorizationScope(campaign_id=cid),
+    )
+    records = {LaneName.KNOWLEDGE_VISIBILITY: [knowledge], LaneName.CURRENT_SCENE: [scene]}
+    if acting_character_id:
+        records[LaneName.PLAYER_INPUTS] = [ContextRecord(
+            record_id="submission:s1",
+            value={"submission_id": "s1", "character_id": acting_character_id,
+                   "segments": [{"position": 0, "segment_type": "ic", "text": "Who are you?"}]},
+            sources=[SourceRef(source_type="player_submission", source_id="s1", source_version="1")],
+            authorization=AuthorizationScope(campaign_id=cid),
+        )]
+    pkt, _, _ = _packet(
+        campaign_id=cid, extra_records=records,
+        extra_status={LaneName.KNOWLEDGE_VISIBILITY: "authoritative", LaneName.CURRENT_SCENE: "authoritative"},
+    )
+    return pkt
+
+
+def _npc_observation_at(location_id):
+    return _base([{"id": "beat_1", "type": "narration", "claims": [{
+        "text": "The hooded traveler edges into the lantern light.",
+        "claim_kind": "observation", "origin": "dm_adjudication",
+        "actor_ref": {"type": "npc", "id": "npc:traveler"},
+        "location_ref": {"type": "location", "id": location_id},
+    }]}])
+
+
+def test_npc_claim_in_current_scene_location_needs_no_location_knowledge():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _scene_npc_observation_packet("loc:chapel", [])
+    result = KnowledgeValidator().validate(_npc_observation_at("loc:chapel"), pkt)
+    assert result.passed, result.violations
+
+
+def test_npc_claim_set_elsewhere_still_needs_location_knowledge():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _scene_npc_observation_packet("loc:chapel", [])
+    result = KnowledgeValidator().validate(_npc_observation_at("loc:crypt"), pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_without_knowledge"
+    assert result.violations[0].details["unknown"] == ["loc:crypt"]
+
+
+def _npc_line_to(character_id, topic_id=None):
+    claim = {
+        "text": "I don't know if the way down is still open.",
+        "claim_kind": "npc_utterance", "origin": "dm_adjudication",
+        "actor_ref": {"type": "npc", "id": "npc:traveler"},
+        "target_refs": [{"type": "character", "id": character_id}],
+    }
+    if topic_id:
+        claim["topic_refs"] = [{"type": "location", "id": topic_id}]
+    return _base([{
+        "id": "beat_1", "type": "npc_dialogue", "speaker_ref": {"type": "npc", "id": "npc:traveler"},
+        "speaker_public_name": "Hooded traveler", "truth_status": "truthful", "claims": [claim],
+    }])
+
+
+def test_npc_addressing_acting_pc_about_current_location_is_co_presence():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _scene_npc_observation_packet("loc:chapel", [], acting_character_id="char:rowan")
+    result = KnowledgeValidator().validate(_npc_line_to("char:rowan", topic_id="loc:chapel"), pkt)
+    assert result.passed, result.violations
+
+
+def test_npc_referencing_pc_not_acting_this_turn_still_needs_knowledge():
+    from app.dm.validators import KnowledgeValidator
+    pkt = _scene_npc_observation_packet("loc:chapel", [], acting_character_id="char:rowan")
+    result = KnowledgeValidator().validate(_npc_line_to("char:absent"), pkt)
+    assert not result.passed
+    assert result.violations[0].details["unknown"] == ["char:absent"]
+
+
+def test_explicit_does_not_know_beats_co_presence():
+    from app.dm.validators import KnowledgeValidator
+    denied = [{"knowledge_id": "k1", "target_kind": "entity", "target_id": "char:rowan",
+               "knowledge_state": "does_not_know", "acquisition_source": "dm_adjudication", "visibility": "dm_only"}]
+    pkt = _scene_npc_observation_packet("loc:chapel", denied, acting_character_id="char:rowan")
+    result = KnowledgeValidator().validate(_npc_line_to("char:rowan"), pkt)
+    assert not result.passed
+    assert result.violations[0].code == "npc_utterance_denied_knowledge"

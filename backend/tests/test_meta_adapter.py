@@ -1,10 +1,8 @@
-"""Meta Model API (OpenAI-compatible) adapter + DM end-to-end.
+"""Meta Model API (OpenAI-compatible) adapter.
 
 Meta serves Muse Spark from ``https://api.meta.ai/v1`` with standard
 ``choices`` envelopes, so these tests pin the ``choices[0].message`` /
-``choices[].delta`` shapes and the ``META_API_KEY`` credential, plus a
-Meta-routed response reaching ``normalize_contract()`` through
-``adjudicate_with_failover``.
+``choices[].delta`` shapes and the ``META_API_KEY`` credential.
 """
 
 import json
@@ -131,12 +129,12 @@ def test_meta_json_schema_strict(monkeypatch):
     assert payload["response_format"]["json_schema"]["strict"] is True
 
 
-def test_dm_area_uses_direct_model_api_pair(monkeypatch):
-    """Provider contract: DM resolves to the exact direct-API URL+model."""
+def test_meta_area_uses_direct_model_api_pair(monkeypatch):
+    """Provider contract: a Meta area resolves to the exact direct-API URL+model."""
     from app.providers.areas import resolve_area
 
     monkeypatch.setenv("META_API_KEY", "dummy")
-    adapter, model, name = resolve_area("dm")
+    adapter, model, name = resolve_area("character_chat")
     assert name == "meta"
     assert adapter.base_url() == "https://api.meta.ai/v1/chat/completions"
     assert model == "muse-spark-1.3-contributor"
@@ -144,41 +142,3 @@ def test_dm_area_uses_direct_model_api_pair(monkeypatch):
     assert "llama.com" not in adapter.base_url()
     assert "opencode" not in adapter.base_url()
     assert "opencode" not in model
-
-
-class _StubPacket:
-    def serialize_for_adjudication(self):
-        return "{}"
-
-
-def test_dm_contract_via_meta_choices_envelope(monkeypatch):
-    from app.dm.adjudication import adjudicate_with_failover
-
-    monkeypatch.setenv("META_API_KEY", "dummy")
-    contract_json = json.dumps({
-        "contract_version": CONTRACT_VERSION,
-        "mode": "silent",
-        "reason": "meta envelope test",
-        "beats": [],
-    })
-    envelope = {
-        "id": "resp_dm",
-        "model": "muse-spark-1.3-contributor",
-        "choices": [
-            {
-                "index": 0,
-                "message": {"role": "assistant", "content": contract_json},
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {},
-    }
-
-    def _fake_execute(adapter, request, **kwargs):
-        assert adapter.name == "meta"
-        assert request.json_schema is not None
-        return MetaAdapter().parse_response(envelope)
-
-    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
-    contract, _ = adjudicate_with_failover(_StubPacket())
-    assert contract.mode == "silent"

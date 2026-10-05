@@ -304,3 +304,86 @@ def test_repair_returns_none_when_nothing_resolves():
     pkt = _packet_with_empty_knowledge_lane(camp.id)
     assert repair_packet_missing_perspectives(pkt, db, camp, ["tmp_ghost", "no such entity"]) is None
     assert repair_packet_missing_perspectives(pkt, db, camp, []) is None
+
+
+def _resolved_attempt(db, camp, snapshot):
+    from models.dm import DmTurnAttempt
+
+    row = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=uuid.uuid4(), attempt_number=1, status="succeeded",
+        campaign_id=camp.id, thread_id="t", source_revision=0, input_set_revision=0,
+        submission_ids=[], contract_snapshot=snapshot,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _npc_ref(entity):
+    return {"type": "npc", "id": str(entity.id)}
+
+
+def test_recently_active_npcs_come_from_introductions_and_contract_refs():
+    from app.dm.context import _recently_active_npc_ids
+
+    Fac, camp = _setup()
+    db = Fac()
+    names = ["Speaker", "Actor", "Target", "Introduced", "Stale"]
+    npcs = {}
+    for i, name in enumerate(names):
+        npcs[name], _ = commit_world_write(
+            db, camp.id, i, create_entity, entity_type="npc", name=name,
+            operation_id=f"op-active-{name}",
+        )
+    location, _ = commit_world_write(
+        db, camp.id, len(names), create_entity, entity_type="location", name="Chapel",
+        operation_id="op-active-location",
+    )
+    older = _resolved_attempt(db, camp, {"beats": [{
+        "type": "narration",
+        "claims": [{"actor_ref": _npc_ref(npcs["Stale"]), "target_refs": [], "topic_refs": []}],
+    }]})
+    newer = _resolved_attempt(db, camp, {"beats": [
+        {"type": "npc_dialogue", "speaker_ref": _npc_ref(npcs["Speaker"]), "claims": [
+            {"actor_ref": _npc_ref(npcs["Speaker"]),
+             "target_refs": [_npc_ref(npcs["Target"]), {"type": "character", "id": str(uuid.uuid4())}],
+             "topic_refs": [{"type": "location", "id": str(location.id)}]},
+        ]},
+        {"type": "narration", "claims": [{"actor_ref": _npc_ref(npcs["Actor"])}]},
+    ]})
+    npcs["Introduced"].source_attempt_id = newer.id
+    db.flush()
+
+    active = _recently_active_npc_ids(db, camp.id, [str(newer.id), str(older.id)])
+    assert active == [
+        str(npcs["Introduced"].id), str(npcs["Speaker"].id), str(npcs["Target"].id),
+        str(npcs["Actor"].id), str(npcs["Stale"].id),
+    ]
+    assert _recently_active_npc_ids(db, camp.id, [str(newer.id), str(older.id)], limit=2) == [
+        str(npcs["Introduced"].id), str(npcs["Speaker"].id),
+    ]
+
+
+def test_recently_active_npcs_skip_superseded_and_foreign_entities():
+    from app.dm.context import _recently_active_npc_ids
+
+    Fac, camp = _setup()
+    db = Fac()
+    kept, _ = commit_world_write(
+        db, camp.id, 0, create_entity, entity_type="npc", name="Kept", operation_id="op-kept",
+    )
+    merged, _ = commit_world_write(
+        db, camp.id, 1, create_entity, entity_type="npc", name="Merged", operation_id="op-merged",
+    )
+    merged.superseded_by_id = kept.id
+    db.flush()
+    attempt = _resolved_attempt(db, camp, {"beats": [{"type": "narration", "claims": [
+        {"actor_ref": _npc_ref(merged)},
+        {"actor_ref": {"type": "npc", "id": str(uuid.uuid4())}},
+        {"actor_ref": {"type": "npc", "id": "tmp_guard"}},
+        {"actor_ref": _npc_ref(kept)},
+    ]}]})
+
+    assert _recently_active_npc_ids(db, camp.id, [str(attempt.id)]) == [str(kept.id)]
+    assert _recently_active_npc_ids(db, uuid.uuid4(), [str(attempt.id)]) == []
+    assert _recently_active_npc_ids(db, camp.id, ["not-a-uuid"]) == []

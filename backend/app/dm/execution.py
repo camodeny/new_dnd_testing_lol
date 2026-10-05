@@ -387,7 +387,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     carrying the resolved lane entries, and later validation must use it.
     """
     from app.dm.contract import ContractValidationError
-    from app.dm.evidence import run_bounded_evidence_loop
+    from app.dm.evidence import EvidenceLoopLimitError, run_bounded_evidence_loop
     from app.dm.rules_guidance import enrich_rules_context, check_rules_advisory
     from app.dm.validators import attempt_pipeline, run_with_bounded_regeneration
     from app.observability.tracing import trace_context
@@ -438,7 +438,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
             logger.warning("dm_execute perspective repair failed: %s", exc)
             return None
 
-    def regenerate(pkt):
+    def regenerate(pkt, initial_contract=None):
         repaired_packets = []
 
         def repair_hook(report, current):
@@ -447,7 +447,10 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
                 repaired_packets.append(repaired)
             return repaired
 
-        contract, _ = run_with_bounded_regeneration(adjudicate, pkt, packet_repair=repair_hook, pipeline=pipeline)
+        contract, _ = run_with_bounded_regeneration(
+            adjudicate, pkt, packet_repair=repair_hook, pipeline=pipeline,
+            initial_contract=initial_contract,
+        )
         return contract, (repaired_packets[-1] if repaired_packets else pkt)
 
     validation_packet = start_packet
@@ -464,9 +467,25 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     final_contract, _bundle = run_bounded_evidence_loop(
         initial_packet=start_packet, adjudicate=evidence_adjudicate, db=run.db,
     )
-    if pipeline.validate(final_contract, validation_packet).passed:
-        return checked(final_contract, validation_packet)
-    regenerated, repaired_packet = regenerate(validation_packet)
+    # Validate the produced contract inside the bounded loop so a missing
+    # perspective is repaired against it before any model retry.
+    regenerated, repaired_packet = regenerate(validation_packet, initial_contract=final_contract)
+    if regenerated.mode == "need_evidence":
+        # A retry may answer a rejection by asking for evidence. need_evidence
+        # carries no beats, so it validates, but committing it would end the
+        # turn on its progress prelude: resume the evidence loop once instead.
+        pending = [regenerated]
+
+        def resume(pkt):
+            return pending.pop() if pending else evidence_adjudicate(pkt)
+
+        validation_packet = repaired_packet
+        final_contract, _bundle = run_bounded_evidence_loop(
+            initial_packet=repaired_packet, adjudicate=resume, db=run.db,
+        )
+        regenerated, repaired_packet = regenerate(validation_packet, initial_contract=final_contract)
+        if regenerated.mode == "need_evidence":
+            raise EvidenceLoopLimitError("DM requested evidence again after its evidence was resolved")
     return checked(regenerated, repaired_packet)
 
 

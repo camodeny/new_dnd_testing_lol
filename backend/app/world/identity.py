@@ -1052,6 +1052,93 @@ def reveal_entity_name(db: Session, campaign_id: uuid.UUID, entity_id: Any, new_
     return entity
 
 
+def _co_presence_targets(db: Session, campaign: Campaign, scene: CampaignCurrentScene) -> list[uuid.UUID]:
+    """Baseline knowledge targets for an NPC present in the scene: its location + present PCs."""
+    targets: list[uuid.UUID] = []
+    if scene.location_entity_id:
+        targets.append(scene.location_entity_id)
+    for actor in scene.present_actors or []:
+        if not isinstance(actor, dict) or actor.get("kind") != "pc":
+            continue
+        ref = actor.get("entity_id") or actor.get("name")
+        pc, _ = exact_identity_match(db, campaign.id, ref)
+        if pc is not None and pc.entity_type == "character" and pc.id not in targets:
+            targets.append(pc.id)
+    return targets
+
+
+def _assert_co_presence(
+    db: Session,
+    campaign: Campaign,
+    entity: WorldEntity,
+    targets: list[uuid.UUID],
+    *,
+    key: str,
+    provenance: dict,
+    turn_id: Any,
+    attempt_id: Any,
+    operation_id: str | None,
+) -> None:
+    for target_id in targets:
+        assert_knowledge(
+            db, campaign, subject_kind="npc", subject_entity_id=entity.id,
+            target_kind="entity", target_entity_id=target_id,
+            knowledge_state="knows", acquisition_source="co_presence",
+            visibility="dm_only",
+            provenance=provenance,
+            source_turn_id=turn_id, source_attempt_id=attempt_id,
+            operation_id=operation_id,
+            idempotency_key=compose_operation_id(key, "know", target_id),
+        )
+
+
+def grant_entered_npcs_baseline(
+    db: Session,
+    campaign: Campaign,
+    entity_ids: list[str],
+    *,
+    attempt: Any,
+    turn: Any = None,
+) -> int:
+    """Give existing NPCs who just entered the scene the introduction baseline.
+
+    An NPC added to ``present_actors`` by a staged ``update_scene``
+    (``actors_entered`` or a full ``present_actors`` list) is co-present the
+    same way a freshly introduced NPC is: it knows the scene location and the
+    PCs present. Runs inside the turn-commit transaction after the scene
+    patch applied. Only live NPC entities of this campaign count. Returns
+    the number of NPCs granted the baseline.
+    """
+    scene = db.get(CampaignCurrentScene, campaign.id)
+    if scene is None or not entity_ids:
+        return 0
+    targets = _co_presence_targets(db, campaign, scene)
+    if not targets:
+        return 0
+    attempt_id = getattr(attempt, "id", None)
+    operation_id = getattr(attempt, "commit_operation_id", None) or (str(attempt_id) if attempt_id else None)
+    turn_id = getattr(turn, "id", None)
+    granted = 0
+    for raw in dict.fromkeys(entity_ids):
+        try:
+            entity = db.get(WorldEntity, uuid.UUID(str(raw)))
+        except ValueError:
+            continue
+        if (
+            entity is None or entity.campaign_id != campaign.id
+            or entity.entity_type != "npc" or entity.superseded_by_id is not None
+        ):
+            continue
+        _assert_co_presence(
+            db, campaign, entity, [t for t in targets if t != entity.id],
+            key=compose_operation_id(stable_jit_key(attempt_id, str(entity.id)), "entered"),
+            provenance={"source": "npc_entered_scene"},
+            turn_id=turn_id, attempt_id=attempt_id, operation_id=operation_id,
+        )
+        granted += 1
+    return granted
+
+
 def register_promoted_npcs_in_scene(
     db: Session,
     campaign: Campaign,
@@ -1080,18 +1167,7 @@ def register_promoted_npcs_in_scene(
     attempt_id = getattr(attempt, "id", None)
     operation_id = getattr(attempt, "commit_operation_id", None) or (str(attempt_id) if attempt_id else None)
     turn_id = getattr(turn, "id", None)
-
-    # Baseline knowledge targets: scene location + PCs already present.
-    targets: list[uuid.UUID] = []
-    if scene.location_entity_id:
-        targets.append(scene.location_entity_id)
-    for actor in actors:
-        if actor.get("kind") != "pc":
-            continue
-        ref = actor.get("entity_id") or actor.get("name")
-        pc, _ = exact_identity_match(db, campaign.id, ref)
-        if pc is not None and pc.entity_type == "character" and pc.id not in targets:
-            targets.append(pc.id)
+    targets = _co_presence_targets(db, campaign, scene)
 
     added = 0
     for entity in npcs:
@@ -1118,18 +1194,12 @@ def register_promoted_npcs_in_scene(
         if not replaced:
             actors.append(entry)
             added += 1
-        jit_key = stable_jit_key(attempt_id, temp_id or eid)
-        for target_id in targets:
-            assert_knowledge(
-                db, campaign, subject_kind="npc", subject_entity_id=entity.id,
-                target_kind="entity", target_entity_id=target_id,
-                knowledge_state="knows", acquisition_source="co_presence",
-                visibility="dm_only",
-                provenance={"source": "npc_introduction", "temp_id": temp_id or None},
-                source_turn_id=turn_id, source_attempt_id=attempt_id,
-                operation_id=operation_id,
-                idempotency_key=compose_operation_id(jit_key, "know", target_id),
-            )
+        _assert_co_presence(
+            db, campaign, entity, targets,
+            key=stable_jit_key(attempt_id, temp_id or eid),
+            provenance={"source": "npc_introduction", "temp_id": temp_id or None},
+            turn_id=turn_id, attempt_id=attempt_id, operation_id=operation_id,
+        )
     apply_scene_update(
         db, campaign, new_revision=int(campaign.revision or 0) + 1,
         present_actors=actors,
