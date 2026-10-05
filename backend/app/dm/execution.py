@@ -247,10 +247,12 @@ def _is_recovery_attempt(db: Session, attempt) -> bool:
         parent = db.get(DmTurnAttempt, parent_id)
     except Exception:
         return False
+    from app.dm.recovery import RECOVERY_REASONS
+
     return (
         parent is not None
         and parent.status == "abandoned"
-        and (parent.abandonment_reason or "") == "explicit_retry"
+        and (parent.abandonment_reason or "") in RECOVERY_REASONS
     )
 
 
@@ -1143,6 +1145,7 @@ def run_dm_execute_sweep(
     Returns ``{"executed": [...], "failed": [...], "skipped": [...]}`` with
     string attempt ids. One attempt's failure never blocks the rest.
     """
+    from app.dm.recovery import auto_retry_failed_turns
     from app.dm.turns import recover_stuck_attempts
 
     lease = int(os.getenv("DM_EXECUTE_LEASE_SECONDS", "300") or 300)
@@ -1153,6 +1156,14 @@ def run_dm_execute_sweep(
         recovered = 0
     outcome: dict = {"executed": [], "failed": [], "skipped": [], "recovered": recovered}
     outcome["coordinated"] = coordinate_stranded_submissions(db, limit=limit)
+    # #480: a failed turn gets one automatic retry, executed by the
+    # prepared-attempt loop below in this same sweep.
+    try:
+        outcome["auto_retried"] = auto_retry_failed_turns(db, limit=limit)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("dm_execute_sweep auto_retry failed error=%s", exc)
+        outcome["auto_retried"] = []
     for attempt in find_prepared_attempts(db, limit=limit):
         aid = str(attempt.id)
         try:

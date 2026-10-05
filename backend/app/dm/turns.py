@@ -535,6 +535,22 @@ def coordinate_turn(
                 return active, None  # type: ignore[return-value]
             return active, cur
         cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
+        if active.status == TURN_FAILED_VISIBLE and cur is not None and cur.status == ATTEMPT_FAILED_VISIBLE:
+            # #480: new input after a visible failure retries the turn with
+            # that input added, instead of freezing the table until the owner
+            # presses Retry. (The new-work capacity gate above already ran.)
+            from app.dm.recovery import retry_failed_with_new_input
+
+            turn, attempt = retry_failed_with_new_input(
+                db, campaign=campaign, turn=active, old=cur, submission_ids=new_ids,
+            )
+            logger.info(
+                "dm_turn failed_turn_retried_with_new_input campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s",
+                campaign_id, tid, turn.id, attempt.id,
+            )
+            if commit:
+                db.commit()
+            return turn, attempt
         if cur and cur.status in (ATTEMPT_STREAMING, ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_VISIBLE):
             logger.warning(
                 "dm_turn stream_boundary_blocked campaign_id=%s thread_id=%s blocking_turn_id=%s attempt_id=%s "

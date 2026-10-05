@@ -8,6 +8,10 @@ Two operations on the same spine:
   attempt from current authoritative state. Idempotent.
 - :func:`retry_narration_only` — narration-independent retry that reuses a
   preserved valid ``contract_snapshot`` without re-adjudication.
+- :func:`auto_retry_failed_turns` and :func:`retry_failed_with_new_input`
+  (#480) — a failed turn never freezes the table: the dm-execute sweep
+  retries it once on its own, and new player input retries it with that
+  input added, instead of waiting for the owner to press Retry.
 - Partial-stream resume/continuation lives in ``app.dm.narration``
   (``resume_narration_stream`` / ``continue_partial_stream``).
 """
@@ -23,7 +27,14 @@ from models.dm import DmTurn, DmTurnAttempt, DMStream
 logger = logging.getLogger(__name__)
 
 
-def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = False):
+#: Abandonment reasons whose replacement attempt is recovery work (non-billable):
+#: the owner's explicit Retry and the sweep's one automatic retry (#480). A
+#: retry carrying new player input is ordinary, billable work.
+RECOVERY_REASONS = frozenset({"explicit_retry", "auto_retry"})
+
+
+def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = False,
+                            reason: str = "explicit_retry", submission_ids: list | None = None):
     """Build the fresh logical attempt; caller owns flush/commit."""
     from app.dm.turns import create_attempt
 
@@ -33,38 +44,44 @@ def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = F
     # so the fresh attempt cannot duplicate prior staged effects).
     old.status = "abandoned"
     old.abandoned_at = now
-    old.abandonment_reason = "explicit_retry"
+    old.abandonment_reason = reason
     if old.stream_id:
         stream = db.get(DMStream, old.stream_id)
         if stream is not None and stream.status != "abandoned":
             stream.status = "abandoned"
             stream.abandoned_at = now
-            stream.abandonment_reason = "explicit_retry"
+            stream.abandonment_reason = reason
     # Fresh logical attempt from the original accepted intent: new
     # idempotency scope, no staged effects carried over (re-staged on
     # success), no stream attached.
+    expanded = submission_ids is not None and set(submission_ids) != set(old.submission_ids or [])
     attempt = create_attempt(
         db, turn, source_revision=campaign.revision, parent=old,
-        submission_ids=old.submission_ids, roll_evidence=old.roll_evidence,
+        submission_ids=list(submission_ids) if submission_ids is not None else old.submission_ids,
+        input_set_revision=int(turn.input_set_revision or 1) + 1 if expanded else None,
+        roll_evidence=old.roll_evidence,
         assembly_window=(old.assembly_window_start, old.assembly_window_end),
         contract_snapshot=dict(old.contract_snapshot)
         if (reuse_contract and old.contract_snapshot) else None,
     )
+    if expanded:
+        turn.submission_ids = list(submission_ids)
+        turn.input_set_revision = int(turn.input_set_revision or 1) + 1
     turn.status = "pending"
     turn.source_revision = campaign.revision
     turn.streaming_attempt_id = None
     turn.streaming_started_at = None
     db.flush()
     logger.info(
-        "dm_retry explicit_retry turn_id=%s old_attempt_id=%s new_attempt_id=%s "
+        "dm_retry %s turn_id=%s old_attempt_id=%s new_attempt_id=%s "
         "reuse_contract=%s abandoned_partial_stream=%s",
-        turn.id, old.id, attempt.id, reuse_contract,
+        reason, turn.id, old.id, attempt.id, reuse_contract,
         bool(old.stream_id),
     )
     return turn, attempt
 
 
-def retry_failed_adjudication(db, campaign_id, turn_id, attempt_id):
+def retry_failed_adjudication(db, campaign_id, turn_id, attempt_id, *, reason: str = "explicit_retry"):
     """Create one fresh attempt for the original input; caller owns commit.
 
     Explicit Retry semantics (#208): abandons the failed attempt, discards
@@ -94,13 +111,61 @@ def retry_failed_adjudication(db, campaign_id, turn_id, attempt_id):
     replacement = db.execute(select(DmTurnAttempt).where(
         DmTurnAttempt.turn_id == turn.id, DmTurnAttempt.parent_attempt_id == old.id,
     ).order_by(DmTurnAttempt.attempt_number)).scalars().first()
-    if old.status == "abandoned" and old.abandonment_reason == "explicit_retry" and replacement is not None:
+    if old.status == "abandoned" and old.abandonment_reason in RECOVERY_REASONS and replacement is not None:
         return turn, replacement
     if turn.current_attempt_id != old.id or turn.status != "failed_visible" or old.status != "failed_visible":
         raise ValueError("Only the current failed attempt can be retried")
     # Explicit Retry abandons even partial visible streams — the old stream
     # is marked abandoned/non-canonical and the fresh attempt starts clean.
-    return _fresh_attempt_from_old(db, campaign=campaign, turn=turn, old=old)
+    return _fresh_attempt_from_old(db, campaign=campaign, turn=turn, old=old, reason=reason)
+
+
+def retry_failed_with_new_input(db, *, campaign, turn, old, submission_ids):
+    """Retry a failed turn with new player input added (#480); caller owns locks/commit.
+
+    New input after a visible failure must not wait for the owner: the failed
+    attempt is abandoned like an explicit Retry and a fresh attempt covers the
+    original input plus the new submissions in one turn. Billable: it
+    adjudicates new player work, not only a recovery of ours.
+    """
+    return _fresh_attempt_from_old(db, campaign=campaign, turn=turn, old=old,
+                                   reason="new_player_input", submission_ids=submission_ids)
+
+
+def auto_retry_failed_turns(db, *, limit: int = 5) -> list[str]:
+    """Retry each failed turn once on its own (#480); returns new attempt ids.
+
+    Visible failures are usually transient (a model failing validation four
+    times, a provider error), and in the 2026-10-04 playtest the owner's Retry
+    succeeded unchanged. Nobody may be at the table to press it, so the sweep
+    does once. A turn that already had an automatic retry is left for new
+    player input or the owner, so a poison turn never loops. Non-billable.
+    """
+    from app.dm.turns import TURN_FAILED_VISIBLE
+
+    rows = db.execute(
+        select(DmTurn.campaign_id, DmTurn.id, DmTurn.current_attempt_id)
+        .where(DmTurn.status == TURN_FAILED_VISIBLE, DmTurn.current_attempt_id.is_not(None))
+        .order_by(DmTurn.updated_at.asc())
+    ).all()
+    retried: list[str] = []
+    for campaign_id, turn_id, attempt_id in rows:
+        if len(retried) >= max(1, limit):
+            break
+        already = db.execute(select(DmTurnAttempt.id).where(
+            DmTurnAttempt.turn_id == turn_id, DmTurnAttempt.abandonment_reason == "auto_retry",
+        )).first()
+        if already is not None:
+            continue
+        try:
+            _turn, attempt = retry_failed_adjudication(db, campaign_id, turn_id, attempt_id, reason="auto_retry")
+            db.commit()
+        except Exception as exc:  # one turn's trouble never blocks the others
+            db.rollback()
+            logger.warning("dm_retry auto_retry skipped turn_id=%s error=%s", turn_id, exc)
+            continue
+        retried.append(str(attempt.id))
+    return retried
 
 
 def retry_narration_only(db, campaign_id, turn_id, attempt_id):
