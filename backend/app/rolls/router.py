@@ -6,14 +6,14 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from sqlalchemy.orm import Session
 
 from app.combat.service import get_encounter
-from app.deps.campaign import campaign_for, require_owner, run_campaign_command
+from app.deps.campaign import campaign_for, run_campaign_command
 from app.deps.auth import current_profile
 from app.deps.idempotency import require_idempotency_key
 from app.dm.recovery import execute_committed_attempt
 from app.realtime.service import publish_encounter_ready, publish_encounter_turn
 from app.rolls.service import (
-    RollAuthorizationError, RollLifecycleError, cancel_or_replace, fulfill_roll,
-    get_fulfillment, list_roll_requests, request_rolls,
+    RollAuthorizationError, RollLifecycleError, fulfill_roll,
+    get_fulfillment, list_roll_requests,
 )
 from app.threads.service import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
@@ -70,47 +70,6 @@ def _request_or_404(db: Session, campaign_id: uuid.UUID, request_id: uuid.UUID) 
     if row is None or row.campaign_id != campaign_id:
         raise HTTPException(status_code=404, detail="Roll request not found")
     return row
-
-
-@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/roll-requests", status_code=201)
-def create_roll_requests(
-    turn_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    tid = _id(turn_id, "turn id")
-    turn = _visible_turn(db, campaign.id, tid, profile.id)
-    attempt_raw = payload.get("attempt_id")
-    if not attempt_raw:
-        raise HTTPException(status_code=422, detail="attempt_id is required")
-    try:
-        attempt_id = uuid.UUID(str(attempt_raw))
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    raw_requests = payload.get("requests")
-    if raw_requests is None and isinstance(payload.get("request"), dict):
-        raw_requests = [payload["request"]]
-    if not isinstance(raw_requests, list) or any(not isinstance(item, dict) for item in raw_requests):
-        raise HTTPException(status_code=422, detail="requests must be a list of objects")
-    key = require_idempotency_key(request, payload.get("operation_id"))
-
-    def execute():
-        try:
-            rows = request_rolls(db, campaign_id=campaign.id, turn_id=turn.id, attempt_id=attempt_id, requests=raw_requests)
-            return {"roll_requests": [row.to_dict() for row in rows], "turn_id": str(turn.id)}
-        except RollLifecycleError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    return run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="player_roll.request", scope_type="dm_turn", scope_id=turn.id,
-        payload=payload, execute=execute,
-    )
 
 
 @router.get("/api/campaigns/{campaign_id}/roll-requests")
@@ -175,40 +134,3 @@ def fulfill_roll_request(
     if resumed:
         background_tasks.add_task(execute_committed_attempt, resumed["id"])
     return result
-
-
-@router.post("/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/cancel")
-def cancel_roll_request(
-    roll_request_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    rid = _id(roll_request_id, "roll request id")
-    row = _request_or_404(db, campaign.id, rid)
-    _visible_turn(db, campaign.id, row.turn_id, profile.id)
-    replacement = payload.get("replacement")
-    if replacement is not None and not isinstance(replacement, dict):
-        raise HTTPException(status_code=422, detail="replacement must be an object")
-    key = require_idempotency_key(request, payload.get("operation_id"))
-
-    def execute():
-        try:
-            old, created, resumed = cancel_or_replace(db, request_id=rid, replacement=replacement)
-            return {
-                "roll_request": old.to_dict(),
-                "replacement": created[0].to_dict() if created else None,
-                "resumed_attempt": resumed.to_dict() if resumed else None,
-            }
-        except RollLifecycleError as exc:
-            raise HTTPException(status_code=409 if "status" in str(exc) else 422, detail=str(exc)) from exc
-
-    return run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="player_roll.cancel_or_replace", scope_type="roll_request", scope_id=rid,
-        payload=payload, execute=execute,
-    )

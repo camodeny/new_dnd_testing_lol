@@ -1131,7 +1131,8 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
     Hooks (all code-owned, inside the same atomic commit):
     - first save at 0 HP, or stabilization, ensures the ``unconscious``
       condition is structurally present;
-    - death breaks active concentration;
+    - death breaks active concentration, and a PC's death is recorded on its
+      campaign lifecycle (terminal canon state that opens replacement);
     - natural-20 revival restores 1 HP and clears ``unconscious``.
     """
     args = effect.get("arguments") or {}
@@ -1139,6 +1140,7 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
     mutation_id = args.get("mutation_id")
     target = _load_state_target(db, campaign, effect)
     staged_visibility = args.get("visibility") or "dm_private"
+    died = False
     try:
         if op == "record":
             pre_s, pre_f = target.successes, target.failures
@@ -1162,6 +1164,7 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
                 )
                 _mark_npc_section(target, "conditions", staged_visibility)
             if state.dead:
+                died = True
                 try:
                     broke_state, _broke = _break_conc(target.concentration, reason="dead", mutation_id=f"{mutation_id}:conc")
                     target.concentration = broke_state
@@ -1182,6 +1185,20 @@ def _handle_apply_death_save(db: Session, campaign: Campaign, effect: dict[str, 
     except _StateError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} invalid death-save transition ({exc.code}): {exc}") from exc
     target.commit(db)
+    if died and target.kind == "pc":
+        import uuid as _uuid
+
+        from app.campaigns.replacements import PcLifecycleError, declare_pc_death
+
+        try:
+            declare_pc_death(
+                db, campaign, _uuid.UUID(str(args.get("target_id"))),
+                status="dead", cause="Failed three death saving throws.",
+            )
+        except PcLifecycleError as exc:
+            # Converge: a replayed effect finds the PC already dead.
+            if getattr(exc, "status_code", None) != 409 or "already" not in str(exc).lower():
+                raise
     logger.info(
         "effect apply_death_save effect_id=%s target=%s:%s op=%s result=%s outcome=%s",
         effect.get("id"), args.get("target_kind"), args.get("target_id"), op,

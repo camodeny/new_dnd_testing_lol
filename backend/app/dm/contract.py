@@ -373,15 +373,28 @@ class EncounterParticipantSelector(StrictModel):
         return self
 
 
+class EncounterMapSpec(StrictModel):
+    """Battle-map geometry created with the encounter — issue #232.
+
+    Structural shape only; the combat lane owns geometry legality (bounds,
+    zone kinds) at promotion time via ``init_map_inline``. Every participant
+    gets a deterministic default cell; reposition with ``update_map_placement``.
+    """
+    width: int = Field(ge=1, le=100, description="Grid width in 5-ft squares")
+    height: int = Field(ge=1, le=100, description="Grid height in 5-ft squares")
+    terrain: list[dict[str, Any]] = Field(default_factory=list, max_length=64, description="Terrain zones: kind, rect {col,row,width,height}, optional label/visibility")
+
+
 class StartEncounterArgs(StrictModel):
     """DM-declared encounter start — issue #230.
 
     Combat begins when the DM decides initiative is useful. Participants are
-    explicit; human PCs roll their own initiative via #204 records and
-    NPC/monster initiative rolls on the DM/runtime path.
+    explicit; human PCs roll their own initiative via #204 records and code
+    rolls NPC/monster initiative at start.
     """
     participants: list[EncounterParticipantSelector] = Field(min_length=1, max_length=20)
     scene: dict[str, Any] | None = Field(default=None, description="Optional scene/map links: location_entity_id, location_name, map_ref")
+    map: EncounterMapSpec | None = Field(default=None, description="Optional battle map; omit for theater-of-the-mind combat")
     idempotency_key: str | None = Field(default=None, max_length=128)
 
     @field_validator("scene", mode="before")

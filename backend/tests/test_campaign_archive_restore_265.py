@@ -548,7 +548,9 @@ def test_campaign_detail_reports_server_side_restore_target(api):
 
 
 def test_roll_writes_rejected_while_archived(api):
+    from app.campaigns.service import CampaignArchivedError
     from app.dm.turns import coordinate_turn
+    from app.rolls.service import request_rolls
     from app.submissions.service import accept_submission
 
     client, factory, _, owner_id, _, _ = api
@@ -578,42 +580,39 @@ def test_roll_writes_rejected_while_archived(api):
         turn, attempt = coordinate_turn(db, uuid.UUID(cid), str(thread.id))
         db.commit()
         turn_id, attempt_id = turn.id, attempt.id
-    create = client.post(
-        f"/api/campaigns/{cid}/dm-turns/{turn_id}/roll-requests",
-        json={
-            "attempt_id": str(attempt_id),
-            "requests": [{
-                "request_key": "owner-check", "requested_user_id": str(owner_id),
-                "character_id": str(char_id), "roll_kind": "check",
-                "ability_or_skill": "Investigation", "label": "Investigation check",
-                "advantage_state": "normal", "reason_public": "Inspect the door",
-            }],
-        },
-        headers={"Idempotency-Key": "request-rolls"},
-    )
-    assert create.status_code == 201, create.text
-    roll_id = create.json()["roll_requests"][0]["id"]
+        char_id_s, owner_id_s = str(char_id), str(owner_id)
+
+    def _check_request(key, ability):
+        return {
+            "request_key": key, "requested_user_id": owner_id_s,
+            "character_id": char_id_s, "roll_kind": "check",
+            "ability_or_skill": ability, "label": f"{ability} check",
+            "advantage_state": "normal", "reason_public": "Inspect the door",
+        }
+
+    # Rolls are raised the way the AI DM does — direct service call (the
+    # human DM create route is deleted).
+    with factory() as db:
+        rows = request_rolls(
+            db, campaign_id=uuid.UUID(cid), turn_id=turn_id,
+            attempt_id=attempt_id, requests=[_check_request("owner-check", "Investigation")],
+        )
+        roll_id = rows[0].id
+        db.commit()
     assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
     body = {"source": "app", "raw_rolls": [14], "modifier": 3, "total": 17, "visibility": "public"}
     # New roll requests cannot be raised on a dormant table either.
-    second = client.post(
-        f"/api/campaigns/{cid}/dm-turns/{turn_id}/roll-requests",
-        json={"attempt_id": str(attempt_id), "requests": [{
-            "request_key": "late-check", "requested_user_id": str(owner_id),
-            "character_id": str(char_id), "roll_kind": "check",
-            "ability_or_skill": "Perception", "label": "Perception check",
-            "advantage_state": "normal", "reason_public": "Listen at the door",
-        }]},
-        headers={"Idempotency-Key": "request-archived"},
-    )
-    assert second.status_code == 409, second.text
+    with factory() as db:
+        with pytest.raises(CampaignArchivedError):
+            request_rolls(
+                db, campaign_id=uuid.UUID(cid), turn_id=turn_id,
+                attempt_id=attempt_id,
+                requests=[_check_request("late-check", "Perception")],
+            )
+        db.rollback()
     assert client.post(
         f"/api/campaigns/{cid}/roll-requests/{roll_id}/fulfill", json=body,
         headers={"Idempotency-Key": "fulfill-archived"},
-    ).status_code == 409
-    assert client.post(
-        f"/api/campaigns/{cid}/roll-requests/{roll_id}/cancel", json={},
-        headers={"Idempotency-Key": "cancel-archived"},
     ).status_code == 409
 
     # Restored table fulfills the exact same pending request.
@@ -717,12 +716,17 @@ def test_world_seed_rejected_while_archived(api):
 def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     """Issue #265 dormancy covers adventure + PC lifecycle writers.
 
-    start_adventure guards on the locked row; adventure completion and the
-    PC death/replacement/introduction mutations guard inside their locked
-    commit_campaign_mutation callbacks. All surface as HTTP 409 with no
+    start_adventure guards on the locked row; the replacement/introduction
+    mutations guard inside their locked commit_campaign_mutation callbacks.
+    Adventure completion only happens inside a DM turn commit, which refuses
+    dormant tables. All surface as HTTP 409 / CampaignArchivedError with no
     state change; restore unfreezes the table.
     """
+    from app.campaigns.service import CampaignArchivedError
+    from app.dm.turns import commit_turn
     from models.campaigns import Adventure, CampaignPcLifecycle
+    from models.dm import DmTurn, DmTurnAttempt
+    from tests.support.combat import apply_dm_effect
 
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
@@ -740,7 +744,6 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
     with factory() as db:
         member = db.get(CampaignMember, {"campaign_id": uuid.UUID(cid), "user_id": owner_id})
         assert member is not None and member.selected_character_id is not None
-        char_id = str(member.selected_character_id)
         replacement = Character(owner_id=owner_id, name="Second Hero", system="dnd5e")
         db.add(replacement)
         db.flush()
@@ -758,24 +761,52 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
         assert resp.status_code == 409, resp.text
         assert "archived" in resp.json()["detail"].lower()
 
+    def _pending_turn_ids(effect_id):
+        with factory() as db:
+            thread = db.execute(
+                select(CampaignThread).where(
+                    CampaignThread.campaign_id == uuid.UUID(cid),
+                    CampaignThread.thread_type == "campaign",
+                )
+            ).scalars().first()
+            turn = DmTurn(
+                campaign_id=uuid.UUID(cid), thread_id=str(thread.id), status="pending",
+                source_revision=archived_rev, submission_ids=[],
+            )
+            db.add(turn)
+            db.flush()
+            attempt = DmTurnAttempt(
+                turn_id=turn.id, attempt_number=1, status="prepared",
+                campaign_id=uuid.UUID(cid), thread_id=str(thread.id),
+                source_revision=archived_rev, input_set_revision=archived_rev,
+                submission_ids=[],
+                staged_effects=[{
+                    "id": effect_id, "effect_type": "complete_adventure",
+                    "arguments": {
+                        "adventure_id": adventure_id, "outcome": "victory",
+                        "reason": "The chapel is cleansed.",
+                    },
+                }],
+            )
+            db.add(attempt)
+            db.flush()
+            turn.current_attempt_id = attempt.id
+            db.commit()
+            return turn.id, attempt.id
+
     # New adventure cannot open on a dormant table.
     _archived(client.post(
         f"/api/campaigns/{cid}/adventures",
         json={"title": "Sneaky Sequel"},
         headers={"Idempotency-Key": "adv-start-archived"},
     ))
-    # The open adventure cannot complete while archived.
-    _archived(client.post(
-        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
-        json={"expected_revision": archived_rev, "outcome": "victory"},
-        headers={"Idempotency-Key": "adv-complete-archived"},
-    ))
-    # PC death/retirement cannot advance party canon while archived.
-    _archived(client.post(
-        f"/api/campaigns/{cid}/pc-deaths",
-        json={"expected_revision": archived_rev, "character_id": char_id},
-        headers={"Idempotency-Key": "death-archived"},
-    ))
+    # The open adventure cannot complete while archived: completion only
+    # happens inside a DM turn commit, which refuses dormant tables.
+    turn_id, attempt_id = _pending_turn_ids("eff-complete-archived")
+    with factory() as db:
+        with pytest.raises(CampaignArchivedError):
+            commit_turn(db, turn_id, attempt_id, silent=True)
+        db.rollback()
     # Replacement activation is frozen (guard fires before any canon write).
     _archived(client.post(
         f"/api/campaigns/{cid}/pc-replacements",
@@ -811,13 +842,15 @@ def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
         assert "adventure.completed" not in types
         assert not any(t.startswith("campaign.pc") for t in types)
 
-    # Restore unfreezes the table: the pending adventure completes normally.
+    # Restore unfreezes the table: the pending adventure completes through
+    # the AI DM's staged effect, and PC lifecycle advances again.
     assert _transition(client, cid, archived_rev, "active", "restore-1").status_code == 200
-    completed = client.post(
-        f"/api/campaigns/{cid}/adventures/{adventure_id}/complete",
-        json={"expected_revision": archived_rev + 1, "outcome": "victory"},
-        headers={"Idempotency-Key": "adv-complete-restored"},
-    )
-    assert completed.status_code == 200, completed.text
+    with factory() as db:
+        apply_dm_effect(
+            db, uuid.UUID(cid), turn_id, attempt_id, "complete_adventure",
+            {"adventure_id": adventure_id, "outcome": "victory",
+             "reason": "The chapel is cleansed."},
+            effect_id="eff-complete-restored",
+        )
     with factory() as db:
         assert db.get(Adventure, uuid.UUID(adventure_id)).status == "completed"

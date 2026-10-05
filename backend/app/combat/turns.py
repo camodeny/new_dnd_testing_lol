@@ -5,13 +5,13 @@ Code-owned authority (never delegated to models):
   reaction / extensible per-turn extras) initialized at initiative-ready and
   reset at each participant's own turn start.
 - Active-turn ownership: turn-bound consumption requires the active
-  participant, executed by its controller (PC) or the campaign owner
-  (NPC/monster runtime path). Reactions are the explicit rule-permitted
+  participant, executed by its controller (PC). NPC/monster turns belong to
+  the AI DM; no human acts for them. Reactions are the explicit rule-permitted
   exception: any participant may consume its own reaction off-turn.
 - Explicit human end-turn bound to the observed turn sequence (source turn):
   stale sequences fail closed as conflicts, never double-advance.
 - Missing human PCs block progression: nobody else may end their turn; only
-  a party/owner skip vote advances past them, generating no actions.
+  a party skip vote advances past them, generating no actions.
 - IC/OOC chat is never gated on mechanical turns (no encounter check lives
   on the submission path by design; covered by test).
 
@@ -40,7 +40,6 @@ from app.combat.service import (
     TURN_STARTED_EVENT,
     EncounterError,
     get_turn_order,
-    is_campaign_owner,
     list_participants,
     lock_encounter,
     lock_playable_campaign,
@@ -95,7 +94,11 @@ def _active_or_raise(db: Session, encounter: Encounter) -> EncounterParticipant:
 
 
 def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterParticipant, actor_id: uuid.UUID) -> None:
-    """Only the controlling player may execute a PC's turn-bound actions."""
+    """Only the controlling player may execute a PC's turn-bound actions.
+
+    NPC/monster turns belong to the AI DM; no human — the campaign owner
+    included — acts for them (#236 gives the DM its NPC-turn path).
+    """
     if participant.kind == "pc":
         if participant.controller_user_id is None or str(participant.controller_user_id) != str(actor_id):
             raise TurnAuthorizationError("Only the PC's controller may act on its turn")
@@ -103,8 +106,7 @@ def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterPa
         if character is None or str(character.owner_id) != str(actor_id):
             raise TurnAuthorizationError("Character control changed; turn action refused")
     else:
-        if not is_campaign_owner(db, encounter.campaign_id, actor_id):
-            raise TurnAuthorizationError("Only the campaign owner may act for NPC/monster turns")
+        raise TurnAuthorizationError("NPC/monster turns are run by the AI DM")
 
 
 def _record_invalid_attempt(db: Session, encounter: Encounter, *, reason: str, commit: bool) -> None:
@@ -454,7 +456,7 @@ def cast_skip_vote(
     if target is None or target.encounter_id != encounter.id:
         raise TurnError("skip target not found in this encounter")
     if target.kind != "pc" or target.controller_user_id is None:
-        raise TurnError("skip votes target an absent human PC; NPC/monster turns end through the owner")
+        raise TurnError("skip votes target an absent human PC; NPC/monster turns are run by the AI DM")
     if str(target.controller_user_id) == str(voter_id):
         raise TurnError("the controller ends their own turn instead of voting to skip it")
     active = _active_or_raise(db, encounter)

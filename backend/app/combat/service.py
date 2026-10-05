@@ -8,7 +8,6 @@ import uuid
 from typing import Any, Callable
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.campaigns.events import commit_campaign_mutation
@@ -18,7 +17,7 @@ from app.clock import ms_between, utcnow
 from app.observability.tracing import structured_log
 from app.realtime.service import publish_encounter_ended, publish_encounter_ready, publish_encounter_started
 from app.rules.mechanics import MechanicsError, ability_modifier, get_character_mechanics
-from app.threads.service import ThreadNotFoundError, can_read_thread, parse_thread_id
+from app.threads.service import can_read_thread, parse_thread_id
 from app.visibility.access import is_campaign_participant
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
@@ -300,25 +299,6 @@ def _validate_scene(db: Session, campaign_id: uuid.UUID, scene: dict | None) -> 
     }
 
 
-def _load_source_turn(db: Session, campaign_id: uuid.UUID, turn_id: Any, attempt_id: Any) -> tuple[DmTurn, DmTurnAttempt]:
-    try:
-        turn_uuid = uuid.UUID(str(turn_id))
-        attempt_uuid = uuid.UUID(str(attempt_id))
-    except (ValueError, TypeError) as exc:
-        raise EncounterError("source_turn_id and source_attempt_id must be UUIDs") from exc
-    turn = db.get(DmTurn, turn_uuid)
-    attempt = db.get(DmTurnAttempt, attempt_uuid)
-    if turn is None or attempt is None or turn.campaign_id != campaign_id:
-        raise EncounterError("source turn not found in this campaign")
-    if attempt.turn_id != turn.id:
-        raise EncounterError("source attempt does not belong to the source turn")
-    # Provenance must be exact: a stale attempt from the same turn is
-    # rejected rather than silently rewritten to the current attempt.
-    if turn.current_attempt_id is None or str(turn.current_attempt_id) != str(attempt.id):
-        raise EncounterError("source_attempt_id must be the turn's current attempt")
-    return turn, attempt
-
-
 # ── Reads ───────────────────────────────────────────────────────────────────
 
 
@@ -582,7 +562,7 @@ def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.
     return view
 
 
-# ── Core builder (shared by direct + inline paths) ──────────────────────────
+# ── Core builder (DM structured-effect path) ─────────────────────────────────
 
 
 def _build_encounter_rows(
@@ -594,7 +574,6 @@ def _build_encounter_rows(
     operation_id: str,
     scene: dict | None,
     participants: list[dict],
-    start_source: str,
 ) -> Encounter:
     resolved = _validate_selection(db, campaign.id, participants)
     # Thread-scoped audience (#230 privacy): a human controller who cannot
@@ -629,7 +608,7 @@ def _build_encounter_rows(
         scene_location_entity_id=scene_parts["location_entity_id"],
         scene_location_name=scene_parts["location_name"],
         map_ref=scene_parts["map_ref"],
-        start_source=start_source,
+        start_source="dm_effect",
         source_turn_id=turn.id,
         source_attempt_id=attempt_id,
         operation_id=operation_id,
@@ -680,9 +659,10 @@ def _build_encounter_rows(
             db.flush()
             participant.roll_request_id = roll_request.id
             db.flush()
-        # NPC/monster participants stay pending until an explicit DM/runtime
-        # roll (roll_npc_initiative): the runtime never invents human rolls,
-        # and human rolls are never generated for anyone.
+        else:
+            # NPC/monster initiative is a DM/runtime roll: code rolls it at
+            # start. Humans always roll their own (the request above).
+            _roll_npc_inline(participant, raw_d20=None)
     db.flush()
     return encounter
 
@@ -809,139 +789,6 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
     return event
 
 
-# ── Public service API ──────────────────────────────────────────────────────
-
-
-def start_encounter(
-    db: Session,
-    campaign_id: uuid.UUID,
-    *,
-    operation_id: str,
-    expected_revision: int,
-    actor_id: uuid.UUID | None = None,
-    source_turn_id: uuid.UUID | str,
-    source_attempt_id: uuid.UUID | str,
-    scene: dict | None = None,
-    participants: list[dict] | None = None,
-    start_source: str = "api",
-    commit: bool = True,
-) -> tuple[Encounter, Any]:
-    """Start an encounter as an authoritative fictional mutation.
-
-    Idempotent on (campaign_id, operation_id): retries return the original
-    encounter + event without duplicating participants or roll requests.
-    """
-    operation_id = (operation_id or "").strip()
-    if not operation_id or len(operation_id) > 128:
-        raise EncounterError("operation_id is required (1-128 characters)")
-    if start_source not in ("dm_effect", "api"):
-        raise EncounterError("start_source must be dm_effect or api")
-
-    campaign = lock_campaign_row(db, campaign_id)
-    if campaign is None:
-        raise EncounterError(f"Campaign {campaign_id} not found")
-    require_playable_campaign(campaign)
-    turn, attempt = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
-    if start_source == "api" and actor_id is not None:
-        # Thread-scoped writes (#230): the actor must read the source
-        # turn's thread, mirroring the encounter read boundary. Hidden as
-        # not-found so private-thread existence never leaks.
-        try:
-            thread_ok = can_read_thread(
-                db, campaign_id, parse_thread_id(turn.thread_id), actor_id
-            )
-        except Exception:
-            thread_ok = False
-        if not thread_ok:
-            raise ThreadNotFoundError("Source turn not found")
-
-    prior = find_by_operation(db, campaign_id, operation_id)
-    if prior is not None:
-        logger.info(
-            "encounter duplicate_start_hit campaign_id=%s encounter_id=%s op=%s",
-            campaign_id, prior.id, operation_id,
-        )
-        return prior, find_created_event(db, prior)
-
-    active = get_active_encounter(db, campaign_id)
-    if active is not None:
-        raise EncounterAlreadyActiveError(campaign_id, active.id)
-
-    holder: dict[str, Encounter] = {}
-
-    def _mutate(locked: Campaign) -> None:
-        holder["encounter"] = _build_encounter_rows(
-            db, locked, turn, attempt.id, operation_id=operation_id,
-            scene=scene, participants=participants or [], start_source=start_source,
-        )
-
-    def _payload() -> dict:
-        encounter = holder["encounter"]
-        return {
-            "encounter_id": str(encounter.id),
-            "thread_id": encounter.thread_id,
-            "participant_count": encounter.participant_count,
-            "start_source": start_source,
-            "source_turn_id": str(turn.id),
-            "participants": [
-                {"id": str(p.id), "kind": p.kind, "display_name": p.display_name}
-                for p in list_participants(db, encounter.id)
-            ],
-        }
-
-    try:
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            campaign_id,
-            expected_revision=int(expected_revision),
-            event_type=ENCOUNTER_STARTED_EVENT,
-            operation_id=operation_id,
-            actor_id=actor_id or campaign.owner_id,
-            mutate=_mutate,
-            commit=False,
-            payload_builder=_payload,
-        )
-    except IntegrityError as exc:
-        # The shared mutation helper rolls back on every error path, and an
-        # unguarded flush rolls back here: the session is unusable
-        # until rolled back, so this rollback is required rather than
-        # optional. It never commits partial state — below either returns a
-        # genuinely committed same-operation replay or raises.
-        db.rollback()
-        replay = find_by_operation(db, campaign_id, operation_id)
-        if replay is not None:
-            logger.info(
-                "encounter concurrent_start_rejected campaign_id=%s op=%s winner=%s",
-                campaign_id, operation_id, replay.id,
-            )
-            return replay, find_created_event(db, replay)
-        # Same-operation replay is impossible, but a *different* encounter
-        # may have won the race: report it as a conflict, never as a replay
-        # of this operation.
-        active = get_active_encounter(db, campaign_id)
-        if active is not None:
-            raise EncounterAlreadyActiveError(campaign_id, active.id) from exc
-        raise EncounterError(f"encounter start conflict: {exc}") from exc
-
-    encounter = holder["encounter"]
-    encounter.created_event_id = event.id
-    db.flush()
-    if commit:
-        db.commit()
-        db.refresh(encounter)
-        db.refresh(event)
-        db.refresh(campaign_after)
-    structured_log(
-        logger, logging.INFO, "encounter_started",
-        encounter_id=str(encounter.id), campaign_id=str(campaign_id),
-        start_source=start_source, participant_count=encounter.participant_count,
-        operation_id=operation_id, revision=campaign_after.revision,
-    )
-    if commit:
-        publish_encounter_started(db, encounter)
-    return encounter, event
-
-
 def start_encounter_inline(
     db: Session,
     campaign: Campaign,
@@ -972,8 +819,12 @@ def start_encounter_inline(
         db, campaign, turn, attempt.id, operation_id=operation_key,
         scene=args.get("scene") if isinstance(args, dict) else None,
         participants=(args.get("participants") if isinstance(args, dict) else None) or [],
-        start_source="dm_effect",
     )
+    map_spec = args.get("map") if isinstance(args, dict) else None
+    if map_spec:
+        from app.combat.maps import init_map_inline
+
+        init_map_inline(db, encounter, map_spec)
     structured_log(
         logger, logging.INFO, "encounter_started",
         encounter_id=str(encounter.id), campaign_id=str(campaign.id),
@@ -981,57 +832,6 @@ def start_encounter_inline(
         operation_id=operation_key, source_turn_id=str(turn.id),
     )
     return encounter
-
-
-def roll_npc_initiative(
-    db: Session,
-    encounter_id: uuid.UUID,
-    participant_id: uuid.UUID,
-    *,
-    raw_d20: int | None = None,
-    commit: bool = True,
-) -> tuple[EncounterParticipant, Encounter, Any | None]:
-    """DM/runtime roll path for NPC/monster initiative (code-owned arithmetic)."""
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise EncounterError(f"Encounter {encounter_id} not found")
-    require_playable_campaign(lock_campaign_row(db, encounter.campaign_id))
-    if encounter.status == "active":
-        raise EncounterError("initiative is already complete for this encounter")
-    if encounter.status != "pending_initiative":
-        raise EncounterError(f"encounter cannot accept initiative from status {encounter.status}")
-    participant = db.get(EncounterParticipant, participant_id)
-    if participant is None or participant.encounter_id != encounter.id:
-        raise EncounterError("participant not found in this encounter")
-    if participant.initiative_status == "fulfilled":
-        # Idempotent replay: same die (or unspecified) returns current state;
-        # a conflicting re-roll is rejected to protect recorded initiative.
-        # The replay value runs through the same bounded parser so malformed
-        # input stays inside the encounter validation contract (no 500s).
-        if raw_d20 is None or _parse_d20(raw_d20) == int(participant.raw_roll or -1):
-            return participant, encounter, None
-        raise EncounterError("initiative already recorded for this participant")
-    _roll_npc_inline(participant, raw_d20=raw_d20)
-    db.flush()
-    campaign = db.get(Campaign, encounter.campaign_id)
-    event = _maybe_mark_ready(db, campaign, encounter, commit=False)
-    started = utcnow()
-    if commit:
-        db.commit()
-        db.refresh(participant)
-        db.refresh(encounter)
-    structured_log(
-        logger, logging.INFO, "encounter_initiative_npc_rolled",
-        encounter_id=str(encounter.id), participant_id=str(participant.id),
-        roll_source="dm_runtime", raw_roll=participant.raw_roll,
-        total=participant.initiative_total,
-        latency_ms=round((utcnow() - started).total_seconds() * 1000, 2),
-    )
-    if commit and event is not None:
-        publish_encounter_ready(db, encounter)
-    return participant, encounter, event
 
 
 def fulfill_human_initiative(

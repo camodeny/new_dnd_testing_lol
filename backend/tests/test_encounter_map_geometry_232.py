@@ -22,25 +22,20 @@ from app.combat.geometry import (  # noqa: E402
 )
 from app.combat.maps import (  # noqa: E402
     MOVED_EVENT,
-    MAP_UPDATED_EVENT,
+    MapAuthorizationError,
     MapError,
-    ensure_map,
     find_move_by_operation,
     get_map,
     get_placement,
     map_projection,
     move_participant,
     reachable_for,
-    update_terrain,
     update_terrain_inline,
 )
 from app.combat.service import (  # noqa: E402
     encounter_view,
     fulfill_human_initiative,
     get_snapshot_encounter,
-    list_participants,
-    roll_npc_initiative,
-    start_encounter,
 )
 from app.combat.turns import StaleTurnError, get_turn_state_row  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
@@ -51,6 +46,11 @@ from models.characters import Character, Dnd5eCharacterSheet  # noqa: E402
 from models.combat import Encounter, EncounterParticipant  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldEntity  # noqa: E402
+from tests.support.combat import (  # noqa: E402
+    dm_place_tokens,
+    dm_start_encounter,
+    dm_update_terrain,
+)
 
 
 def _engine(url="sqlite://"):
@@ -89,7 +89,7 @@ def _seed_world(db):
     db.add(goblin)
     db.commit()
     thread = get_or_create_campaign_thread(db, campaign_id, created_by=owner)
-    submission = accept_submission(
+    accept_submission(
         db, campaign_id=campaign_id, user_id=owner, character_id=owner_pc,
         raw_content="Goblins burst from the treeline!",
         segments=[{"type": "ic", "text": "Goblins burst from the treeline!"}],
@@ -122,14 +122,14 @@ def _pc(db, encounter_id, character_id):
     ).scalars().one()
 
 
-def _active_solo(db, ctx, *, operation_id="op-enc-1", raw_d20=10):
+def _active_solo(db, ctx, *, operation_id="op-enc-1", raw_d20=10, map=None):
     """Start a solo-PC encounter and drive it to active; returns (encounter, participant)."""
-    encounter, _ = start_encounter(
-        db, ctx["campaign_id"], operation_id=operation_id, expected_revision=0,
-        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-        source_attempt_id=ctx["attempt_id"],
+    encounter = dm_start_encounter(
+        db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
+        [{"character_id": str(ctx["owner_pc"])}],
         scene={"location_name": "Treeline"},
-        participants=[{"character_id": str(ctx["owner_pc"])}],
+        map=map if map is not None else {"width": 10, "height": 10},
+        effect_id=operation_id,
     )
     participant = _pc(db, encounter.id, ctx["owner_pc"])
     _, _, _, encounter, _ = fulfill_human_initiative(
@@ -140,19 +140,8 @@ def _active_solo(db, ctx, *, operation_id="op-enc-1", raw_d20=10):
     )
     assert encounter.status == "active"
     db.refresh(participant)
+    db.refresh(encounter)
     return encounter, participant
-
-
-def _map(db, ctx, encounter, participant, **kwargs):
-    revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-    defaults = {
-        "actor_id": ctx["owner"], "width": 10, "height": 10,
-        "terrain": [],
-        "placements": [{"participant_id": str(participant.id), "col": 0, "row": 0}],
-        "expected_revision": revision, "operation_id": f"op-map-{uuid.uuid4().hex[:8]}",
-    }
-    defaults.update(kwargs)
-    return ensure_map(db, encounter.id, **defaults)
 
 
 def _move(db, ctx, encounter, participant, col, row, **kwargs):
@@ -238,21 +227,18 @@ def test_geometry_later_zones_win_and_open_clears():
 def test_map_init_is_durable_and_background_art_stays_opaque():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        encounter_map, event = _map(
-            db, ctx, encounter, participant, width=8, height=6,
-            background_art_ref="gen-art-123",
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 8, "height": 6},
         )
+        encounter_map = get_map(db, encounter.id)
         assert (encounter_map.width, encounter_map.height) == (8, 6)
         assert encounter_map.diagonal_policy == "no_corner_cut"
         assert encounter_map.revision == 1
-        assert event.event_type == MAP_UPDATED_EVENT
         placement = get_placement(db, encounter.id, participant.id)
         assert (placement.col, placement.row) == (0, 0)
         # Reconnect read: snapshot carries the same authoritative geometry.
         snapshot = get_snapshot_encounter(db, ctx["campaign_id"], ctx["owner"])
         assert snapshot["map"]["width"] == 8
-        assert snapshot["map"]["background_art_ref"] == "gen-art-123"
         assert snapshot["map"]["placements"][0]["col"] == 0
 
 
@@ -260,7 +246,6 @@ def test_normal_move_commits_position_and_budget_atomically():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         state = get_turn_state_row(db, encounter.id, participant.id)
         assert state.movement_remaining == 30
 
@@ -279,10 +264,11 @@ def test_normal_move_commits_position_and_budget_atomically():
 def test_difficult_terrain_move_spends_double():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant, terrain=[
-            {"kind": "difficult", "rect": {"col": 1, "row": 0, "width": 2, "height": 10}},
-        ])
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 10, "height": 10, "terrain": [
+                {"kind": "difficult", "rect": {"col": 1, "row": 0, "width": 2, "height": 10}},
+            ]},
+        )
         move, _, _ = _move(db, ctx, encounter, participant, 2, 0)
         assert move.cost_squares == 4 and move.cost_feet == 20
         assert get_turn_state_row(db, encounter.id, participant.id).movement_remaining == 10
@@ -291,10 +277,11 @@ def test_difficult_terrain_move_spends_double():
 def test_blocked_destination_rejected_before_mutation():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant, terrain=[
-            {"kind": "blocked", "rect": {"col": 2, "row": 0, "width": 1, "height": 1}},
-        ])
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 10, "height": 10, "terrain": [
+                {"kind": "blocked", "rect": {"col": 2, "row": 0, "width": 1, "height": 1}},
+            ]},
+        )
         with pytest.raises(MapError, match="blocked") as excinfo:
             _move(db, ctx, encounter, participant, 2, 0)
         assert excinfo.value.reason == "blocked"
@@ -308,7 +295,6 @@ def test_insufficient_movement_rejected_with_exact_reason():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         # 30 ft = 6 squares; (0,0) -> (8,0) needs 8.
         with pytest.raises(MapError, match="unreachable") as excinfo:
             _move(db, ctx, encounter, participant, 8, 0)
@@ -321,7 +307,6 @@ def test_out_of_bounds_rejected_before_mutation():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         with pytest.raises(MapError, match="out of bounds") as excinfo:
             _move(db, ctx, encounter, participant, 10, 0)
         assert excinfo.value.reason == "out_of_bounds"
@@ -332,10 +317,6 @@ def test_occupied_destination_rejected():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        encounter_map, _ = _map(
-            db, ctx, encounter, participant,
-            placements=[{"participant_id": str(participant.id), "col": 0, "row": 0}],
-        )
         # Second token stands at (1, 0): fabricate via a guest participant row.
         from models.combat import EncounterPlacement
         guest_id = uuid.uuid4()
@@ -353,11 +334,12 @@ def test_occupied_destination_rejected():
 def test_diagonal_around_blocking_corners_rejected_under_launch_policy():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant, terrain=[
-            {"kind": "blocked", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
-            {"kind": "blocked", "rect": {"col": 0, "row": 1, "width": 1, "height": 1}},
-        ])
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 10, "height": 10, "terrain": [
+                {"kind": "blocked", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
+                {"kind": "blocked", "rect": {"col": 0, "row": 1, "width": 1, "height": 1}},
+            ]},
+        )
         with pytest.raises(MapError) as excinfo:
             _move(db, ctx, encounter, participant, 1, 1)
         assert excinfo.value.reason == "unreachable"
@@ -368,7 +350,6 @@ def test_stale_turn_sequence_cannot_spend():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         with pytest.raises(StaleTurnError):
             _move(db, ctx, encounter, participant, 2, 0, expected_turn_sequence=999)
         assert get_turn_state_row(db, encounter.id, participant.id).movement_remaining == 30
@@ -378,7 +359,6 @@ def test_unsupported_movement_mode_rejected():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         with pytest.raises(MapError, match="movement_mode") as excinfo:
             _move(db, ctx, encounter, participant, 2, 0, movement_mode="fly")
         assert excinfo.value.reason == "unsupported_mode"
@@ -391,18 +371,15 @@ def test_dm_terrain_change_affects_subsequent_reachable_calc():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         before = reachable_for(db, encounter.id, participant.id)
         assert any(c["col"] == 5 and c["row"] == 0 for c in before["cells"])
 
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        encounter_map, event = update_terrain(
-            db, encounter.id, actor_id=ctx["owner"],
+        dm_update_terrain(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
             zones=[{"kind": "blocked", "rect": {"col": 0, "row": 0, "width": 10, "height": 1},
                     "label": "Wall of thorns"}],
-            expected_revision=revision, operation_id="op-terrain-wall",
         )
-        assert event.event_type == MAP_UPDATED_EVENT
+        encounter_map = get_map(db, encounter.id)
         assert encounter_map.revision == 2
         after = reachable_for(db, encounter.id, participant.id)
         # The walled row is impassable along itself, but the stranded token
@@ -419,7 +396,6 @@ def test_dm_terrain_inline_effect_path_validates_and_bumps_revision():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         campaign = db.get(Campaign, ctx["campaign_id"])
         encounter_map = update_terrain_inline(
             db, campaign, encounter,
@@ -441,7 +417,6 @@ def test_duplicate_move_command_cannot_double_spend():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         first, _, _ = _move(db, ctx, encounter, participant, 2, 0, operation_id="op-move-dup")
         # Same operation retried — even against a *different* destination the
         # recorded outcome replays instead of moving again.
@@ -463,11 +438,12 @@ def test_duplicate_move_command_cannot_double_spend():
 def test_reconnect_reconstructs_positions_and_terrain_from_backend():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant, terrain=[
-            {"kind": "difficult", "rect": {"col": 3, "row": 3, "width": 2, "height": 2},
-             "label": "Rubble"},
-        ])
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 10, "height": 10, "terrain": [
+                {"kind": "difficult", "rect": {"col": 3, "row": 3, "width": 2, "height": 2},
+                 "label": "Rubble"},
+            ]},
+        )
         _move(db, ctx, encounter, participant, 2, 1)
     # Fresh session: no in-memory state, rebuild purely from durable rows.
     with fac() as db2:
@@ -487,12 +463,15 @@ def test_reconnect_reconstructs_positions_and_terrain_from_backend():
 def test_projection_hides_dm_labels_and_hidden_npc_tokens():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-enc-1", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
-            participants=[{"character_id": str(ctx["owner_pc"])},
-                          {"npc_entity_id": str(ctx["goblin_id"])}],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
+            [{"character_id": str(ctx["owner_pc"])},
+             {"npc_entity_id": str(ctx["goblin_id"])}],
+            map={"width": 6, "height": 6, "terrain": [{"kind": "blocked",
+                      "rect": {"col": 2, "row": 2, "width": 1, "height": 1},
+                      "label": "Secret pit trap", "visibility": "dm_only"}]},
+            npc_d20=5,
+            effect_id="op-enc-1",
         )
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         goblin_p = db.execute(
@@ -507,16 +486,11 @@ def test_projection_hides_dm_labels_and_hidden_npc_tokens():
                      "modifier": owner_p.initiative_modifier,
                      "total": 10 + owner_p.initiative_modifier},
         )
-        roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=5)
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        ensure_map(
-            db, encounter.id, actor_id=ctx["owner"], width=6, height=6,
-            terrain=[{"kind": "blocked",
-                      "rect": {"col": 2, "row": 2, "width": 1, "height": 1},
-                      "label": "Secret pit trap", "visibility": "dm_only"}],
-            placements=[{"participant_id": str(owner_p.id), "col": 0, "row": 0},
-                        {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
-            expected_revision=revision, operation_id="op-map-hidden",
+        db.refresh(encounter)
+        dm_place_tokens(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
+            [{"participant_id": str(owner_p.id), "col": 0, "row": 0},
+             {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
         )
         # Issue #250 supersedes shared-mechanics visibility: dm_only zones
         # are omitted entirely (kind/rect/label all absent). The AI is the
@@ -531,23 +505,10 @@ def test_projection_hides_dm_labels_and_hidden_npc_tokens():
         assert len(player_view["placements"]) == 1
 
 
-def test_non_owner_cannot_define_geometry_or_terrain():
-    fac, ctx = _fixture()
-    with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        from app.combat.maps import MapAuthorizationError
-        with pytest.raises(MapAuthorizationError):
-            ensure_map(db, encounter.id, actor_id=ctx["player"], width=6, height=6,
-                       expected_revision=revision, operation_id="op-map-nope")
-        assert get_map(db, encounter.id) is None
-
-
 def test_reachable_read_is_safe_for_any_reader_and_reports_budget():
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         result = reachable_for(db, encounter.id, participant.id)
         assert result["movement_remaining_ft"] == 30
         assert result["max_squares"] == 6
@@ -560,18 +521,18 @@ def test_reachable_read_is_safe_for_any_reader_and_reports_budget():
 
 
 def _active_duo(db, ctx, *, pc="owner_pc", actor="owner", pc_roll=1, goblin_roll=20,
-               operation_id=None):
+               operation_id=None, **kwargs):
     """Two-token active encounter where the goblin holds the turn by default.
 
     Pass pc_roll high / goblin_roll low to put the PC on turn instead.
     """
-    encounter, _ = start_encounter(
-        db, ctx["campaign_id"], operation_id=operation_id or f"op-enc-duo-{uuid.uuid4().hex[:8]}",
-        expected_revision=0,
-        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-        source_attempt_id=ctx["attempt_id"],
-        participants=[{"character_id": str(ctx[pc])},
-                      {"npc_entity_id": str(ctx["goblin_id"])}],
+    encounter = dm_start_encounter(
+        db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
+        [{"character_id": str(ctx[pc])},
+         {"npc_entity_id": str(ctx["goblin_id"])}],
+        map={"width": 6, "height": 6},
+        npc_d20=goblin_roll,
+        effect_id=operation_id or f"op-enc-duo-{uuid.uuid4().hex[:8]}",
     )
     pc_p = _pc(db, encounter.id, ctx[pc])
     goblin_p = db.execute(
@@ -586,28 +547,33 @@ def _active_duo(db, ctx, *, pc="owner_pc", actor="owner", pc_roll=1, goblin_roll
                  "modifier": pc_p.initiative_modifier,
                  "total": pc_roll + pc_p.initiative_modifier},
     )
-    roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=goblin_roll)
     db.refresh(encounter)
     assert encounter.status == "active"
+    db.refresh(pc_p)
+    db.refresh(goblin_p)
     return encounter, pc_p, goblin_p
 
 
 def _duo_map(db, ctx, encounter, pc_p, goblin_p, **kwargs):
-    revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-    defaults = {
-        "actor_id": ctx["owner"], "width": 6, "height": 6,
-        "terrain": [],
-        "placements": [{"participant_id": str(pc_p.id), "col": 0, "row": 0},
-                       {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
-        "expected_revision": revision,
-        "operation_id": f"op-duo-map-{uuid.uuid4().hex[:8]}",
-    }
-    defaults.update(kwargs)
-    return ensure_map(db, encounter.id, **defaults)
+    terrain = kwargs.get("terrain", None)
+    placements = kwargs.get("placements", None)
+    if terrain:
+        dm_update_terrain(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
+            zones=list(terrain),
+        )
+    if placements is None:
+        placements = [{"participant_id": str(pc_p.id), "col": 0, "row": 0},
+                      {"participant_id": str(goblin_p.id), "col": 5, "row": 5}]
+    dm_place_tokens(
+        db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
+        [dict(p) for p in placements],
+    )
+    db.refresh(encounter)
+    return get_map(db, encounter.id)
 
 
 def test_hidden_npc_reachable_denied_for_every_player():
-    from app.combat.maps import MapAuthorizationError
     fac, ctx = _fixture()
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
@@ -629,12 +595,10 @@ def test_hidden_stranded_placements_filtered_for_every_player():
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
         _duo_map(db, ctx, encounter, owner_p, goblin_p)
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        update_terrain(
-            db, encounter.id, actor_id=ctx["owner"],
+        dm_update_terrain(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
             zones=[{"kind": "blocked", "rect": {"col": 5, "row": 5, "width": 1, "height": 1},
                     "label": "Secret pit", "visibility": "dm_only"}],
-            expected_revision=revision, operation_id="op-strand-hidden",
         )
         # The goblin is stranded in durable state...
         assert any(s["participant_id"] == str(goblin_p.id)
@@ -651,11 +615,12 @@ def test_overlapping_zones_preserve_authored_order():
     from app.combat.maps import list_zones
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant, width=3, height=1, terrain=[
-            {"kind": "blocked", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
-            {"kind": "open", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
-        ])
+        encounter, participant = _active_solo(
+            db, ctx, map={"width": 3, "height": 1, "terrain": [
+                {"kind": "blocked", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
+                {"kind": "open", "rect": {"col": 1, "row": 0, "width": 1, "height": 1}},
+            ]},
+        )
         # Same-transaction rows share created_at: only the explicit ordinal
         # keeps authored order deterministic on read-back.
         zones = list_zones(db, get_map(db, encounter.id).id)
@@ -664,32 +629,6 @@ def test_overlapping_zones_preserve_authored_order():
         # Later-wins semantics hold through the persisted read path.
         move, _, _ = _move(db, ctx, encounter, participant, 2, 0)
         assert (move.to_col, move.to_row) == (2, 0)
-
-
-def test_map_redefine_without_placements_preserves_positions():
-    fac, ctx = _fixture()
-    with fac() as db:
-        encounter, participant = _active_solo(db, ctx)
-        encounter_map, _ = _map(db, ctx, encounter, participant)
-        assert encounter_map.revision == 1
-        _move(db, ctx, encounter, participant, 3, 0, operation_id="op-preserve-move")
-        # Redefine geometry/art without placements: position survives.
-        kept, _ = _map(db, ctx, encounter, participant,
-                       background_art_ref="gen-art-2", placements=None,
-                       operation_id="op-redefine-keep")
-        assert kept.revision == 2
-        assert (get_placement(db, encounter.id, participant.id).col,
-                get_placement(db, encounter.id, participant.id).row) == (3, 0)
-        # A shrink that would push the token off-grid rejects instead.
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        with pytest.raises(MapError, match="outside the replacement") as excinfo:
-            ensure_map(db, encounter.id, actor_id=ctx["owner"], width=2, height=2,
-                       placements=None, expected_revision=revision,
-                       operation_id="op-redefine-shrink")
-        assert excinfo.value.reason == "out_of_bounds"
-        db.rollback()
-        assert (get_placement(db, encounter.id, participant.id).col,
-                get_placement(db, encounter.id, participant.id).row) == (3, 0)
 
 
 def test_two_moves_same_turn_have_distinct_realtime_event_ids():
@@ -701,7 +640,6 @@ def test_two_moves_same_turn_have_distinct_realtime_event_ids():
     try:
         with fac() as db:
             encounter, participant = _active_solo(db, ctx)
-            _map(db, ctx, encounter, participant)
             first, _, _ = _move(db, ctx, encounter, participant, 1, 0,
                                 operation_id="op-rt-move-1")
             second, _, _ = _move(db, ctx, encounter, participant, 2, 0,
@@ -729,20 +667,15 @@ def test_hidden_mover_move_redacts_positions():
             encounter, owner_p, goblin_p = _active_duo(db, ctx)
             assert encounter.active_participant_id == goblin_p.id
             _duo_map(db, ctx, encounter, owner_p, goblin_p)
-            move, _, event = _move(db, ctx, encounter, goblin_p, 4, 5,
-                                   operation_id="op-hidden-move")
-            # Authoritative state still commits exactly.
-            assert (move.to_col, move.to_row) == (4, 5)
+            # No human — the campaign owner included — may act for an
+            # NPC/monster turn: the AI DM runs those turns.
+            with pytest.raises(MapAuthorizationError, match="AI DM"):
+                _move(db, ctx, encounter, goblin_p, 4, 5,
+                      operation_id="op-hidden-move")
+            # The refused move commits nothing and publishes nothing.
             assert (get_placement(db, encounter.id, goblin_p.id).col,
-                    get_placement(db, encounter.id, goblin_p.id).row) == (4, 5)
-            # Durable thread-scoped event carries no hidden coordinates.
-            assert "from" not in event.payload and "to" not in event.payload
-            assert event.payload.get("position_redacted") is True
-            # Shared realtime payload is a position-free invalidation.
-            moved = [r for r in pub.published if r["event"] == "encounter.moved"]
-            assert len(moved) == 1
-            assert moved[0]["payload"]["to"] == {}
-            assert moved[0]["payload"].get("position_redacted") is True
+                    get_placement(db, encounter.id, goblin_p.id).row) == (5, 5)
+            assert [r for r in pub.published if r["event"] == "encounter.moved"] == []
     finally:
         set_realtime_publisher(None)
 
@@ -760,12 +693,13 @@ def test_public_npc_token_stays_visible_despite_private_stats():
                             details={"initiative_modifier": 1, "dex_modifier": 1})
         db.add(guard)
         db.commit()
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-enc-guard", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
-            participants=[{"character_id": str(ctx["owner_pc"])},
-                          {"npc_entity_id": str(guard.id)}],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
+            [{"character_id": str(ctx["owner_pc"])},
+             {"npc_entity_id": str(guard.id)}],
+            map={"width": 6, "height": 6},
+            npc_d20=5,
+            effect_id="op-enc-guard",
         )
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         guard_p = db.execute(
@@ -780,15 +714,13 @@ def test_public_npc_token_stays_visible_despite_private_stats():
                      "modifier": owner_p.initiative_modifier,
                      "total": 10 + owner_p.initiative_modifier},
         )
-        roll_npc_initiative(db, encounter.id, guard_p.id, raw_d20=5)
+        db.refresh(encounter)
         # Stats stay DM-private per #230 even though the token is public.
         assert guard_p.stat_visibility == "dm_private"
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        ensure_map(
-            db, encounter.id, actor_id=ctx["owner"], width=6, height=6,
-            placements=[{"participant_id": str(owner_p.id), "col": 0, "row": 0},
-                        {"participant_id": str(guard_p.id), "col": 5, "row": 0}],
-            expected_revision=revision, operation_id="op-map-guard",
+        dm_place_tokens(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
+            [{"participant_id": str(owner_p.id), "col": 0, "row": 0},
+             {"participant_id": str(guard_p.id), "col": 5, "row": 0}],
         )
         player_view = map_projection(db, encounter, viewer_id=ctx["player"])
         assert any(p["participant_id"] == str(guard_p.id)
@@ -804,17 +736,18 @@ def test_shared_terrain_event_omits_hidden_stranded():
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
         _duo_map(db, ctx, encounter, owner_p, goblin_p)
-        revision = int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
-        _, event = update_terrain(
-            db, encounter.id, actor_id=ctx["owner"],
+        dm_update_terrain(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"], encounter.id,
             zones=[{"kind": "blocked", "rect": {"col": 5, "row": 5, "width": 1, "height": 1}}],
-            expected_revision=revision, operation_id="op-event-strand",
         )
-        # Thread-scoped history must not carry the hidden token's cell.
-        assert event.payload["stranded_placements"] == []
-        # Durable state still flags it for the DM runtime.
+        # Durable state still flags it for the DM runtime...
         assert any(s["participant_id"] == str(goblin_p.id)
                    for s in _stranded_placements(db, encounter, get_map(db, encounter.id)))
+        # ...but the hidden token's cell never reaches any player's projection.
+        for viewer in (ctx["owner"], ctx["player"]):
+            player_view = map_projection(db, encounter, viewer_id=viewer)
+            assert all(s["participant_id"] != str(goblin_p.id)
+                       for s in player_view["stranded_placements"])
 
 
 def test_non_owner_preview_and_commit_share_hidden_occupancy():
@@ -869,7 +802,6 @@ def test_staged_terrain_effect_promotes_through_turn_pipeline_and_bumps_revision
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         assert get_map(db, encounter.id).revision == 1
 
         accept_submission(
@@ -939,7 +871,6 @@ def test_staged_placement_effect_promotes_through_turn_pipeline_and_bumps_revisi
     fac, ctx = _fixture()
     with fac() as db:
         encounter, participant = _active_solo(db, ctx)
-        _map(db, ctx, encounter, participant)
         assert get_map(db, encounter.id).revision == 1
         assert (get_placement(db, encounter.id, participant.id).col,
                 get_placement(db, encounter.id, participant.id).row) == (0, 0)
