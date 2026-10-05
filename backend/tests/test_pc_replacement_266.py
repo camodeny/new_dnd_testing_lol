@@ -110,12 +110,23 @@ def _go_active(factory, campaign_id):
         db.commit()
 
 
-def _declare(client, cid, char_id, key, **extra):
-    return client.post(
-        f"/api/campaigns/{cid}/pc-deaths",
-        json={"expected_revision": _revision(client, cid), "character_id": char_id, **extra},
-        headers={"Idempotency-Key": key},
-    )
+def _declare(factory, cid, char_id, *, status="dead", cause=None, is_tpk=False):
+    """Declare a PC dead/retired the way the AI DM does — service primitive.
+
+    Replaces the deleted human owner route (POST /pc-deaths). The primitive
+    is flush-only, so this helper owns the commit and returns the row dict.
+    """
+    from app.campaigns.replacements import declare_pc_death
+
+    with factory() as db:
+        camp = db.get(Campaign, uuid.UUID(cid))
+        row = declare_pc_death(
+            db, camp, uuid.UUID(char_id),
+            status=status, cause=cause, is_tpk=is_tpk,
+        )
+        result = row.to_dict()
+        db.commit()
+        return result
 
 
 def _replace(client, cid, char_id, key):
@@ -216,9 +227,8 @@ def test_single_death_and_replacement(api):
     hero = ids["owner_char"]
     before_sheet = _sheet_snapshot(factory, hero)
 
-    death = _declare(client, cid, hero, "death-1", cause="dragon fire")
-    assert death.status_code == 200, death.text
-    assert death.json()["lifecycle"]["status"] == "dead"
+    death = _declare(factory, cid, hero, cause="dragon fire")
+    assert death["status"] == "dead"
 
     party = client.get(f"/api/campaigns/{cid}/party")
     assert party.status_code == 200, party.text
@@ -255,7 +265,8 @@ def test_single_death_and_replacement(api):
         assert new_sheet.backstory is None
 
     types = _event_types(factory, cid)
-    assert "campaign.pc_dead" in types
+    # No campaign.pc_dead event: the deleted owner route's command wrapper is
+    # gone with it — the DM-path primitive records the lifecycle row directly.
     assert "campaign.pc_replaced" in types
 
 
@@ -277,7 +288,7 @@ def test_dead_pc_canon_cannot_be_edited_or_deleted(api):
     client, factory, actor, owner_id, _ = api
     cid, ids = _launch_party(api)
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-canon").status_code == 200
+    assert _declare(factory, cid, hero)["status"] == "dead"
 
     edit = client.put(f"/api/characters/{hero}", json={"name": "Rewritten"})
     assert edit.status_code == 409, edit.text
@@ -296,7 +307,7 @@ def test_no_automatic_knowledge_inheritance(api):
     assert before_world != (0, 0)
 
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-know").status_code == 200
+    _declare(factory, cid, hero)
     hero2 = _make_character(factory, owner_id, name="Hero II")
     assert _replace(client, cid, hero2, "replace-know").status_code == 200
 
@@ -315,8 +326,8 @@ def test_tpk_new_party_same_campaign(api):
     _seed_world(factory, cid)
     before_world = _world_counts(factory, cid)
 
-    assert _declare(client, cid, ids["owner_char"], "death-tpk-1", is_tpk=True).status_code == 200
-    assert _declare(client, cid, ids["member_char"], "death-tpk-2", is_tpk=True).status_code == 200
+    _declare(factory, cid, ids["owner_char"], is_tpk=True)
+    _declare(factory, cid, ids["member_char"], is_tpk=True)
 
     party = client.get(f"/api/campaigns/{cid}/party").json()["party"]
     assert party["is_tpk"] is True
@@ -348,7 +359,7 @@ def test_duplicate_replacement_transition_rejected(api):
     client, factory, actor, owner_id, _ = api
     cid, ids = _launch_party(api)
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-dup").status_code == 200
+    _declare(factory, cid, hero)
     hero2 = _make_character(factory, owner_id, name="Hero II")
     rev_before_replace = _revision(client, cid)
     first = client.post(
@@ -382,7 +393,7 @@ def test_failed_replacement_leaves_state_intact(api):
     client, factory, actor, owner_id, member_id = api
     cid, ids = _launch_party(api, members=2)
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-fail").status_code == 200
+    _declare(factory, cid, hero)
     before_sheet = _sheet_snapshot(factory, hero)
     before_world = _world_counts(factory, cid)
     before_rev = _revision(client, cid)
@@ -435,7 +446,7 @@ def test_introduction_flow(api):
     client, factory, actor, owner_id, _ = api
     cid, ids = _launch_party(api)
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-intro").status_code == 200
+    _declare(factory, cid, hero)
     hero2 = _make_character(factory, owner_id, name="Hero II")
     assert _replace(client, cid, hero2, "replace-intro").status_code == 200
 
@@ -459,9 +470,8 @@ def test_retirement_enables_replacement(api):
     client, factory, actor, owner_id, _ = api
     cid, ids = _launch_party(api)
     hero = ids["owner_char"]
-    death = _declare(client, cid, hero, "retire-1", status="retired", cause="settled down")
-    assert death.status_code == 200, death.text
-    assert death.json()["lifecycle"]["status"] == "retired"
+    death = _declare(factory, cid, hero, status="retired", cause="settled down")
+    assert death["status"] == "retired"
 
     party = client.get(f"/api/campaigns/{cid}/party").json()["party"]
     assert party["is_tpk"] is False
@@ -483,14 +493,24 @@ def test_replacement_rejected_before_launch(api):
 
 
 def test_duplicate_death_declaration_rejected(api):
+    from app.campaigns.replacements import PcLifecycleError, declare_pc_death
+
     client, factory, actor, owner_id, _ = api
     cid, ids = _launch_party(api)
     hero = ids["owner_char"]
-    assert _declare(client, cid, hero, "death-once").status_code == 200
-    again = _declare(client, cid, hero, "death-twice")
-    assert again.status_code == 409, again.text
+    assert _declare(factory, cid, hero)["status"] == "dead"
+    with factory() as db:
+        camp = db.get(Campaign, uuid.UUID(cid))
+        with pytest.raises(PcLifecycleError) as exc_info:
+            declare_pc_death(db, camp, uuid.UUID(hero))
+        assert exc_info.value.status_code == 409
+        db.rollback()
 
     # A non-party character cannot be declared dead.
     outsider = _make_character(factory, owner_id, name="Outsider")
-    resp = _declare(client, cid, outsider, "death-outsider")
-    assert resp.status_code == 409, resp.text
+    with factory() as db:
+        camp = db.get(Campaign, uuid.UUID(cid))
+        with pytest.raises(PcLifecycleError) as exc_info:
+            declare_pc_death(db, camp, uuid.UUID(outsider))
+        assert exc_info.value.status_code == 409
+        db.rollback()

@@ -6,19 +6,16 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.deps.campaign import campaign_for, require_owner, run_campaign_command
+from app.deps.campaign import campaign_for, run_campaign_command
 from app.campaigns.service import CampaignArchivedError
 from app.combat.maps import (
     MapAuthorizationError,
     MapError,
-    ensure_map,
     map_projection,
     move_participant,
     reachable_for,
-    update_terrain,
 )
 from app.combat.service import (
-    EncounterAlreadyActiveError,
     EncounterAuthorizationError,
     EncounterError,
     EncounterNotReadyError,
@@ -29,8 +26,6 @@ from app.combat.service import (
     get_encounter,
     get_turn_order,
     list_participants,
-    roll_npc_initiative,
-    start_encounter,
 )
 from app.combat.turns import (
     StaleTurnError,
@@ -41,24 +36,15 @@ from app.combat.turns import (
     end_turn,
     turn_projection,
 )
-from app.combat.ending import (
-    EndEncounterAuthorizationError,
-    end_encounter,
-    list_end_followups,
-    process_end_followup,
-)
 from app.deps.auth import current_profile
 from app.deps.idempotency import require_idempotency_key
 from app.campaigns.events import RevisionConflictError
 from app.realtime.service import (
-    publish_encounter_ended,
     publish_encounter_map,
     publish_encounter_moved,
     publish_encounter_ready,
-    publish_encounter_started,
     publish_encounter_turn,
 )
-from app.threads.service import ThreadNotFoundError
 from database import get_db
 from models.campaigns import Campaign
 from models.combat import Encounter
@@ -115,8 +101,6 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
         encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
         if encounter is None:
             return
-        if result.get("event") is not None:
-            publish_encounter_started(db, encounter)
         if result.get("ready_event") is not None:
             publish_encounter_ready(db, encounter)
             # Readiness opens turn 1 atomically (#231): project it too.
@@ -127,73 +111,8 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
             publish_encounter_turn(db, encounter, "skipped")
         if result.get("started_event") is not None:
             publish_encounter_turn(db, encounter, "started")
-        if result.get("encounter_ended_event") is not None:
-            publish_encounter_ended(db, encounter)
     except Exception:
         logger.warning("encounter post-commit publish skipped", exc_info=True)
-
-
-@router.post("/api/campaigns/{campaign_id}/encounters", status_code=201)
-def create_encounter(
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    key = require_idempotency_key(request, payload.get("operation_id"))
-    expected_revision = payload.get("expected_revision")
-    if expected_revision is None:
-        raise HTTPException(status_code=400, detail="expected_revision is required")
-    try:
-        expected_revision = int(expected_revision)
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
-    for field in ("source_turn_id", "source_attempt_id"):
-        if not payload.get(field):
-            raise HTTPException(status_code=422, detail=f"{field} is required")
-
-    def execute():
-        try:
-            # Flush-only: the outer idempotent command owns the commit so the
-            # record, mutation, and result commit atomically (no crash window
-            # with a stuck in_progress row).
-            encounter, event = start_encounter(
-                db,
-                campaign.id,
-                operation_id=key,
-                expected_revision=expected_revision,
-                actor_id=profile.id,
-                source_turn_id=payload["source_turn_id"],
-                source_attempt_id=payload["source_attempt_id"],
-                scene=payload.get("scene"),
-                participants=payload.get("participants") or [],
-                start_source="api",
-                commit=False,
-            )
-            return {
-                "encounter": encounter_view(db, encounter, profile.id),
-                "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
-            }
-        except EncounterAlreadyActiveError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ThreadNotFoundError as exc:
-            raise HTTPException(status_code=404, detail="Source turn not found") from exc
-        except EncounterError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.start", scope_type="campaign", scope_id=campaign.id,
-        payload=payload, execute=execute,
-    )
-    _publish_post_commit(
-        db, result,
-        replayed=response.headers.get("X-Idempotent-Replay") == "true",
-    )
-    return result
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/active")
@@ -308,56 +227,6 @@ def fulfill_initiative(
     return result
 
 
-@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/initiative/roll-npc")
-def roll_npc(
-    encounter_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    participant_raw = payload.get("participant_id")
-    if not participant_raw:
-        raise HTTPException(status_code=422, detail="participant_id is required")
-    participant_id = _id(str(participant_raw), "participant id")
-    key = require_idempotency_key(request, payload.get("operation_id"))
-
-    def execute():
-        try:
-            participant, updated, event = roll_npc_initiative(
-                db, encounter.id, participant_id, raw_d20=payload.get("raw_d20"),
-                # Flush-only: the outer idempotent command owns the commit.
-                commit=False,
-            )
-            return {
-                "participant": participant.to_dict(),
-                "encounter": encounter_view(db, updated, profile.id),
-                "ready_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
-            }
-        except EncounterError as exc:
-            message = str(exc)
-            raise HTTPException(
-                status_code=409 if "status" in message or "already" in message else 422,
-                detail=message,
-            ) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.npc_roll", scope_type="encounter_participant", scope_id=participant_id,
-        payload=payload, execute=execute,
-    )
-    _publish_post_commit(
-        db, result,
-        replayed=response.headers.get("X-Idempotent-Replay") == "true",
-    )
-    return result
-
-
 # ── Turn progression — issue #231 ────────────────────────────────────────────
 
 
@@ -368,7 +237,7 @@ def _turn_http_error(exc: Exception) -> HTTPException:
             status_code=409, detail=str(exc),
             headers={"X-Current-Turn-Sequence": str(exc.actual_sequence)},
         )
-    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError, MapAuthorizationError, EndEncounterAuthorizationError)):
+    if isinstance(exc, (TurnAuthorizationError, EncounterAuthorizationError, MapAuthorizationError)):
         return HTTPException(status_code=403, detail=str(exc))
     if isinstance(exc, CampaignArchivedError):
         return HTTPException(status_code=409, detail=str(exc))
@@ -603,97 +472,6 @@ def _publish_map_post_commit(db: Session, result: dict, encounter_id: str, *, re
         logger.warning("map post-commit publish skipped", exc_info=True)
 
 
-@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map", status_code=201)
-def init_encounter_map(
-    encounter_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    key = require_idempotency_key(request, payload.get("operation_id"))
-    expected_revision = _require_revision(payload)
-    if payload.get("width") is None or payload.get("height") is None:
-        raise HTTPException(status_code=422, detail="width and height are required")
-
-    def execute():
-        try:
-            # Flush-only: the outer idempotent command owns the commit.
-            encounter_map, event = ensure_map(
-                db, encounter.id, actor_id=profile.id,
-                width=payload["width"], height=payload["height"],
-                diagonal_policy=payload.get("diagonal_policy") or "no_corner_cut",
-                background_art_ref=payload.get("background_art_ref"),
-                terrain=payload.get("terrain") or [],
-                placements=payload.get("placements"),
-                expected_revision=expected_revision,
-                operation_id=key, commit=False,
-            )
-            return {
-                "map": map_projection(db, encounter, viewer_id=profile.id),
-                "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
-            }
-        except Exception as exc:
-            raise _map_http_error(exc) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.map_init", scope_type="encounter", scope_id=encounter.id,
-        payload=payload, execute=execute,
-    )
-    _publish_map_post_commit(db, result, str(encounter.id),
-                             replayed=response.headers.get("X-Idempotent-Replay") == "true")
-    return result
-
-
-@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/terrain")
-def change_encounter_terrain(
-    encounter_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    key = require_idempotency_key(request, payload.get("operation_id"))
-    expected_revision = _require_revision(payload)
-
-    def execute():
-        try:
-            # Flush-only: the outer idempotent command owns the commit.
-            encounter_map, event = update_terrain(
-                db, encounter.id, actor_id=profile.id,
-                zones=payload.get("zones") or [],
-                clear_zone_ids=payload.get("clear_zone_ids") or [],
-                expected_revision=expected_revision,
-                operation_id=key, commit=False,
-            )
-            return {
-                "map": map_projection(db, encounter, viewer_id=profile.id),
-                "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
-            }
-        except Exception as exc:
-            raise _map_http_error(exc) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.terrain_change", scope_type="encounter", scope_id=encounter.id,
-        payload=payload, execute=execute,
-    )
-    _publish_map_post_commit(db, result, str(encounter.id),
-                             replayed=response.headers.get("X-Idempotent-Replay") == "true")
-    return result
-
-
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/map")
 def read_encounter_map(
     encounter_id: str,
@@ -782,128 +560,4 @@ def post_move(
     )
     _publish_map_post_commit(db, result, str(encounter.id),
                              replayed=response.headers.get("X-Idempotent-Replay") == "true")
-    return result
-
-
-# ── DM-controlled encounter end + post-combat hooks — issue #239 ─────────────
-
-
-@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end")
-def post_end_encounter(
-    encounter_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    # The AI is the only DM: ending runs on the campaign-owner path, never a
-    # separate human DM role.
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    key = require_idempotency_key(request, payload.get("operation_id"))
-    expected_revision = _require_revision(payload)
-    for field in ("outcome", "reason"):
-        if not payload.get(field):
-            raise HTTPException(status_code=422, detail=f"{field} is required")
-
-    def execute():
-        try:
-            # Flush-only: the outer idempotent command owns the commit so the
-            # transition, death writes, hook rows, and ended event commit
-            # atomically — failures leave the encounter active, never
-            # half-closed.
-            updated, event, hooks = end_encounter(
-                db, encounter.id, actor_id=profile.id,
-                outcome=payload["outcome"], reason=payload["reason"],
-                participant_outcomes=payload.get("participant_outcomes"),
-                expected_revision=expected_revision, operation_id=key,
-                commit=False,
-            )
-            return {
-                "encounter": encounter_view(db, updated, profile.id),
-                "encounter_ended_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
-                "followups": [h.to_dict() for h in hooks],
-            }
-        except Exception as exc:
-            raise _turn_http_error(exc) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.end", scope_type="encounter", scope_id=encounter.id,
-        payload=payload, execute=execute,
-    )
-    _publish_post_commit(
-        db, result,
-        replayed=response.headers.get("X-Idempotent-Replay") == "true",
-    )
-    return result
-
-
-@router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups")
-def read_end_followups(
-    encounter_id: str,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    # Issue #239 privacy: hook results carry post-combat custody/death/loot
-    # detail (participant IDs) that can name hidden NPC fates — owner-only
-    # bookkeeping, matching the process endpoint below. Members converge via
-    # the redacted encounter view (public outcome) instead.
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    return {
-        "encounter_id": str(encounter.id),
-        "status": encounter.status,
-        "followups": [h.to_dict() for h in list_end_followups(db, encounter.id)],
-    }
-
-
-@router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/end-followups/process")
-def post_process_end_followup(
-    encounter_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for()),
-    db: Session = Depends(get_db),
-):
-    require_owner(campaign, profile.id)
-    encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
-    _assert_encounter_visible(db, encounter, profile.id)
-    hook_type = payload.get("hook_type")
-    if not hook_type:
-        raise HTTPException(status_code=422, detail="hook_type is required")
-    if payload.get("result") is None and payload.get("fail_reason") is None:
-        raise HTTPException(status_code=422, detail="result or fail_reason is required")
-    key = require_idempotency_key(request, payload.get("operation_id"))
-
-    def execute():
-        try:
-            # Flush-only under the idempotency guard. Hook completion/failure
-            # is a non-fictional ledger write (no revision bump); it never
-            # reopens or invalidates the ended encounter.
-            row = process_end_followup(
-                db, encounter.id, str(hook_type),
-                result=payload.get("result"),
-                fail_reason=payload.get("fail_reason"),
-                commit=False,
-            )
-            return {
-                "encounter": encounter_view(db, encounter, profile.id),
-                "followup": row.to_dict(),
-            }
-        except Exception as exc:
-            raise _turn_http_error(exc) from exc
-
-    result = run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="encounter.end_followup", scope_type="encounter", scope_id=encounter.id,
-        payload=payload, execute=execute,
-    )
     return result

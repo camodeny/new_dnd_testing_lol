@@ -35,7 +35,7 @@ from app.adventures.epilogues import (  # noqa: E402
     skip_epilogue,
     submit_epilogue,
 )
-from app.adventures.service import complete_adventure, start_adventure  # noqa: E402
+from app.adventures.service import start_adventure  # noqa: E402
 from app.campaigns.events import RevisionConflictError  # noqa: E402
 from models.campaigns import (  # noqa: E402
     Adventure,
@@ -52,6 +52,77 @@ def _factory():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def _ensure_thread_id(db, camp_id):
+    """The single shared game thread for a campaign (created if missing)."""
+    from models.threads import CampaignThread
+
+    thread = db.execute(
+        select(CampaignThread).where(
+            CampaignThread.campaign_id == camp_id,
+            CampaignThread.thread_type == "campaign",
+        )
+    ).scalars().first()
+    if thread is None:
+        camp = db.get(Campaign, camp_id)
+        thread = CampaignThread(
+            id=uuid.uuid4(), campaign_id=camp_id,
+            thread_type="campaign", created_by=camp.owner_id,
+        )
+        db.add(thread)
+        db.flush()
+    return thread.id
+
+
+def _dm_complete(factory, camp_id, outcome, op_id, *, reason=None,
+                 public_summary=None, adventure_id=None):
+    """Complete the campaign's adventure via the AI DM's staged effect.
+
+    Returns (adventure_id, event_id, turn_id). The only production
+    completion path: stage ``complete_adventure`` on a DM turn and commit it.
+    """
+    from models.dm import DmTurn, DmTurnAttempt
+
+    with factory() as db:
+        camp = db.get(Campaign, camp_id)
+        rev = int(camp.revision or 0)
+        thread_id = _ensure_thread_id(db, camp_id)
+        args: dict = {"outcome": outcome, "reason": reason or f"{outcome} reason"}
+        if public_summary is not None:
+            args["public_summary"] = public_summary
+        if adventure_id is not None:
+            args["adventure_id"] = str(adventure_id)
+        turn = DmTurn(
+            id=uuid.uuid4(), campaign_id=camp_id, thread_id=str(thread_id),
+            audience="campaign", status="streaming", source_revision=rev,
+            input_set_revision=rev + 1, submission_ids=[],
+        )
+        db.add(turn)
+        db.flush()
+        attempt = DmTurnAttempt(
+            id=uuid.uuid4(), turn_id=turn.id, attempt_number=1, status="streaming",
+            campaign_id=camp_id, thread_id=str(thread_id), audience="campaign",
+            source_revision=rev, input_set_revision=rev + 1, submission_ids=[],
+            staged_effects=[{
+                "id": f"eff-{op_id}", "effect_type": "complete_adventure",
+                "arguments": args,
+            }],
+        )
+        db.add(attempt)
+        db.flush()
+        turn.current_attempt_id = attempt.id
+        turn.streaming_attempt_id = attempt.id
+        db.flush()
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        from app.dm.turns import commit_turn
+
+        _t, _a, event = commit_turn(db, turn_id, attempt_id, operation_id=op_id)
+        db.commit()
+        adv_id = event.payload["adventure_completion"]["adventure_id"]
+        return uuid.UUID(str(adv_id)), event.id, turn_id
 
 
 @pytest.fixture
@@ -80,15 +151,15 @@ def table():
             CampaignMember(campaign_id=camp.id, user_id=bob, role="player",
                            selected_character_id=pcs["bob"].id),
         ])
-        adv = start_adventure(db, camp.id, "The Goblin Arc")
-        camp = db.get(Campaign, camp.id)
-        adv, _ = complete_adventure(
-            db, camp.id, outcome="victory", reason="Goblins routed",
-            public_summary="The village is safe.",
-            operation_id="op-complete-262", expected_revision=int(camp.revision),
-        )
+        start_adventure(db, camp.id, "The Goblin Arc")
         db.commit()
-        yield factory, camp.id, adv.id, owner, alice, bob, pcs["alice"].id, pcs["bob"].id
+        camp_id, alice_pc, bob_pc = camp.id, pcs["alice"].id, pcs["bob"].id
+    adv_id, _, _ = _dm_complete(
+        factory, camp_id, "victory", "op-complete-262",
+        reason="Goblins routed", public_summary="The village is safe.",
+    )
+    with factory() as db:
+        yield factory, camp_id, adv_id, owner, alice, bob, alice_pc, bob_pc
 
 
 def _open(factory, camp_id, adv_id):
@@ -553,16 +624,13 @@ def test_roll_through_mismatched_route_resolves_nothing(table, monkeypatch):
     epi_id = _submit_climb(factory, camp_id, adv_id, alice, alice_pc, "op-climb-scope")
     with factory() as db:
         start_adventure(db, camp_id, "Second arc")
-        camp = db.get(Campaign, camp_id)
-        adv2, _ = complete_adventure(
-            db, camp_id, outcome="victory", reason="Second arc done",
-            public_summary="Second arc safe.",
-            operation_id="op-complete-262-second",
-            expected_revision=int(camp.revision),
-        )
-        open_epilogues(db, camp_id, adv2.id)
         db.commit()
-        adv2_id = adv2.id
+    adv2_id, _, _ = _dm_complete(
+        factory, camp_id, "victory", "op-complete-262-second",
+        reason="Second arc done", public_summary="Second arc safe.",
+    )
+    with factory() as db:
+        open_epilogues(db, camp_id, adv2_id)
         revision_before = int(db.get(Campaign, camp_id).revision)
         events_before = db.execute(
             select(CampaignDomainEvent).where(

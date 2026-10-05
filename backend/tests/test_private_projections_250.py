@@ -417,7 +417,7 @@ def test_invalidation_fanout_targets_grantee_threads(ctx):
 def test_dm_only_map_zones_absent_for_every_player(ctx):
     """Review #418 round 3: hidden trap geometry (kind/rect/label) must be
     absent from unauthorized payloads — in surfaces AND the full snapshot."""
-    from app.combat.maps import ensure_map
+    from app.combat.maps import init_map_inline
     from models.combat import Encounter
 
     db = _db(ctx)
@@ -429,10 +429,9 @@ def test_dm_only_map_zones_absent_for_every_player(ctx):
         )
         db.add(enc)
         db.flush()
-        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-        ensure_map(
-            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
-            terrain=[
+        init_map_inline(db, enc, {
+            "width": 6, "height": 6,
+            "terrain": [
                 {"kind": "difficult",
                  "rect": {"col": 0, "row": 0, "width": 2, "height": 2},
                  "visibility": "public"},
@@ -440,8 +439,8 @@ def test_dm_only_map_zones_absent_for_every_player(ctx):
                  "rect": {"col": 4, "row": 3, "width": 1, "height": 1},
                  "visibility": "dm_only", "label": "secret pit trap"},
             ],
-            expected_revision=rev, operation_id="op-trapmap-250", commit=True,
-        )
+        })
+        db.commit()
         alice_view = build_surfaces_for_viewer(db, camp, ctx["alice"])
         assert alice_view["maps"]["visible"] is True
         alice_zones = alice_view["maps"]["map"]["zones"]
@@ -465,7 +464,7 @@ def test_dm_only_map_zones_absent_for_every_player(ctx):
 def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
     """Review #418 round 6: a private NPC granted to Alice reveals its map
     token to Alice alone — Bob's map stays token-free."""
-    from app.combat.maps import ensure_map
+    from app.combat.maps import init_map_inline
     from models.combat import Encounter, EncounterParticipant, EncounterPlacement
 
     db = _db(ctx)
@@ -486,14 +485,13 @@ def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
         )
         db.add(enc)
         db.flush()
-        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-        ensure_map(
-            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
-            terrain=[{"kind": "open",
-                      "rect": {"col": 0, "row": 0, "width": 6, "height": 6},
-                      "visibility": "public"}],
-            expected_revision=rev, operation_id="op-shademap-250", commit=True,
-        )
+        init_map_inline(db, enc, {
+            "width": 6, "height": 6,
+            "terrain": [{"kind": "open",
+                         "rect": {"col": 0, "row": 0, "width": 6, "height": 6},
+                         "visibility": "public"}],
+        })
+        db.commit()
         part = EncounterParticipant(
             encounter_id=enc.id, campaign_id=camp.id,
             participant_key=f"npc:{shade.id}", kind="npc",

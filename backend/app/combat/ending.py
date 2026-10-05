@@ -2,8 +2,8 @@
 
 Code-owned authority (never delegated to models):
 
-- The DM (campaign owner on the AI-DM runtime path — the AI is the only DM)
-  ends structured initiative with an explicit outcome/reason pair. Supported
+- The AI DM (the only DM) ends structured initiative through the
+  ``end_encounter`` staged effect with an explicit outcome/reason pair. Supported
   outcomes cover kill-based victory plus surrender, escape, capture, retreat,
   defeat, and negotiated truce; participant outcomes record per-combatant
   fates (standing, slain, unconscious, surrendered, captured, fled,
@@ -17,12 +17,10 @@ Code-owned authority (never delegated to models):
   snapshot for history/review and post-turn consolidation.
 - Post-combat hooks (loot availability, XP/progression, death aftermath,
   custody state, post-turn consolidation) are durable rows created pending
-  in the end transaction. Normal campaign processing completes them (or
-  records a failure) afterwards; a hook failure never reopens or invalidates
-  the ended encounter.
-- Ending is idempotent on (encounter_id, end_operation_id): a duplicate end
-  command replays the original encounter + event + hooks without duplicating
-  rewards/events/state transitions.
+  in the end transaction; a hook never reopens or invalidates the ended
+  encounter.
+- Ending is idempotent on (encounter_id, end_operation_id): a replayed end
+  effect is a no-op without duplicating rewards/events/state transitions.
 - Manual post-combat interaction (searching bodies/rooms) stays available
   via normal chat: the submission path never gates on encounter status.
 """
@@ -36,19 +34,14 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.campaigns.events import commit_campaign_mutation
 from app.campaigns.replacements import PcLifecycleError, declare_pc_death
 from app.characters.service import latest_sheet
 from app.clock import ms_between, utcnow
 from app.combat.service import (
-    ENCOUNTER_ENDED_EVENT,
     EncounterError,
     list_participants,
-    lock_encounter,
-    lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
-from app.realtime.service import publish_encounter_ended
 from models.campaigns import Campaign
 from models.combat import (
     END_FOLLOWUP_HOOKS,
@@ -91,10 +84,6 @@ class EndEncounterError(EncounterError):
     """Deterministic encounter-end validation failure — caller must block."""
 
 
-class EndEncounterAuthorizationError(PermissionError):
-    pass
-
-
 def _validate_end_args(
     outcome: Any, reason: Any, participant_outcomes: Any
 ) -> tuple[str, str, dict[str, str]]:
@@ -125,13 +114,6 @@ def _validate_end_args(
             )
         outcomes[pid] = fate
     return outcome, reason, outcomes
-
-
-def _check_owner(db: Session, campaign: Campaign, actor_id: uuid.UUID) -> None:
-    if str(campaign.owner_id) != str(actor_id):
-        raise EndEncounterAuthorizationError(
-            "Only the campaign owner (DM runtime path) may end an encounter"
-        )
 
 
 def _read_final_hp(db: Session, participant: EncounterParticipant) -> dict | None:
@@ -322,25 +304,6 @@ def list_end_followups(db: Session, encounter_id: uuid.UUID) -> list[EncounterEn
     ).scalars().all())
 
 
-def find_ended_event(db: Session, encounter: Encounter):
-    """Resolve the encounter-ended domain event: stored id, else op lookup."""
-    from models.campaigns import CampaignDomainEvent
-
-    if encounter.ended_event_id is not None:
-        event = db.get(CampaignDomainEvent, encounter.ended_event_id)
-        if event is not None:
-            return event
-    if encounter.end_operation_id:
-        return db.execute(
-            select(CampaignDomainEvent).where(
-                CampaignDomainEvent.campaign_id == encounter.campaign_id,
-                CampaignDomainEvent.operation_id == encounter.end_operation_id,
-                CampaignDomainEvent.event_type == ENCOUNTER_ENDED_EVENT,
-            )
-        ).scalars().first()
-    return None
-
-
 def _transition_rows(
     db: Session,
     campaign: Campaign,
@@ -380,142 +343,6 @@ def _transition_rows(
     hooks = _seed_followups(db, encounter)
     db.flush()
     return declared_deaths, hooks
-
-
-def end_encounter(
-    db: Session,
-    encounter_id: uuid.UUID,
-    *,
-    actor_id: uuid.UUID,
-    outcome: str,
-    reason: str,
-    participant_outcomes: dict | None = None,
-    expected_revision: int,
-    operation_id: str,
-    commit: bool = True,
-) -> tuple[Encounter, Any, list[EncounterEndFollowup]]:
-    """End an encounter as a DM-declared authoritative transition.
-
-    Idempotent on (encounter_id, end_operation_id): a duplicate end command
-    replays the original encounter + ended event + hooks, bumps the
-    duplicate counter, and creates nothing new. A *different* operation
-    against an ended encounter fails closed as a conflict.
-
-    Returns (encounter, ended_event, followups).
-    """
-    operation_id = (operation_id or "").strip()
-    if not operation_id or len(operation_id) > 128:
-        raise EndEncounterError("operation_id is required (1-128 characters)")
-    outcome, reason, outcomes = _validate_end_args(outcome, reason, participant_outcomes)
-
-    encounter = lock_encounter(db, encounter_id, EndEncounterError)
-    campaign = lock_playable_campaign(db, encounter.campaign_id, EndEncounterError)
-    _check_owner(db, campaign, actor_id)
-
-    if encounter.status == "ended":
-        encounter.duplicate_end_count = int(encounter.duplicate_end_count or 0) + 1
-        db.flush()
-        if encounter.end_operation_id != operation_id:
-            if commit:
-                db.commit()
-                db.refresh(encounter)
-            structured_log(
-                logger, logging.WARNING, "encounter_end_conflict",
-                encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-                end_operation_id=encounter.end_operation_id,
-                operation_id=operation_id,
-                duplicate_end_count=int(encounter.duplicate_end_count or 0),
-            )
-            raise EndEncounterError(
-                f"encounter is already ended (outcome={encounter.end_outcome}); "
-                "a duplicate end must replay the original operation_id"
-            )
-        if commit:
-            db.commit()
-            db.refresh(encounter)
-        structured_log(
-            logger, logging.INFO, "encounter_end_duplicate_hit",
-            encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-            operation_id=operation_id,
-            duplicate_end_count=int(encounter.duplicate_end_count or 0),
-        )
-        return encounter, find_ended_event(db, encounter), list_end_followups(db, encounter.id)
-
-    if encounter.status not in ENDABLE_STATUSES:
-        raise EndEncounterError(
-            f"encounter cannot be ended from status {encounter.status}"
-        )
-
-    prior_status = encounter.status
-    holder: dict[str, Any] = {}
-
-    def _mutate(locked: Campaign) -> None:
-        declared, hooks = _transition_rows(
-            db, locked, encounter, outcome=outcome, reason=reason,
-            outcomes=outcomes, operation_id=operation_id, actor_id=actor_id,
-        )
-        holder["declared_deaths"] = declared
-        holder["hooks"] = hooks
-        holder["final"] = build_final_snapshot(db, encounter)
-
-    def _payload() -> dict:
-        final = holder["final"]
-        return {
-            "encounter_id": str(encounter.id),
-            "thread_id": encounter.thread_id,
-            "prior_status": prior_status,
-            "outcome": outcome,
-            "reason": reason,
-            "round": int(encounter.round or 1),
-            "turn_sequence": int(encounter.turn_sequence or 0),
-            "duration_ms": int(encounter.end_duration_ms or 0),
-            "participant_outcomes": dict(encounter.end_participant_outcomes or {}),
-            "declared_deaths": list(holder.get("declared_deaths") or []),
-            "followup_hooks": [h.hook_type for h in (holder.get("hooks") or [])],
-            "final_state": final,
-            "ended_by": str(actor_id),
-        }
-
-    campaign_after, event = commit_campaign_mutation(
-        db,
-        campaign.id,
-        expected_revision=int(expected_revision),
-        event_type=ENCOUNTER_ENDED_EVENT,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        mutate=_mutate,
-        commit=False,
-        payload_builder=_payload,
-        # Issue #239 privacy: the DM-authored reason and per-participant
-        # fates may name hidden NPC outcomes (end_encounter staged effects
-        # are dm_private for the same reason). Owner-only visibility keeps
-        # the full payload for owner/audit reads while member feeds
-        # (public-or-own-actor) converge via the redacted encounter view.
-        visibility="dm_only",
-        provenance={"source": "dm_end_encounter"},
-    )
-    encounter.ended_event_id = event.id
-    db.flush()
-    if commit:
-        db.commit()
-        db.refresh(encounter)
-        db.refresh(event)
-        db.refresh(campaign_after)
-    structured_log(
-        logger, logging.INFO, "encounter_ended",
-        encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-        outcome=outcome, prior_status=prior_status,
-        round=int(encounter.round or 1),
-        turn_sequence=int(encounter.turn_sequence or 0),
-        duration_ms=int(encounter.end_duration_ms or 0),
-        participant_outcomes=dict(encounter.end_participant_outcomes or {}),
-        declared_deaths=list(holder.get("declared_deaths") or []),
-        followup_hooks=[h.hook_type for h in (holder.get("hooks") or [])],
-        operation_id=operation_id, revision=int(campaign_after.revision or 0),
-    )
-    if commit:
-        publish_encounter_ended(db, encounter)
-    return encounter, event, holder.get("hooks") or []
 
 
 def end_encounter_inline(
@@ -563,85 +390,3 @@ def end_encounter_inline(
         operation_id=operation_key,
     )
     return encounter
-
-
-def process_end_followup(
-    db: Session,
-    encounter_id: uuid.UUID,
-    hook_type: str,
-    *,
-    result: dict | None = None,
-    fail_reason: str | None = None,
-    commit: bool = True,
-) -> EncounterEndFollowup:
-    """Record normal campaign processing against one post-combat hook.
-
-    Either completes the hook with a validated ``result`` object or records
-    a downstream ``fail_reason``. Both paths bump ``attempts``; failures
-    also bump the encounter's ``followup_failure_count`` for observability.
-    A hook failure never reopens or otherwise touches the ended encounter's
-    lifecycle state. Completed hooks replay their recorded result instead
-    of re-applying.
-    """
-    hook_type = str(hook_type or "").strip()
-    if hook_type not in END_FOLLOWUP_HOOKS:
-        raise EndEncounterError(
-            f"hook_type must be one of {sorted(END_FOLLOWUP_HOOKS)}"
-        )
-    encounter = db.execute(
-        select(Encounter).where(Encounter.id == encounter_id).with_for_update()
-    ).scalars().first()
-    if encounter is None:
-        raise EndEncounterError(f"Encounter {encounter_id} not found")
-    if encounter.status != "ended":
-        raise EndEncounterError("follow-up hooks require an ended encounter")
-    row = db.execute(
-        select(EncounterEndFollowup).where(
-            EncounterEndFollowup.encounter_id == encounter.id,
-            EncounterEndFollowup.hook_type == hook_type,
-        ).with_for_update()
-    ).scalars().first()
-    if row is None:
-        raise EndEncounterError(
-            f"no {hook_type} hook for encounter {encounter_id}"
-        )
-    if row.status == "complete":
-        structured_log(
-            logger, logging.INFO, "encounter_end_followup_duplicate_hit",
-            encounter_id=str(encounter.id), hook_type=hook_type,
-        )
-        return row
-    row.attempts = int(row.attempts or 0) + 1
-    if fail_reason is not None:
-        detail = str(fail_reason or "").strip() or "downstream processing failed"
-        row.status = "failed"
-        row.error = detail[:2000]
-        encounter.followup_failure_count = int(encounter.followup_failure_count or 0) + 1
-        db.flush()
-        if commit:
-            db.commit()
-            db.refresh(row)
-            db.refresh(encounter)
-        structured_log(
-            logger, logging.WARNING, "encounter_end_followup_failed",
-            encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-            hook_type=hook_type, attempts=int(row.attempts or 0),
-            followup_failure_count=int(encounter.followup_failure_count or 0),
-            error=detail[:500],
-        )
-        return row
-    if result is not None and not isinstance(result, dict):
-        raise EndEncounterError("follow-up result must be an object")
-    row.status = "complete"
-    row.result = dict(result or {})
-    row.error = None
-    db.flush()
-    if commit:
-        db.commit()
-        db.refresh(row)
-    structured_log(
-        logger, logging.INFO, "encounter_end_followup_complete",
-        encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-        hook_type=hook_type, attempts=int(row.attempts or 0),
-    )
-    return row

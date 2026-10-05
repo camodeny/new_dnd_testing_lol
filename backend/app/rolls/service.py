@@ -100,7 +100,7 @@ def _validate_request(db: Session, campaign_id: uuid.UUID, payload: dict) -> dic
 
 def request_rolls(
     db: Session, *, campaign_id: uuid.UUID, turn_id: uuid.UUID, attempt_id: uuid.UUID,
-    requests: list[dict], replacement_of_id: uuid.UUID | None = None,
+    requests: list[dict],
 ) -> list[PlayerRollRequest]:
     if not requests or len(requests) > 20:
         raise RollLifecycleError("requests must contain between 1 and 20 roll requests")
@@ -118,7 +118,7 @@ def request_rolls(
         raise RollLifecycleError("request_key values must be unique within the batch")
     rows = [PlayerRollRequest(
         campaign_id=campaign_id, thread_id=turn.thread_id, turn_id=turn.id, attempt_id=attempt.id,
-        replacement_of_id=replacement_of_id, **value,
+        **value,
     ) for value in values]
     db.add_all(rows)
     turn.status = "awaiting_roll"
@@ -278,35 +278,3 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     logger.info("player_roll fulfilled request_id=%s turn_id=%s source=%s visibility=%s latency_ms=%.2f resumed=%s",
                 req.id, req.turn_id, source, visibility, (time.monotonic() - started) * 1000, bool(resumed))
     return req, fulfillment, resumed, None
-
-
-def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict | None) -> tuple[PlayerRollRequest, list[PlayerRollRequest], DmTurnAttempt | None]:
-    # Issue #230 — encounter initiative requests are owned by the encounter
-    # lifecycle; cancelling one would strand its participant in pending.
-    # Checked lock-free first: linkage never changes after creation, and the
-    # error path needs no row lock.
-    encounter_linked = db.execute(
-        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == request_id).limit(1)
-    ).scalars().first()
-    if encounter_linked is not None:
-        raise RollLifecycleError("encounter initiative requests cannot be cancelled; resolve them through the encounter")
-    req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
-    if req is None:
-        raise RollLifecycleError("Roll request not found")
-    require_playable_campaign(lock_campaign_row(db, req.campaign_id))
-    if req.status != "pending":
-        raise RollLifecycleError(f"Roll request cannot be changed from status {req.status}")
-    turn = db.get(DmTurn, req.turn_id)
-    attempt = db.get(DmTurnAttempt, req.attempt_id)
-    if turn is None or attempt is None:
-        raise RollLifecycleError("Owning turn or attempt no longer exists")
-    req.status = "replaced" if replacement else "cancelled"
-    req.cancelled_at = utcnow()
-    created: list[PlayerRollRequest] = []
-    if replacement:
-        created = request_rolls(db, campaign_id=req.campaign_id, turn_id=turn.id, attempt_id=attempt.id,
-                                requests=[replacement], replacement_of_id=req.id)
-    resumed = None if created else _resume_if_unblocked(db, turn, attempt)
-    logger.info("player_roll %s request_id=%s turn_id=%s replacement_ids=%s",
-                req.status, req.id, turn.id, [str(item.id) for item in created])
-    return req, created, resumed
