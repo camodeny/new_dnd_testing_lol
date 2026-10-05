@@ -23,9 +23,8 @@ from app.combat.service import (  # noqa: E402
     fulfill_human_initiative,
     get_active_encounter,
     encounter_view,
-    roll_npc_initiative,
-    start_encounter,
 )
+from tests.support.combat import dm_start_encounter  # noqa: E402
 from app.combat.turns import (  # noqa: E402
     StaleTurnError,
     TurnAuthorizationError,
@@ -131,12 +130,10 @@ def _revision(db, ctx):
     return int(db.get(Campaign, ctx["campaign_id"]).revision or 0)
 
 
-def _ready_two_pc(db, ctx, *, owner_raw=10, player_raw=12, operation_id="op-ready-1"):
+def _ready_two_pc(db, ctx, *, owner_raw=10, player_raw=12):
     """Owner total 14 (dex 3), player total 14 (dex 2): owner acts first."""
-    encounter, _ = start_encounter(
-        db, ctx["campaign_id"], operation_id=operation_id, expected_revision=0,
-        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-        source_attempt_id=ctx["attempt_id"],
+    encounter = dm_start_encounter(
+        db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
         participants=[{"character_id": str(ctx["owner_pc"])},
                       {"character_id": str(ctx["player_pc"])}],
     )
@@ -435,12 +432,11 @@ def test_missing_player_blocks_foreign_end_turn():
 def test_npc_turn_ended_by_owner_not_members():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-npc-first", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
             participants=[{"character_id": str(ctx["owner_pc"])},
                           {"npc_entity_id": str(ctx["goblin_id"])}],
+            npc_d20=19,
         )
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         goblin = db.execute(
@@ -453,17 +449,19 @@ def test_npc_turn_ended_by_owner_not_members():
             payload={"source": "app", "raw_rolls": [2],
                      "modifier": owner_p.initiative_modifier,
                      "total": 2 + owner_p.initiative_modifier})
-        roll_npc_initiative(db, encounter.id, goblin.id, raw_d20=19)
         encounter = db.get(Encounter, encounter.id)
+        assert encounter.status == "active"
         assert encounter.active_participant_id == goblin.id
         with pytest.raises(TurnAuthorizationError):
             end_turn(db, encounter.id, actor_id=ctx["player"],
                      expected_turn_sequence=1, expected_revision=_revision(db, ctx))
-        rev = _revision(db, ctx)
-        updated, _, _ = end_turn(
-            db, encounter.id, actor_id=ctx["owner"],
-            expected_turn_sequence=1, expected_revision=rev)
-        assert updated.active_participant_id == owner_p.id
+        # The owner cannot act for the NPC either: NPC/monster turns are
+        # run by the AI DM.
+        with pytest.raises(TurnAuthorizationError, match="AI DM"):
+            end_turn(db, encounter.id, actor_id=ctx["owner"],
+                     expected_turn_sequence=1, expected_revision=_revision(db, ctx))
+        assert db.get(Encounter, encounter.id).turn_sequence == 1
+        assert db.get(Encounter, encounter.id).active_participant_id == goblin.id
 
 
 # ── skip votes ──────────────────────────────────────────────────────────────
@@ -598,10 +596,8 @@ def test_private_thread_nonreaders_excluded_from_skip_threshold():
         turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
         db.commit()
         private_turn_id, private_attempt_id = turn.id, attempt.id
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-private-skip-231",
-            expected_revision=_revision(db, ctx), actor_id=ctx["owner"],
-            source_turn_id=private_turn_id, source_attempt_id=private_attempt_id,
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], private_turn_id, private_attempt_id,
             participants=[{"character_id": str(ctx["owner_pc"])},
                           {"character_id": str(ctx["player_pc"])}],
         )
@@ -663,12 +659,11 @@ def test_skip_authorization_and_target_rules():
 def test_skip_rejected_for_npc_targets():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-skip-npc", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
             participants=[{"character_id": str(ctx["owner_pc"])},
                           {"npc_entity_id": str(ctx["goblin_id"])}],
+            npc_d20=19,
         )
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         goblin = db.execute(
@@ -681,7 +676,6 @@ def test_skip_rejected_for_npc_targets():
             payload={"source": "app", "raw_rolls": [2],
                      "modifier": owner_p.initiative_modifier,
                      "total": 2 + owner_p.initiative_modifier})
-        roll_npc_initiative(db, encounter.id, goblin.id, raw_d20=19)
         with pytest.raises(TurnError, match="NPC/monster"):
             cast_skip_vote(db, encounter.id, goblin.id, voter_id=ctx["owner"],
                            expected_revision=_revision(db, ctx), expected_turn_sequence=1)
@@ -698,7 +692,7 @@ def test_state_reconstructs_exactly_after_reconnect(tmp_path):
     with fac() as db:
         ctx = _seed_world(db, third_member=True)
         encounter = _ready_two_pc(
-            db, ctx, owner_raw=5, player_raw=18, operation_id="op-reconnect")
+            db, ctx, owner_raw=5, player_raw=18)
         player_p = _pc(db, encounter.id, ctx["player_pc"])
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         consume_resource(db, encounter.id, player_p.id, actor_id=ctx["player"],
@@ -807,7 +801,7 @@ def test_encounter_view_carries_turn_block_for_snapshot():
     fac, ctx = _fixture()
     with fac() as db:
         encounter = _ready_two_pc(db, ctx)
-        view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
+        view = encounter_view(db, encounter, ctx["owner"])
         assert view["turn"] is not None
         assert view["turn"]["turn_sequence"] == 1
         assert view["turn"]["active_participant_id"] == str(encounter.active_participant_id)
@@ -815,7 +809,7 @@ def test_encounter_view_carries_turn_block_for_snapshot():
         assert view["skipped_count"] == 0
 
 
-def test_hidden_npc_speed_redacted_for_non_owners():
+def test_hidden_npc_speed_redacted_for_every_player():
     fac, ctx = _fixture()
     with fac() as db:
         swift = WorldEntity(
@@ -828,12 +822,11 @@ def test_hidden_npc_speed_redacted_for_non_owners():
         db.commit()
         swift_id = swift.id
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-hidden-speed", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["turn_id"], ctx["attempt_id"],
             participants=[{"character_id": str(ctx["owner_pc"])},
                           {"npc_entity_id": str(swift_id)}],
+            npc_d20=10,
         )
         owner_p = _pc(db, encounter.id, ctx["owner_pc"])
         npc = db.execute(
@@ -847,28 +840,28 @@ def test_hidden_npc_speed_redacted_for_non_owners():
             payload={"source": "app", "raw_rolls": [10],
                      "modifier": owner_p.initiative_modifier,
                      "total": 10 + owner_p.initiative_modifier})
-        roll_npc_initiative(db, encounter.id, npc.id, raw_d20=10)
         encounter = db.get(Encounter, encounter.id)
         assert encounter.status == "active"
         npc_id = str(npc.id)
         owner_id, player_id = ctx["owner"], ctx["player"]
-        # Owner (DM runtime path) sees the canonical derived speed.
-        owner_proj = turn_projection(db, encounter, viewer_id=owner_id, is_owner=True)
-        assert owner_proj["resources"][npc_id]["movement_max"] == 50
-        assert owner_proj["resources"][npc_id]["movement_remaining"] == 50
-        # A thread reader who is not the owner cannot reconstruct it.
-        player_proj = turn_projection(db, encounter, viewer_id=player_id, is_owner=False)
+        # Durable turn state carries the canonical derived speed for the DM runtime.
+        from app.combat.turns import get_turn_state_row
+        state = get_turn_state_row(db, encounter.id, npc.id)
+        assert int(state.movement_max) == 50
+        assert int(state.movement_remaining) == 50
+        # No player — the owner included — can reconstruct it.
+        player_proj = turn_projection(db, encounter)
         assert player_proj["resources"][npc_id]["movement_max"] is None
         assert player_proj["resources"][npc_id]["movement_remaining"] is None
         assert player_proj["resources"][npc_id]["extra_resources"] == {}
         assert player_proj["resources"][npc_id]["movement_max"] != 50
         assert player_proj["resources"][npc_id]["movement_remaining"] != 50
-        # The PC's own budget stays visible to the non-owner.
+        # PC budgets stay visible.
         assert player_proj["resources"][str(owner_p.id)]["movement_max"] == 30
         # Same redaction rides the snapshot view and the default (fail-closed) read.
-        owner_view = encounter_view(db, encounter, owner_id, is_owner=True)
-        player_view = encounter_view(db, encounter, player_id, is_owner=False)
-        assert owner_view["turn"]["resources"][npc_id]["movement_max"] == 50
+        owner_view = encounter_view(db, encounter, owner_id)
+        player_view = encounter_view(db, encounter, player_id)
+        assert owner_view["turn"]["resources"][npc_id]["movement_max"] is None
         assert player_view["turn"]["resources"][npc_id]["movement_max"] is None
         default_proj = turn_projection(db, encounter)
         assert default_proj["resources"][npc_id]["movement_max"] is None
@@ -908,7 +901,7 @@ def test_http_end_turn_replay_stale_and_skip_vote(monkeypatch):
         player_h = {"x-test-user": player_id}
         with fac() as db:
             encounter = _ready_two_pc(
-                db, ctx, owner_raw=5, player_raw=18, operation_id="op-http-231")
+                db, ctx, owner_raw=5, player_raw=18)
             encounter_id = str(encounter.id)
             player_p = _pc(db, encounter.id, ctx["player_pc"])
             rev = _revision(db, ctx)
@@ -1011,7 +1004,7 @@ def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
 
     fac, ctx = _fixture()
     campaign_id = str(ctx["campaign_id"])
-    owner_id, player_id = str(ctx["owner"]), str(ctx["player"])
+    player_id = str(ctx["player"])
 
     def override_db():
         with fac() as db:
@@ -1027,11 +1020,10 @@ def test_http_end_turn_replay_after_skip_publishes_nothing(monkeypatch):
     set_realtime_publisher(recorder)
     try:
         client = TestClient(app)
-        owner_h = {"x-test-user": owner_id}
         player_h = {"x-test-user": player_id}
         with fac() as db:
             encounter = _ready_two_pc(
-                db, ctx, owner_raw=5, player_raw=18, operation_id="op-replay-skip")
+                db, ctx, owner_raw=5, player_raw=18)
             encounter_id = str(encounter.id)
             rev = _revision(db, ctx)
         # Turn 1 (player) ends normally with key K.

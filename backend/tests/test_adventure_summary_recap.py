@@ -110,26 +110,104 @@ def _open(client: TestClient, cid: str, key: str = "op-open-1") -> dict:
     return r.json()["adventure"]
 
 
-def _complete(client: TestClient, cid: str, aid: str, rev: int, key: str, **kw) -> dict:
-    body = {"expected_revision": rev, "outcome": "victory",
-            "public_summary": "The chapel was reclaimed.", "operation_id": key}
-    body.update(kw)
-    r = client.post(
-        f"/api/campaigns/{cid}/adventures/{aid}/complete", json=body,
-        headers={"Idempotency-Key": key},
-    )
-    assert r.status_code == 200, r.text
-    return r.json()
+def _ensure_thread_id(db, camp_id):
+    """The single shared game thread for a campaign (created if missing)."""
+    from models.threads import CampaignThread
+
+    thread = db.execute(
+        select(CampaignThread).where(
+            CampaignThread.campaign_id == camp_id,
+            CampaignThread.thread_type == "campaign",
+        )
+    ).scalars().first()
+    if thread is None:
+        camp = db.get(Campaign, camp_id)
+        thread = CampaignThread(
+            id=uuid.uuid4(), campaign_id=camp_id,
+            thread_type="campaign", created_by=camp.owner_id,
+        )
+        db.add(thread)
+        db.flush()
+    return thread.id
+
+
+def _stage_completion_turn(factory, cid, aid, key, *, outcome="victory",
+                           reason="The DM declares the adventure complete.",
+                           public_summary="The chapel was reclaimed."):
+    """Stage a streaming DM turn carrying a ``complete_adventure`` effect."""
+    from models.dm import DmTurn, DmTurnAttempt
+
+    camp_id = uuid.UUID(str(cid))
+    with factory() as db:
+        thread_id = _ensure_thread_id(db, camp_id)
+        camp = db.get(Campaign, camp_id)
+        rev = int(camp.revision or 0)
+        turn = DmTurn(
+            id=uuid.uuid4(), campaign_id=camp_id, thread_id=str(thread_id),
+            audience="campaign", status="streaming", source_revision=rev,
+            input_set_revision=rev + 1, submission_ids=[],
+        )
+        db.add(turn)
+        db.flush()
+        args: dict = {
+            "outcome": outcome,
+            "reason": reason,
+            "adventure_id": str(aid),
+            "idempotency_key": key,
+        }
+        if public_summary is not None:
+            args["public_summary"] = public_summary
+        attempt = DmTurnAttempt(
+            id=uuid.uuid4(), turn_id=turn.id, attempt_number=1, status="streaming",
+            campaign_id=camp_id, thread_id=str(thread_id), audience="campaign",
+            source_revision=rev, input_set_revision=rev + 1, submission_ids=[],
+            staged_effects=[{
+                "id": f"eff-{key}", "effect_type": "complete_adventure",
+                "arguments": args,
+            }],
+        )
+        db.add(attempt)
+        db.flush()
+        turn.current_attempt_id = attempt.id
+        turn.streaming_attempt_id = attempt.id
+        db.flush()
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    return turn_id, attempt_id
+
+
+def _complete(factory, cid, aid, key, **kw) -> dict:
+    """Complete an adventure through the AI DM's staged effect (issue #260).
+
+    Stages ``complete_adventure`` on a fresh DM turn and commits it — the
+    only production completion path (the owner POST .../complete route was
+    deleted) — then returns the same ``{"adventure", "summary"}`` shape the
+    old route returned, read back from the committed rows. Accepts
+    ``outcome``, ``reason``, and ``public_summary`` kwargs.
+    """
+    from app.dm.turns import commit_turn
+
+    turn_id, attempt_id = _stage_completion_turn(factory, cid, aid, key, **kw)
+    with factory() as db:
+        commit_turn(db, turn_id, attempt_id, operation_id=key)
+        db.commit()
+    with factory() as db:
+        adv = db.get(Adventure, uuid.UUID(str(aid)))
+        row = db.execute(
+            select(AdventureSummary).where(AdventureSummary.adventure_id == adv.id)
+        ).scalars().first()
+        return {
+            "adventure": adv.to_dict(),
+            "summary": row.to_dict() if row is not None else None,
+        }
 
 
 def test_normal_completion_produces_derived_summary_with_source_range(api):
     client, factory, actor, owner = api
     camp = _campaign(client)
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"])
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-1")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-1")
     summary = out["summary"]
     assert summary["is_derived"] is True
     assert summary["status"] == "current"
@@ -149,10 +227,8 @@ def test_private_event_omitted_from_recap_but_kept_in_historical(api):
     client, factory, actor, owner = api
     camp = _campaign(client)
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"])
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-2")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-2")
     summary = out["summary"]
     assert "zxqv-secret-phylactery" in (summary["historical_text"] or "")
     recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
@@ -164,10 +240,8 @@ def test_generation_failure_does_not_invalidate_completion_and_retry_recovers(ap
     client, factory, actor, owner = api
     camp = _campaign(client)
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-fail")
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-fail")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-fail")
     assert out["adventure"]["status"] == "completed"
     # Force a failed regeneration: prior artifact goes to failed, stays completed.
     r = client.post(
@@ -196,10 +270,8 @@ def test_repair_marks_stale_and_regeneration_bumps_version(api):
     client, factory, actor, owner = api
     camp = _campaign(client)
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-stale")
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-stale")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-stale")
     v0 = out["summary"]["version"]
     r = client.post(
         f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summaries/mark-stale",
@@ -230,10 +302,8 @@ def test_review_available_after_continuation_and_summary_never_overrides_authori
     client, factory, actor, owner = api
     camp = _campaign(client)
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-cont")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-cont", outcome="tpk",
+    _complete(factory, camp["id"], adv["id"], "op-complete-cont", outcome="tpk",
               public_summary="The party fell; the world endures.")
     # Campaign continues: more authoritative events after completion.
     from app.campaigns.events import commit_campaign_mutation
@@ -250,10 +320,6 @@ def test_review_available_after_continuation_and_summary_never_overrides_authori
     recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
     assert recap.status_code == 200, recap.text
     assert "Sunken Chapel" in recap.json()["recap_text"]
-    durable = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
-    assert durable.status_code == 200, durable.text
-    s = durable.json()["summary"]
-    assert s["is_derived"] is True
     # Authority precedence: source events are unchanged by derived prose.
     with factory() as db:
         rows = db.execute(select(AdventureSummary)).scalars().all()
@@ -270,54 +336,76 @@ def test_review_available_after_continuation_and_summary_never_overrides_authori
 
 
 def test_duplicate_completion_is_idempotent(api):
+    """Retrying the same DM turn commit returns the original completion.
+
+    The turn commit's operation id makes duplicate delivery a no-op: the
+    original outcome is preserved and no second adventure/summary is written.
+    """
+    from app.dm.turns import commit_turn
+
     client, factory, actor, owner = api
     camp = _campaign(client)
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-dup")
-    first = _complete(client, camp["id"], adv["id"], rev, "op-complete-dup")
-    second = _complete(client, camp["id"], adv["id"], rev + 1, "op-complete-dup")
-    assert second["adventure"]["status"] == "completed"
-    assert second.get("idempotent") is True
+    turn_id, attempt_id = _stage_completion_turn(
+        factory, camp["id"], adv["id"], "op-complete-dup")
+    with factory() as db:
+        _, _, event1 = commit_turn(db, turn_id, attempt_id, operation_id="op-complete-dup")
+        db.commit()
+        first_event_id = event1.id
+        first_summary_id = db.execute(
+            select(AdventureSummary).where(
+                AdventureSummary.adventure_id == uuid.UUID(adv["id"]))
+        ).scalars().one().id
+    with factory() as db:
+        _, _, event2 = commit_turn(db, turn_id, attempt_id, operation_id="op-complete-dup")
+        assert str(event2.id) == str(first_event_id)
     with factory() as db:
         rows = db.execute(
             select(Adventure).where(Adventure.campaign_id == uuid.UUID(camp["id"]))
         ).scalars().all()
         assert len(rows) == 1
-    assert first["summary"]["id"] == second["summary"]["id"]
+        assert rows[0].status == "completed"
+        summaries = db.execute(
+            select(AdventureSummary).where(
+                AdventureSummary.adventure_id == uuid.UUID(adv["id"]))
+        ).scalars().all()
+        assert len(summaries) == 1
+        assert summaries[0].id == first_summary_id
 
 
 def test_villain_victory_and_outcome_validation(api):
+    from app.dm.turns import commit_turn
+
     client, factory, actor, owner = api
     camp = _campaign(client)
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-vv")
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-vv",
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-vv",
                     outcome="villain_victory")
     assert out["adventure"]["outcome"] == "villain_victory"
     adv2 = _open(client, camp["id"], key="op-open-bad")
-    r = client.post(
-        f"/api/campaigns/{camp['id']}/adventures/{adv2['id']}/complete",
-        json={"expected_revision": rev + 1, "outcome": "ascension", "operation_id": "op-bad"},
-        headers={"Idempotency-Key": "op-bad"},
-    )
-    assert r.status_code == 400
+    turn_id, attempt_id = _stage_completion_turn(
+        factory, camp["id"], adv2["id"], "op-bad", outcome="ascension")
+    with factory() as db:
+        with pytest.raises(Exception, match="ascension|outcome"):
+            commit_turn(db, turn_id, attempt_id, operation_id="op-bad")
+        db.rollback()
+    with factory() as db:
+        assert db.get(Adventure, uuid.UUID(adv2["id"])).status == "active"
 
 
-def test_historical_summary_is_owner_only_while_recap_is_member_visible(api):
+def test_historical_summary_has_no_human_read_path_while_recap_is_member_visible(api):
     client, factory, actor, owner = api
     camp = _campaign(client)
     member = _make_member(factory, camp["id"])
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-owneronly")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-owneronly")
+    _complete(factory, camp["id"], adv["id"], "op-complete-owneronly")
+    # The durable summary compresses hidden sources: no human — the owner
+    # included (#470) — can read it.
+    gone = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
+    assert gone.status_code in (404, 405), gone.text
     actor["id"] = member
     try:
-        denied = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
-        assert denied.status_code == 403, denied.text
         recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
         assert recap.status_code == 200, recap.text
         assert "zxqv-secret-phylactery" not in recap.json()["recap_text"]
@@ -349,10 +437,8 @@ def test_recap_is_viewer_scoped_private_actor_event_does_not_cross_viewers(api):
             operation_id="seed-king-private", visibility="private",
             actor_id=member_a,
         )
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
     adv = _open(client, camp["id"], key="op-open-scope")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-scope")
+    _complete(factory, camp["id"], adv["id"], "op-complete-scope")
     # Viewer B (not the private actor): no leak, even though every 4+ char
     # token overlaps public text.
     actor["id"] = member_b
@@ -390,11 +476,6 @@ def test_player_members_cannot_perform_dm_declared_mutations(api):
     adv = _open(client, camp["id"], key="op-open-owned")
     actor["id"] = member
     try:
-        assert client.post(
-            f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/complete",
-            json={"expected_revision": rev0, "outcome": "victory", "operation_id": "op-sneak2"},
-            headers={"Idempotency-Key": "op-sneak2"},
-        ).status_code == 403
         assert client.post(
             f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summaries/generate",
             json={},
@@ -440,8 +521,7 @@ def test_default_source_range_excludes_pre_open_event(api):
             payload={"summary": "post-open happening at the new chapel"},
             operation_id="seed-post-open", visibility="public",
         )
-        rev2 = int(db.get(Campaign, cid).revision)
-    out = _complete(client, camp["id"], adv["id"], rev2, "op-complete-boundary")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-boundary")
     historical = out["summary"]["historical_text"] or ""
     assert "post-open happening" in historical
     assert "pre-open happening" not in historical
@@ -458,28 +538,22 @@ def test_completion_with_dm_reason_produces_summary_and_recap(api):
     camp = _campaign(client)
     cid = camp["id"]
     adv = _open(client, cid, key="op-open-current")
-    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    done = client.post(
-        f"/api/campaigns/{cid}/adventures/{adv['id']}/complete",
-        json={
-            "expected_revision": revision,
-            "outcome": "victory",
-            "reason": "DM-only: the seal holds.",
-            "public_summary": "The Sunken Chapel stands quiet.",
-        },
-        headers={"Idempotency-Key": "complete-current"},
+    done = _complete(
+        factory, cid, adv["id"], "complete-current",
+        outcome="victory",
+        reason="DM-only: the seal holds.",
+        public_summary="The Sunken Chapel stands quiet.",
     )
-    assert done.status_code == 200, done.text
-    assert done.json()["adventure"]["status"] == "completed"
+    assert done["adventure"]["status"] == "completed"
     recap = client.get(f"/api/campaigns/{cid}/adventures/{adv['id']}/recap")
     assert recap.status_code == 200, recap.text
     body = recap.json()
     assert body["is_derived"] is True
     assert "Sunken Chapel" in body["recap_text"]
     assert "the seal holds" not in body["recap_text"]
-    durable = client.get(f"/api/campaigns/{cid}/adventures/{adv['id']}/summary")
-    assert durable.status_code == 200, durable.text
-    assert durable.json()["summary"]["status"] == "current"
+    with factory() as db:
+        row = db.execute(select(AdventureSummary)).scalars().one()
+        assert row.status == "current"
 
 
 def test_recap_keeps_viewer_authorized_private_tokens(api):
@@ -510,10 +584,8 @@ def test_recap_keeps_viewer_authorized_private_tokens(api):
             operation_id="seed-moonstone-private", visibility="private",
             actor_id=member_a,
         )
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
     adv = _open(client, camp["id"], key="op-open-moonstone")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-moonstone")
+    _complete(factory, camp["id"], adv["id"], "op-complete-moonstone")
     # Viewer B: authorized public text present, private token absent.
     actor["id"] = member_b
     try:
@@ -582,10 +654,8 @@ def test_unknown_visibility_matches_event_feed_fail_closed(api):
             payload={"summary": "zxqv-unrecognized-seclusion beneath the chapel"},
             operation_id="seed-pubvis-2", visibility="secret",
         )
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
     adv = _open(client, camp["id"], key="op-open-secretvis")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-secretvis")
+    _complete(factory, camp["id"], adv["id"], "op-complete-secretvis")
     actor["id"] = member
     try:
         feed = client.get(f"/api/campaigns/{camp['id']}/events")
@@ -649,9 +719,7 @@ def test_open_cursor_excludes_concurrent_pre_insert_event(api, monkeypatch):
         ).scalar()
         assert racing_seq is not None
         assert int(adv_row.start_sequence) == int(racing_seq) + 1
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
-    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-race")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-race")
     assert "racing happening" not in (out["summary"]["historical_text"] or "")
 
 
@@ -680,11 +748,9 @@ def test_public_summary_token_shared_with_hidden_evidence_does_not_fail_generati
             payload={"summary": "moonstone sigil powers the hidden seal"},
             operation_id="seed-moonstone-hidden", visibility="dm_only",
         )
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
     adv = _open(client, camp["id"], key="op-open-overlap")
     out = _complete(
-        client, camp["id"], adv["id"], rev, "op-complete-overlap",
+        factory, camp["id"], adv["id"], "op-complete-overlap",
         public_summary="The moonstone was recovered.",
     )
     summary = out["summary"]
@@ -784,8 +850,7 @@ def test_active_legacy_adventure_backfill_excludes_pre_open_events(api):
             payload={"summary": "fresh happening at the far chapel"},
             operation_id="seed-fresh-1", visibility="public",
         )
-        rev2 = int(db.get(Campaign, cid).revision)
-    out = _complete(client, camp["id"], adv["id"], rev2, "op-complete-legacy-active")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-legacy-active")
     historical = out["summary"]["historical_text"] or ""
     assert "middle happening" in historical
     assert "fresh happening" in historical
@@ -842,8 +907,7 @@ def test_active_legacy_adventure_without_events_starts_at_next_sequence(api):
             payload={"summary": "dawn happening at the far chapel"},
             operation_id="seed-dawn-1", visibility="public",
         )
-        rev2 = int(db.get(Campaign, cid).revision)
-    out = _complete(client, camp["id"], adv["id"], rev2, "op-complete-legacy-noevent")
+    out = _complete(factory, camp["id"], adv["id"], "op-complete-legacy-noevent")
     historical = out["summary"]["historical_text"] or ""
     assert "dawn happening" in historical
     assert "elder happening" not in historical
@@ -859,10 +923,8 @@ def test_legacy_completed_row_finalizes_from_source_event_not_max(api):
     camp = _campaign(client)
     cid = uuid.UUID(camp["id"])
     _seed_events(factory, camp["id"])
-    with factory() as db:
-        rev = int(db.get(Campaign, cid).revision)
     adv = _open(client, camp["id"], key="op-open-legacy")
-    _complete(client, camp["id"], adv["id"], rev, "op-complete-legacy")
+    _complete(factory, camp["id"], adv["id"], "op-complete-legacy")
     with factory() as db:
         adv_row = db.get(Adventure, uuid.UUID(adv["id"]))
         completion_seq = int(adv_row.end_sequence)

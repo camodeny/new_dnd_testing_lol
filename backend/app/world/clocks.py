@@ -75,8 +75,7 @@ from app.decisions import (
 )
 from app.idempotency import compose_operation_id
 from app.observability.tracing import structured_log
-from app.visibility.access import is_campaign_participant, is_world_authority
-from app.visibility.policy import RESTRICTED_VISIBILITIES, visible_to_viewer, world_event_visibility
+from app.visibility.policy import RESTRICTED_VISIBILITIES, world_event_visibility
 from app.world._common import require_provenance
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.world import (
@@ -1210,48 +1209,6 @@ def consolidate_clocks_for_range(
         "advanced": advanced,
         "results": results,
     }
-
-
-# ── Viewer-aware projection (secrecy first) ────────────────────────────────
-
-def project_clocks_for_viewer(
-    db: Session, campaign: Campaign, viewer_user_id: Any,
-) -> dict[str, Any]:
-    """List clocks visible to a human viewer; hidden clocks are filtered.
-
-    Non-members see nothing. Ordinary members see only ``public``/``campaign``
-    clocks, and even then without DM-side provenance, completion effects, or
-    resolution internals. The campaign owner (AI-DM authority lane) sees
-    every clock in full.
-    """
-    viewer = coerce_uuid(viewer_user_id, field="viewer_user_id")
-    if not is_campaign_participant(db, campaign, viewer):
-        return {"clocks": [], "count": 0}
-    authority = is_world_authority(campaign, viewer)
-    rows = list(db.execute(select(CampaignClock).where(
-        CampaignClock.campaign_id == campaign.id,
-    ).order_by(CampaignClock.created_at.asc())).scalars().all())
-    visible: list[dict[str, Any]] = []
-    hidden = 0
-    for row in rows:
-        if visible_to_viewer(row.visibility, authority):
-            data = row.to_dict()
-            if not authority:
-                for key in ("provenance", "completion_effect", "resolution",
-                            "progress_carry", "evaluated_through_sequence",
-                            "operation_id", "idempotency_key",
-                            "source_turn_id", "source_attempt_id", "source_event_id"):
-                    data.pop(key, None)
-                completion = data.get("completion_criteria") or {}
-                if isinstance(completion, dict):
-                    completion.pop("description", None)
-            visible.append(data)
-        else:
-            hidden += 1
-    result: dict[str, Any] = {"clocks": visible, "count": len(visible)}
-    if authority:
-        result["hidden_count"] = hidden
-    return result
 
 
 # ── Forward-DM pressure view (post-turn writes, the DM reacts) ────────────

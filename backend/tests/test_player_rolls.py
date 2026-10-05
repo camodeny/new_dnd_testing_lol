@@ -15,7 +15,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.dm.turns import coordinate_turn, mark_streaming_started  # noqa: E402
-from app.rolls.service import RollAuthorizationError, fulfill_roll  # noqa: E402
+from app.rolls.service import RollAuthorizationError, fulfill_roll, request_rolls  # noqa: E402
 from app.submissions.service import accept_submission  # noqa: E402
 from app.threads.service import get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
@@ -53,7 +53,7 @@ def roll_api(monkeypatch):
         ])
         db.commit()
         thread = get_or_create_campaign_thread(db, campaign_id, created_by=owner)
-        submission = accept_submission(
+        accept_submission(
             db, campaign_id=campaign_id, user_id=owner, character_id=owner_character,
             raw_content="I inspect the door", segments=[{"type": "ic", "text": "I inspect the door"}],
             thread_id=str(thread.id),
@@ -102,19 +102,26 @@ def request_payload(ctx, *, two=False, private_dc=17):
     return {"attempt_id": str(ctx["attempt_id"]), "requests": requests}
 
 
-def create_requests(ctx, *, two=False):
-    response = ctx["client"].post(
-        f'/api/campaigns/{ctx["campaign_id"]}/dm-turns/{ctx["turn_id"]}/roll-requests',
-        json=request_payload(ctx, two=two), headers={"Idempotency-Key": "request-rolls"},
-    )
-    assert response.status_code == 201, response.text
-    return response
+def create_requests(ctx, *, two=False, requests=None):
+    """Create roll requests the way the AI DM does — direct service call.
+
+    Returns the created rows serialized as ``row.to_dict()`` (which never
+    includes ``dc_private``), replacing the deleted human DM create route.
+    """
+    payload = requests if requests is not None else request_payload(ctx, two=two)["requests"]
+    with ctx["factory"]() as db:
+        rows = request_rolls(
+            db, campaign_id=ctx["campaign_id"], turn_id=ctx["turn_id"],
+            attempt_id=ctx["attempt_id"], requests=payload,
+        )
+        result = [row.to_dict() for row in rows]
+        db.commit()
+    return result
 
 
 def test_normal_roll_duplicate_retry_resumes_same_logical_turn(roll_api):
     ctx = roll_api
-    create = create_requests(ctx)
-    roll_id = create.json()["roll_requests"][0]["id"]
+    roll_id = create_requests(ctx)[0]["id"]
     body = {"source": "app", "raw_rolls": [14], "modifier": 3, "total": 17, "visibility": "public"}
     first = ctx["client"].post(
         f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{roll_id}/fulfill', json=body,
@@ -142,7 +149,7 @@ def test_normal_roll_duplicate_retry_resumes_same_logical_turn(roll_api):
 
 def test_multiple_players_remain_independently_pending_and_authorized(roll_api):
     ctx = roll_api
-    rows = create_requests(ctx, two=True).json()["roll_requests"]
+    rows = create_requests(ctx, two=True)
     owner_req, player_req = rows
     owner_result = ctx["client"].post(
         f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{owner_req["id"]}/fulfill',
@@ -168,7 +175,7 @@ def test_multiple_players_remain_independently_pending_and_authorized(roll_api):
 
 def test_fulfill_rejects_total_that_does_not_match_dice_arithmetic(roll_api):
     ctx = roll_api
-    owner_req, player_req = create_requests(ctx, two=True).json()["roll_requests"]
+    owner_req, player_req = create_requests(ctx, two=True)
     url = f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{{}}/fulfill'
     forged = ctx["client"].post(
         url.format(owner_req["id"]),
@@ -203,16 +210,10 @@ def test_fulfill_rejects_total_that_does_not_match_dice_arithmetic(roll_api):
 
 def test_disadvantage_keeps_lower_die(roll_api):
     ctx = roll_api
-    row = create_requests(ctx).json()["roll_requests"][0]
-    replacement = request_payload(ctx)["requests"][0] | {
-        "request_key": "owner-check-disadvantage", "advantage_state": "disadvantage",
-    }
-    changed = ctx["client"].post(
-        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{row["id"]}/cancel',
-        json={"replacement": replacement}, headers={"Idempotency-Key": "replace-disadvantage"},
-    )
-    assert changed.status_code == 200, changed.text
-    replacement_id = changed.json()["replacement"]["id"]
+    payload_requests = request_payload(ctx)["requests"]
+    payload_requests[0]["request_key"] = "owner-check-disadvantage"
+    payload_requests[0]["advantage_state"] = "disadvantage"
+    replacement_id = create_requests(ctx, requests=payload_requests)[0]["id"]
     url = f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{replacement_id}/fulfill'
     higher = ctx["client"].post(
         url, json={"source": "app", "raw_rolls": [16, 4], "modifier": 2, "total": 18},
@@ -228,7 +229,7 @@ def test_disadvantage_keeps_lower_die(roll_api):
 
 def test_snapshot_survives_reconnect_without_leaking_private_dc_or_result(roll_api):
     ctx = roll_api
-    rows = create_requests(ctx, two=True).json()["roll_requests"]
+    rows = create_requests(ctx, two=True)
     player_req = rows[1]
     pending_snapshot = ctx["client"].get(
         f'/api/campaigns/{ctx["campaign_id"]}/snapshot', headers={"X-Test-User": str(ctx["player"])}
@@ -250,28 +251,25 @@ def test_snapshot_survives_reconnect_without_leaking_private_dc_or_result(roll_a
     assert own["fulfillment"]["total"] == 11
 
 
-def test_cancel_and_replace_are_durable_and_final_submission_cannot_change(roll_api):
+def test_final_fulfillment_cannot_be_changed(roll_api):
     ctx = roll_api
-    row = create_requests(ctx).json()["roll_requests"][0]
-    replacement = request_payload(ctx)["requests"][0] | {"request_key": "owner-check-replacement", "advantage_state": "advantage"}
-    changed = ctx["client"].post(
-        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{row["id"]}/cancel',
-        json={"replacement": replacement}, headers={"Idempotency-Key": "replace-roll"},
-    )
-    assert changed.status_code == 200, changed.text
-    assert changed.json()["roll_request"]["status"] == "replaced"
-    replacement_id = changed.json()["replacement"]["id"]
+    row = create_requests(ctx)[0]
+    url = f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{row["id"]}/fulfill'
     fulfilled = ctx["client"].post(
-        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{replacement_id}/fulfill',
-        json={"source": "physical", "raw_rolls": [20, 5], "modifier": 0, "total": 20},
-        headers={"Idempotency-Key": "replacement-result"},
+        url,
+        json={"source": "physical", "raw_rolls": [20], "modifier": 0, "total": 20},
+        headers={"Idempotency-Key": "first-result"},
     )
-    assert fulfilled.status_code == 200
-    cannot_cancel = ctx["client"].post(
-        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{replacement_id}/cancel',
-        json={}, headers={"Idempotency-Key": "too-late"},
+    assert fulfilled.status_code == 200, fulfilled.text
+    changed = ctx["client"].post(
+        url,
+        json={"source": "physical", "raw_rolls": [10], "modifier": 0, "total": 10},
+        headers={"Idempotency-Key": "changed-result"},
     )
-    assert cannot_cancel.status_code == 409
+    assert changed.status_code == 409
+    with ctx["factory"]() as db:
+        assert len(db.execute(select(PlayerRollFulfillment)).scalars().all()) == 1
+        assert db.get(PlayerRollRequest, uuid.UUID(row["id"])).status == "fulfilled"
 
 
 def test_pending_roll_prohibits_streaming_outcome(roll_api):
@@ -284,7 +282,7 @@ def test_pending_roll_prohibits_streaming_outcome(roll_api):
 
 def test_service_rejects_other_human_without_mutating_request(roll_api):
     ctx = roll_api
-    row = create_requests(ctx, two=True).json()["roll_requests"][1]
+    row = create_requests(ctx, two=True)[1]
     with ctx["factory"]() as db:
         with pytest.raises(RollAuthorizationError):
             fulfill_roll(db, request_id=uuid.UUID(row["id"]), actor_id=ctx["outsider"], payload={
@@ -318,3 +316,26 @@ def test_retry_endpoint_authorization_idempotency_and_post_commit_execution(roll
         assert fresh.status == 'prepared'
         assert fresh.submission_ids == db.get(DmTurnAttempt, ctx['attempt_id']).submission_ids
     assert set(ctx['executed']) == {first.json()['attempt_id']}
+
+
+def test_owner_never_receives_hidden_dc_or_other_players_private_result(roll_api):
+    """#470: the AI is the only DM — the campaign owner is a player and gets
+    no hidden DC or another player's private roll, on any read path."""
+    ctx = roll_api
+    owner_headers = {"X-Test-User": str(ctx["owner"])}
+    created = create_requests(ctx, two=True)
+    assert "dc_private" not in json.dumps(created)
+    player_req = created[1]
+    result = ctx["client"].post(
+        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{player_req["id"]}/fulfill',
+        json={"source": "physical", "raw_rolls": [], "modifier": 4, "total": 11, "visibility": "private"},
+        headers={"Idempotency-Key": "physical-private-470", "X-Test-User": str(ctx["player"])},
+    )
+    assert result.status_code == 200, result.text
+    for path in ("snapshot", "roll-requests"):
+        body = ctx["client"].get(f'/api/campaigns/{ctx["campaign_id"]}/{path}', headers=owner_headers)
+        assert body.status_code == 200, body.text
+        encoded = json.dumps(body.json())
+        assert "dc_private" not in encoded, path
+        fulfilled = next(row for row in body.json()["roll_requests"] if row["id"] == player_req["id"])
+        assert "total" not in fulfilled["fulfillment"], path

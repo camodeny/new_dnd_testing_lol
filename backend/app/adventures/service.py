@@ -6,8 +6,8 @@ authoritative fictional mutation (``adventure.completed`` domain event tied
 to source turn/event provenance); downstream closing work (recap/rewards)
 is best-effort and never invalidates the committed completion.
 
-Single canonical code path: both the HTTP API and the ``complete_adventure``
-staged DM effect funnel through ``complete_adventure_inline`` inside a
+Completion has one path: the AI DM's ``complete_adventure`` staged effect,
+committed through ``complete_adventure_inline`` inside the turn's
 ``commit_campaign_mutation`` transaction.
 
 Derived summaries/recaps (issue #263) live in ``app.adventures.summaries``.
@@ -17,12 +17,10 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.campaigns.events import commit_campaign_mutation
 from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.adventures.summaries import finalize_adventure_derived
@@ -418,144 +416,6 @@ def finalize_turn_completion(
             )
     except Exception as exc:
         logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, exc)
-
-
-def complete_adventure(
-    db: Session,
-    campaign_id: uuid.UUID,
-    *,
-    outcome: str,
-    reason: str | None = None,
-    public_summary: str | None = None,
-    adventure_id: uuid.UUID | None = None,
-    source_turn_id: uuid.UUID | None = None,
-    operation_id: str | None = None,
-    actor_id: uuid.UUID | None = None,
-    expected_revision: int | None = None,
-    commit: bool = True,
-) -> tuple[Adventure, Any]:
-    """Declare the current adventure complete as an authoritative mutation.
-
-    - Idempotent on ``operation_id``: a retried completion returns the
-      original adventure + event instead of creating duplicates.
-    - Emits the ``adventure.completed`` domain event with turn/event
-      provenance and enqueues ``adventure.closing`` downstream work.
-    - The campaign status is untouched — it stays active/continuable and
-      later adventures can be created in the same world.
-
-    Returns:
-        (adventure, event). On duplicate operation replay, returns the
-        existing (adventure, event) with ``duplicate=True`` in the caller
-        response (the event payload itself is unchanged).
-    """
-    campaign = db.get(Campaign, campaign_id)
-    if campaign is None:
-        raise AdventureNotFoundError(f"Campaign {campaign_id} not found")
-
-    # Idempotency first: a retried operation must not create duplicate
-    # adventure records/events.
-    if operation_id:
-        prior = find_by_operation(db, campaign_id, operation_id)
-        if prior is not None and prior.status == "completed":
-            from models.campaigns import CampaignDomainEvent
-
-            event = (
-                db.execute(
-                    select(CampaignDomainEvent).where(
-                        CampaignDomainEvent.campaign_id == campaign_id,
-                        CampaignDomainEvent.operation_id == operation_id,
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            logger.info(
-                "adventure duplicate_completion_hit campaign_id=%s adventure_id=%s op=%s",
-                campaign_id, prior.id, operation_id,
-            )
-            return prior, event
-
-    if adventure_id is not None:
-        adventure = db.get(Adventure, adventure_id)
-        if adventure is None or str(adventure.campaign_id) != str(campaign_id):
-            raise AdventureNotFoundError(f"Adventure {adventure_id} not found in campaign {campaign_id}")
-    else:
-        adventure = get_current_adventure(db, campaign_id)
-        if adventure is None:
-            raise AdventureNotFoundError(f"Campaign {campaign_id} has no active adventure to complete")
-
-    if adventure.status == "completed":
-        raise AdventureAlreadyCompletedError(adventure.id, adventure.outcome)
-
-    expected = expected_revision if expected_revision is not None else int(campaign.revision or 0)
-    completed: dict[str, Adventure] = {}
-
-    def _mutate(locked: Campaign):
-        require_playable_campaign(locked)
-        adv = db.get(Adventure, adventure.id)
-        if adv is None:
-            raise AdventureNotFoundError(f"Adventure {adventure.id} not found")
-        complete_adventure_inline(
-            db, locked, adv,
-            outcome=outcome, reason=reason, public_summary=public_summary,
-            source_turn_id=source_turn_id, operation_id=operation_id,
-        )
-        completed["adventure"] = adv
-
-    def _payload() -> dict:
-        adv = completed["adventure"]
-        # Player-readable lifecycle data only: the DM's completion reason
-        # stays on the owner-visible adventure row, never in the public
-        # domain-event feed (issue #260 security).
-        return {
-            "adventure_id": str(adv.id),
-            "title": adv.title,
-            "outcome": adv.outcome,
-            "public_summary": adv.public_summary,
-            "source_turn_id": str(adv.source_turn_id) if adv.source_turn_id else None,
-            "source_event_id": str(adv.source_event_id) if adv.source_event_id else None,
-            "campaign_status": campaign.status,
-        }
-
-    def _provenance() -> dict:
-        return {
-            "source_turn_id": str(source_turn_id) if source_turn_id else None,
-            "declared_by": "dm",
-        }
-
-    campaign_after, event = commit_campaign_mutation(
-        db,
-        campaign_id,
-        expected_revision=int(expected),
-        event_type=ADVENTURE_COMPLETED_EVENT,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets={"adventure_id": str(adventure.id)},
-        provenance=_provenance(),
-        mutate=_mutate,
-        commit=False,
-        payload_builder=_payload,
-    )
-
-    # Link the authoritative event back onto the adventure for provenance.
-    adv = completed["adventure"]
-    adv.source_event_id = event.id
-    stage_adventure_closing(db, adv, operation_id=operation_id)
-    if commit:
-        db.commit()
-        db.refresh(adv)
-        db.refresh(event)
-        db.refresh(campaign_after)
-
-    logger.info(
-        "adventure completed campaign_id=%s adventure_id=%s outcome=%s revision=%s event_id=%s campaign_status=%s op=%s",
-        campaign_id, adv.id, adv.outcome, campaign_after.revision, event.id,
-        campaign_after.status, operation_id or "-",
-    )
-    return adv, event
-
-
-# ── Downstream closing work (best-effort) ────────────────────────────────────
 
 
 def stage_adventure_closing(db: Session, adventure: Adventure, *, operation_id: str | None) -> None:

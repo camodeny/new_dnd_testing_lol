@@ -1,15 +1,14 @@
 """Adventures transport — APIRouter.
 
 - GET/POST .../adventures — list (member-readable) / open (issue #260).
-- POST .../adventures/{adventure_id}/complete — DM-declared completion that
-  also derives the AdventureSummary (best-effort, never blocks).
-- GET .../summary — durable historical summary (owner/DM-only).
 - GET .../recap — visibility-filtered player recap (member-readable).
 - POST .../summaries/generate + .../summaries/mark-stale — retry/repair.
 - .../epilogues/* — optional player epilogues (issue #262).
 - /api/cron/adventure-closing — best-effort closing sweep (issue #260).
 
-AI-only DM: all lifecycle/repair mutations are owner-only; list/recap stay
+The AI is the only DM: it alone completes adventures (``complete_adventure``
+staged effect). The routes here are host actions (open/continue, epilogue
+phase, summary repair) gated to the campaign owner; list/recap stay
 member-readable.
 """
 
@@ -24,16 +23,11 @@ from sqlalchemy.orm import Session
 
 from app.adventures.service import (
     AdventureAlreadyActiveError,
-    AdventureAlreadyCompletedError,
-    AdventureNotFoundError,
-    complete_adventure,
     get_current_adventure,
     list_adventures,
 )
 from app.adventures.summaries import (
     AdventureError,
-    _ensure_summary_placeholder,
-    finalize_adventure_derived,
     generate_summary,
     mark_stale,
     project_recap,
@@ -41,7 +35,7 @@ from app.adventures.summaries import (
 from app.campaigns.events import RevisionConflictError
 from app.campaigns.service import CampaignArchivedError
 from app.deps.auth import current_profile
-from app.deps.campaign import campaign_for, parse_uuid_or_404, require_expected_revision, run_campaign_command
+from app.deps.campaign import campaign_for, parse_uuid_or_404, run_campaign_command
 from app.deps.cron import require_cron_secret
 from app.deps.idempotency import command_keys
 from database import get_db
@@ -52,10 +46,10 @@ logger = logging.getLogger(__name__)
 
 #: Member-readable adventure routes.
 adventure_reader = campaign_for("participant")
-#: DM-declared lifecycle mutations are owner/DM-only: ordinary members may
-#: read the recap projection but must never complete adventures, choose
-#: outcomes, or drive repair/regeneration of canonical derived state.
-adventure_owner = campaign_for("owner", forbidden="Only the campaign owner (DM) can perform this action")
+#: Host actions (open/continue, epilogue phase, summary repair) are
+#: owner-only; ordinary members read the recap projection. No human
+#: completes adventures or chooses outcomes — that is the AI DM's effect.
+adventure_owner = campaign_for("owner", forbidden="Only the campaign owner can perform this action")
 
 _ADVENTURE_OUTCOME_ERROR = (
     "outcome must be one of victory, failure, retreat, capture, death, tpk, villain_victory"
@@ -94,16 +88,15 @@ def list_adventures_endpoint(
     campaign: Campaign = Depends(campaign_for("participant", forbidden="Not a campaign member")),
     db: Session = Depends(get_db),
 ):
-    # Only the player-visible summary leaves the table for members; the DM's
-    # reason, metadata, provenance ids, and closing bookkeeping stay
-    # owner-visible (issue #260 security).
-    is_owner = campaign.owner_id == profile.id
+    # Only the player-visible summary leaves the table; the DM's reason,
+    # metadata, provenance ids, and closing bookkeeping never do — the owner
+    # is a player too (issue #260 security, #470).
     current = get_current_adventure(db, campaign.id)
     return {
         "campaign_id": str(campaign.id),
         "campaign_status": campaign.status,
         "current_adventure_id": str(current.id) if current else None,
-        "adventures": [a.to_dict() if is_owner else a.to_public_dict() for a in list_adventures(db, campaign.id)],
+        "adventures": [a.to_public_dict() for a in list_adventures(db, campaign.id)],
     }
 
 
@@ -156,109 +149,6 @@ def start_adventure_endpoint(
         command_type="adventure.start", scope_type="campaign", scope_id=campaign.id,
         payload=payload, execute=_execute,
     )
-
-
-@router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/complete")
-def complete_adventure_endpoint(
-    adventure_id: str,
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(adventure_owner),
-    db: Session = Depends(get_db),
-):
-    """DM-declared completion of an adventure + derived summary.
-
-    Funnels through the canonical ``complete_adventure`` service (same code
-    path as the staged DM effect). ``public_summary`` is member-visible; the
-    DM-private ``reason`` stays owner-visible and never enters the recap.
-    Derived summary generation is best-effort and never blocks the
-    authoritative completion.
-    """
-    adv = _adventure_or_404(db, campaign, adventure_id)
-    body = payload or {}
-    operation_id = str(body.get("operation_id") or "").strip() or None
-    if adv.status == "completed":
-        # Idempotent replay: same completion operation reuses the existing
-        # row + derived summary instead of duplicating.
-        if operation_id is not None and adv.operation_id not in (None, operation_id):
-            raise HTTPException(status_code=409, detail=f"Adventure {adv.id} is already completed")
-        row = db.execute(
-            select(AdventureSummary).where(AdventureSummary.adventure_id == adv.id)
-        ).scalars().first()
-        if row is None:
-            row = _ensure_summary_placeholder(db, adv)
-            db.commit()
-            db.refresh(row)
-        return {"adventure": adv.to_dict(), "summary": row.to_dict(), "idempotent": True}
-    expected = require_expected_revision(body)
-    outcome = str(body.get("outcome") or "").strip().lower()
-    if not outcome:
-        raise HTTPException(status_code=400, detail=_ADVENTURE_OUTCOME_ERROR)
-    operation_id, idempotency_key = command_keys(request, body)
-    source_turn_id = _opt_uuid(body.get("source_turn_id"))
-
-    def _execute():
-        try:
-            completed, event = complete_adventure(
-                db, campaign.id,
-                outcome=outcome,
-                reason=body.get("reason"),
-                public_summary=body.get("public_summary"),
-                adventure_id=adv.id,
-                operation_id=operation_id or idempotency_key,
-                actor_id=profile.id,
-                expected_revision=expected,
-                source_turn_id=source_turn_id,
-                commit=False,
-            )
-        except AdventureNotFoundError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
-        except (AdventureAlreadyCompletedError, CampaignArchivedError) as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        # Bind the authoritative end cursor and derive the summary through
-        # the shared finalizer (best-effort, never rolls back the completion).
-        current = db.get(Campaign, campaign.id)
-        row = finalize_adventure_derived(
-            db, completed,
-            event_sequence=event.sequence if event is not None else None,
-            revision=current.revision if current is not None else None,
-            actor_id=profile.id,
-        )
-        db.flush()
-        return {
-            "adventure": completed.to_dict(),
-            "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
-            "summary": row.to_dict() if row is not None else None,
-            "campaign_status": current.status if current else campaign.status,
-        }
-
-    return run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=idempotency_key,
-        command_type="adventure.complete", scope_type="adventure", scope_id=adv.id,
-        payload=body, execute=_execute,
-    )
-
-
-@router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/summary")
-def get_summary(
-    adventure_id: str,
-    profile=Depends(current_profile),
-    camp: Campaign = Depends(adventure_owner),
-    db: Session = Depends(get_db),
-):
-    """Durable historical summary (derived; events/facts outrank it).
-
-    Owner/DM-only: the historical summary compresses hidden source evidence
-    (dm_only/private) for retrieval/context. Members use the /recap
-    projection, which is visibility-filtered.
-    """
-    adv = _adventure_or_404(db, camp, adventure_id)
-    row = _summary_or_404(db, adv)
-    return {"adventure": adv.to_dict(), "summary": row.to_dict()}
 
 
 @router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/recap")
@@ -383,7 +273,7 @@ def open_epilogues_endpoint(
     camp: Campaign = Depends(adventure_owner),
     db: Session = Depends(get_db),
 ):
-    """Open the optional epilogue phase for a completed adventure (owner/DM-only)."""
+    """Open the optional epilogue phase for a completed adventure (owner host action)."""
     from app.adventures.epilogues import epilogue_stats, open_epilogues
 
     cid = camp.id
@@ -541,7 +431,7 @@ def close_epilogues_endpoint(
     camp: Campaign = Depends(adventure_owner),
     db: Session = Depends(get_db),
 ):
-    """Close the epilogue phase (owner/DM-only). Partial participation is fine."""
+    """Close the epilogue phase (owner host action). Partial participation is fine."""
     from app.adventures.epilogues import close_epilogues
 
     cid = camp.id
@@ -566,7 +456,5 @@ def list_epilogues_endpoint(
 
     adv = _adventure_or_404(db, camp, adventure_id)
     aid = adv.id
-    entries = list_epilogues(
-        db, aid, viewer_id=profile.id, is_owner=(camp.owner_id == profile.id)
-    )
+    entries = list_epilogues(db, aid, viewer_id=profile.id)
     return {"epilogues": entries, "stats": epilogue_stats(db, aid)}

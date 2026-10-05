@@ -454,57 +454,6 @@ def is_historical_canon(db: Session, character_id: uuid_lib.UUID) -> bool:
 # mutation. Flush-only: the HTTP idempotency guard owns the commit.
 
 
-def commit_pc_death(
-    db: Session,
-    campaign_id: uuid_lib.UUID,
-    *,
-    actor_id: uuid_lib.UUID,
-    character_id: uuid_lib.UUID,
-    status: str,
-    cause: str | None,
-    is_tpk: bool,
-    expected_revision: int,
-    operation_id: str,
-) -> dict:
-    from app.campaigns.events import commit_campaign_mutation
-
-    rows: list[CampaignPcLifecycle] = []
-
-    def _mutate(locked: Campaign):
-        require_playable_campaign(locked)
-        rows.append(declare_pc_death(
-            db, locked, character_id, status=status, cause=cause, is_tpk=is_tpk, actor_id=actor_id,
-        ))
-
-    campaign_after, event = commit_campaign_mutation(
-        db,
-        campaign_id,
-        expected_revision,
-        event_type=f"campaign.pc_{status}",
-        operation_id=operation_id,
-        actor_id=actor_id,
-        targets={"character_id": str(character_id)},
-        payload_builder=lambda: {
-            "character_id": str(character_id),
-            "status": rows[0].status,
-            "cause": rows[0].cause,
-            "is_tpk": bool(rows[0].is_tpk),
-        },
-        mutate=_mutate,
-        commit=False,
-    )
-    logger.info(
-        "pc death declared campaign_id=%s actor_id=%s character_id=%s status=%s revision=%s",
-        campaign_id, actor_id, character_id, rows[0].status, campaign_after.revision,
-    )
-    return {
-        "ok": True,
-        "campaign": campaign_after.to_dict(),
-        "lifecycle": rows[0].to_dict(),
-        "event": event.to_dict(),
-    }
-
-
 def commit_replacement(
     db: Session,
     campaign_id: uuid_lib.UUID,

@@ -20,9 +20,6 @@ import models  # noqa: E402, F401
 from app.adventures.service import (  # noqa: E402
     ADVENTURE_OUTCOMES,
     AdventureAlreadyActiveError,
-    AdventureAlreadyCompletedError,
-    AdventureNotFoundError,
-    complete_adventure,
     get_current_adventure,
     handle_adventure_closing,
     list_adventures,
@@ -51,13 +48,66 @@ def setup():
         yield factory, camp.id, owner
 
 
-def _complete(factory, camp_id, outcome, op, **kw):
-    with factory() as db:
-        camp = db.get(Campaign, camp_id)
-        return complete_adventure(
-            db, camp_id, outcome=outcome, reason=f"{outcome} reason",
-            operation_id=op, expected_revision=int(camp.revision), **kw,
+def _ensure_thread_id(db, camp_id):
+    """The single shared game thread for a campaign (created if missing)."""
+    from models.threads import CampaignThread
+
+    thread = db.execute(
+        select(CampaignThread).where(
+            CampaignThread.campaign_id == camp_id,
+            CampaignThread.thread_type == "campaign",
         )
+    ).scalars().first()
+    if thread is None:
+        camp = db.get(Campaign, camp_id)
+        thread = CampaignThread(
+            id=uuid.uuid4(), campaign_id=camp_id,
+            thread_type="campaign", created_by=camp.owner_id,
+        )
+        db.add(thread)
+        db.flush()
+    return thread.id
+
+
+def _discard_turn(factory, turn_id, attempt_id):
+    """Remove a failed turn + attempt so the thread accepts later turns."""
+    from models.dm import DmTurn, DmTurnAttempt
+
+    with factory() as db:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is not None:
+            db.delete(attempt)
+        turn = db.get(DmTurn, turn_id)
+        if turn is not None:
+            db.delete(turn)
+        db.commit()
+
+
+def _dm_complete(factory, camp_id, outcome, op_id, *, reason=None,
+                 public_summary=None, adventure_id=None):
+    """Complete the campaign's adventure through the AI DM's staged effect.
+
+    Stages ``complete_adventure`` on a fresh DM turn and commits it — the
+    only production completion path. Returns     (adventure_id, event_id, turn_id).
+    Raises on failure (failed completions leave the adventure open); call
+    _discard_turn afterwards if the caller stages more turns on the thread.
+    """
+    with factory() as db:
+        thread_id = _ensure_thread_id(db, camp_id)
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, adventure_id=adventure_id,
+            outcome=outcome, reason=reason or f"{outcome} reason",
+            public_summary=public_summary, effect_id=f"eff-{op_id}",
+        )
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        from app.dm.turns import commit_turn
+
+        _t, _a, event = commit_turn(db, turn_id, attempt_id, operation_id=op_id)
+        db.commit()
+        adv_id = event.payload["adventure_completion"]["adventure_id"]
+        return uuid.UUID(str(adv_id)), event.id, turn_id
 
 
 @pytest.mark.parametrize("outcome", sorted(ADVENTURE_OUTCOMES))
@@ -66,14 +116,15 @@ def test_all_outcomes_complete_without_ending_campaign(setup, outcome):
     with factory() as db:
         adv = start_adventure(db, camp_id, f"The {outcome} arc")
         assert adv.status == "active"
-    adv, event = _complete(factory, camp_id, outcome, f"op-{outcome}")
-    assert adv.status == "completed"
-    assert adv.outcome == outcome
-    assert adv.completed_at is not None
-    assert event.event_type == "adventure.completed"
-    assert event.payload["outcome"] == outcome
-    assert event.payload["campaign_status"] == "active"
+    adv_id, event_id, _turn_id = _dm_complete(factory, camp_id, outcome, f"op-{outcome}")
     with factory() as db:
+        adv = db.get(Adventure, adv_id)
+        assert adv.status == "completed"
+        assert adv.outcome == outcome
+        assert adv.completed_at is not None
+        event = db.get(CampaignDomainEvent, event_id)
+        assert event.event_type == "adventure.completed"
+        assert event.payload["outcome"] == outcome
         camp = db.get(Campaign, camp_id)
         assert camp.status == "active"
         assert get_current_adventure(db, camp_id) is None
@@ -84,35 +135,30 @@ def test_tpk_and_villain_victory_are_legitimate_completions(setup):
     for outcome, op in (("tpk", "op-tpk"), ("villain_victory", "op-vv")):
         with factory() as db:
             start_adventure(db, camp_id, f"Arc {op}")
-        adv, _event = _complete(factory, camp_id, outcome, op)
-        assert adv.status == "completed" and adv.outcome == outcome
+        adv_id, _event_id, _turn_id = _dm_complete(factory, camp_id, outcome, op)
         with factory() as db:
+            adv = db.get(Adventure, adv_id)
+            assert adv.status == "completed" and adv.outcome == outcome
             assert db.get(Campaign, camp_id).status == "active"
 
 
 def test_completion_provenance_and_closing_trigger(setup):
     factory, camp_id, _owner = setup
-    turn_id = uuid.uuid4()
     with factory() as db:
         start_adventure(db, camp_id, "Provenance arc")
-    with factory() as db:
-        camp = db.get(Campaign, camp_id)
-        adv, event = complete_adventure(
-            db, camp_id, outcome="victory", reason="Dragon slain",
-            public_summary="The town is saved.",
-            source_turn_id=turn_id, operation_id="op-prov",
-            expected_revision=int(camp.revision),
-        )
-        db.commit()
-        adv_id, event_id = adv.id, event.id
+    adv_id, event_id, turn_id = _dm_complete(
+        factory, camp_id, "victory", "op-prov",
+        reason="Dragon slain", public_summary="The town is saved.",
+    )
     with factory() as db:
         adv = db.get(Adventure, adv_id)
         assert adv.source_turn_id == turn_id
         assert adv.source_event_id == event_id
         assert adv.public_summary == "The town is saved."
         event = db.get(CampaignDomainEvent, event_id)
-        assert event.provenance["source_turn_id"] == str(turn_id)
-        assert event.provenance["declared_by"] == "dm"
+        # The DM turn is the authoritative provenance for the decision.
+        assert event.provenance["source"] == "dm_turn"
+        assert event.payload["source_turn_id"] == str(turn_id)
         from models.reliability import Outbox
 
         rows = db.execute(
@@ -123,25 +169,36 @@ def test_completion_provenance_and_closing_trigger(setup):
 
 
 def test_duplicate_completion_is_idempotent(setup):
+    """Retrying the same DM turn commit returns the original completion.
+
+    The turn commit's operation id makes duplicate delivery a no-op: the
+    original outcome is preserved and no second adventure/event is written.
+    """
+    from app.dm.turns import commit_turn
+
     factory, camp_id, _owner = setup
     with factory() as db:
         start_adventure(db, camp_id, "Retry arc")
-    adv1, event1 = _complete(factory, camp_id, "retreat", "op-dup")
-    with factory() as db:
-        camp = db.get(Campaign, camp_id)
-        adv2, event2 = complete_adventure(
-            db, camp_id, outcome="victory", reason="changed mind",
-            operation_id="op-dup", expected_revision=int(camp.revision),
+        thread_id = _ensure_thread_id(db, camp_id)
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, outcome="retreat",
+            reason="retreat reason", effect_id="eff-op-dup",
         )
+        turn_id, attempt_id = turn.id, attempt.id
         db.commit()
-    assert str(adv2.id) == str(adv1.id)
-    assert adv2.outcome == "retreat"  # original outcome preserved
-    assert str(event2.id) == str(event1.id)
+    with factory() as db:
+        _t, _a, event1 = commit_turn(db, turn_id, attempt_id, operation_id="op-dup")
+        db.commit()
+        first_event_id = event1.id
+    with factory() as db:
+        _t, _a, event2 = commit_turn(db, turn_id, attempt_id, operation_id="op-dup")
+        assert str(event2.id) == str(first_event_id)
     with factory() as db:
         rows = db.execute(
             select(Adventure).where(Adventure.campaign_id == camp_id)
         ).scalars().all()
         assert len(rows) == 1
+        assert rows[0].outcome == "retreat"  # original outcome preserved
         events = db.execute(
             select(CampaignDomainEvent).where(
                 CampaignDomainEvent.campaign_id == camp_id,
@@ -152,40 +209,68 @@ def test_duplicate_completion_is_idempotent(setup):
 
 
 def test_repeat_completion_without_operation_id_fails_closed(setup):
+    """A new DM completion with no open adventure fails closed.
+
+    Both the implicit-current form and an explicit re-close of the finished
+    adventure raise; the completed adventure is untouched.
+    """
+    from app.dm.turns import commit_turn
+
     factory, camp_id, _owner = setup
     with factory() as db:
         adv = start_adventure(db, camp_id, "Closed arc")
         adv_id = adv.id
-    _complete(factory, camp_id, "capture", "op-first")
+    _dm_complete(factory, camp_id, "capture", "op-first")
     with factory() as db:
-        camp = db.get(Campaign, camp_id)
+        thread_id = _ensure_thread_id(db, camp_id)
         # No active adventure remains...
-        with pytest.raises(AdventureNotFoundError):
-            complete_adventure(
-                db, camp_id, outcome="victory", reason="again",
-                expected_revision=int(camp.revision),
-            )
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, outcome="victory",
+            reason="again", effect_id="eff-again",
+        )
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        with pytest.raises(ValueError, match="no active adventure"):
+            commit_turn(db, turn_id, attempt_id, operation_id="op-again")
         db.rollback()
+    _discard_turn(factory, turn_id, attempt_id)
+    with factory() as db:
         # ...and explicitly re-closing the finished one fails closed.
-        with pytest.raises(AdventureAlreadyCompletedError):
-            complete_adventure(
-                db, camp_id, outcome="victory", reason="again",
-                adventure_id=adv_id, expected_revision=int(camp.revision),
-            )
+        thread_id = _ensure_thread_id(db, camp_id)
+        turn2, attempt2 = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, adventure_id=adv_id,
+            outcome="victory", reason="again", effect_id="eff-again-2",
+        )
+        turn2_id, attempt2_id = turn2.id, attempt2.id
+        db.commit()
+    with factory() as db:
+        with pytest.raises(ValueError, match="already completed"):
+            commit_turn(db, turn2_id, attempt2_id, operation_id="op-again-2")
         db.rollback()
+    _discard_turn(factory, turn2_id, attempt2_id)
+    with factory() as db:
+        adv = db.get(Adventure, adv_id)
+        assert adv.status == "completed" and adv.outcome == "capture"
 
 
 def test_failed_completion_leaves_adventure_open(setup):
+    from app.dm.turns import commit_turn
+
     factory, camp_id, _owner = setup
     with factory() as db:
         adv = start_adventure(db, camp_id, "Fragile arc")
         adv_id = adv.id
-        camp = db.get(Campaign, camp_id)
-        with pytest.raises(ValueError):
-            complete_adventure(
-                db, camp_id, outcome="tie", reason="not a real outcome",
-                operation_id="op-bad", expected_revision=int(camp.revision),
-            )
+        thread_id = _ensure_thread_id(db, camp_id)
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, outcome="tie",
+            reason="not a real outcome", effect_id="eff-op-bad",
+        )
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        with pytest.raises(ValueError, match="Invalid adventure outcome"):
+            commit_turn(db, turn_id, attempt_id, operation_id="op-bad")
         db.rollback()
     with factory() as db:
         adv = db.get(Adventure, adv_id)
@@ -201,28 +286,34 @@ def test_later_adventures_continue_in_same_campaign(setup):
         with pytest.raises(AdventureAlreadyActiveError):
             start_adventure(db, camp_id, "Arc two overlapping")
         db.rollback()
-    _complete(factory, camp_id, "failure", "op-arc1")
+    _dm_complete(factory, camp_id, "failure", "op-arc1")
     # ...but after completion a new arc opens cleanly.
     with factory() as db:
         second = start_adventure(db, camp_id, "Arc two")
         assert second.status == "active"
         assert get_current_adventure(db, camp_id).id == second.id
         assert len(list_adventures(db, camp_id)) == 2
-    _complete(factory, camp_id, "victory", "op-arc2")
+    _dm_complete(factory, camp_id, "victory", "op-arc2")
     with factory() as db:
         assert db.get(Campaign, camp_id).status == "active"
         assert [a.outcome for a in list_adventures(db, camp_id)] == ["failure", "victory"]
 
 
 def test_no_active_adventure_to_complete(setup):
+    from app.dm.turns import commit_turn
+
     factory, camp_id, _owner = setup
     with factory() as db:
-        camp = db.get(Campaign, camp_id)
-        with pytest.raises(AdventureNotFoundError):
-            complete_adventure(
-                db, camp_id, outcome="victory", reason="nothing open",
-                operation_id="op-empty", expected_revision=int(camp.revision),
-            )
+        thread_id = _ensure_thread_id(db, camp_id)
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, camp_id, thread_id, outcome="victory",
+            reason="nothing open", effect_id="eff-op-empty",
+        )
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        with pytest.raises(ValueError, match="no active adventure"):
+            commit_turn(db, turn_id, attempt_id, operation_id="op-empty")
         db.rollback()
 
 
@@ -234,7 +325,7 @@ def test_closing_worker_success_and_failure_isolation(setup, monkeypatch):
     factory, camp_id, _owner = setup
     with factory() as db:
         start_adventure(db, camp_id, "Closing arc")
-    adv, _event = _complete(factory, camp_id, "victory", "op-close")
+    adv_id, _event_id, _turn_id = _dm_complete(factory, camp_id, "victory", "op-close")
 
     # Failure in downstream work retries but never invalidates completion.
     import app.adventures.service as svc
@@ -242,12 +333,12 @@ def test_closing_worker_success_and_failure_isolation(setup, monkeypatch):
     monkeypatch.setattr(svc, "_run_closing_followups", lambda db, adv: (_ for _ in ()).throw(RuntimeError("recap exploded")))
     with factory() as db:
         env = SimpleNamespace(
-            job_id=uuid.uuid4(), payload={"adventure_id": str(adv.id), "campaign_id": str(camp_id)}
+            job_id=uuid.uuid4(), payload={"adventure_id": str(adv_id), "campaign_id": str(camp_id)}
         )
         with pytest.raises(RetriableError):
             handle_adventure_closing(env, db)
     with factory() as db:
-        still = db.get(Adventure, adv.id)
+        still = db.get(Adventure, adv_id)
         assert still.status == "completed"
         assert still.outcome == "victory"
         assert still.closing_status == "failed"
@@ -256,14 +347,14 @@ def test_closing_worker_success_and_failure_isolation(setup, monkeypatch):
     monkeypatch.undo()
     with factory() as db:
         env = SimpleNamespace(
-            job_id=uuid.uuid4(), payload={"adventure_id": str(adv.id), "campaign_id": str(camp_id)}
+            job_id=uuid.uuid4(), payload={"adventure_id": str(adv_id), "campaign_id": str(camp_id)}
         )
         result = handle_adventure_closing(env, db)
         assert result["ok"] is True
         again = handle_adventure_closing(env, db)
         assert again["duplicate"] is True
     with factory() as db:
-        done = db.get(Adventure, adv.id)
+        done = db.get(Adventure, adv_id)
         assert done.closing_status == "succeeded"
         assert done.status == "completed"
 
@@ -291,25 +382,32 @@ def test_staged_effect_contract_validation():
         })
 
 
-def _streaming_turn_with_completion_effect(db, camp_id, thread_id, adventure_id=None):
+def _streaming_turn_with_completion_effect(db, camp_id, thread_id, adventure_id=None, *,
+                                             outcome="retreat", reason=None,
+                                             public_summary=None, effect_id="eff_close_1"):
     """Directly stage a streaming turn carrying a complete_adventure effect."""
     from models.dm import DmTurn, DmTurnAttempt
 
+    camp = db.get(Campaign, camp_id)
+    rev = int(camp.revision or 0)
     turn = DmTurn(
         id=uuid.uuid4(), campaign_id=camp_id, thread_id=str(thread_id),
-        audience="campaign", status="streaming", source_revision=0,
-        input_set_revision=1, submission_ids=[],
+        audience="campaign", status="streaming", source_revision=rev,
+        input_set_revision=rev + 1, submission_ids=[],
     )
     db.add(turn)
     db.flush()
-    args: dict = {"outcome": "retreat", "reason": "The party flees the collapsing tomb."}
+    args: dict = {"outcome": outcome,
+                  "reason": reason or "The party flees the collapsing tomb."}
+    if public_summary is not None:
+        args["public_summary"] = public_summary
     if adventure_id is not None:
         args["adventure_id"] = str(adventure_id)
     attempt = DmTurnAttempt(
         id=uuid.uuid4(), turn_id=turn.id, attempt_number=1, status="streaming",
         campaign_id=camp_id, thread_id=str(thread_id), audience="campaign",
-        source_revision=0, input_set_revision=1, submission_ids=[],
-        staged_effects=[{"id": "eff_close_1", "effect_type": "complete_adventure", "arguments": args}],
+        source_revision=rev, input_set_revision=rev + 1, submission_ids=[],
+        staged_effects=[{"id": effect_id, "effect_type": "complete_adventure", "arguments": args}],
     )
     db.add(attempt)
     db.flush()
@@ -359,7 +457,6 @@ def test_staged_effect_completion_binds_exact_source_range(setup):
     pre-commit values visible inside the effect handler.
     """
     from models.campaigns import AdventureSummary
-    from models.dm import DmTurn
     from models.threads import CampaignThread
 
     factory, camp_id, owner = setup
@@ -400,8 +497,7 @@ def test_staged_effect_duplicate_retry_is_idempotent(setup):
     thread_id = uuid.uuid4()
     with factory() as db:
         db.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
-        adv = start_adventure(db, camp_id, "Idempotent arc")
-        adv_id = adv.id
+        start_adventure(db, camp_id, "Idempotent arc")
         turn, attempt = _streaming_turn_with_completion_effect(db, camp_id, thread_id)
         turn_id, attempt_id = turn.id, attempt.id
         db.commit()
@@ -460,7 +556,10 @@ def api(monkeypatch):
 
 
 def test_adventure_api_lifecycle(api):
-    client, _factory, _actor = api
+    # Starting/listing adventures stay owner admin actions over HTTP; the
+    # completion itself goes through the AI DM's staged effect (there is no
+    # POST .../complete route anymore).
+    client, factory, _actor = api
     camp = client.post("/api/campaigns", json={"name": "API campaign"}).json()["campaign"]
     cid = camp["id"]
 
@@ -471,7 +570,6 @@ def test_adventure_api_lifecycle(api):
     )
     assert started.status_code == 200, started.text
     assert started.json()["adventure"]["status"] == "active"
-    aid = started.json()["adventure"]["id"]
 
     # Overlapping start is rejected while one is active.
     overlap = client.post(
@@ -481,43 +579,18 @@ def test_adventure_api_lifecycle(api):
     )
     assert overlap.status_code == 409
 
-    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    done = client.post(
-        f"/api/campaigns/{cid}/adventures/{aid}/complete",
-        json={
-            "expected_revision": revision,
-            "outcome": "villain_victory",
-            "reason": "The lich completes the ritual.",
-            "public_summary": "Darkness falls over the vale.",
-        },
-        headers={"Idempotency-Key": "adv-done-1"},
+    # The AI DM completes the arc via its staged effect.
+    _dm_complete(
+        factory, uuid.UUID(cid), "villain_victory", "adv-done-1",
+        reason="The lich completes the ritual.",
+        public_summary="Darkness falls over the vale.",
     )
-    assert done.status_code == 200, done.text
-    body = done.json()
-    assert body["adventure"]["status"] == "completed"
-    assert body["adventure"]["outcome"] == "villain_victory"
-    assert body["event"]["event_type"] == "adventure.completed"
-    assert body["campaign_status"] == camp["status"]  # completion never ends/archives the campaign
-
-    # Idempotent replay of the same completion key returns the same record.
-    revision2 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    replay = client.post(
-        f"/api/campaigns/{cid}/adventures/{aid}/complete",
-        json={
-            "expected_revision": revision,
-            "outcome": "villain_victory",
-            "reason": "The lich completes the ritual.",
-            "public_summary": "Darkness falls over the vale.",
-        },
-        headers={"Idempotency-Key": "adv-done-1"},
-    )
-    assert replay.status_code == 200, replay.text
-    assert replay.json()["adventure"]["outcome"] == "villain_victory"
 
     listed = client.get(f"/api/campaigns/{cid}/adventures").json()
     assert listed["campaign_status"] == camp["status"]
     assert len(listed["adventures"]) == 1
     assert listed["current_adventure_id"] is None
+    assert listed["adventures"][0]["outcome"] == "villain_victory"
 
     # A later adventure opens in the same campaign.
     again = client.post(
@@ -527,14 +600,21 @@ def test_adventure_api_lifecycle(api):
     )
     assert again.status_code == 200, again.text
 
-    # Invalid outcome is rejected without closing the new adventure.
-    revision3 = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    bad = client.post(
-        f"/api/campaigns/{cid}/adventures/{again.json()['adventure']['id']}/complete",
-        json={"expected_revision": revision3, "outcome": "tie", "reason": "nope"},
-        headers={"Idempotency-Key": "adv-bad-1"},
-    )
-    assert bad.status_code == 400
+    # An invalid DM outcome is rejected without closing the new adventure.
+    from app.dm.turns import commit_turn
+
+    with factory() as db:
+        thread_id = _ensure_thread_id(db, uuid.UUID(cid))
+        turn, attempt = _streaming_turn_with_completion_effect(
+            db, uuid.UUID(cid), thread_id, outcome="tie",
+            reason="nope", effect_id="eff-adv-bad-1",
+        )
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        with pytest.raises(ValueError, match="Invalid adventure outcome"):
+            commit_turn(db, turn_id, attempt_id, operation_id="adv-bad-1")
+        db.rollback()
     listed2 = client.get(f"/api/campaigns/{cid}/adventures").json()
     assert listed2["current_adventure_id"] == again.json()["adventure"]["id"]
 
@@ -551,33 +631,23 @@ def test_member_sees_only_public_adventure_fields(api):
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
         db.commit()
 
-    secret_arc = client.post(
+    client.post(
         f"/api/campaigns/{cid}/adventures",
         json={"title": "Secret arc", "metadata": {"dm_notes": "the butler did it"}},
         headers={"Idempotency-Key": "adv-spoiler-start"},
-    ).json()["adventure"]
-    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    client.post(
-        f"/api/campaigns/{cid}/adventures/{secret_arc['id']}/complete",
-        json={
-            "expected_revision": revision,
-            "outcome": "capture",
-            "reason": "DM-only: the traitor is the castellan.",
-            "public_summary": "The party wakes in chains.",
-        },
-        headers={"Idempotency-Key": "adv-spoiler-done"},
+    )
+    _dm_complete(
+        factory, uuid.UUID(cid), "capture", "adv-spoiler-done",
+        reason="DM-only: the traitor is the castellan.",
+        public_summary="The party wakes in chains.",
     )
 
-    # Owner sees the full record.
+    # Every player — the campaign owner included (#470) — sees identity +
+    # outcome + public summary only.
     owner_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
-    assert owner_view["reason"] == "DM-only: the traitor is the castellan."
-    assert owner_view["metadata"] == {"dm_notes": "the butler did it"}
-    assert owner_view["source_turn_id"] is None
-    assert "source_event_id" in owner_view
-
-    # Members see identity + outcome + public summary only.
     actor["id"] = member_id
     member_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
+    assert owner_view == member_view
     assert member_view["title"] == "Secret arc"
     assert member_view["outcome"] == "capture"
     assert member_view["public_summary"] == "The party wakes in chains."
@@ -629,18 +699,10 @@ def test_member_event_feed_hides_dm_reason(api):
         headers={"Idempotency-Key": "adv-leak-start"},
     )
     assert started.status_code == 200, started.text
-    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
-    done = client.post(
-        f"/api/campaigns/{cid}/adventures/{started.json()['adventure']['id']}/complete",
-        json={
-            "expected_revision": revision,
-            "outcome": "failure",
-            "reason": secret,
-            "public_summary": "The town falls ill.",
-        },
-        headers={"Idempotency-Key": "adv-leak-done"},
+    _dm_complete(
+        factory, uuid.UUID(cid), "failure", "adv-leak-done",
+        reason=secret, public_summary="The town falls ill.",
     )
-    assert done.status_code == 200, done.text
 
     actor["id"] = member_id
     feed = client.get(f"/api/campaigns/{cid}/events").json()
@@ -662,7 +724,7 @@ def test_closing_sweep_converges_pending_work(setup):
     factory, camp_id, _owner = setup
     with factory() as db:
         start_adventure(db, camp_id, "Sweep arc")
-    adv, _event = _complete(factory, camp_id, "retreat", "op-sweep")
+    adv_id, _event_id, _turn_id = _dm_complete(factory, camp_id, "retreat", "op-sweep")
     with factory() as db:
         row = db.execute(
             select(Outbox).where(Outbox.event_type == "adventure.closing")
@@ -671,7 +733,7 @@ def test_closing_sweep_converges_pending_work(setup):
         assert sweep["executed"] == [str(row.id)]
         assert sweep["failed"] == []
     with factory() as db:
-        assert db.get(Adventure, adv.id).closing_status == "succeeded"
+        assert db.get(Adventure, adv_id).closing_status == "succeeded"
         assert db.get(Outbox, row.id).status == "published"
         # Second sweep finds nothing to do.
         assert run_adventure_closing_sweep(db)["executed"] == []
@@ -685,15 +747,15 @@ def test_terminal_closing_job_retires_without_starving_newer_work(setup, monkeyp
     factory, camp_id, _owner = setup
     with factory() as db:
         start_adventure(db, camp_id, "Poison arc")
-    adv_a, _ = _complete(factory, camp_id, "death", "op-poison")
+    adv_a_id, _, _ = _dm_complete(factory, camp_id, "death", "op-poison")
     with factory() as db:
         start_adventure(db, camp_id, "Fresh arc")
-    adv_b, _ = _complete(factory, camp_id, "victory", "op-fresh")
+    adv_b_id, _, _ = _dm_complete(factory, camp_id, "victory", "op-fresh")
 
     real_followups = svc._run_closing_followups
 
     def _flaky(db, adventure):
-        if str(adventure.id) == str(adv_a.id):
+        if str(adventure.id) == str(adv_a_id):
             raise RuntimeError("recap store offline")
         return real_followups(db, adventure)
 
@@ -722,21 +784,18 @@ def test_terminal_closing_job_retires_without_starving_newer_work(setup, monkeyp
         second = run_adventure_closing_sweep(db, limit=10)
         assert len(second["executed"]) == 1
         assert second["failed"] == []
-        assert db.get(Adventure, adv_b.id).closing_status == "succeeded"
+        assert db.get(Adventure, adv_b_id).closing_status == "succeeded"
     with factory() as db:
         third = run_adventure_closing_sweep(db, limit=10)
         assert third["executed"] == [] and third["failed"] == []
         # Narrative completion stands; only best-effort closing failed.
-        poisoned = db.get(Adventure, adv_a.id)
+        poisoned = db.get(Adventure, adv_a_id)
         assert poisoned.status == "completed" and poisoned.outcome == "death"
         assert poisoned.closing_status == "failed"
 
 
 def test_effect_argument_redaction_unit():
-    from app.adventures.service import (
-        redact_private_contract_snapshot,
-        redact_private_effect_arguments,
-    )
+    from app.adventures.service import redact_private_effect_arguments
 
     staged = [
         {"id": "e1", "effect_type": "complete_adventure",
@@ -844,7 +903,7 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
     assert nested_secret not in blob
     assert "castellan" not in blob
 
+    # The owner is a player too: same redaction (#470).
     actor["id"] = TEST_USER_ID
     owner_body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
-    assert owner_body["attempts"][0]["staged_effects"][0]["arguments"]["reason"] == nested_secret
-    assert top_secret in json.dumps(owner_body)
+    assert owner_body["attempts"] == body["attempts"]

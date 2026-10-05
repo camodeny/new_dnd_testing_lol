@@ -15,13 +15,13 @@ Code-owned authority (never delegated to models):
   ``encounter.moved`` domain event) and idempotent (movement ledger keyed on
   ``(encounter_id, operation_id)`` — duplicate commands replay the recorded
   outcome instead of moving/spending twice).
-- DM-authored terrain/placement changes arrive as validated structured
-  arguments (``ensure_map`` / ``update_terrain`` direct, plus
-  ``update_terrain_inline`` for the DM turn-commit transaction owned by the
-  dm lane). Every change bumps the map revision and emits
-  ``encounter.map_updated``.
-- Projections strip DM-only terrain labels and hide hidden-entity NPC
-  tokens from non-owners (fog/hidden hook; token hiding follows the source
+- Only the AI DM authors geometry: the map is created with the encounter
+  (``init_map_inline``) and terrain/placements change through
+  ``update_terrain_inline`` / ``update_placements_inline``, all inside the
+  DM turn-commit transaction owned by the dm lane. Every change bumps the
+  map revision.
+- Projections strip DM-only terrain and labels and hide hidden-entity NPC
+  tokens from every player (fog/hidden hook; token hiding follows the source
   entity visibility signal, never #230 stat_visibility). Reconnects rebuild
   positions and terrain from these rows via ``map_projection`` / the snapshot.
 
@@ -48,20 +48,18 @@ from app.combat.geometry import (
     reachable_cells,
     squares_to_feet,
     validate_cell,
-    validate_diagonal_policy,
     validate_dimensions,
     validate_rect,
     zone_cell_effect,
 )
 from app.combat.service import (
     EncounterError,
-    is_campaign_owner,
     list_participants,
     lock_encounter,
     lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
-from app.realtime.service import publish_encounter_map, publish_encounter_moved
+from app.realtime.service import publish_encounter_moved
 from app.visibility.access import may_user_receive
 from models.campaigns import Campaign
 from models.combat import (
@@ -77,7 +75,6 @@ from models.combat import (
 
 logger = logging.getLogger(__name__)
 
-MAP_UPDATED_EVENT = "encounter.map_updated"
 MOVED_EVENT = "encounter.moved"
 
 MAX_ZONES_PER_MAP = 200
@@ -192,9 +189,7 @@ def _hidden_token_ids(
             )
         except Exception:
             continue
-        # Only an explicit grant reveals a token. The owner's DM-authority
-        # pass is not a reveal: owner callers opt in via ``is_owner``, and the
-        # player-lane table view must not inherit it.
+        # Only an explicit grant reveals a token.
         if verdict.get("allowed") and verdict.get("reason") == "explicit_grant":
             revealed.add(participant_id)
     return hidden - revealed
@@ -367,38 +362,6 @@ def _validate_placements_args(
     return resolved
 
 
-def _revalidate_preserved_placements(
-    db: Session,
-    encounter: Encounter,
-    encounter_map: EncounterMap,
-    zones: list[EncounterTerrainZone],
-    preserved: dict[str, tuple[int, int]],
-) -> dict[str, tuple[int, int]]:
-    """Revalidate carried-over positions against replacement geometry/terrain.
-
-    A geometry redefine without explicit placements keeps every current
-    token where it stands. Cells pushed out of bounds reject the redefine
-    (a token cannot strand off-grid); cells newly covered by blocking
-    terrain are kept as stranded (movement *out* stays legal, same as
-    :func:`update_terrain`). Rows for participants no longer in the
-    encounter are dropped.
-    """
-    participants = {str(p.id) for p in list_participants(db, encounter.id)}
-    width, height = int(encounter_map.width), int(encounter_map.height)
-    kept: dict[str, tuple[int, int]] = {}
-    for participant_id, (col, row) in preserved.items():
-        if participant_id not in participants:
-            continue
-        if not (0 <= col < width and 0 <= row < height):
-            raise MapError(
-                f"preserved placement for {participant_id} at ({col}, {row}) "
-                f"is outside the replacement {width}x{height} geometry",
-                reason="out_of_bounds",
-            )
-        kept[participant_id] = (col, row)
-    return kept
-
-
 def _default_placements(
     db: Session,
     encounter: Encounter,
@@ -441,284 +404,71 @@ def _default_placements(
     return keep
 
 
-# ── Map init + DM terrain changes ────────────────────────────────────────────
+# ── Map init + DM terrain changes (DM structured-effect path) ────────────────────────────────────────────
 
 
 def _bump_map_revision(encounter_map: EncounterMap) -> None:
     encounter_map.revision = int(encounter_map.revision or 1) + 1
 
 
-def ensure_map(
-    db: Session,
-    encounter_id: uuid.UUID,
-    *,
-    actor_id: uuid.UUID,
-    width: int,
-    height: int,
-    diagonal_policy: str = "no_corner_cut",
-    background_art_ref: str | None = None,
-    terrain: list[dict] | None = None,
-    placements: list[dict] | None = None,
-    expected_revision: int,
-    operation_id: str,
-    commit: bool = True,
-) -> tuple[EncounterMap, Any]:
-    """Create (or deterministically re-assert) the encounter's authoritative map.
+def init_map_inline(db: Session, encounter: Encounter, spec: Mapping) -> EncounterMap:
+    """DM structured-effect path: create the encounter's map inside the start txn.
 
-    Owner-only: map geometry is DM-authored state. Re-running with the same
-    ``operation_id`` replays the recorded map without duplicating zones or
-    placements. Geometry replacement re-validates every placement against the
-    new bounds/terrain so a shrink can never strand a token out of bounds.
+    Called from ``start_encounter_inline`` when the DM's ``start_encounter``
+    effect carries a ``map``. No commit here — the outer turn commit owns the
+    transaction. Every participant gets a deterministic default placement;
+    the DM repositions tokens with ``update_map_placement``.
     """
-    operation_id = (operation_id or "").strip()
-    if not operation_id or len(operation_id) > 128:
-        raise MapError("operation_id is required (1-128 characters)")
-    encounter = lock_encounter(db, encounter_id, _no_map)
-    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
-    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
-        raise MapAuthorizationError("Only the campaign owner may define encounter map geometry")
-    if encounter.status not in ("pending_initiative", "active"):
-        raise MapError(f"maps require a pending or active encounter (status {encounter.status})")
+    if not isinstance(spec, Mapping):
+        raise MapError("map must be an object")
+    if get_map(db, encounter.id) is not None:
+        return get_map(db, encounter.id)
     try:
-        width, height = validate_dimensions(width, height)
+        width, height = validate_dimensions(spec.get("width"), spec.get("height"))
     except GeometryError as exc:
         raise MapError(str(exc), reason="out_of_bounds") from exc
-    try:
-        diagonal_policy = validate_diagonal_policy(diagonal_policy or "no_corner_cut")
-    except GeometryError as exc:
-        raise MapError(str(exc)) from exc
-    if background_art_ref is not None:
-        background_art_ref = str(background_art_ref).strip() or None
-        if background_art_ref is not None and len(background_art_ref) > 512:
-            raise MapError("background_art_ref must be at most 512 characters")
-    terrain = terrain if terrain is not None else []
+    terrain = spec.get("terrain") or []
     if not isinstance(terrain, list) or len(terrain) > MAX_ZONES_PER_MAP:
         raise MapError(f"terrain must be a list of at most {MAX_ZONES_PER_MAP} zones")
     validated_zones = [_validate_zone_args(width, height, raw, index=i) for i, raw in enumerate(terrain)]
-
-    existing = get_map(db, encounter.id)
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(locked: Campaign) -> None:
-        nonlocal existing
-        redefining = existing is not None
-        # Snapshot current positions BEFORE the delete below: re-defining
-        # geometry/art/terrain without explicit placements must preserve
-        # (and revalidate) authoritative positions, never silently reseed.
-        preserved: dict[str, tuple[int, int]] = {}
-        if redefining and placements is None:
-            for row in list_placements(db, encounter.id):
-                preserved[str(row.participant_id)] = (int(row.col), int(row.row))
-        encounter_map = existing
-        if encounter_map is None:
-            encounter_map = EncounterMap(
-                id=uuid.uuid4(),
-                encounter_id=encounter.id,
-                campaign_id=encounter.campaign_id,
-                width=width,
-                height=height,
-                diagonal_policy=diagonal_policy,
-                background_art_ref=background_art_ref,
-                revision=1,
-            )
-            db.add(encounter_map)
-            db.flush()
-        else:
-            encounter_map.width = width
-            encounter_map.height = height
-            encounter_map.diagonal_policy = diagonal_policy
-            encounter_map.background_art_ref = background_art_ref
-            db.query(EncounterTerrainZone).filter(
-                EncounterTerrainZone.map_id == encounter_map.id
-            ).delete(synchronize_session=False)
-            db.query(EncounterPlacement).filter(
-                EncounterPlacement.encounter_id == encounter.id
-            ).delete(synchronize_session=False)
-            db.flush()
-            _bump_map_revision(encounter_map)
-        zone_rows: list[EncounterTerrainZone] = []
-        for index, fields in enumerate(validated_zones):
-            zone_rows.append(EncounterTerrainZone(
-                id=uuid.uuid4(),
-                map_id=encounter_map.id,
-                encounter_id=encounter.id,
-                campaign_id=encounter.campaign_id,
-                zone_order=index,
-                **fields,
-            ))
-        db.add_all(zone_rows)
-        db.flush()
-        if placements is None and redefining:
-            explicit = _revalidate_preserved_placements(
-                db, encounter, encounter_map, zone_rows, preserved
-            )
-        else:
-            explicit = _validate_placements_args(db, encounter, encounter_map, zone_rows, placements)
-        full = _default_placements(db, encounter, encounter_map, zone_rows, keep=explicit)
-        for participant_id, (col, row) in full.items():
-            db.add(EncounterPlacement(
-                encounter_id=encounter.id,
-                campaign_id=encounter.campaign_id,
-                participant_id=uuid.UUID(participant_id),
-                col=col, row=row,
-            ))
-        db.flush()
-        holder["map"] = encounter_map
-        holder["zone_count"] = len(zone_rows)
-        holder["placement_count"] = len(full)
-
-    try:
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            campaign.id,
-            expected_revision=int(expected_revision),
-            event_type=MAP_UPDATED_EVENT,
-            operation_id=operation_id,
-            actor_id=actor_id,
-            mutate=_mutate,
-            commit=False,
-            payload_builder=lambda: {
-                "encounter_id": str(encounter.id),
-                "thread_id": encounter.thread_id,
-                "map_revision": int(holder["map"].revision or 1),
-                "width": width, "height": height,
-                "diagonal_policy": diagonal_policy,
-                "zone_count": holder["zone_count"],
-                "placement_count": holder["placement_count"],
-                "init": existing is None,
-            },
-        )
-    except IntegrityError as exc:
-        db.rollback()
-        raise MapError(f"map init conflict: {exc}") from exc
-
-    encounter_map = holder["map"]
+    encounter_map = EncounterMap(
+        id=uuid.uuid4(),
+        encounter_id=encounter.id,
+        campaign_id=encounter.campaign_id,
+        width=width,
+        height=height,
+        diagonal_policy="no_corner_cut",
+        revision=1,
+    )
+    db.add(encounter_map)
     db.flush()
-    if commit:
-        db.commit()
-        db.refresh(encounter_map)
-        db.refresh(event)
+    zone_rows = [
+        EncounterTerrainZone(
+            id=uuid.uuid4(),
+            map_id=encounter_map.id,
+            encounter_id=encounter.id,
+            campaign_id=encounter.campaign_id,
+            zone_order=index,
+            **fields,
+        )
+        for index, fields in enumerate(validated_zones)
+    ]
+    db.add_all(zone_rows)
+    db.flush()
+    for participant_id, (col, row) in _default_placements(db, encounter, encounter_map, zone_rows).items():
+        db.add(EncounterPlacement(
+            encounter_id=encounter.id,
+            campaign_id=encounter.campaign_id,
+            participant_id=uuid.UUID(participant_id),
+            col=col, row=row,
+        ))
+    db.flush()
     structured_log(
         logger, logging.INFO, "encounter_map_initialized",
         encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-        width=width, height=height, diagonal_policy=diagonal_policy,
-        map_revision=int(encounter_map.revision or 1),
-        zone_count=holder["zone_count"], operation_id=operation_id,
+        width=width, height=height, zone_count=len(zone_rows),
     )
-    if commit:
-        publish_encounter_map(db, encounter)
-    return encounter_map, event
-
-
-def update_terrain(
-    db: Session,
-    encounter_id: uuid.UUID,
-    *,
-    actor_id: uuid.UUID,
-    zones: list[dict] | None = None,
-    clear_zone_ids: list[str] | None = None,
-    expected_revision: int,
-    operation_id: str,
-    commit: bool = True,
-) -> tuple[EncounterMap, Any]:
-    """Apply a DM-authored terrain change through validated structured arguments.
-
-    ``zones`` appends new validated zones (later rows win on overlap);
-    ``clear_zone_ids`` removes named zones (an ``open``-kind audit trail stays
-    in the event payload). Placements standing on newly blocked cells are
-    left in place but flagged in the response — movement *out* is still
-    legal (start cells never deny exit), movement *in* is denied.
-    """
-    operation_id = (operation_id or "").strip()
-    if not operation_id or len(operation_id) > 128:
-        raise MapError("operation_id is required (1-128 characters)")
-    encounter = lock_encounter(db, encounter_id, _no_map)
-    campaign = lock_playable_campaign(db, encounter.campaign_id, _no_map)
-    if not is_campaign_owner(db, encounter.campaign_id, actor_id):
-        raise MapAuthorizationError("Only the campaign owner may change encounter terrain")
-    encounter_map = get_map(db, encounter.id)
-    if encounter_map is None:
-        raise MapError("encounter has no map yet; initialize geometry first", reason="no_map")
-    zones = zones or []
-    if not isinstance(zones, list) or len(zones) > MAX_ZONES_PER_MAP:
-        raise MapError(f"zones must be a list of at most {MAX_ZONES_PER_MAP} entries")
-    width, height = int(encounter_map.width), int(encounter_map.height)
-    validated = [_validate_zone_args(width, height, raw, index=i) for i, raw in enumerate(zones)]
-    clear_ids: list[uuid.UUID] = []
-    for raw in (clear_zone_ids or []):
-        try:
-            clear_ids.append(uuid.UUID(str(raw)))
-        except ValueError as exc:
-            raise MapError(f"clear_zone_ids must be UUIDs (got {raw!r})") from exc
-
-    holder: dict[str, Any] = {}
-
-    def _mutate(locked: Campaign) -> None:
-        if clear_ids:
-            db.query(EncounterTerrainZone).filter(
-                EncounterTerrainZone.map_id == encounter_map.id,
-                EncounterTerrainZone.id.in_(clear_ids),
-            ).delete(synchronize_session=False)
-        base_order = _next_zone_order(db, encounter_map.id)
-        for index, fields in enumerate(validated):
-            db.add(EncounterTerrainZone(
-                id=uuid.uuid4(),
-                map_id=encounter_map.id,
-                encounter_id=encounter.id,
-                campaign_id=encounter.campaign_id,
-                zone_order=base_order + index,
-                **fields,
-            ))
-        db.flush()
-        _bump_map_revision(encounter_map)
-        db.flush()
-        holder["zone_count"] = len(list_zones(db, encounter_map.id))
-        holder["stranded"] = _stranded_placements(db, encounter, encounter_map)
-
-    def _terrain_payload() -> dict:
-        # The domain event is thread-scoped/shared history: stranded flags
-        # carry exact cells, so hidden-entity tokens are filtered here too
-        # (the owner reads full state via the ledger + projection).
-        hidden = _hidden_token_ids(db, encounter.id)
-        return {
-            "encounter_id": str(encounter.id),
-            "thread_id": encounter.thread_id,
-            "map_revision": int(encounter_map.revision or 1),
-            "zones_added": len(validated),
-            "zones_cleared": len(clear_ids),
-            "zone_count": holder["zone_count"],
-            "stranded_placements": [
-                s for s in holder["stranded"] if s["participant_id"] not in hidden
-            ],
-        }
-
-    campaign_after, event = commit_campaign_mutation(
-        db,
-        campaign.id,
-        expected_revision=int(expected_revision),
-        event_type=MAP_UPDATED_EVENT,
-        operation_id=operation_id,
-        actor_id=actor_id,
-        mutate=_mutate,
-        commit=False,
-        payload_builder=_terrain_payload,
-    )
-    db.flush()
-    if commit:
-        db.commit()
-        db.refresh(encounter_map)
-        db.refresh(event)
-    structured_log(
-        logger, logging.INFO, "encounter_terrain_changed",
-        encounter_id=str(encounter.id), campaign_id=str(encounter.campaign_id),
-        map_revision=int(encounter_map.revision or 1),
-        zones_added=len(validated), zones_cleared=len(clear_ids),
-        operation_id=operation_id,
-    )
-    if commit:
-        publish_encounter_map(db, encounter)
-    return encounter_map, event
+    return encounter_map
 
 
 def update_terrain_inline(
@@ -792,7 +542,7 @@ def update_placements_inline(
     the dm lane; this module never imports dm code). Explicit staged cells win;
     unmentioned participants keep their current cells; participants with no
     cell yet fall back to the deterministic row-major default (same legality
-    as :func:`ensure_map`: known participants, in-bounds, unblocked, unique).
+    as :func:`init_map_inline`: known participants, in-bounds, unblocked, unique).
     """
     if not isinstance(args, Mapping):
         raise MapError("placement effect arguments must be an object")
@@ -866,17 +616,15 @@ def reachable_for(
     *,
     movement_mode: str = WALK_MODE,
     viewer_id: uuid.UUID | None = None,
-    is_owner: bool = False,
 ) -> dict:
     """Reachable cells + cheapest costs for a participant's remaining budget.
 
     Read-only: safe to call before any move. Output carries coordinates and
     square costs only — never DM-only terrain labels — so it is safe to serve
     to any encounter reader, with one boundary: a hidden-entity NPC/monster
-    token's position (``from`` + reachable cells) is visible to the owner
-    only. Non-owners querying another hidden token get 403 via
-    MapAuthorizationError, and hidden tokens do not carve non-owner
-    reachable shapes; every other reader keeps working.
+    token's position (``from`` + reachable cells) is never served to a
+    player. Querying a hidden token gets 403 via MapAuthorizationError, and
+    hidden tokens do not carve reachable shapes.
     """
     mode = str(movement_mode or WALK_MODE).strip().lower()
     if mode not in MOVEMENT_MODES:
@@ -892,10 +640,8 @@ def reachable_for(
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise MapError("participant not found in this encounter", reason="no_placement")
-    if not is_owner and str(participant.id) in _hidden_token_ids(db, encounter.id):
-        raise MapAuthorizationError(
-            "Only the campaign owner may read a hidden token's reachable space"
-        )
+    if str(participant.id) in _hidden_token_ids(db, encounter.id):
+        raise MapAuthorizationError("A hidden token's reachable space is not readable")
     placement = get_placement(db, encounter.id, participant.id)
     if placement is None:
         raise MapError("participant has no token placement", reason="no_placement")
@@ -908,12 +654,12 @@ def reachable_for(
     started = time.perf_counter()
     max_squares = feet_to_squares(int(state.movement_remaining))
     zones = _zone_dicts(list_zones(db, encounter_map.id))
-    # Visibility-aware occupancy: a non-owner's reachable shape must not be
+    # Visibility-aware occupancy: a player's reachable shape must not be
     # carved by tokens they cannot see (movement commits still enforce the
     # full authoritative collision below).
     occupied = _occupied_cells(
         db, encounter.id, exclude_participant_id=participant.id,
-        include_hidden=is_owner,
+        include_hidden=False,
     )
     # Occupied cells deny entry; fold them as single-cell blocked overlays on
     # top of DM terrain (later wins, same as DM re-carves).
@@ -1062,14 +808,13 @@ def move_participant(
     max_squares = feet_to_squares(int(state.movement_remaining))
     zones = _zone_dicts(list_zones(db, encounter_map.id))
     # Commit geometry uses the same visibility-aware occupancy as the
-    # reachable preview: hidden-entity tokens do not block non-owner actors.
+    # reachable preview: hidden-entity tokens do not block player moves.
     # Preview/commit consistency (same inputs, same occupancy) removes the
     # probing oracle where a reachable cell fails only because a hidden
-    # token stands there. Owners keep the full authoritative collision set.
-    actor_is_owner = is_campaign_owner(db, encounter.campaign_id, actor_id)
+    # token stands there.
     occupied = _occupied_cells(
         db, encounter.id, exclude_participant_id=participant.id,
-        include_hidden=actor_is_owner,
+        include_hidden=False,
     )
     if goal in occupied:
         _log_rejection(encounter, participant, operation_id, "occupied", started, from_cell,
@@ -1155,8 +900,8 @@ def move_participant(
 
     def _moved_payload() -> dict:
         # A hidden token's coordinates must not ride the shared/thread-scoped
-        # event: non-owners get a position-free invalidation (the movement
-        # ledger row keeps the authoritative cells for the owner/DM path).
+        # event: players get a position-free invalidation (the movement
+        # ledger row keeps the authoritative cells for the DM runtime).
         if str(participant.id) in _hidden_token_ids(db, encounter.id):
             return {
                 "encounter_id": str(encounter.id),
@@ -1295,38 +1040,32 @@ def map_projection(
     encounter: Encounter,
     *,
     viewer_id: uuid.UUID | None = None,
-    is_owner: bool = False,
 ) -> dict | None:
-    """Full map/terrain/placement projection; None when no map exists.
+    """Player-facing map/terrain/placement projection; None when no map exists.
 
-    Viewer-aware privacy: DM-only terrain zones are omitted for non-owners
-    entirely — kind, rect, and label are all absent, not merely unlabeled
+    Viewer-aware privacy: DM-only terrain zones are omitted for every
+    player, the campaign owner included, — kind, rect, and label are all absent, not merely unlabeled
     (issue #250: hidden map geometry must never reach unauthorized
     payloads; movement legality stays server-side in commit geometry, so
     clients never need hidden rects). Tokens of hidden-entity NPC/monster
-    participants are hidden from non-owners entirely (fog/hidden hook),
-    except when the viewer holds an explicit visibility grant for that
+    participants are hidden entirely (fog/hidden hook), except when the viewer holds an explicit visibility grant for that
     entity (issue #250 player-specific map reveal). Token hiding follows
     the source entity visibility signal, never
-    ``stat_visibility`` (#230 stats-privacy stays separate). The AI is the
-    only DM: ownership here means the campaign owner on the runtime path.
+    ``stat_visibility`` (#230 stats-privacy stays separate).
     """
     encounter_map = get_map(db, encounter.id)
     if encounter_map is None:
         return None
     zones = [
-        z.to_dict(include_dm_label=is_owner)
+        z.to_dict()
         for z in list_zones(db, encounter_map.id)
-        if is_owner or str(z.visibility or "") != "dm_only"
+        if str(z.visibility or "") != "dm_only"
     ]
     participants = {str(p.id): p for p in list_participants(db, encounter.id)}
-    if is_owner:
-        hidden_ids: set[str] = set()
-    else:
-        campaign = db.get(Campaign, encounter.campaign_id)
-        hidden_ids = _hidden_token_ids(
-            db, encounter.id, viewer_user_id=viewer_id, campaign=campaign
-        )
+    campaign = db.get(Campaign, encounter.campaign_id)
+    hidden_ids = _hidden_token_ids(
+        db, encounter.id, viewer_user_id=viewer_id, campaign=campaign
+    )
     placements = []
     for placement in list_placements(db, encounter.id):
         participant = participants.get(str(placement.participant_id))
@@ -1338,11 +1077,12 @@ def map_projection(
         item["display_name"] = participant.display_name
         item["kind"] = participant.kind
         placements.append(item)
-    stranded = _stranded_placements(db, encounter, encounter_map)
-    if not is_owner:
-        # A stranded flag carries the token's exact cell: hide it for
-        # hidden-entity tokens exactly like placements above.
-        stranded = [s for s in stranded if s["participant_id"] not in hidden_ids]
+    # A stranded flag carries the token's exact cell: hide it for
+    # hidden-entity tokens exactly like placements above.
+    stranded = [
+        s for s in _stranded_placements(db, encounter, encounter_map)
+        if s["participant_id"] not in hidden_ids
+    ]
     return {
         **encounter_map.to_dict(),
         "zones": zones,

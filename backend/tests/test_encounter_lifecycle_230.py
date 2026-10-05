@@ -26,14 +26,13 @@ from app.combat.service import (  # noqa: E402
     can_view_encounter,
     compute_turn_order,
     encounter_view,
+    find_created_event,
     fulfill_human_initiative,
     get_active_encounter,
     get_active_participant,
     get_snapshot_encounter,
     get_turn_order,
     list_participants,
-    roll_npc_initiative,
-    start_encounter,
 )
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.submissions.service import accept_submission  # noqa: E402
@@ -44,6 +43,7 @@ from models.combat import Encounter, EncounterParticipant  # noqa: E402
 from models.dm import PlayerRollFulfillment, PlayerRollRequest  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.world import WorldEntity  # noqa: E402
+from tests.support.combat import dm_start_encounter  # noqa: E402
 
 
 def _engine(url="sqlite://"):
@@ -95,7 +95,7 @@ def _seed_world(db, *, second_pc=True, npc=True):
         goblin_id = goblin.id
     db.commit()
     thread = get_or_create_campaign_thread(db, campaign_id, created_by=owner)
-    submission = accept_submission(
+    accept_submission(
         db, campaign_id=campaign_id, user_id=owner, character_id=owner_pc,
         raw_content="Goblins burst from the treeline!",
         segments=[{"type": "ic", "text": "Goblins burst from the treeline!"}],
@@ -119,12 +119,14 @@ def _fixture():
     return fac, ctx
 
 
-def _start(db, ctx, participants, *, operation_id="op-enc-1", revision=0, scene=None, attempt_id=None):
-    return start_encounter(
-        db, ctx["campaign_id"], operation_id=operation_id, expected_revision=revision,
-        actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-        source_attempt_id=attempt_id or ctx["attempt_id"],
-        scene=scene or {"location_name": "Treeline"}, participants=participants,
+def _start(db, ctx, participants, *, scene=None, npc_d20=None, effect_id=None,
+           turn_id=None, attempt_id=None):
+    """Start via the AI DM's staged effect. Returns the Encounter (committed)."""
+    return dm_start_encounter(
+        db, ctx["campaign_id"], turn_id or ctx["turn_id"],
+        attempt_id or ctx["attempt_id"], participants,
+        scene=scene or {"location_name": "Treeline"},
+        npc_d20=npc_d20, effect_id=effect_id,
     )
 
 
@@ -149,19 +151,20 @@ def _fulfill(db, encounter_id, participant, actor, raw):
 # ── selection: solo + absent-PC exclusion ───────────────────────────────────
 
 
-def test_solo_start_selects_only_listed_pc_and_emits_start_event():
+def test_solo_start_selects_only_listed_pc_and_defers_start_event():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, event = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+        encounter = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
         assert encounter.status == "pending_initiative"
         assert encounter.round == 1
         assert encounter.revision == 1
-        assert encounter.start_source == "api"
+        assert encounter.start_source == "dm_effect"
         assert encounter.participant_count == 1
         assert encounter.active_participant_id is None
-        assert event.event_type == ENCOUNTER_STARTED_EVENT
-        assert event.sequence == 1
-        assert db.get(Campaign, ctx["campaign_id"]).revision == 1
+        # The helper applies the staged effect directly; the encounter.started
+        # lifecycle event and campaign revision advance at commit_turn.
+        assert find_created_event(db, encounter) is None
+        assert db.get(Campaign, ctx["campaign_id"]).revision == 0
         parts = list_participants(db, encounter.id)
         assert len(parts) == 1
         assert parts[0].kind == "pc"
@@ -190,7 +193,7 @@ def test_solo_start_selects_only_listed_pc_and_emits_start_event():
 def test_multiplayer_start_includes_only_selected_pcs():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(
+        encounter = _start(
             db, ctx,
             [{"character_id": str(ctx["owner_pc"])}, {"character_id": str(ctx["player_pc"])}],
         )
@@ -216,8 +219,7 @@ def test_second_start_while_pending_fails_closed():
     with fac() as db:
         _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
         with pytest.raises(EncounterAlreadyActiveError):
-            _start(db, ctx, [{"character_id": str(ctx["player_pc"])}],
-                   operation_id="op-enc-2", revision=1)
+            _start(db, ctx, [{"character_id": str(ctx["player_pc"])}])
 
 
 # ── human + NPC initiative, ordering, readiness ─────────────────────────────
@@ -226,11 +228,12 @@ def test_second_start_while_pending_fails_closed():
 def test_human_and_npc_initiative_complete_to_active_with_order():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        # NPC initiative is rolled by code at start (npc_d20=15 pins the die).
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},   # +4
             {"character_id": str(ctx["player_pc"])},  # +2
             {"npc_entity_id": str(ctx["goblin_id"])},  # +2
-        ])
+        ], npc_d20=15)
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
         player_p = _pc_participant(db, encounter.id, ctx["player_pc"])
         goblin_p = db.execute(
@@ -240,11 +243,8 @@ def test_human_and_npc_initiative_complete_to_active_with_order():
             )
         ).scalars().one()
         assert goblin_p.roll_request_id is None  # runtime path, no #204 request
-
-        # NPC rolls first: encounter stays pending, humans never auto-filled.
-        _, encounter, ready_event = roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=15)
+        # NPC is already fulfilled at start; encounter stays pending on humans.
         assert encounter.status == "pending_initiative"
-        assert ready_event is None
         assert db.get(EncounterParticipant, goblin_p.id).initiative_total == 17
         assert db.get(EncounterParticipant, goblin_p.id).roll_source == "dm_runtime"
 
@@ -270,41 +270,74 @@ def test_human_and_npc_initiative_complete_to_active_with_order():
             str(owner_p.id): "human_app", str(player_p.id): "human_app", str(goblin_p.id): "dm_runtime",
         }
         assert "total_desc" in (encounter.tie_resolution or "")
-        # Domain events exist in campaign order. Issue #231 opens turn 1
-        # atomically with readiness, appending encounter.turn_started.
+        # Domain events exist in campaign order. The encounter.started event
+        # is staged at commit_turn (not by the direct staged-effect helper),
+        # so only readiness + first turn are present here. Issue #231 opens
+        # turn 1 atomically with readiness, appending encounter.turn_started.
         from app.combat.service import TURN_STARTED_EVENT  # noqa: E402
 
         types = [e.event_type for e in list_campaign_events(db, ctx["campaign_id"])]
-        assert types == [ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT, TURN_STARTED_EVENT]
+        assert types == [ENCOUNTER_READY_EVENT, TURN_STARTED_EVENT]
 
 
-def test_runtime_roll_refuses_human_pc_and_human_path_refuses_npc():
+def test_dm_start_fulfills_npcs_immediately_and_last_pc_roll_readies():
+    """NPCs are fulfilled with roll_source dm_runtime right after a DM start;
+    the encounter becomes active when the last PC rolls."""
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
-        ])
+        ], npc_d20=10)
+        assert encounter.status == "pending_initiative"
+        assert encounter.active_participant_id is None
+        parts = {p.kind: p for p in list_participants(db, encounter.id)}
+        assert parts["npc"].initiative_status == "fulfilled"
+        assert parts["npc"].roll_source == "dm_runtime"
+        assert parts["npc"].initiative_total == 12  # 10 + 2
+        assert parts["npc"].roll_request_id is None
+        assert parts["pc"].initiative_status == "pending"
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        _, _, _, encounter, ready_event = _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+        assert ready_event is not None
+        assert db.get(Encounter, encounter.id).status == "active"
+        assert get_active_participant(db, encounter.id).id == owner_p.id
+
+
+def test_npcs_fulfilled_at_dm_start_and_human_path_refuses_npc():
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter = _start(db, ctx, [
+            {"character_id": str(ctx["owner_pc"])},
+            {"npc_entity_id": str(ctx["goblin_id"])},
+        ], npc_d20=15)
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
         goblin_p = db.execute(
             select(EncounterParticipant).where(EncounterParticipant.encounter_id == encounter.id,
                                                EncounterParticipant.kind == "npc")
         ).scalars().one()
-        with pytest.raises(EncounterError, match="humans roll their own"):
-            roll_npc_initiative(db, encounter.id, owner_p.id, raw_d20=12)
+        assert goblin_p.initiative_status == "fulfilled"
+        assert goblin_p.roll_source == "dm_runtime"
         with pytest.raises(EncounterError, match="runtime roll path"):
             fulfill_human_initiative(
                 db, encounter.id, goblin_p.id, actor_id=ctx["owner"],
                 payload={"source": "app", "raw_rolls": [10], "modifier": 2, "total": 12},
             )
+        assert owner_p.initiative_status == "pending"
+
+    fac2, ctx2 = _fixture()
+    with fac2() as db:
+        # Out-of-range NPC dice are rejected by the same bounded parser.
         with pytest.raises(EncounterError, match="between 1 and 20"):
-            roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=99)
+            _start(db, ctx2, [
+                {"npc_entity_id": str(ctx2["goblin_id"])},
+            ], npc_d20=99)
 
 
 def test_tie_handling_is_deterministic_2024():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},   # dex +3, mod +4
             {"character_id": str(ctx["player_pc"])},  # dex +2, mod +2
         ])
@@ -320,7 +353,7 @@ def test_tie_handling_is_deterministic_2024():
     fac2, ctx2 = _fixture()
     with fac2() as db:
         # Exact tie on total AND dex needs equal sheets; force via compute_turn_order.
-        encounter, _ = _start(db, ctx2, [{"character_id": str(ctx2["owner_pc"])}])
+        encounter = _start(db, ctx2, [{"character_id": str(ctx2["owner_pc"])}])
         parts = list_participants(db, encounter.id)
         a, b = parts[0], EncounterParticipant(
             encounter_id=encounter.id, campaign_id=ctx2["campaign_id"],
@@ -341,15 +374,16 @@ def test_tie_handling_is_deterministic_2024():
 def test_incomplete_initiative_stays_pending_without_guessing():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
-        ])
+        ], npc_d20=15)
         goblin_p = db.execute(
             select(EncounterParticipant).where(EncounterParticipant.encounter_id == encounter.id,
                                                EncounterParticipant.kind == "npc")
         ).scalars().one()
-        roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=15)
+        # NPC was fulfilled by code at start; the human roll is still pending.
+        assert goblin_p.initiative_total == 17
         encounter = db.get(Encounter, encounter.id)
         assert encounter.status == "pending_initiative"
         assert encounter.active_participant_id is None
@@ -368,12 +402,10 @@ def test_incomplete_initiative_stays_pending_without_guessing():
         ).scalars().first() is None
 
 
-def test_ready_operation_key_bounded_for_max_length_start_key():
+def test_ready_operation_key_bounded():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(
-            db, ctx, [{"character_id": str(ctx["owner_pc"])}], operation_id="o" * 128,
-        )
+        encounter = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
         _, _, _, encounter, event = _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
         assert encounter.status == "active"
@@ -400,80 +432,50 @@ def test_npc_override_preserves_canonical_dex_tiebreak():
         db.commit()
         # NPC total modifier overridden to +5, but canonical Dex +3 survives
         # for tiebreaks: 9+5=14 ties the PC's 12+2=14 (Dex +2) → NPC first.
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["player_pc"])},
             {"npc_entity_id": str(brute.id), "initiative_modifier": 5},
-        ])
+        ], npc_d20=9)
         npc_p = next(p for p in list_participants(db, encounter.id) if p.kind == "monster")
         assert npc_p.initiative_modifier == 5
         assert npc_p.dex_modifier == 3
+        assert npc_p.initiative_status == "fulfilled"
         player_p = _pc_participant(db, encounter.id, ctx["player_pc"])
-        roll_npc_initiative(db, encounter.id, npc_p.id, raw_d20=9)
         _, _, _, encounter, _ = _fulfill(db, encounter.id, player_p, ctx["player"], 12)
         order = get_turn_order(db, encounter.id)
         assert [p.id for p in order] == [npc_p.id, player_p.id]
 
 
-# ── idempotency / duplicates ────────────────────────────────────────────────
+# ── fulfillment authorization / single-application ──────────────────────────
 
-def test_duplicate_start_and_duplicate_fulfill_are_idempotent():
+def test_fulfill_authorization_and_single_application():
     fac, ctx = _fixture()
     with fac() as db:
-        first, first_event = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},
             {"character_id": str(ctx["player_pc"])},
         ])
-        replay, replay_event = _start(db, ctx, [
-            {"character_id": str(ctx["owner_pc"])},
-            {"character_id": str(ctx["player_pc"])},
-        ])
-        assert replay.id == first.id
-        assert replay_event is not None and replay_event.id == first_event.id
-        assert len(list_participants(db, first.id)) == 2
-        assert len(db.execute(
-            select(PlayerRollRequest).where(PlayerRollRequest.campaign_id == ctx["campaign_id"])
-        ).scalars().all()) == 2
-
-        owner_p = _pc_participant(db, first.id, ctx["owner_pc"])
-        player_p = _pc_participant(db, first.id, ctx["player_pc"])
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        player_p = _pc_participant(db, encounter.id, ctx["player_pc"])
         # Wrong human cannot roll for another PC.
         with pytest.raises(EncounterAuthorizationError):
-            _fulfill(db, first.id, owner_p, ctx["player"], 10)
+            _fulfill(db, encounter.id, owner_p, ctx["player"], 10)
         # Arithmetic is code-owned: lying totals/modifiers rejected.
         with pytest.raises(EncounterError, match="must equal d20"):
             fulfill_human_initiative(
-                db, first.id, owner_p.id, actor_id=ctx["owner"],
+                db, encounter.id, owner_p.id, actor_id=ctx["owner"],
                 payload={"source": "app", "raw_rolls": [10],
                          "modifier": owner_p.initiative_modifier, "total": 999},
             )
-        _fulfill(db, first.id, owner_p, ctx["owner"], 10)
+        _fulfill(db, encounter.id, owner_p, ctx["owner"], 10)
         # Duplicate fulfillment of the same request cannot apply twice.
         with pytest.raises(EncounterError, match="cannot be fulfilled"):
-            _fulfill(db, first.id, owner_p, ctx["owner"], 10)
+            _fulfill(db, encounter.id, owner_p, ctx["owner"], 10)
         assert len(db.execute(select(PlayerRollFulfillment)).scalars().all()) == 1
         # Retry preserves already submitted initiative: PC1 still fulfilled.
         assert db.get(EncounterParticipant, owner_p.id).initiative_status == "fulfilled"
-        _fulfill(db, first.id, player_p, ctx["player"], 12)
-        assert db.get(Encounter, first.id).status == "active"
-
-
-def test_npc_reroll_replay_is_idempotent_but_conflicts_rejected():
-    fac, ctx = _fixture()
-    with fac() as db:
-        encounter, _ = _start(db, ctx, [
-            {"npc_entity_id": str(ctx["goblin_id"])},
-            {"character_id": str(ctx["owner_pc"])},  # stays pending: replay is not terminal
-        ])
-        goblin_p = next(p for p in list_participants(db, encounter.id) if p.kind == "npc")
-        first_p, _, _ = roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=15)
-        replay_p, _, _ = roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=15)
-        assert replay_p.initiative_total == first_p.initiative_total == 17
-        with pytest.raises(EncounterError, match="already recorded"):
-            roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20=3)
-        # Malformed replay input stays inside the validation contract (422),
-        # never escaping as an uncaught ValueError (500).
-        with pytest.raises(EncounterError, match="between 1 and 20"):
-            roll_npc_initiative(db, encounter.id, goblin_p.id, raw_d20="not-a-number")
+        _fulfill(db, encounter.id, player_p, ctx["player"], 12)
+        assert db.get(Encounter, encounter.id).status == "active"
 
 
 def test_off_roster_and_terminal_pcs_are_rejected():
@@ -483,9 +485,8 @@ def test_off_roster_and_terminal_pcs_are_rejected():
     with fac() as db:
         # absent_pc belongs to a member but is not selected: off-roster.
         with pytest.raises(EncounterError, match="active roster"):
-            _start(db, ctx, [{"character_id": str(ctx["absent_pc"])}],
-                   operation_id="op-off-roster")
-            db.rollback()
+            _start(db, ctx, [{"character_id": str(ctx["absent_pc"])}])
+        db.rollback()
         # A selected PC with a terminal lifecycle cannot join combat.
         db.add(CampaignPcLifecycle(
             campaign_id=ctx["campaign_id"], character_id=ctx["player_pc"],
@@ -493,9 +494,8 @@ def test_off_roster_and_terminal_pcs_are_rejected():
         ))
         db.commit()
         with pytest.raises(EncounterError, match="is dead"):
-            _start(db, ctx, [{"character_id": str(ctx["player_pc"])}],
-                   operation_id="op-dead-pc")
-            db.rollback()
+            _start(db, ctx, [{"character_id": str(ctx["player_pc"])}])
+        db.rollback()
         assert get_active_encounter(db, ctx["campaign_id"]) is None
 
 
@@ -509,13 +509,13 @@ def test_state_survives_reconnect_and_restart(tmp_path):
     fac = sessionmaker(bind=eng, expire_on_commit=False)
     with fac() as db:
         ctx = _seed_world(db)
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
-        ])
+        ], npc_d20=15)
         encounter_id = encounter.id
         goblin_id = next(p.id for p in list_participants(db, encounter_id) if p.kind == "npc")
-        roll_npc_initiative(db, encounter_id, goblin_id, raw_d20=15)
+        assert db.get(EncounterParticipant, goblin_id).initiative_total == 17
     eng.dispose()  # simulate process restart: all sessions gone
 
     eng2 = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
@@ -544,16 +544,16 @@ def test_state_survives_reconnect_and_restart(tmp_path):
 def test_hidden_npc_stats_stay_dm_private():
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["player_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
-        ])
-        owner_view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
-        member_view = encounter_view(db, encounter, ctx["player"], is_owner=False)
+        ], npc_d20=15)
+        owner_view = encounter_view(db, encounter, ctx["owner"])
+        member_view = encounter_view(db, encounter, ctx["player"])
         npc_owner = next(p for p in owner_view["participants"] if p["kind"] == "npc")
         npc_member = next(p for p in member_view["participants"] if p["kind"] == "npc")
-        assert npc_owner["initiative_modifier"] == 2
-        assert npc_owner["stat_source"]["source_type"] == "world_entity_details"
+        # The AI is the only DM: the owner is a player and gets no NPC stats.
+        assert npc_owner == npc_member
         assert "initiative_modifier" not in npc_member
         assert "stat_source" not in npc_member
         assert "raw_roll" not in npc_member
@@ -620,29 +620,6 @@ def test_dm_structured_effect_starts_encounter_inline():
         assert len(list_participants(db, encounter.id)) == 2
 
 
-def test_stale_source_attempt_id_is_rejected_not_rewritten():
-    fac, ctx = _fixture()
-    with fac() as db:
-        # A second submission supersedes the fixture attempt: it is now stale.
-        accept_submission(
-            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
-            character_id=ctx["owner_pc"], raw_content="I draw my blade!",
-            segments=[{"type": "ic", "text": "I draw my blade!"}],
-            thread_id=ctx["thread_id"],
-        )
-        db.commit()
-        turn, fresh_attempt = coordinate_turn(db, ctx["campaign_id"], ctx["thread_id"])
-        assert fresh_attempt.id != ctx["attempt_id"]
-        with pytest.raises(EncounterError, match="current attempt"):
-            _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}],
-                   operation_id="op-stale-attempt", attempt_id=ctx["attempt_id"])
-            db.rollback()
-        # The current attempt is accepted.
-        encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}],
-                              operation_id="op-fresh-attempt", attempt_id=fresh_attempt.id)
-        assert encounter.source_attempt_id == fresh_attempt.id
-
-
 def test_contract_rejects_ambiguous_participant_selection():
     from app.dm.contract import ContractValidationError, normalize_contract
 
@@ -663,21 +640,19 @@ def test_contract_rejects_ambiguous_participant_selection():
         })
 
 
-# ── #204 interplay: delegation + cancel guard ───────────────────────────────
+# ── #204 interplay: delegation ─────────────────────────────────────────────
 
 
-def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
+def test_rolls_service_delegates_encounter_fulfillment():
     from app.rolls.service import (
         RollAuthorizationError,
-        RollLifecycleError,
-        cancel_or_replace,
         fulfill_roll,
     )
     from models.profiles import Profile as ProfileModel
 
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+        encounter = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
         outsider = uuid.uuid4()
         db.add(ProfileModel(id=outsider, email="outsider@example.com"))
@@ -701,8 +676,6 @@ def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
         assert encounter_ready == {"encounter_id": str(encounter.id), "ready": True}
         assert fulfillment.source == "physical"
         assert db.get(EncounterParticipant, owner_p.id).roll_source == "human_physical"
-        with pytest.raises(RollLifecycleError, match="cannot be cancelled"):
-            cancel_or_replace(db, request_id=owner_p.roll_request_id, replacement=None)
 
 
 # ── realtime hooks ──────────────────────────────────────────────────────────
@@ -722,11 +695,10 @@ def test_realtime_hooks_emit_stable_encounter_events():
     set_realtime_publisher(recorder)
     try:
         with fac() as db:
-            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
-            started = [p for p in recorder.published if p["event"] == "encounter.started"]
-            assert len(started) == 1
-            assert started[0]["payload"]["encounter_id"] == str(encounter.id)
-            assert started[0]["payload"]["dedupe_key"] == f"{encounter.id}:started"
+            # The direct staged-effect helper runs outside commit_turn, so no
+            # encounter.started lifecycle event or realtime publish happens
+            # here; readiness (below) still publishes post-commit.
+            encounter = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
             owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
             _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
             ready = [p for p in recorder.published if p["event"] == "encounter.initiative_ready"]
@@ -740,146 +712,7 @@ def test_realtime_hooks_emit_stable_encounter_events():
         set_realtime_publisher(previous)
 
 
-# ── HTTP transport: start + idempotent replay ───────────────────────────────
-
-
-def test_http_start_and_duplicate_replay(monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from app.auth.service import TEST_USER_ID
-    from database import get_db
-    from main import app
-    from models.profiles import Profile as ProfileModel
-
-    eng = _engine()
-    fac = sessionmaker(bind=eng, expire_on_commit=False)
-    with fac() as db:
-        db.add(ProfileModel(id=TEST_USER_ID, email="owner@example.com"))
-        db.commit()
-    with fac() as db:
-        ctx = _seed_world(db, second_pc=False, npc=False)
-        # Re-key the seeded world onto the HTTP test user.
-        owner, campaign_id = ctx["owner"], ctx["campaign_id"]
-        camp = db.get(Campaign, campaign_id)
-        camp.owner_id = TEST_USER_ID
-        for member in db.execute(
-            select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
-        ).scalars().all():
-            if member.user_id == owner:
-                member.user_id = TEST_USER_ID
-        for char in db.execute(select(Character)).scalars().all():
-            if char.owner_id == owner:
-                char.owner_id = TEST_USER_ID
-        for sheet in db.execute(select(Dnd5eCharacterSheet)).scalars().all():
-            if sheet.owner_id == owner:
-                sheet.owner_id = TEST_USER_ID
-        for req in db.execute(select(PlayerRollRequest)).scalars().all():
-            if req.requested_user_id == owner:
-                req.requested_user_id = TEST_USER_ID
-        db.commit()
-        owner_pc = ctx["owner_pc"]
-        turn_id, attempt_id, revision = ctx["turn_id"], ctx["attempt_id"], 0
-
-    def override_db():
-        with fac() as db:
-            yield db
-
-    def resolve_test_profile(request, db):
-        return db.get(ProfileModel, TEST_USER_ID)
-
-    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
-    app.dependency_overrides[get_db] = override_db
-    try:
-        client = TestClient(app)
-        body = {
-            "expected_revision": revision,
-            "source_turn_id": str(turn_id),
-            "source_attempt_id": str(attempt_id),
-            "participants": [{"character_id": str(owner_pc)}],
-        }
-        first = client.post(f"/api/campaigns/{campaign_id}/encounters", json=body,
-                            headers={"Idempotency-Key": "http-start-1"})
-        assert first.status_code == 201, first.text
-        assert first.headers["X-Idempotent-Replay"] == "false"
-        encounter_id = first.json()["encounter"]["id"]
-        replay = client.post(f"/api/campaigns/{campaign_id}/encounters", json=body,
-                             headers={"Idempotency-Key": "http-start-1"})
-        assert replay.status_code == 201
-        assert replay.headers["X-Idempotent-Replay"] == "true"
-        assert replay.json()["encounter"]["id"] == encounter_id
-        active = client.get(f"/api/campaigns/{campaign_id}/encounters/active")
-        assert active.status_code == 200
-        assert active.json()["encounter"]["id"] == encounter_id
-        # Turn order is not authoritative while initiative is pending.
-        order = client.get(f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order")
-        assert order.status_code == 409
-    finally:
-        app.dependency_overrides.clear()
-
-
-def test_http_start_with_stale_revision_returns_409(monkeypatch):
-    """A stale expected_revision on the encounter-start API maps to the
-    repository's standard 409 + X-Current-Revision response, not a 500."""
-    from fastapi.testclient import TestClient
-
-    from app.auth.service import TEST_USER_ID
-    from app.campaigns.events import commit_campaign_mutation
-    from database import get_db
-    from main import app
-    from models.profiles import Profile as ProfileModel
-
-    eng = _engine()
-    fac = sessionmaker(bind=eng, expire_on_commit=False)
-    with fac() as db:
-        db.add(ProfileModel(id=TEST_USER_ID, email="owner@example.com"))
-        db.commit()
-    with fac() as db:
-        ctx = _seed_world(db, second_pc=False, npc=False)
-        owner, campaign_id = ctx["owner"], ctx["campaign_id"]
-        camp = db.get(Campaign, campaign_id)
-        camp.owner_id = TEST_USER_ID
-        for member in db.execute(
-            select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
-        ).scalars().all():
-            if member.user_id == owner:
-                member.user_id = TEST_USER_ID
-        for char in db.execute(select(Character)).scalars().all():
-            if char.owner_id == owner:
-                char.owner_id = TEST_USER_ID
-        db.commit()
-        # Bump the campaign past revision 0 so the start below is stale.
-        commit_campaign_mutation(
-            db, campaign_id, expected_revision=0, event_type="test.revision_bump",
-            operation_id="test-bump-1", actor_id=TEST_USER_ID,
-        )
-        owner_pc = ctx["owner_pc"]
-        turn_id, attempt_id = ctx["turn_id"], ctx["attempt_id"]
-
-    def override_db():
-        with fac() as db:
-            yield db
-
-    def resolve_test_profile(request, db):
-        return db.get(ProfileModel, TEST_USER_ID)
-
-    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
-    app.dependency_overrides[get_db] = override_db
-    try:
-        client = TestClient(app)
-        stale = client.post(
-            f"/api/campaigns/{campaign_id}/encounters",
-            json={
-                "expected_revision": 0,
-                "source_turn_id": str(turn_id),
-                "source_attempt_id": str(attempt_id),
-                "participants": [{"character_id": str(owner_pc)}],
-            },
-            headers={"Idempotency-Key": "http-start-stale"},
-        )
-        assert stale.status_code == 409, stale.text
-        assert stale.headers["X-Current-Revision"] == "1"
-    finally:
-        app.dependency_overrides.clear()
+# ── HTTP transport: generic fulfill still readies ───────────────────────────
 
 
 def test_http_generic_fulfill_emits_ready_event(monkeypatch):
@@ -946,25 +779,20 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     recorder = InMemoryRealtimePublisher()
     set_realtime_publisher(recorder)
     try:
-        client = TestClient(app)
-        start = client.post(
-            f"/api/campaigns/{campaign_id}/encounters",
-            json={
-                "expected_revision": 0,
-                "source_turn_id": str(turn_id),
-                "source_attempt_id": str(attempt_id),
-                "participants": [{"character_id": str(owner_pc)}],
-            },
-            headers={"Idempotency-Key": "http-ready-start"},
-        )
-        assert start.status_code == 201, start.text
-        encounter_id = start.json()["encounter"]["id"]
+        # The encounter starts via the AI DM effect (POST /encounters is gone).
         with fac() as db:
+            started = dm_start_encounter(
+                db, campaign_id, turn_id, attempt_id,
+                [{"character_id": str(owner_pc)}],
+                scene={"location_name": "Treeline"},
+            )
             participant = next(
-                p for p in list_participants(db, uuid.UUID(encounter_id))
+                p for p in list_participants(db, started.id)
                 if p.character_id == owner_pc
             )
             roll_request_id, modifier = participant.roll_request_id, participant.initiative_modifier
+            encounter_id = str(started.id)
+        client = TestClient(app)
         fulfill = client.post(
             f"/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/fulfill",
             json={"source": "app", "raw_rolls": [12],
@@ -985,7 +813,7 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
         app.dependency_overrides.clear()
 
 
-# ── private-thread audience ───────────────────────────────────────────────
+# ── private-thread audience ─────────────────────────────────────────────────
 
 
 def _private_thread_fixture():
@@ -1017,12 +845,10 @@ def _private_thread_fixture():
 def test_private_thread_encounter_hidden_from_non_members():
     fac, ctx = _private_thread_fixture()
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-private-1", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
-            source_attempt_id=ctx["private_attempt_id"],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["private_turn_id"], ctx["private_attempt_id"],
+            [{"character_id": str(ctx["owner_pc"])}],
             scene={"location_name": "Side Room"},
-            participants=[{"character_id": str(ctx["owner_pc"])}],
         )
         assert encounter.thread_id == str(ctx["private_thread_id"])
         # Thread member sees it; campaign member outside the thread does not.
@@ -1033,6 +859,8 @@ def test_private_thread_encounter_hidden_from_non_members():
         assert visible is not None and visible["id"] == str(encounter.id)
         # Activating writes the ready + first-turn events; no lifecycle or
         # turn event may reach the non-thread member's campaign history feed.
+        # (encounter.started itself is staged at commit_turn, so the direct
+        # helper path only produces readiness + first turn here.)
         from app.combat.service import TURN_STARTED_EVENT  # noqa: E402
 
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
@@ -1043,11 +871,9 @@ def test_private_thread_encounter_hidden_from_non_members():
             for e in feed_outsider
         )
         feed_member = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
-        assert {ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT} <= {
-            e.event_type for e in feed_member
-        }
+        assert {ENCOUNTER_READY_EVENT} <= {e.event_type for e in feed_member}
         # Unscoped callers (provenance/audit) still see full history.
-        assert {ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT} <= {
+        assert {ENCOUNTER_READY_EVENT} <= {
             e.event_type for e in list_campaign_events(db, ctx["campaign_id"])
         }
 
@@ -1058,12 +884,10 @@ def test_private_thread_rejects_unreadable_controller():
         # The player controls player_pc but cannot read the private thread:
         # selecting them must fail fast, not strand an invisible request.
         with pytest.raises(EncounterError, match="cannot read the encounter thread"):
-            start_encounter(
-                db, ctx["campaign_id"], operation_id="op-private-2", expected_revision=0,
-                actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
-                source_attempt_id=ctx["private_attempt_id"],
+            dm_start_encounter(
+                db, ctx["campaign_id"], ctx["private_turn_id"], ctx["private_attempt_id"],
+                [{"character_id": str(ctx["player_pc"])}],
                 scene={"location_name": "Side Room"},
-                participants=[{"character_id": str(ctx["player_pc"])}],
             )
         db.rollback()
 
@@ -1077,12 +901,10 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
 
     fac, ctx = _private_thread_fixture()
     with fac() as db:
-        encounter, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-private-http", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
-            source_attempt_id=ctx["private_attempt_id"],
+        encounter = dm_start_encounter(
+            db, ctx["campaign_id"], ctx["private_turn_id"], ctx["private_attempt_id"],
+            [{"character_id": str(ctx["owner_pc"])}],
             scene={"location_name": "Side Room"},
-            participants=[{"character_id": str(ctx["owner_pc"])}],
         )
         db.commit()
         encounter_id = str(encounter.id)
@@ -1128,19 +950,23 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
             e["event_type"] not in ("encounter.started", "encounter.initiative_ready")
             for e in events_outsider.json()["events"]
         )
+        # Lifecycle history follows the same thread boundary. The direct
+        # staged-effect helper stages no encounter.started event (that
+        # happens at commit_turn), so neither feed has lifecycle events yet.
         events_member = client.get(
             f"/api/campaigns/{campaign_id}/events", headers=member_headers)
         assert events_member.status_code == 200
-        assert "encounter.started" in {
-            e["event_type"] for e in events_member.json()["events"]
-        }
+        assert all(
+            e["event_type"] not in ("encounter.started", "encounter.initiative_ready")
+            for e in events_member.json()["events"]
+        )
     finally:
         app.dependency_overrides.clear()
 
 
 def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
     """Turn-order matches encounter_view: another PC's roll_request_id stays
-    with its controller (or the owner)."""
+    with its controller — the campaign owner included."""
     from fastapi.testclient import TestClient
 
     from database import get_db
@@ -1149,7 +975,7 @@ def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
 
     fac, ctx = _fixture()
     with fac() as db:
-        encounter, _ = _start(db, ctx, [
+        encounter = _start(db, ctx, [
             {"character_id": str(ctx["owner_pc"])},
             {"character_id": str(ctx["player_pc"])},
         ])
@@ -1188,17 +1014,22 @@ def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
             headers={"x-test-user": owner_id},
         )
         assert as_owner.status_code == 200, as_owner.text
-        assert all("roll_request_id" in p for p in as_owner.json()["order"])
+        owner_by_controller = {
+            p["controller_user_id"]: p for p in as_owner.json()["order"]
+        }
+        assert owner_by_controller[owner_id]["roll_request_id"]
+        assert "roll_request_id" not in owner_by_controller[player_id]
     finally:
         app.dependency_overrides.clear()
 
 
-def test_api_start_from_unreadable_thread_is_hidden():
-    """Direct start from a thread the actor cannot read fails as not-found."""
-    from app.threads.service import ThreadNotFoundError, create_private_thread
-
+def test_dm_start_from_unreadable_thread_is_rejected():
+    """A DM start whose participant controller cannot read the source thread
+    fails fast instead of stranding an invisible initiative request."""
     fac, ctx = _fixture()
     with fac() as db:
+        from app.threads.service import create_private_thread
+
         thread = create_private_thread(
             db, campaign_id=ctx["campaign_id"], created_by=ctx["player"],
             member_ids=[ctx["player"]], title="Whispers",
@@ -1214,70 +1045,14 @@ def test_api_start_from_unreadable_thread_is_hidden():
         db.commit()
         turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
         db.commit()
-        # The owner passes ownership but cannot read this private thread.
-        with pytest.raises(ThreadNotFoundError):
-            start_encounter(
-                db, ctx["campaign_id"], operation_id="op-nope", expected_revision=0,
-                actor_id=ctx["owner"], source_turn_id=turn.id,
-                source_attempt_id=attempt.id,
-                participants=[{"character_id": str(ctx["owner_pc"])}],
+        # The owner_pc's controller (the owner) cannot read this private thread.
+        with pytest.raises(EncounterError, match="cannot read the encounter thread"):
+            dm_start_encounter(
+                db, ctx["campaign_id"], turn.id, attempt.id,
+                [{"character_id": str(ctx["owner_pc"])}],
             )
         db.rollback()
         assert get_active_encounter(db, ctx["campaign_id"]) is None
-
-
-def test_http_start_from_unreadable_thread_returns_404(monkeypatch):
-    from fastapi.testclient import TestClient
-
-    from database import get_db
-    from main import app
-    from models.profiles import Profile as ProfileModel
-    from app.threads.service import create_private_thread
-
-    fac, ctx = _fixture()
-    with fac() as db:
-        thread = create_private_thread(
-            db, campaign_id=ctx["campaign_id"], created_by=ctx["player"],
-            member_ids=[ctx["player"]], title="Whispers",
-        )
-        db.commit()
-        accept_submission(
-            db, campaign_id=ctx["campaign_id"], user_id=ctx["player"],
-            character_id=ctx["player_pc"],
-            raw_content="Something moves in the dark!",
-            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
-            thread_id=str(thread.id),
-        )
-        db.commit()
-        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
-        db.commit()
-        campaign_id = str(ctx["campaign_id"])
-        owner_id = str(ctx["owner"])
-
-    def override_db():
-        with fac() as db:
-            yield db
-
-    def resolve_test_profile(request, db):
-        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
-
-    monkeypatch.setattr("app.deps.auth.resolve_profile", resolve_test_profile)
-    app.dependency_overrides[get_db] = override_db
-    try:
-        client = TestClient(app)
-        resp = client.post(
-            f"/api/campaigns/{campaign_id}/encounters",
-            json={
-                "expected_revision": 0,
-                "source_turn_id": str(turn.id),
-                "source_attempt_id": str(attempt.id),
-                "participants": [{"character_id": str(ctx["owner_pc"])}],
-            },
-            headers={"x-test-user": owner_id, "Idempotency-Key": "http-hidden-start"},
-        )
-        assert resp.status_code == 404, resp.text
-    finally:
-        app.dependency_overrides.clear()
 
 
 def test_private_attempt_promotes_start_encounter():
@@ -1287,7 +1062,7 @@ def test_private_attempt_promotes_start_encounter():
 
     from app.dm.contract import normalize_contract
     from app.dm.turns import commit_turn, mark_streaming_started, stage_validated_attempt
-    from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
+    from models.dm import DMStream, DMStreamChunk
     from app.threads.service import create_private_thread
 
     fac, ctx = _fixture()
@@ -1364,56 +1139,3 @@ def test_private_attempt_promotes_start_encounter():
         assert all(
             e.event_type != ENCOUNTER_STARTED_EVENT for e in outsider_feed
         )
-
-
-def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
-    """Same-operation integrity races replay; a different active encounter 409s."""
-    from sqlalchemy.exc import IntegrityError
-
-    import app.combat.service as combat_service
-
-    fac, ctx = _fixture()
-    with fac() as db:
-        encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
-        # Different operation with an active encounter: conflict, never replay.
-        with pytest.raises(EncounterAlreadyActiveError):
-            start_encounter(
-                db, ctx["campaign_id"], operation_id="op-other", expected_revision=0,
-                actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-                source_attempt_id=ctx["attempt_id"],
-                participants=[{"character_id": str(ctx["owner_pc"])}],
-            )
-        db.rollback()
-        # Same operation: simulate the race (prior committed between the
-        # pre-checks and the flush) and prove the handler replays it.
-        real_find = combat_service.find_by_operation
-        real_active = combat_service.get_active_encounter
-        state = {"find": 0, "active": 0}
-
-        def _find_once_none(*args, **kwargs):
-            state["find"] += 1
-            if state["find"] == 1:
-                return None
-            return real_find(*args, **kwargs)
-
-        def _active_once_none(*args, **kwargs):
-            state["active"] += 1
-            if state["active"] == 1:
-                return None
-            return real_active(*args, **kwargs)
-
-        def _conflict(*args, **kwargs):
-            raise IntegrityError(
-                "INSERT INTO encounters", {}, Exception("UNIQUE constraint failed")
-            )
-
-        monkeypatch.setattr(combat_service, "find_by_operation", _find_once_none)
-        monkeypatch.setattr(combat_service, "get_active_encounter", _active_once_none)
-        monkeypatch.setattr(combat_service, "commit_campaign_mutation", _conflict)
-        replay, _ = start_encounter(
-            db, ctx["campaign_id"], operation_id="op-enc-1", expected_revision=0,
-            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
-            source_attempt_id=ctx["attempt_id"],
-            participants=[{"character_id": str(ctx["owner_pc"])}],
-        )
-        assert replay.id == encounter.id

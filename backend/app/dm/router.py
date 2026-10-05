@@ -278,7 +278,7 @@ def get_dm_turn(
                      "message": "The DM is finishing processing recent events before continuing."}
     return {
         "turn": turn.to_dict(),
-        "attempts": [a.to_dict(include_private_roll_evidence=campaign.owner_id == profile.id, include_private_staged_effects=campaign.owner_id == profile.id) for a in attempts],
+        "attempts": [a.to_dict() for a in attempts],
         "readiness": readiness,
     }
 

@@ -21,6 +21,7 @@ from app.visibility.access import may_user_receive  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     grant_visibility,
+    list_knowledge_for_subject,
     project_facts_for_user,
     project_relations_for_user,
     what_does_subject_know,
@@ -115,13 +116,14 @@ def test_dm_only_truth_exists_with_zero_knowers():
     assert db.execute(
         select(WorldKnowledge).where(WorldKnowledge.campaign_id == camp.id)
     ).scalars().all() == []
-    assert may_user_receive(db, camp, "fact", fact.id, owner)["allowed"] is True
-    denied = may_user_receive(db, camp, "fact", fact.id, alice)
-    assert denied == {"allowed": False, "reason": "dm_only_requires_authority"}
+    # No human receives dm_only truth — the owner is a player too (#470).
+    for viewer in (owner, alice):
+        denied = may_user_receive(db, camp, "fact", fact.id, viewer)
+        assert denied == {"allowed": False, "reason": "dm_only"}
     proj = project_facts_for_user(db, camp, alice, [fact])
     assert proj["visible"] == 0 and proj["denied"] == 1
     assert proj["records"] == []
-    assert proj["denied_reasons"] == {"dm_only_requires_authority": 1}
+    assert proj["denied_reasons"] == {"dm_only": 1}
 
 
 # ── One-character knowledge; two characters differ on the same fact ─────────
@@ -155,10 +157,10 @@ def test_one_character_knowledge_and_two_characters_differ():
     assert k_aria.knowledge_state == "knows"
     assert k_bram.knowledge_state == "does_not_know"
     # Per-subject projections differ on the same fact.
-    aria_view = what_does_subject_know(db, camp, aria.id, owner)
-    bram_view = what_does_subject_know(db, camp, bram.id, owner)
-    assert [(e["target_id"], e["knowledge_state"]) for e in aria_view["entries"]] == [(str(fact.id), "knows")]
-    assert [(e["target_id"], e["knowledge_state"]) for e in bram_view["entries"]] == [(str(fact.id), "does_not_know")]
+    aria_rows = list_knowledge_for_subject(db, camp.id, aria.id)
+    bram_rows = list_knowledge_for_subject(db, camp.id, bram.id)
+    assert [(str(r.target_fact_id), r.knowledge_state) for r in aria_rows] == [(str(fact.id), "knows")]
+    assert [(str(r.target_fact_id), r.knowledge_state) for r in bram_rows] == [(str(fact.id), "does_not_know")]
 
 
 # ── Party belief vs truth ───────────────────────────────────────────────────
@@ -182,8 +184,10 @@ def test_party_belief_can_contradict_truth():
     assert row.knowledge_state == "believes"
     # Belief does not promote the rumor to truth.
     assert db.get(type(fact), fact.id).epistemic_state == "false"
-    proj = what_does_subject_know(db, camp, party.id, owner)
-    assert proj["total"] == 1 and proj["entries"][0]["knowledge_state"] == "believes"
+    rows = list_knowledge_for_subject(db, camp.id, party.id)
+    assert [r.knowledge_state for r in rows] == ["believes"]
+    # The dm_only belief and truth never reach a human, owner included.
+    assert what_does_subject_know(db, camp, party.id, owner)["entries"] == []
 
 
 # ── Human visibility differs from character knowledge ───────────────────────
@@ -399,14 +403,15 @@ def test_hidden_subject_never_disclosed_through_projections():
     # The subject entity itself is hidden from the member viewer even though
     # both the knowledge row and the target are campaign-visible.
     assert may_user_receive(db, camp, "entity", shade.id, alice) == {
-        "allowed": False, "reason": "dm_only_requires_authority",
+        "allowed": False, "reason": "dm_only",
     }
     subj_view = what_does_subject_know(db, camp, shade.id, alice)
     assert subj_view["entries"] == []
     assert subj_view["total"] == 0
     assert subj_view["denied_reasons"] == {"subject_not_visible": 1}
-    # DM authority still sees the full picture in both directions.
-    assert what_does_subject_know(db, camp, shade.id, owner)["visible"] == 1
+    # The owner is a player too (#470); the knowledge row stays DM-internal.
+    assert what_does_subject_know(db, camp, shade.id, owner)["entries"] == []
+    assert len(list_knowledge_for_subject(db, camp.id, shade.id)) == 1
 
 
 # ── Re-assertion updates source provenance; same-key retry is idempotent ───

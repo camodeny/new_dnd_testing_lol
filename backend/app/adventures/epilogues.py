@@ -615,12 +615,11 @@ def list_epilogues(
     adventure_id: uuid.UUID,
     *,
     viewer_id: uuid.UUID | None = None,
-    is_owner: bool = False,
 ) -> list[dict]:
     """Visibility-filtered epilogue roster.
 
-    The owner sees everything. Other viewers see full entries for public
-    rows and their own rows; private rows belonging to other players project
+    Every viewer — the campaign owner included — sees full entries for
+    public rows and their own rows; private rows belonging to other players project
     to participation metadata only (mirrors #211 private semantics).
     """
     rows = list(
@@ -634,7 +633,7 @@ def list_epilogues(
     )
     out: list[dict] = []
     for row in rows:
-        if is_owner or row.visibility == "public" or (
+        if row.visibility == "public" or (
             viewer_id is not None and str(row.user_id) == str(viewer_id)
         ):
             out.append(row.to_dict())

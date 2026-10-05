@@ -1,12 +1,13 @@
-"""Campaign participation, DM authority, and per-record receive checks.
+"""Campaign participation and per-record receive checks for humans.
 
 Fail-closed everywhere: missing/ambiguous visibility, unknown records,
 non-membership, and revoked/missing grants all deny with a reason code.
 Access is never inferred from a related shared record — each record is
-authorized from its own visibility and its own active grants. Owner status
-grants ``dm_only`` access (the AI-DM authority lane) but never ``private``
-access: private disclosure requires an explicit active grant naming the
-human user.
+authorized from its own visibility and its own active grants. The AI is the
+only DM: no human — the campaign owner included — ever receives a
+``dm_only`` record, and ``private`` disclosure requires an explicit active
+grant naming the human user. DM-internal paths read records directly and
+never go through these checks.
 """
 
 from __future__ import annotations
@@ -32,11 +33,6 @@ from models.world import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def is_world_authority(campaign: Campaign, user_id: Any) -> bool:
-    """Owner / DM authority sees restricted records; ordinary members do not."""
-    return campaign.owner_id == user_id
 
 
 def is_campaign_participant(db: Session, campaign: Campaign, user_id: Any) -> bool:
@@ -115,14 +111,11 @@ def may_user_receive(
     if vis in MEMBER_VISIBILITIES:
         return {"allowed": True, "reason": "member_visible"}
     if vis == "dm_only":
-        if is_world_authority(campaign, uid):
-            return {"allowed": True, "reason": "dm_authority"}
         structured_log(
             logger, logging.INFO, "world_access_denied",
-            campaign_id=str(campaign.id), target_kind=kind,
-            reason="dm_only_requires_authority",
+            campaign_id=str(campaign.id), target_kind=kind, reason="dm_only",
         )
-        return {"allowed": False, "reason": "dm_only_requires_authority"}
+        return {"allowed": False, "reason": "dm_only"}
     # Private: exactly the active grantee set — owner included only if granted.
     if has_active_grant(db, campaign.id, kind, tid, uid):
         return {"allowed": True, "reason": "explicit_grant"}

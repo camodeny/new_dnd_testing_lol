@@ -137,7 +137,7 @@ def test_hidden_data_absent_not_masked(ctx):
         # cannot be inferred from an unauthorized payload.
         assert "denied" not in blob
         assert "private_requires_grant" not in blob
-        assert "dm_only_requires_authority" not in blob
+        assert "dm_only" not in blob
     finally:
         db.close()
 
@@ -239,19 +239,13 @@ def test_shared_appearance_differs_from_hidden_reality(ctx):
             visibility="campaign", details=details, operation_id="op-vex-250",
         )
         db.commit()
-        owner_view = build_surfaces_for_viewer(db, camp, ctx["owner"])
-        alice_view = build_surfaces_for_viewer(db, camp, ctx["alice"])
-        assert owner_view["knowledge"]["visible"] >= 0  # sanity: builder ran
         # NPCs are not items/shops; assert via the entity projection path directly.
-        owner_proj = _world.project_entity_for_viewer(row, True)
-        member_proj = _world.project_entity_for_viewer(row, False)
-        assert str(owner_proj["id"]) == str(member_proj["id"]) == str(row.id)
+        member_proj = _world.project_entity_for_viewer(row)
+        assert str(member_proj["id"]) == str(row.id)
         assert member_proj["details"].get("resources") == []
         assert "rules_state_visibility" not in member_proj["details"]
-        assert owner_proj["details"]["resources"] == [{"name": "signal whistle", "uses": 1}]
-        # Same campaign-visible entity id reaches both viewers' knowledge-adjacent
-        # world reads; hidden reality (full details) stays owner-only.
-        _ = alice_view
+        # Hidden reality stays on the row for the DM runtime only.
+        assert row.details["resources"] == [{"name": "signal whistle", "uses": 1}]
     finally:
         db.close()
 
@@ -303,26 +297,26 @@ def test_reconnect_restores_same_authorized_view(ctx):
         db.close()
 
 
-def test_owner_sees_all_and_outsider_sees_nothing(ctx):
+def test_owner_gets_member_view_and_outsider_sees_nothing(ctx):
     _seed_private_fact(ctx)
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
         owner_view = build_surfaces_for_viewer(db, camp, ctx["owner"])
+        bob_view = build_surfaces_for_viewer(db, camp, ctx["bob"])
+        # The AI is the only DM (#470): the owner is a player, sees no dm_only
+        # truth and no private record without an explicit grant.
+        assert owner_view == bob_view
         owner_texts = {r["content"] for r in owner_view["clues"]["records"]}
-        # Owner (DM authority) sees dm_only truth but never private grants
-        # without an explicit grant — may_user_receive semantics.
-        assert "the DM tracks a hidden omen" in owner_texts
-        assert "the vault sigil is a moth" not in owner_texts
+        assert owner_texts == {"the tavern serves stew"}
         outsider_view = build_surfaces_for_viewer(db, camp, uuid.uuid4())
         assert outsider_view["clues"]["records"] == []
         assert outsider_view["items"]["records"] == []
-        assert outsider_view["clocks"] == {"clocks": [], "count": 0}
     finally:
         db.close()
 
 
-def test_clocks_member_vs_owner(ctx):
+def test_clocks_never_reach_players(ctx):
     db = _db(ctx)
     try:
         camp = db.get(Campaign, ctx["campaign_id"])
@@ -340,16 +334,13 @@ def test_clocks_member_vs_owner(ctx):
             operation_id="op-clock-secret-250",
         )
         db.commit()
-        alice_view = build_surfaces_for_viewer(db, camp, ctx["alice"])
-        owner_view = build_surfaces_for_viewer(db, camp, ctx["owner"])
-        alice_names = {c["name"] for c in alice_view["clocks"]["clocks"]}
-        owner_names = {c["name"] for c in owner_view["clocks"]["clocks"]}
-        assert alice_names == {"City Alarm"}
-        assert owner_names == {"City Alarm", "Secret Ritual"}
-        # Member projection strips DM-side internals.
-        open_clock = alice_view["clocks"]["clocks"][0]
-        assert "completion_effect" not in open_clock
-        assert "Secret Ritual" not in str(alice_view["clocks"])
+        # Clocks are DM storytelling machinery (#470): no player surface
+        # carries them, campaign-visible or not, owner or member.
+        for viewer in (ctx["alice"], ctx["owner"]):
+            view = build_surfaces_for_viewer(db, camp, viewer)
+            assert "clocks" not in view
+            assert "City Alarm" not in str(view)
+            assert "Secret Ritual" not in str(view)
     finally:
         db.close()
 
@@ -423,10 +414,10 @@ def test_invalidation_fanout_targets_grantee_threads(ctx):
         db.close()
 
 
-def test_dm_only_map_zones_absent_for_non_owner(ctx):
+def test_dm_only_map_zones_absent_for_every_player(ctx):
     """Review #418 round 3: hidden trap geometry (kind/rect/label) must be
     absent from unauthorized payloads — in surfaces AND the full snapshot."""
-    from app.combat.maps import ensure_map
+    from app.combat.maps import init_map_inline
     from models.combat import Encounter
 
     db = _db(ctx)
@@ -438,10 +429,9 @@ def test_dm_only_map_zones_absent_for_non_owner(ctx):
         )
         db.add(enc)
         db.flush()
-        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-        ensure_map(
-            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
-            terrain=[
+        init_map_inline(db, enc, {
+            "width": 6, "height": 6,
+            "terrain": [
                 {"kind": "difficult",
                  "rect": {"col": 0, "row": 0, "width": 2, "height": 2},
                  "visibility": "public"},
@@ -449,8 +439,8 @@ def test_dm_only_map_zones_absent_for_non_owner(ctx):
                  "rect": {"col": 4, "row": 3, "width": 1, "height": 1},
                  "visibility": "dm_only", "label": "secret pit trap"},
             ],
-            expected_revision=rev, operation_id="op-trapmap-250", commit=True,
-        )
+        })
+        db.commit()
         alice_view = build_surfaces_for_viewer(db, camp, ctx["alice"])
         assert alice_view["maps"]["visible"] is True
         alice_zones = alice_view["maps"]["map"]["zones"]
@@ -458,7 +448,7 @@ def test_dm_only_map_zones_absent_for_non_owner(ctx):
         assert alice_zones[0]["kind"] == "difficult"
         assert "secret pit trap" not in str(alice_view["maps"])
         owner_view = build_surfaces_for_viewer(db, camp, ctx["owner"])
-        assert len(owner_view["maps"]["map"]["zones"]) == 2
+        assert owner_view["maps"] == alice_view["maps"]
 
         # Full-snapshot paths expose the same safe projection.
         from app.snapshot.service import build_live_table_snapshot
@@ -474,7 +464,7 @@ def test_dm_only_map_zones_absent_for_non_owner(ctx):
 def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
     """Review #418 round 6: a private NPC granted to Alice reveals its map
     token to Alice alone — Bob's map stays token-free."""
-    from app.combat.maps import ensure_map
+    from app.combat.maps import init_map_inline
     from models.combat import Encounter, EncounterParticipant, EncounterPlacement
 
     db = _db(ctx)
@@ -495,14 +485,13 @@ def test_granted_hidden_npc_token_revealed_only_to_grantee(ctx):
         )
         db.add(enc)
         db.flush()
-        rev = int(db.get(Campaign, ctx["campaign_id"]).revision)
-        ensure_map(
-            db, enc.id, actor_id=ctx["owner"], width=6, height=6,
-            terrain=[{"kind": "open",
-                      "rect": {"col": 0, "row": 0, "width": 6, "height": 6},
-                      "visibility": "public"}],
-            expected_revision=rev, operation_id="op-shademap-250", commit=True,
-        )
+        init_map_inline(db, enc, {
+            "width": 6, "height": 6,
+            "terrain": [{"kind": "open",
+                         "rect": {"col": 0, "row": 0, "width": 6, "height": 6},
+                         "visibility": "public"}],
+        })
+        db.commit()
         part = EncounterParticipant(
             encounter_id=enc.id, campaign_id=camp.id,
             participant_key=f"npc:{shade.id}", kind="npc",
@@ -537,8 +526,7 @@ def test_snapshot_wires_surfaces(ctx):
         snap = build_live_table_snapshot(db, ctx["campaign_id"], ctx["alice"])
         assert "surfaces" in snap
         surfaces = snap["surfaces"]
-        for key in ("knowledge", "clues", "items", "shops", "maps", "clocks"):
-            assert key in surfaces, key
+        assert set(surfaces) == {"knowledge", "clues", "items", "shops", "maps"}
         texts = {r["content"] for r in surfaces["clues"]["records"]}
         assert "the vault sigil is a moth" in texts
         bob_snap = build_live_table_snapshot(db, ctx["campaign_id"], ctx["bob"])

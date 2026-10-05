@@ -504,18 +504,20 @@ def test_staged_patch_explicit_null_location_clears_reference():
     assert db.get(WorldEntity, loc.id) is not None
 
 
-def test_restricted_scene_hidden_from_ordinary_member():
-    from app.visibility.policy import visible_to_viewer
+def test_restricted_scene_hidden_from_every_player():
+    from app.world.evidence_packets import scene_gate
 
-    Fac, cid, _owner = _setup()
+    Fac, cid, owner = _setup()
     db = Fac()
     commit_world_write(
         db, cid, 0, apply_scene_update, location_name="Secret Lair", visibility="dm_only",
         operation_id="op-s",
     )
     scene = get_current_scene(db, cid)
-    assert visible_to_viewer(scene.visibility, True) is True
-    assert visible_to_viewer(scene.visibility, False) is False
+    campaign = db.get(Campaign, cid)
+    # The owner is a player (#470): only the DM-internal lane sees the scene.
+    assert scene_gate(db, campaign, scene, [owner], dm_internal=False) == (False, "scene_not_visible")
+    assert scene_gate(db, campaign, scene, [], dm_internal=True) == (True, None)
 
 
 def test_dm_only_scene_excluded_from_player_narration_projection():

@@ -865,6 +865,29 @@ def test_staged_death_save_progression_reset_and_hooks():
         assert has_condition(sheet.conditions, "unconscious") is False
 
 
+def test_third_failed_death_save_records_pc_death():
+    """The AI DM's death saves are the rules path to PC death: the third
+    failure records the PC as dead on its campaign lifecycle (no human
+    declares deaths)."""
+    from app.campaigns.replacements import get_lifecycle
+    from app.dm.effects import apply_staged_effects
+
+    factory = _handler_db()
+    with factory() as db:
+        camp, turn, attempt, char, _brute = _handler_fixture(db)
+        for i in range(3):
+            apply_staged_effects(db, camp, [
+                build_death_save_effect(
+                    effect_id=f"h-dead-{i}", mutation_id=f"h-dead-mut-{i}", target_kind="pc",
+                    target_id=str(char.id), op="record", result="failure",
+                ),
+            ], turn, attempt)
+            db.commit()
+            row = get_lifecycle(db, camp.id, char.id)
+            assert (row is not None and row.status == "dead") is (i == 2)
+        assert get_lifecycle(db, camp.id, char.id).cause == "Failed three death saving throws."
+
+
 def test_staged_npc_hidden_state_applies_and_stays_structural():
     from app.dm.effects import apply_staged_effects
     from models.world import WorldEntity
@@ -957,13 +980,13 @@ def test_campaign_visible_npc_dm_private_state_redacted_for_members():
         assert member_details["death_saves"] == {"successes": 0, "failures": 0}
         assert "rules_state_visibility" not in member_details
 
-        member_view = project_entity_for_viewer(row, False)
+        member_view = project_entity_for_viewer(row)
         assert "poisoned" not in str(member_view["details"])
         assert "Hex" not in str(member_view["details"])
         assert member_view["visibility"] == "campaign"
 
-        authority_view = project_entity_for_viewer(row, True)
-        assert has_condition(authority_view["details"]["conditions"], "poisoned") is True
+        # The DM runtime reads the row itself; full state stays there.
+        assert has_condition(row.details["conditions"], "poisoned") is True
 
 
 def test_multi_effect_mutation_is_transactional_with_source_turn():

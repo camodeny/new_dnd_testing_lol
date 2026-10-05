@@ -43,7 +43,7 @@ from app.dm.validators import KnowledgeValidator  # noqa: E402
 from app.world.knowledge import (  # noqa: E402
     assert_knowledge,
     grant_visibility,
-    what_does_subject_know,
+    list_knowledge_for_subject,
 )
 from app.world.facts import create_fact  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
@@ -323,8 +323,8 @@ def test_one_pc_discovery_is_not_party_knowledge():
         target_kind="fact", target_fact_id=fact.id,
         knowledge_state="knows", acquisition_source="direct_observation",
         operation_id="op-know-sep")
-    assert what_does_subject_know(db, camp, aria.id, owner)["visible"] == 1
-    assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
+    assert len(list_knowledge_for_subject(db, camp.id, aria.id)) == 1
+    assert list_knowledge_for_subject(db, camp.id, bram.id) == []
 
 
 def test_human_disclosure_does_not_create_character_knowledge():
@@ -343,7 +343,7 @@ def test_human_disclosure_does_not_create_character_knowledge():
     from app.visibility.access import may_user_receive
     assert may_user_receive(db, camp, "fact", fact.id, alice)["allowed"] is True
     # ...but no character knowledge row exists for anyone.
-    assert what_does_subject_know(db, camp, bram.id, owner)["visible"] == 0
+    assert list_knowledge_for_subject(db, camp.id, bram.id) == []
 
 
 # ── review findings: contract, mixed refs, scene relevance, lane NPCs ─────

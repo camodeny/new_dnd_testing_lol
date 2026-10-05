@@ -108,7 +108,7 @@ def _validate_no_leak(
 
 
 def build_historical_text(adventure: Adventure, events: list) -> str:
-    """Owner/DM-facing durable summary; may compress hidden sources."""
+    """DM-internal durable summary; may compress hidden sources (no human reader)."""
     lines = [
         f"Adventure '{adventure.title}' concluded with outcome: {adventure.outcome or 'unknown'}.",
     ]

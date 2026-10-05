@@ -701,8 +701,9 @@ class AdventureEpilogue(Base):
     def to_public_dict(self):
         """Member-safe projection.
 
-        Private epilogue content stays restricted to the owning player (and
-        the owner/DM); everyone else sees only participation metadata.
+        Private epilogue content stays restricted to the owning player;
+        everyone else, the campaign owner included, sees only participation
+        metadata.
         """
         d = self.to_dict(include_content=False)
         d["authority"] = "canon once resolved: adventure.epilogue domain event"

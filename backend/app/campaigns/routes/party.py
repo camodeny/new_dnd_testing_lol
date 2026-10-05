@@ -49,37 +49,6 @@ def get_party_roster(
     return {"party": replacements.party_roster(db, campaign)}
 
 
-@router.post("/api/campaigns/{campaign_id}/pc-deaths")
-def declare_pc_death(
-    payload: dict,
-    request: Request,
-    response: Response,
-    profile=Depends(current_profile),
-    campaign: Campaign = Depends(campaign_for("owner", forbidden="Only the owner can declare PC death")),
-    db: Session = Depends(get_db),
-):
-    """Declare a party PC dead/retired — terminal canon state, never deletion."""
-    char_id = parse_character_id(payload.get("character_id"))
-    target_status = str(payload.get("status") or "dead").strip().lower()
-    if target_status not in ("dead", "retired"):
-        raise HTTPException(status_code=400, detail="status must be dead or retired")
-    cause = payload.get("cause")
-    expected_revision = require_expected_revision(payload)
-    operation_id, idempotency_key = command_keys(request, payload)
-    return run_campaign_command(
-        db, response, actor_id=profile.id, idempotency_key=idempotency_key,
-        command_type="campaign.pc.death", scope_type="campaign", scope_id=campaign.id,
-        payload={**payload, "character_id": str(char_id)},
-        execute=lambda: replacements.commit_pc_death(
-            db, campaign.id, actor_id=profile.id, character_id=char_id,
-            status=target_status,
-            cause=str(cause) if cause is not None else None,
-            is_tpk=bool(payload.get("is_tpk", False)),
-            expected_revision=expected_revision, operation_id=operation_id or idempotency_key,
-        ),
-    )
-
-
 @router.post("/api/campaigns/{campaign_id}/pc-replacements")
 def activate_pc_replacement(
     payload: dict,
