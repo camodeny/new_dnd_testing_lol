@@ -348,7 +348,7 @@ def test_staged_update_scene_empty_values_clear_state():
     db.commit()
     tid = str(thread.id)
     _t, _a, event = _commit_scene_patch_turn(
-        db, cid, owner, tid, {"present_actors": [], "environment": {}},
+        db, cid, owner, tid, {"present_actors": [], "environment": {"weather": None}},
     )
     assert event is not None
     scene = get_current_scene(db, cid)
@@ -356,26 +356,6 @@ def test_staged_update_scene_empty_values_clear_state():
     assert scene.environment == {}
     # Location untouched by the patch is preserved
     assert scene.location_name == "Ember Gate"
-
-
-def test_staged_update_scene_empty_alias_values_clear_state():
-    Fac, cid, owner = _setup()
-    db = Fac()
-    commit_world_write(
-        db, cid, 0, apply_scene_update, location_name="Ember Gate",
-        present_actors=[{"name": "Aria"}],
-        environment={"light": "torchlight"}, operation_id="op-seed-alias",
-    )
-    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
-    db.commit()
-    tid = str(thread.id)
-    _t, _a, event = _commit_scene_patch_turn(
-        db, cid, owner, tid, {"present_actor_names": [], "state": {}},
-    )
-    assert event is not None
-    scene = get_current_scene(db, cid)
-    assert scene.present_actors == []
-    assert scene.environment == {}
 
 
 def test_create_entity_inline_idempotency_race_returns_winner():

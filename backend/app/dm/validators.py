@@ -1004,8 +1004,9 @@ class MechanicsValidator:
     legality reads authoritative sheet/NPC rows, which a packet-only
     validator cannot. A refused intent (no slot left, unknown condition,
     target without tracked HP) or stat-block pick (#478: unknown id, over
-    the party's encounter budget, NPC already statted) becomes regeneration
-    feedback; nothing is consumed before commit.
+    the party's encounter budget, NPC already statted) or a supersede of
+    code-owned canon (#468) becomes regeneration feedback; nothing is
+    consumed before commit.
     """
 
     name = "mechanics_validator"
@@ -1017,11 +1018,13 @@ class MechanicsValidator:
         self.turn = turn
 
     def validate(self, contract, packet) -> ValidatorResult:
-        from app.dm.mechanics import resolve_mechanics, reveal_issues, stat_block_issues
+        from app.dm.mechanics import canon_supersede_issues, resolve_mechanics, reveal_issues, stat_block_issues
 
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
-        issues = stat_block_issues(self.db, self.campaign, contract) + reveal_issues(self.db, self.campaign, self.turn, contract)
+        issues = (stat_block_issues(self.db, self.campaign, contract)
+                  + reveal_issues(self.db, self.campaign, self.turn, contract)
+                  + canon_supersede_issues(self.db, self.campaign, contract))
         if contract.mechanics:
             issues += resolve_mechanics(self.db, self.campaign, self.turn, contract).issues
         for issue in issues:

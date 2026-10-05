@@ -182,7 +182,7 @@ def test_provider_schema_spells_out_effect_argument_keys():
 
     guide = contract_json_schema_strict()["$defs"]["StagedEffect"]["properties"]["arguments"]["description"]
     assert "assign_stat_block{npc_entity_id*, monster_id*, creature_type*=aberration|beast|" in guide
-    assert "update_scene{scene_patch*, reason*}" in guide
+    assert "update_scene{scene_patch*{location_entity_id, location_name," in guide
     assert "apply_attack_damage" not in guide
 
 

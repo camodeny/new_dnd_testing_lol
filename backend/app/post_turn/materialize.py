@@ -31,6 +31,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -50,6 +51,7 @@ from app.decisions import (
     register_policy,
     to_decision_request,
 )
+from app.dm.contract import ScenePatch
 from app.dm.turns import DM_TURN_RESOLVED
 from app.observability.tracing import structured_log
 from app.visibility.access import validate_grant_target_kind
@@ -90,7 +92,7 @@ from app.world.knowledge import (
 from app.world.npcs import apply_npc_state, get_npc_state
 from app.world.service import (
     UNSET,
-    apply_scene_update,
+    apply_scene_patch,
     create_entity,
     get_current_scene,
     validate_entity_status,
@@ -1089,14 +1091,14 @@ def _apply_scene(
     numbering (sequence == resulting revision), so a delayed older
     assertion never overwrites newer committed state.
     """
-    data = assertion.data
-    if not isinstance(data.get("scene_patch", {}), dict) and "scene_patch" in data:
+    try:
+        patch = ScenePatch.model_validate(
+            assertion.data.get("scene_patch") or {}).model_dump(exclude_unset=True)
+    except ValidationError as exc:
         if assertion.mechanical:
-            raise MaterializeError(f"scene/{assertion.key}: scene_patch must be an object")
+            raise MaterializeError(f"scene/{assertion.key}: invalid scene_patch: {exc}") from exc
         return {"outcome": "rejected", "reason": "invalid_scene_patch"}
-    patch = data.get("scene_patch") or {}
-    location_ref = patch.get("location_entity_id", data.get("location_entity_id", UNSET))
-    location_id: Any = UNSET
+    location_ref = patch.get("location_entity_id", UNSET)
     if location_ref is not UNSET and location_ref is not None:
         location, _ = resolve_entity_ref(db, campaign.id, location_ref)
         if location is None:
@@ -1105,26 +1107,17 @@ def _apply_scene(
                     f"scene/{assertion.key}: location ref {location_ref!r} "
                     f"matches no canonical entity")
             return {"outcome": "deferred", "reason": "unresolvable_location_ref"}
-        location_id = location.id
-    elif location_ref is None:
-        location_id = None
+        patch["location_entity_id"] = location.id
     source_order = assertion.source_sequence if assertion.source_sequence is not None else -1
     current = get_current_scene(db, campaign.id)
     if current is not None and int(current.revision or 0) > source_order:
         # A newer committed scene already exists (e.g. update_scene at a
         # later commit ran before this delayed range): preserve it.
         return {"outcome": "skipped", "reason": "stale_source_order"}
-    row = apply_scene_update(
-        db, campaign, new_revision=source_order,
-        location_entity_id=location_id,
-        location_name=patch.get("location_name", data.get("location_name")),
-        fictional_time=patch.get("fictional_time", data.get("fictional_time")),
-        fictional_time_details=patch.get("fictional_time_details"),
-        present_actors=patch.get("present_actors", data.get("present_actors")),
-        environment=patch.get("environment", data.get("environment")),
-        visibility=assertion.visibility,
-        source_turn_id=None, source_attempt_id=None,
-        operation_id=operation_id,
+    # The hint's visibility (normalized at validation) scopes the scene row.
+    patch["visibility"] = assertion.visibility
+    row = apply_scene_patch(
+        db, campaign, patch, new_revision=source_order, operation_id=operation_id,
     )
     return {"outcome": "applied", "scene_revision": int(row.revision)}
 

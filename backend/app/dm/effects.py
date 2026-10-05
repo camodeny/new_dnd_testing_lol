@@ -64,10 +64,20 @@ from app.rules.state import (
     tick_conditions as _tick,
     update_condition as _update,
 )
+from app.dm.contract import ScenePatch
 from app.visibility.policy import EFFECT_VISIBILITIES, record_to_effect_visibility
-from app.world.facts import create_fact, create_relation, supersede_fact, supersede_relation
+from app.world._common import normalize_idempotency_key
+from app.world.facts import (
+    check_model_supersede,
+    create_fact,
+    create_relation,
+    find_fact_by_idempotency,
+    find_relation_by_idempotency,
+    supersede_fact,
+    supersede_relation,
+)
 from app.world.knowledge import assert_knowledge
-from app.world.service import UNSET, UNSET as _UNSET, apply_scene_update
+from app.world.service import UNSET as _UNSET, apply_scene_patch
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
@@ -293,43 +303,10 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     campaign revision (prior + 1), keeping scene changes in revision order.
     """
     args = effect.get("arguments") or {}
-    patch = args.get("scene_patch") or {}
-    if not isinstance(patch, dict):
-        raise ValueError(f"Staged effect {effect.get('id')!r} scene_patch must be an object")
+    patch = ScenePatch.model_validate(args.get("scene_patch") or {}).model_dump(exclude_unset=True)
     prior = int(campaign.revision) if campaign.revision is not None else 0
-    # Key-presence (not truthiness) patch semantics: an explicit empty list /
-    # dict / string clears state, while an absent key leaves it unchanged.
-    # `patch.get("x") or patch.get("alias")` would treat [] / {} / "" as
-    # absent and silently keep stale state.
-    def _pick(primary: str, alias: str):
-        if primary in patch:
-            return patch[primary]
-        if alias in patch:
-            return patch[alias]
-        return None
-    if "present_actors" in patch:
-        present_actors = patch["present_actors"]
-    elif "present_actor_names" in patch:
-        present_actors = patch["present_actor_names"]
-    else:
-        present_actors = None
-    if "environment" in patch:
-        environment = patch["environment"]
-    elif "state" in patch:
-        environment = patch["state"]
-    else:
-        environment = None
-    apply_scene_update(
-        db, campaign, new_revision=prior + 1,
-        # Key-presence: explicit null clears the canonical location reference
-        # while omission preserves it (same as actors/environment above).
-        location_entity_id=patch["location_entity_id"] if "location_entity_id" in patch else UNSET,
-        location_name=_pick("location_name", "location"),
-        fictional_time=_pick("fictional_time", "time"),
-        fictional_time_details=patch.get("fictional_time_details"),
-        present_actors=present_actors,
-        environment=environment,
-        visibility=args.get("visibility") or patch.get("visibility"),
+    apply_scene_patch(
+        db, campaign, patch, new_revision=prior + 1,
         source_turn_id=turn.id, source_attempt_id=attempt.id,
         operation_id=getattr(attempt, "commit_operation_id", None) or str(attempt.id),
     )
@@ -355,6 +332,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
     idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_fact_id")
     if supersedes:
+        check_model_supersede(db, campaign.id, "fact", supersedes)
         supersede_fact(
             db, campaign, supersedes,
             content=args.get("content"),
@@ -386,6 +364,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
     idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_relation_id")
     if supersedes:
+        check_model_supersede(db, campaign.id, "relation", supersedes)
         # Key-presence: absent object keys inherit the prior reference;
         # explicit null clears it (clear_object clears both sides at once).
         supersede_relation(
@@ -1242,6 +1221,18 @@ def _scoped_effect_key(attempt: DmTurnAttempt, key: str) -> str:
     if len(base) <= 128:
         return base
     return f"eff:{hashlib.sha256(base.encode('utf-8')).hexdigest()}"
+
+
+def committed_world_record(db: Session, campaign_id, attempt: DmTurnAttempt, effect: dict[str, Any]):
+    """The fact/relation row a committed ``assert_fact``/``upsert_relation`` wrote.
+
+    Looked up by the same durable key the handler wrote with, so post-turn
+    work (#468 canon promotion) addresses exactly that version.
+    """
+    key = normalize_idempotency_key(_resolve_effect_key(attempt, effect))
+    if effect.get("effect_type") == "assert_fact":
+        return find_fact_by_idempotency(db, campaign_id, key)
+    return find_relation_by_idempotency(db, campaign_id, key)
 
 
 def _resolve_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:

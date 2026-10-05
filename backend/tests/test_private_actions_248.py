@@ -312,7 +312,7 @@ def _private_effect_contract():
             "id": "fx1", "effect_type": "assert_fact",
             "arguments": {
                 "content": f"The vault sigil is a moth. {SECRET}",
-                "epistemic_state": "confirmed", "visibility": "dm_only",
+                "propose_confirmed": True, "visibility": "dm_only",
             },
         }, {
             "id": "rec1", "effect_type": "record_world_event",

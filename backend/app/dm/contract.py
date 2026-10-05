@@ -31,12 +31,18 @@ Observability:
 from __future__ import annotations
 
 import json
+import logging
 import re
+import types
 import typing
 import uuid
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
+
+from models.world import CODE_OWNED_EPISTEMIC_STATES
+
+logger = logging.getLogger(__name__)
 
 CONTRACT_VERSION = "dm_turn_contract_v1"
 SUPPORTED_VERSIONS = {CONTRACT_VERSION}
@@ -296,8 +302,52 @@ class RecordWorldEventArgs(StrictModel):
     payload: dict[str, Any] | None = None
     source_facet_ids: list[str] | None = None
 
+class SceneActor(StrictModel):
+    name: str = Field(min_length=1, max_length=160)
+    entity_id: str | None = Field(default=None, max_length=160)
+    kind: str | None = Field(default=None, max_length=32)
+    role: str | None = Field(default=None, max_length=160)
+
+
+_MAX_ENVIRONMENT_KEYS = 32
+_MAX_ENVIRONMENT_JSON = 4000
+
+
+class ScenePatch(StrictModel):
+    """Typed current-scene patch (#468); unknown keys are rejected.
+
+    Typed fields are the ones code reads (location, time, who is present).
+    ``environment`` is the open, campaign-specific scene state (weather,
+    mood, a ritual's progress, ...): keys merge into the current scene and
+    a null value removes that key. Omitted fields leave state unchanged;
+    explicit null clears a typed field.
+    """
+    location_entity_id: str | None = Field(default=None, max_length=160)
+    location_name: str | None = Field(default=None, max_length=256)
+    fictional_time: str | None = Field(default=None, max_length=256)
+    fictional_time_details: dict[str, Any] | None = None
+    present_actors: list[SceneActor] | None = Field(default=None, max_length=64, description="Replaces everyone present")
+    actors_entered: list[SceneActor] = Field(default_factory=list, max_length=64)
+    actors_left: list[str] = Field(default_factory=list, max_length=64, description="Names or entity ids")
+    environment: dict[str, Any] | None = None
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] | None = None
+
+    @model_validator(mode="after")
+    def _coherent(self) -> "ScenePatch":
+        if self.present_actors is not None and (self.actors_entered or self.actors_left):
+            raise ValueError("use present_actors (full list) or actors_entered/actors_left, not both")
+        env = self.environment or {}
+        if len(env) > _MAX_ENVIRONMENT_KEYS:
+            raise ValueError(f"environment allows at most {_MAX_ENVIRONMENT_KEYS} keys")
+        if any(not k.strip() or len(k) > 64 for k in env):
+            raise ValueError("environment keys must be 1-64 chars")
+        if len(json.dumps(env, default=str)) > _MAX_ENVIRONMENT_JSON:
+            raise ValueError(f"environment must serialize to {_MAX_ENVIRONMENT_JSON} chars or fewer")
+        return self
+
+
 class UpdateSceneArgs(StrictModel):
-    scene_patch: dict[str, Any] = Field(description="Bounded scene patch; no arbitrary SQL")
+    scene_patch: ScenePatch
     reason: str = Field(min_length=1, max_length=400)
 
 class RevealFactArgs(StrictModel):
@@ -306,32 +356,75 @@ class RevealFactArgs(StrictModel):
     visibility: Literal["public", "party_known", "dm_private"]
     reason: str = Field(min_length=1, max_length=400)
 
-class AssertFactArgs(StrictModel):
+#: Epistemic states the DM model may write (#468). ``confirmed`` / ``false``
+#: / ``retconned`` are canon judgments owned by code
+#: (``CODE_OWNED_EPISTEMIC_STATES``); the model asks for confirmation with
+#: ``propose_confirmed`` and post-turn promotion decides. A slip is
+#: downgraded in code (``downgrade_canon_claims``), never regenerated.
+ModelEpistemicState = Literal["believed", "suspected", "claimed", "unknown"]
+
+
+def downgrade_canon_claims(args: dict[str, Any]) -> dict[str, Any]:
+    """Map model-written canon states onto the model vocabulary (#468).
+
+    Cheaper than a regeneration for an easy, code-correctable slip:
+    ``confirmed`` becomes a ``claimed`` + ``propose_confirmed`` proposal
+    (post-turn promotion decides), ``false`` / ``retconned`` become a plain
+    ``claimed`` (never promoted), and a proposal on a non-claim state
+    drops the proposal.
+    """
+    state = args.get("epistemic_state")
+    out = args
+    if state in CODE_OWNED_EPISTEMIC_STATES:
+        out = {**args, "epistemic_state": "claimed"}
+        if state == "confirmed":
+            out["propose_confirmed"] = True
+    elif out.get("propose_confirmed") and state not in (None, "claimed"):
+        out = {**args, "propose_confirmed": False}
+    if out is not args:
+        logger.info("dm_contract_canon_downgraded from=%s propose=%s",
+                    state, out.get("propose_confirmed", False))
+    return out
+
+
+class _ProposesCanon(StrictModel):
+    epistemic_state: ModelEpistemicState = "claimed"
+    propose_confirmed: bool = False
+
+    @model_validator(mode="after")
+    def _proposal_is_a_claim(self):
+        if self.propose_confirmed and self.epistemic_state != "claimed":
+            raise ValueError("propose_confirmed requires epistemic_state=claimed")
+        return self
+
+
+class AssertFactArgs(_ProposesCanon):
     """Durable epistemic fact assertion — issue #210.
 
-    A bare claim stores as non-``confirmed`` epistemic state by default, so a
-    player/NPC utterance never becomes objective truth implicitly.
-    ``supersedes_fact_id`` creates a new version preserving history.
+    Stores as a non-canon epistemic state, so a player/NPC utterance never
+    becomes objective truth implicitly. ``propose_confirmed`` marks a claim
+    the DM narrated as world truth; post-turn promotion (#468) confirms it
+    only if it holds up against confirmed canon. ``supersedes_fact_id``
+    creates a new version preserving history.
     """
     content: str = Field(min_length=1, max_length=2000)
-    epistemic_state: Literal["confirmed", "false", "believed", "suspected", "claimed", "unknown", "retconned"] = "claimed"
     visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
     entity_refs: list[str] = Field(default_factory=list, max_length=24)
     provenance: dict[str, Any] | None = None
     supersedes_fact_id: str | None = Field(default=None, max_length=160)
     idempotency_key: str | None = Field(default=None, max_length=128)
 
-class UpsertRelationArgs(StrictModel):
+class UpsertRelationArgs(_ProposesCanon):
     """Durable world-relation write — issue #210.
 
     Creates a new relation version, or supersedes ``supersedes_relation_id``
-    (history preserved, never destructively overwritten).
+    (history preserved, never destructively overwritten). Canon states are
+    code-owned exactly as for ``AssertFactArgs``.
     """
     subject_entity_id: str = Field(min_length=1, max_length=160)
     relation_type: str = Field(min_length=2, max_length=64)
     object_entity_id: str | None = Field(default=None, max_length=160)
     object_label: str | None = Field(default=None, max_length=256)
-    epistemic_state: Literal["confirmed", "false", "believed", "suspected", "claimed", "unknown", "retconned"] = "claimed"
     visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
     provenance: dict[str, Any] | None = None
     supersedes_relation_id: str | None = Field(default=None, max_length=160)
@@ -914,6 +1007,8 @@ class StagedEffect(StrictModel):
     @model_validator(mode="after")
     def _validate_args(self) -> "StagedEffect":
         t = self.effect_type
+        if t in ("assert_fact", "upsert_relation"):
+            self.arguments = downgrade_canon_claims(self.arguments)
         args = self.arguments
         # Dispatch validation: coerce through the typed model for stricter checks
         try:
@@ -1366,19 +1461,32 @@ def _effect_argument_guide() -> str:
     this the model guesses keys (playtest 2026-10-03: ``npc_id`` for
     ``npc_entity_id`` failed a turn).
     """
-    parts = []
-    for effect_type, model in EFFECT_ARGS_MODELS.items():
-        if effect_type in _CODE_BUILT_EFFECTS:
-            continue
-        keys = []
-        for name, info in model.model_fields.items():
-            key = f"{name}*" if info.is_required() else name
-            # Closed vocabularies (creature_type, outcome, op) list their values.
-            if typing.get_origin(info.annotation) is Literal:
-                key += "=" + "|".join(str(v) for v in typing.get_args(info.annotation))
-            keys.append(key)
-        parts.append(f"{effect_type}{{{', '.join(keys)}}}")
-    return "; ".join(parts)
+    return "; ".join(
+        f"{effect_type}{_guide_keys(model)}"
+        for effect_type, model in EFFECT_ARGS_MODELS.items()
+        if effect_type not in _CODE_BUILT_EFFECTS
+    )
+
+
+def _guide_keys(model: type[BaseModel]) -> str:
+    """``{key*, key=a|b, nested{...}, items=[{...}]}`` for one argument model."""
+    keys = []
+    for name, info in model.model_fields.items():
+        key = f"{name}*" if info.is_required() else name
+        ann = info.annotation
+        # Optional[X] documents X; the null is implied by the key being optional.
+        if typing.get_origin(ann) in (typing.Union, types.UnionType):
+            ann = next(a for a in typing.get_args(ann) if a is not type(None))
+        is_list = typing.get_origin(ann) is list
+        inner = typing.get_args(ann)[0] if is_list else ann
+        # Closed vocabularies (creature_type, outcome, op) list their values.
+        if typing.get_origin(inner) is Literal:
+            key += "=" + "|".join(str(v) for v in typing.get_args(inner))
+        elif isinstance(inner, type) and issubclass(inner, BaseModel):
+            nested = _guide_keys(inner)
+            key += f"=[{nested}]" if is_list else nested
+        keys.append(key)
+    return "{" + ", ".join(keys) + "}"
 
 
 def contract_json_schema_strict() -> dict[str, Any]:
