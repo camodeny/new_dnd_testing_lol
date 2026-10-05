@@ -407,6 +407,71 @@ def apply_scene_update(
 
 # ── Runtime context assembly helper ─────────────────────────────────────────
 
+def _actor_keys(actor: Any) -> set[str]:
+    if isinstance(actor, str):
+        return {" ".join(actor.split()).casefold()}
+    return {" ".join(str(actor.get(k) or "").split()).casefold()
+            for k in ("entity_id", "name") if actor.get(k)}
+
+
+def apply_scene_patch(
+    db: Session,
+    campaign: Campaign,
+    patch: dict,
+    *,
+    new_revision: int,
+    source_turn_id: uuid.UUID | None = None,
+    source_attempt_id: uuid.UUID | None = None,
+    operation_id: str | None = None,
+) -> CampaignCurrentScene:
+    """Apply one validated ``ScenePatch`` dump (``exclude_unset``) (#468).
+
+    Key presence is the patch semantics: an omitted field is unchanged and
+    an explicit null clears it. ``actors_entered``/``actors_left`` edit the
+    current cast (matched by entity id or name, case-insensitive);
+    ``present_actors`` replaces it. ``environment`` merges into the current
+    open scene state, a null value removing that key.
+    """
+    current = get_current_scene(db, campaign.id)
+    actors: list | None = None
+    if "present_actors" in patch:
+        actors = list(patch["present_actors"] or [])
+    elif patch.get("actors_entered") or patch.get("actors_left"):
+        entered = list(patch.get("actors_entered") or [])
+        drop = {" ".join(str(r).split()).casefold() for r in patch.get("actors_left") or []}
+        for actor in entered:
+            drop |= _actor_keys(actor)
+        actors = [a for a in (current.present_actors if current else []) or []
+                  if not (_actor_keys(a) & drop)] + entered
+    environment: dict | None = None
+    if "environment" in patch:
+        environment = dict((current.environment if current else None) or {})
+        for key, value in (patch["environment"] or {}).items():
+            if value is None:
+                environment.pop(key, None)
+            else:
+                environment[key] = value
+    def _cleared(key: str, empty: Any) -> Any:
+        # apply_scene_update reads None as "unchanged"; explicit null clears.
+        if key not in patch:
+            return None
+        return empty if patch[key] is None else patch[key]
+
+    return apply_scene_update(
+        db, campaign, new_revision=new_revision,
+        location_entity_id=patch["location_entity_id"] if "location_entity_id" in patch else UNSET,
+        location_name=_cleared("location_name", ""),
+        fictional_time=_cleared("fictional_time", ""),
+        fictional_time_details=_cleared("fictional_time_details", {}),
+        present_actors=[{k: v for k, v in a.items() if v is not None} if isinstance(a, dict) else a
+                        for a in actors] if actors is not None else None,
+        environment=environment,
+        visibility=patch.get("visibility"),
+        source_turn_id=source_turn_id, source_attempt_id=source_attempt_id,
+        operation_id=operation_id,
+    )
+
+
 def build_current_scene_context_record(
     db: Session, campaign: Campaign, *, thread_id: str | None = None
 ) -> dict | None:

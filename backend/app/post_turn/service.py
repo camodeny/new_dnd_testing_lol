@@ -595,6 +595,17 @@ def run_post_turn_range(
                 operation_id=operation_id,
                 session_factory=clock_telemetry_factory,
             )
+            # Issue #468 — the DM model only proposes canon; promotion to
+            # confirmed is decided here, before consistency verification
+            # so incidents check against the promoted canon.
+            from app.post_turn.canon_promotion import promote_proposed_canon
+
+            patch["canon_promotion"] = promote_proposed_canon(
+                db, material_campaign, events,
+                decision_service=clock_decision_service,
+                operation_id=operation_id,
+                session_factory=clock_telemetry_factory,
+            )
             # Issue #218 — criteria-driven clocks are required consolidation:
             # a clock-processing failure raises here so the run fails and the
             # checkpoint stays put for cumulative retry. Custom
@@ -703,7 +714,7 @@ def run_post_turn_range(
         logger.info("post_turn consolidated campaign=%s %s-%s run=%s",
                     campaign_id, from_sequence, to_sequence, run.id if run else "-")
         if commit:
-            _request_range_semantic_index(db, campaign_id, events)
+            _request_range_semantic_index(db, campaign_id, events, patch)
             _publish_grant_invalidations(db, campaign_id, patch)
         return {"duplicate": False, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": to_sequence, "event_count": len(events), "result": patch}
@@ -870,14 +881,16 @@ def _publish_grant_invalidations(db: Session, campaign_id: uuid.UUID, patch: dic
 
 def _request_range_semantic_index(
     db: Session, campaign_id: uuid.UUID, events: list[CampaignDomainEvent],
+    patch: dict | None = None,
 ) -> None:
     """Stage #213 semantic indexing for a consolidated range.
 
     Materialization writes facts/relations after the turn commit, so the
     turn-commit hook (``note_turn_committed``) never sees them. Stages the
-    range's domain events plus facts/relations citing them; the semantic
-    sweep embeds them later. Best-effort: never raises past the already
-    committed checkpoint.
+    range's domain events plus facts/relations citing them, and both sides
+    of every #468 canon promotion (re-indexing the superseded claim retires
+    its vectors); the semantic sweep embeds them later. Best-effort: never
+    raises past the already committed checkpoint.
     """
     try:
         from models.world import WorldFact, WorldRelation
@@ -891,6 +904,11 @@ def _request_range_semantic_index(
             )).scalars().all()
             entries.extend((source_type, row_id) for row_id in ids)
         entries.extend(("domain_event", event_id) for event_id in event_ids)
+        for outcome in ((patch or {}).get("canon_promotion") or {}).get("outcomes") or []:
+            if outcome.get("promoted_ref"):
+                kind = "world_fact" if outcome.get("record_kind") == "fact" else "world_relation"
+                entries.extend((kind, uuid.UUID(outcome[ref]))
+                               for ref in ("record_ref", "promoted_ref"))
         note_authoritative_write(db, campaign_id, entries)
     except Exception as exc:  # noqa: BLE001 — derived index work never fails the run
         logger.warning("post_turn semantic index staging failed campaign=%s error=%s",

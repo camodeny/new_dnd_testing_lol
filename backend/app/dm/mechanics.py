@@ -140,6 +140,28 @@ def reveal_issues(db: Session, campaign: Any, turn: Any, contract: DmTurnContrac
     return issues
 
 
+def canon_supersede_issues(db: Session, campaign: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
+    """Refusals for model supersedes of missing or code-owned canon rows (#468)."""
+    from app.world.facts import check_model_supersede
+
+    issues: list[MechanicIssue] = []
+    for effect in contract.staged_effects:
+        if effect.effect_type == "assert_fact":
+            kind, prior = "fact", effect.arguments.get("supersedes_fact_id")
+        elif effect.effect_type == "upsert_relation":
+            kind, prior = "relation", effect.arguments.get("supersedes_relation_id")
+        else:
+            continue
+        if not prior:
+            continue
+        try:
+            check_model_supersede(db, campaign.id, kind, prior)
+        except ValueError as exc:
+            issues.append(MechanicIssue(effect.id, "invalid_supersede",
+                                        f"{exc}; assert a new claimed {kind} instead"))
+    return issues
+
+
 def _pending_stat_blocks(contract: DmTurnContractV1) -> dict[str, tuple[str, str | None]]:
     """``npc_entity_id -> (monster_id, creature_type)`` assigned in this same contract."""
     return {

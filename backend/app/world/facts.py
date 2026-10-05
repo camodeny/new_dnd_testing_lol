@@ -44,6 +44,7 @@ from app.world.service import UNSET
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.dm import DmTurn, DmTurnAttempt
 from models.world import (
+    CODE_OWNED_EPISTEMIC_STATES,
     EPISTEMIC_STATES,
     RECORD_STATUSES,
     WorldEntity,
@@ -60,6 +61,7 @@ __all__ = [
     "validate_relation_type",
     "validate_epistemic_state",
     "validate_record_status",
+    "check_model_supersede",
     "validate_new_version_status",
     "validate_object_label",
     "validate_fact_content",
@@ -267,6 +269,21 @@ def get_fact_strict(db: Session, campaign_id: uuid.UUID, fact_id: uuid.UUID) -> 
     return fact
 
 
+def check_model_supersede(db: Session, campaign_id: uuid.UUID, kind: str, prior_id: Any) -> None:
+    """Refuse a DM-model supersede of a missing or canon row (#468).
+
+    Confirmed / false / retconned rows are code-owned canon: the model may
+    not rewrite them, even into another non-canon version. Lifecycle
+    (active vs superseded) stays with the writer, whose idempotency lookup
+    must run first so exact commit retries still succeed.
+    """
+    getter = get_fact_strict if kind == "fact" else get_relation_strict
+    prior = getter(db, campaign_id, prior_id)
+    if prior.epistemic_state in CODE_OWNED_EPISTEMIC_STATES:
+        raise ValueError(
+            f"{kind} {prior.id} is {prior.epistemic_state} canon; the DM cannot supersede it")
+
+
 def list_relations(
     db: Session,
     campaign_id: uuid.UUID,
@@ -364,7 +381,7 @@ def list_records_for_source_turn(
 
 # ── Internal writers (no revision bump; caller owns the transaction) ────────
 
-def _find_relation_by_idempotency(
+def find_relation_by_idempotency(
     db: Session, campaign_id: uuid.UUID, idempotency_key: str | None
 ) -> WorldRelation | None:
     if not idempotency_key or not str(idempotency_key).strip():
@@ -377,7 +394,7 @@ def _find_relation_by_idempotency(
     ).scalars().first()
 
 
-def _find_fact_by_idempotency(
+def find_fact_by_idempotency(
     db: Session, campaign_id: uuid.UUID, idempotency_key: str | None
 ) -> WorldFact | None:
     if not idempotency_key or not str(idempotency_key).strip():
@@ -453,7 +470,7 @@ def _insert_relation_row(
     stays recoverable on every backend.
     """
     if idempotency_key:
-        existing = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
+        existing = find_relation_by_idempotency(db, campaign.id, idempotency_key)
         if existing is not None:
             structured_log(
                 logger, logging.INFO, "world_relation_duplicate_conflict",
@@ -490,7 +507,7 @@ def _insert_relation_row(
                 )
                 .on_conflict_do_nothing(index_elements=["campaign_id", "idempotency_key"])
             )
-            stored = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
+            stored = find_relation_by_idempotency(db, campaign.id, idempotency_key)
             if stored is None:  # pragma: no cover — defensive
                 raise RuntimeError(f"idempotent relation insert for key {idempotency_key!r} left no row")
             if str(stored.id) == str(row_id):
@@ -536,7 +553,7 @@ def _insert_relation_row(
             db.expunge(row)
         except Exception:
             pass
-        winner = _find_relation_by_idempotency(db, campaign.id, idempotency_key)
+        winner = find_relation_by_idempotency(db, campaign.id, idempotency_key)
         if winner is not None:
             structured_log(
                 logger, logging.INFO, "world_relation_duplicate_conflict",
@@ -662,7 +679,7 @@ def supersede_relation(
     prior = get_relation_strict(db, campaign.id, coerce_uuid(prior_relation_id, field="prior_relation_id"))
     key = normalize_idempotency_key(idempotency_key or operation_id)
     if key:
-        dup = _find_relation_by_idempotency(db, campaign.id, key)
+        dup = find_relation_by_idempotency(db, campaign.id, key)
         if dup is not None:
             _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="relation")
             structured_log(
@@ -797,7 +814,7 @@ def create_fact(
     turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
 
     if key:
-        dup = _find_fact_by_idempotency(db, campaign.id, key)
+        dup = find_fact_by_idempotency(db, campaign.id, key)
         if dup is not None:
             structured_log(
                 logger, logging.INFO, "world_fact_duplicate_conflict",
@@ -829,7 +846,7 @@ def create_fact(
                 )
                 .on_conflict_do_nothing(index_elements=["campaign_id", "idempotency_key"])
             )
-            stored = _find_fact_by_idempotency(db, campaign.id, key)
+            stored = find_fact_by_idempotency(db, campaign.id, key)
             if stored is None:  # pragma: no cover — defensive
                 raise RuntimeError(f"idempotent fact insert for key {key!r} left no row")
             if str(stored.id) != str(row_id):
@@ -885,7 +902,7 @@ def create_fact(
                 db.expunge(row)
             except Exception:
                 pass
-            winner = _find_fact_by_idempotency(db, campaign.id, key)
+            winner = find_fact_by_idempotency(db, campaign.id, key)
             if winner is not None:
                 structured_log(
                     logger, logging.INFO, "world_fact_duplicate_conflict",
@@ -933,7 +950,7 @@ def supersede_fact(
     prior = get_fact_strict(db, campaign.id, coerce_uuid(prior_fact_id, field="prior_fact_id"))
     key = normalize_idempotency_key(idempotency_key or operation_id)
     if key:
-        dup = _find_fact_by_idempotency(db, campaign.id, key)
+        dup = find_fact_by_idempotency(db, campaign.id, key)
         if dup is not None:
             _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="fact")
             structured_log(
@@ -1011,7 +1028,7 @@ def supersede_fact(
                 db.expunge(row)
             except Exception:
                 pass
-            winner = _find_fact_by_idempotency(db, campaign.id, key)
+            winner = find_fact_by_idempotency(db, campaign.id, key)
             if winner is not None:
                 structured_log(
                     logger, logging.INFO, "world_fact_duplicate_conflict",

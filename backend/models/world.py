@@ -234,6 +234,12 @@ EPISTEMIC_STATES = frozenset({
     "confirmed", "false", "believed", "suspected", "claimed", "unknown", "retconned",
 })
 
+# Canon judgments only code may write (#468): world seed, mechanical
+# history, post-turn promotion, and repair. The DM model proposes
+# confirmation via ``propose_confirmed``; it never stamps these itself, and
+# never supersedes a row that already carries one.
+CODE_OWNED_EPISTEMIC_STATES = frozenset({"confirmed", "false", "retconned"})
+
 # Effective lifecycle. Only ``active`` rows are current truth; superseded /
 # retracted rows are preserved history, never destructively overwritten.
 RECORD_STATUSES = frozenset({"active", "superseded", "retracted"})

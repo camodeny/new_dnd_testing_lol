@@ -705,7 +705,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
     from unittest import mock
 
     import app.world.facts as facts_mod
-    from app.world.facts import _find_fact_by_idempotency
+    from app.world.facts import find_fact_by_idempotency
     from models.world import WorldFactEntityRef
 
     Fac, cid, _owner = _setup()
@@ -723,7 +723,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
     # Simulate the race window: the precheck SELECT misses, the upsert
     # absorbs the unique conflict, and the post-insert lookup finds the
     # winner. The loser references a DIFFERENT entity.
-    real_find = _find_fact_by_idempotency
+    real_find = find_fact_by_idempotency
     calls = {"n": 0}
 
     def flaky_find(db_, cid_, key_):
@@ -732,7 +732,7 @@ def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
             return None
         return real_find(db_, cid_, key_)
 
-    with mock.patch.object(facts_mod, "_find_fact_by_idempotency", side_effect=flaky_find):
+    with mock.patch.object(facts_mod, "find_fact_by_idempotency", side_effect=flaky_find):
         loser, created2 = create_fact(
             db, db.get(Campaign, cid), content="Guild owns Mara (loser).",
             entity_refs=[guild.id], epistemic_state="suspected",
