@@ -732,6 +732,28 @@ class KnowledgeValidator:
                 out[subject_id] = perspective
         return out
 
+    def _co_present_ids(self, packet) -> set[str]:
+        """What any NPC in the scene perceives by being there.
+
+        The current scene's location and the PCs acting this turn, the same
+        co-presence baseline an NPC gets when introduced or entering the
+        scene, applied at validation so NPCs from before that baseline are
+        covered too. Explicit ``does_not_know`` entries still win.
+        """
+        out: set[str] = set()
+        if packet is None:
+            return out
+        for lane in packet.lanes:
+            if lane.name not in (LaneName.CURRENT_SCENE, LaneName.PLAYER_INPUTS):
+                continue
+            for rec in lane.records:
+                value = rec.value if isinstance(rec.value, dict) else {}
+                key = "location_entity_id" if lane.name == LaneName.CURRENT_SCENE else "character_id"
+                token = _norm_id(value.get(key))
+                if token:
+                    out.add(token)
+        return out
+
     # Claim kinds that can carry fictional knowledge for an NPC subject.
     _NPC_KNOWLEDGE_KINDS = frozenset({"npc_utterance", "observation", "world_fact"})
 
@@ -775,6 +797,7 @@ class KnowledgeValidator:
         violations: list[ValidationViolation] = []
         perspectives = self._perspectives(packet)
         transfers = self._transfer_coverage(contract)
+        co_present = self._co_present_ids(packet)
         for bi, ci, claim in _all_claims(contract):
             if claim.claim_kind not in self._NPC_KNOWLEDGE_KINDS:
                 continue
@@ -826,7 +849,7 @@ class KnowledgeValidator:
             # denial — the turn itself is the learning source.
             unknown = [
                 ref for ref in refs
-                if ref not in perspective["known"] and ref not in taught
+                if ref not in perspective["known"] and ref not in taught and ref not in co_present
             ]
             if unknown:
                 violations.append(
@@ -1175,6 +1198,7 @@ def run_with_bounded_regeneration(
     max_regenerations: int = 3,
     packet_repair: Callable[[ValidationReport, ForwardDmContextPacket | None], ForwardDmContextPacket | None] | None = None,
     pipeline: ValidatorPipeline | None = None,
+    initial_contract: DmTurnContractV1 | None = None,
 ) -> tuple[DmTurnContractV1, ValidationReport]:
     """Bounded retry: adjudicate → validate → on rejection, adjudicate again with feedback.
 
@@ -1187,8 +1211,15 @@ def run_with_bounded_regeneration(
     ``packet_repair`` is an optional deterministic hook for missing knowledge
     perspectives (issue #455): called once with the failing report and current
     packet, it may return a packet with the absent lane entries resolved (or
-    None). A repaired packet costs exactly one model retry inside the normal
-    budget — never an extra call.
+    None). The same contract is first re-validated against the repaired
+    packet: an NPC the DM brought into the turn whose stored perspective
+    covers its claims passes with no model call. Otherwise the repaired packet
+    costs exactly one model retry inside the normal budget — never an extra
+    call.
+
+    ``initial_contract`` validates an already-produced contract as attempt 0
+    instead of calling ``adjudicate``, so its rejection (and any perspective
+    repair) feeds the first retry.
 
     Deterministic fast-path (issue #455): when every violation is a missing
     knowledge perspective, rewording cannot help — the lane entry is absent
@@ -1215,7 +1246,10 @@ def run_with_bounded_regeneration(
             # perspective lane survives re-augmentation.
             if attempt > 0 and feedback is not None:
                 current_packet = _augment_packet_with_feedback(current_packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
-            raw = adjudicate(current_packet, feedback)
+            if attempt == 0 and initial_contract is not None:
+                raw = initial_contract
+            else:
+                raw = adjudicate(current_packet, feedback)
             if isinstance(raw, dict):
                 contract = normalize_contract(raw)
             elif isinstance(raw, DmTurnContractV1):
@@ -1284,7 +1318,15 @@ def run_with_bounded_regeneration(
                         attempt=attempt, subjects=missing_perspective_subjects(report),
                         correlation_id=report.correlation_id,
                     )
+                    # The contract only lacked the perspective: with it in
+                    # the packet, the same claims may already be covered.
+                    resolved_report = pipe.validate(
+                        contract, current_packet, regeneration_index=attempt,
+                    )
+                    if resolved_report.passed:
+                        return contract, resolved_report
                     if attempt < max_regenerations:
+                        last_report = resolved_report
                         continue
             # Repair unavailable or exhausted: narrow deterministically with
             # zero additional model calls. Silence is only a fallback when it

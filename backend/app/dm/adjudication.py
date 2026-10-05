@@ -19,10 +19,9 @@ from app.providers.runner import AiRunLedger, classification_for, require_approv
 
 logger = logging.getLogger(__name__)
 
-#: Reasoning effort for forward-DM adjudication. Muse Spark always reasons
-#: server-side; the default burns ~3k hidden thinking tokens (~30-40s) on a
-#: schema-constrained contract call. "low" holds ~14s with first-try valid
-#: contracts (measured 2026-09-25); "none" is rejected (400) for Muse models.
+#: Reasoning effort for forward-DM adjudication. On GPT-6 Luna "low" settles
+#: ~94% of replayed turns in one call at ~8s median; "none" is ~3s faster but
+#: fails twice as many turns (16-turn replay, 2026-10-05).
 FORWARD_DM_REASONING_EFFORT = "low"
 
 FORWARD_DM_SYSTEM = """\
@@ -67,6 +66,9 @@ Resolve the player's intent with a concrete response, discovery, consequence,
 or necessary roll. Do not merely repeat their action and ask what they do.
 Preserve established facts and player agency, but advance the world in response
 to the action. Missing prewritten story detail is not a reason to freeze play.
+A broad or vague action is still an action: resolve its most plausible reading
+with a concrete lead or consequence. Clarify only when readings conflict in a
+way that changes the outcome, not to ask for specifics.
 Unmarked narration in player inputs can declare actions even when its segment
 is ooc; table_chat is for actual discussion of the game, not action declarations.
 MIXED DISCUSSION + ACTION: when one input asks an OOC question and declares an
@@ -184,9 +186,15 @@ def build_forward_dm_messages(packet) -> list[dict]:
         "player_transcript, or do not assert a PC action. NPC actor_ref, "
         "speaker_ref, and target/topic refs use the exact entity id from the "
         "packet (subject_entity_id / registry id), never a name or alias. "
-        "On narration "
-        "beats, speaker_ref, speaker_public_name, truth_status, and "
-        "dm_private_context must all be null (npc_dialogue beats only)."
+        "npc_dialogue beats are one NPC speaking: speaker_ref is that NPC, "
+        "speaker_public_name is set, truth_status is REQUIRED (truthful, "
+        "mistaken, deceptive, incomplete, or unknown), every claim is an "
+        "npc_utterance whose actor_ref equals speaker_ref, and any "
+        "truth_status other than truthful needs dm_private_context stating "
+        "what is actually true. Narration beats hold no NPC speech: "
+        "speaker_ref, speaker_public_name, truth_status, and "
+        "dm_private_context are null and no claim is an npc_utterance. "
+        "roll_request_id is null except on roll_outcome claims."
     )
     return [
         {"role": "system", "content": FORWARD_DM_SYSTEM + "\n" + schema_hint},

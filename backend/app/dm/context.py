@@ -743,6 +743,97 @@ def _processed_through_sequence(db: Session, campaign_id: uuid.UUID) -> int:
         return 0
 
 
+#: Recently active NPCs preloaded into the knowledge lane per attempt.
+RECENTLY_ACTIVE_NPC_LIMIT = 8
+
+
+def _recently_active_npc_ids(
+    db: Session,
+    campaign_id: uuid.UUID,
+    turn_attempt_ids: list[str],
+    *,
+    limit: int = RECENTLY_ACTIVE_NPC_LIMIT,
+) -> list[str]:
+    """Live NPC entity IDs active in the given resolved turns, most recent first.
+
+    Active means introduced by the turn (``source_attempt_id``) or referenced
+    as speaker, actor, target, or topic in its committed contract. Only
+    current (non-superseded) NPC entities of this campaign count.
+    """
+    from models.world import WorldEntity
+
+    attempt_ids: list[uuid.UUID] = []
+    for value in turn_attempt_ids:
+        try:
+            attempt_ids.append(uuid.UUID(str(value)))
+        except ValueError:
+            continue
+    if not attempt_ids or limit <= 0:
+        return []
+    snapshots = dict(
+        db.execute(
+            select(DmTurnAttempt.id, DmTurnAttempt.contract_snapshot).where(
+                DmTurnAttempt.id.in_(attempt_ids),
+                DmTurnAttempt.campaign_id == campaign_id,
+            )
+        ).all()
+    )
+    introduced: dict[uuid.UUID, list[str]] = {}
+    for entity_id, source_attempt_id in db.execute(
+        select(WorldEntity.id, WorldEntity.source_attempt_id)
+        .where(
+            WorldEntity.campaign_id == campaign_id,
+            WorldEntity.source_attempt_id.in_(attempt_ids),
+            WorldEntity.entity_type == "npc",
+        )
+        .order_by(WorldEntity.created_at.asc())
+    ).all():
+        introduced.setdefault(source_attempt_id, []).append(str(entity_id))
+
+    candidates: list[str] = []
+    for attempt_id in attempt_ids:
+        refs = list(introduced.get(attempt_id, []))
+        for beat in (snapshots.get(attempt_id) or {}).get("beats") or []:
+            if not isinstance(beat, dict):
+                continue
+            refs.append(beat.get("speaker_ref"))
+            for claim in beat.get("claims") or []:
+                if not isinstance(claim, dict):
+                    continue
+                refs.append(claim.get("actor_ref"))
+                refs.extend(claim.get("target_refs") or [])
+                refs.extend(claim.get("topic_refs") or [])
+        for ref in refs:
+            if isinstance(ref, dict):
+                if ref.get("type") != "npc":
+                    continue
+                ref = ref.get("id")
+            token = str(ref or "").strip()
+            if token and token not in candidates:
+                candidates.append(token)
+
+    candidate_ids: list[uuid.UUID] = []
+    for token in candidates:
+        try:
+            candidate_ids.append(uuid.UUID(token))
+        except ValueError:
+            continue
+    if not candidate_ids:
+        return []
+    live = {
+        str(entity_id)
+        for entity_id in db.scalars(
+            select(WorldEntity.id).where(
+                WorldEntity.id.in_(candidate_ids),
+                WorldEntity.campaign_id == campaign_id,
+                WorldEntity.entity_type == "npc",
+                WorldEntity.superseded_by_id.is_(None),
+            )
+        ).all()
+    }
+    return [token for token in candidates if token in live][:limit]
+
+
 def _audience_for_attempt(
     db: Session, campaign: Campaign, turn: DmTurnAttempt
 ) -> ContextAudience:
@@ -1122,6 +1213,9 @@ def assemble_attempt_context(
     # The execution gate (pause_if_backpressured) blocks before that in
     # production; private history keeps its scoped visibility either way.
     processed_through = _processed_through_sequence(db, campaign.id)
+    # Resolved turns this audience can see, newest first: the source of
+    # recently active NPCs for the knowledge lane below.
+    visible_turn_attempt_ids: list[str] = []
     if recent_event_limit:
         recent_events = list(
             db.scalars(
@@ -1151,6 +1245,10 @@ def assemble_attempt_context(
             if record is None:
                 continue
             records[LaneName.RECENT_HISTORY].append(record)
+            if event.event_type == DM_TURN_RESOLVED:
+                turn_attempt_id = str((event.payload or {}).get("attempt_id") or "").strip()
+                if turn_attempt_id:
+                    visible_turn_attempt_ids.insert(0, turn_attempt_id)
         if processed_through < attempt.source_revision:
             gap_events = list(
                 db.scalars(
@@ -1409,6 +1507,16 @@ def assemble_attempt_context(
                     scene_npc_ids.append(eid)
             if len(scene_npc_ids) >= 32:
                 break
+    # Recently active NPCs carry perspectives up front too: an NPC who spoke,
+    # acted, or was introduced in a recent visible turn is likely to act
+    # again, and without a perspective its first claim fails closed and
+    # costs a model retry. present_actors alone misses NPCs that were never
+    # (re)registered in the scene.
+    for eid in _recently_active_npc_ids(db, campaign.id, visible_turn_attempt_ids):
+        if len(scene_npc_ids) >= 32:
+            break
+        if eid not in scene_npc_ids:
+            scene_npc_ids.append(eid)
     knowledge_values = build_knowledge_visibility_values(
         db, campaign, sorted(character_ids, key=str),
         npc_entity_ids=scene_npc_ids,

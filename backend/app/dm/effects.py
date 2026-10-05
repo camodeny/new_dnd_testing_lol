@@ -76,11 +76,13 @@ from app.world.facts import (
     supersede_fact,
     supersede_relation,
 )
+from app.world.identity import grant_entered_npcs_baseline
 from app.world.knowledge import assert_knowledge
 from app.world.service import UNSET as _UNSET, apply_scene_patch
 from models.campaigns import Campaign
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
+from models.world import CampaignCurrentScene
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,16 @@ def _handle_record_world_event(db: Session, campaign: Campaign, effect: dict[str
     logger.info("effect record_world_event effect_id=%s summary=%s visibility=%s", effect.get("id"), args.get("summary"), args.get("visibility"))
 
 
+def _present_entity_ids(scene) -> list[str]:
+    """Entity IDs of the scene's present actors, in order."""
+    out: list[str] = []
+    for actor in (getattr(scene, "present_actors", None) or []):
+        eid = str(actor.get("entity_id") or "").strip() if isinstance(actor, dict) else ""
+        if eid and eid not in out:
+            out.append(eid)
+    return out
+
+
 @register("update_scene")
 def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     """Apply a bounded scene patch to the authoritative current-scene row.
@@ -305,11 +317,15 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     args = effect.get("arguments") or {}
     patch = ScenePatch.model_validate(args.get("scene_patch") or {}).model_dump(exclude_unset=True)
     prior = int(campaign.revision) if campaign.revision is not None else 0
-    apply_scene_patch(
+    before = _present_entity_ids(db.get(CampaignCurrentScene, campaign.id))
+    scene = apply_scene_patch(
         db, campaign, patch, new_revision=prior + 1,
         source_turn_id=turn.id, source_attempt_id=attempt.id,
         operation_id=getattr(attempt, "commit_operation_id", None) or str(attempt.id),
     )
+    entered = [eid for eid in _present_entity_ids(scene) if eid not in before]
+    if entered:
+        grant_entered_npcs_baseline(db, campaign, entered, attempt=attempt, turn=turn)
     logger.info("effect update_scene effect_id=%s reason=%s", effect.get("id"), args.get("reason"))
 
 

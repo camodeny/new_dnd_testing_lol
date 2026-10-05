@@ -17,11 +17,11 @@ def keys(monkeypatch):
     monkeypatch.setenv("OPENROUTER_API_KEY", "dummy")
 
 
-def test_dm_pinned_to_meta(keys):
+def test_dm_pinned_to_openai(keys):
     adapter, model, name = resolve_area("dm")
-    assert name == "meta"
-    assert model == "muse-spark-1.3-contributor"
-    assert adapter.name == "meta"
+    assert name == "openai"
+    assert model == "gpt-6-luna"
+    assert adapter.name == "openai"
 
 
 def test_narrator_pinned_to_openai(keys):
@@ -48,7 +48,7 @@ def test_areas_known(keys):
 
 
 def test_missing_key_fails_clearly(keys, monkeypatch):
-    monkeypatch.delenv("META_API_KEY")
+    monkeypatch.delenv("OPENAI_API_KEY")
     with pytest.raises(RuntimeError, match="API_KEY"):
         resolve_area("dm")
 

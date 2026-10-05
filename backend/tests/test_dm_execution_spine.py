@@ -632,6 +632,50 @@ def test_evidence_survives_validation_and_regeneration(db, regenerate):
     assert len(calls) == (3 if regenerate else 2)
 
 
+def test_retry_asking_for_evidence_resumes_the_evidence_loop(db):
+    """A regeneration retry may answer a rejection with need_evidence; the
+    evidence must be fetched and the turn resolved, never committed as a
+    prelude-only need_evidence turn."""
+    from models.campaigns import CampaignMember
+    from models.characters import Character, Dnd5eCharacterSheet
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Hero", "total_level": 1, "armor_class": 15}, owner)
+    sheet.character_id = char.id
+    s.add(sheet)
+    s.commit()
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(packet)
+        if len(calls) == 1:
+            # Valid structure, rejected by validation: cites a missing source.
+            contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+            contract["beats"][0]["claims"][0].update(origin="resolver_evidence", evidence_refs=["unknown-source"])
+            return normalize_contract(contract)
+        if len(calls) == 2:
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION, "mode": "need_evidence",
+                "reason": "check sheet", "beats": [], "safe_prelude": "Checking the sheet.",
+                "evidence_requests": [{"id": "evidence_1", "tool": "ask_character_sheet",
+                                       "question": "What is AC?", "scope": "current_player"}],
+            })
+        assert any(r.record_id == "evidence:evidence_1" for lane in packet.lanes for r in lane.records)
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        contract["beats"][0]["claims"][0].update(origin="resolver_evidence", evidence_refs=["evidence:evidence_1"])
+        return normalize_contract(contract)
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert result.attempt.contract_snapshot["mode"] == "respond"
+    assert len(calls) == 3
+
+
 def test_two_sessions_only_one_executor_reaches_adjudication(db):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -950,6 +994,59 @@ def test_structural_exhaustion_fails_visibly_not_running(db):
     assert s.get(DmTurn, attempt.turn_id).status != "streaming"
 
 
+def test_npc_active_last_turn_has_perspective_on_next_first_call(db):
+    """An NPC who spoke in a recent visible turn is in the next packet's
+    knowledge lane before the first model call (no fail-repair-retry)."""
+    from app.dm.context import LaneName
+    from app.world.knowledge import assert_knowledge
+    from app.world.service import create_entity
+
+    s, camp_id, thread_id, _ = db
+    camp = s.get(Campaign, camp_id)
+    npc, _ = commit_world_write(
+        s, camp_id, 0, create_entity, entity_type="npc", name="Hooded Traveler", operation_id="op-hood-active",
+    )
+    well, _ = commit_world_write(
+        s, camp_id, 1, create_entity, entity_type="location", name="Old Well", operation_id="op-well-active",
+    )
+    assert_knowledge(
+        s, camp, subject_kind="npc", subject_entity_id=npc.id,
+        target_kind="entity", target_entity_id=well.id,
+        knowledge_state="knows", acquisition_source="direct_observation",
+        operation_id="op-know-active",
+    )
+    s.commit()
+    first_call_subjects = []
+
+    def adjudicate(packet, feedback=None):
+        if feedback is None:
+            lane = next(l for l in packet.lanes if l.name == LaneName.KNOWLEDGE_VISIBILITY)
+            first_call_subjects.append({str((r.value or {}).get("subject_entity_id")) for r in lane.records})
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "npc speaks",
+            "beats": [{
+                "id": "b1", "type": "npc_dialogue",
+                "speaker_ref": {"type": "npc", "id": str(npc.id)},
+                "speaker_public_name": "Hooded traveler", "truth_status": "truthful",
+                "claims": [{
+                    "text": "The old well runs deep.", "claim_kind": "npc_utterance",
+                    "actor_ref": {"type": "npc", "id": str(npc.id)},
+                    "topic_refs": [{"type": "location", "id": str(well.id)}],
+                    "origin": "dm_adjudication",
+                }],
+            }],
+            "open_player_choice": "What do you do?",
+        })
+
+    for text in ("I ask the traveler about the well.", "I ask what lies below."):
+        _, attempt = _submit(s, camp_id, thread_id, text=text)
+        result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+        assert result.attempt.status == "succeeded"
+
+    assert str(npc.id) not in first_call_subjects[0]
+    assert str(npc.id) in first_call_subjects[1]
+
+
 def test_perspective_repair_packet_carries_through_validation(db):
     """Issue #455 review: a contract that passed against the perspective-repaired
     packet must not be re-validated against the unrepaired one (which would
@@ -997,5 +1094,6 @@ def test_perspective_repair_packet_carries_through_validation(db):
 
     result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
     assert result.attempt.status == "succeeded"
-    # structural failure, unrepaired dialogue, retry against the repaired packet
-    assert len(calls) == 3
+    # structural failure, then dialogue that passes once the NPC's stored
+    # perspective is loaded into the packet — no further model call
+    assert len(calls) == 2

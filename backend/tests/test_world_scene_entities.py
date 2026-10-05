@@ -601,3 +601,85 @@ def test_private_scene_context_assembly_stays_hidden():
     assert proj_lane["records"] == []
 
 
+
+
+def _co_presence_targets_of(db, cid, npc_id):
+    from models.world import WorldKnowledge
+
+    rows = db.execute(
+        select(WorldKnowledge).where(
+            WorldKnowledge.campaign_id == cid,
+            WorldKnowledge.subject_entity_id == npc_id,
+            WorldKnowledge.acquisition_source == "co_presence",
+        )
+    ).scalars().all()
+    return sorted(str(r.target_entity_id) for r in rows)
+
+
+def test_existing_npc_entering_scene_gets_introduction_baseline():
+    """An existing NPC added via actors_entered knows the location and present PCs."""
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    chapel, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Cinderfell Chapel", operation_id="op-chapel",
+    )
+    aria, _ = commit_world_write(
+        db, cid, 1, create_entity, entity_type="character", name="Aria", operation_id="op-aria",
+    )
+    traveler, _ = commit_world_write(
+        db, cid, 2, create_entity, entity_type="npc", name="Hooded Traveler", operation_id="op-traveler",
+    )
+    regular, _ = commit_world_write(
+        db, cid, 3, create_entity, entity_type="npc", name="Chapel Warden", operation_id="op-warden",
+    )
+    commit_world_write(
+        db, cid, 4, apply_scene_update, location_entity_id=chapel.id, location_name="Cinderfell Chapel",
+        present_actors=[
+            {"entity_id": str(aria.id), "name": "Aria", "kind": "pc"},
+            {"entity_id": str(regular.id), "name": "Chapel Warden", "kind": "npc"},
+        ],
+        operation_id="op-scene-chapel",
+    )
+
+    _commit_scene_patch_turn(db, cid, owner, tid, {"actors_entered": [
+        {"name": "Hooded Traveler", "entity_id": str(traveler.id), "kind": "npc"},
+        {"name": "Chapel Warden", "entity_id": str(regular.id), "kind": "npc"},
+    ]})
+
+    assert _co_presence_targets_of(db, cid, traveler.id) == sorted([str(chapel.id), str(aria.id)])
+    # Already present before the patch: not an entrance, no new baseline.
+    assert _co_presence_targets_of(db, cid, regular.id) == []
+
+    # Re-entering while present grants nothing new (and never duplicates).
+    _commit_scene_patch_turn(db, cid, owner, tid, {"actors_entered": [
+        {"name": "Hooded Traveler", "entity_id": str(traveler.id), "kind": "npc"},
+    ]})
+    assert _co_presence_targets_of(db, cid, traveler.id) == sorted([str(chapel.id), str(aria.id)])
+
+
+def test_entered_baseline_ignores_non_npc_and_unknown_entities():
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    chapel, _ = commit_world_write(
+        db, cid, 0, create_entity, entity_type="location", name="Cinderfell Chapel", operation_id="op-chapel-2",
+    )
+    statue, _ = commit_world_write(
+        db, cid, 1, create_entity, entity_type="object", name="Ash Statue", operation_id="op-statue",
+    )
+    commit_world_write(
+        db, cid, 2, apply_scene_update, location_entity_id=chapel.id, location_name="Cinderfell Chapel",
+        present_actors=[], operation_id="op-scene-chapel-2",
+    )
+    ghost = uuid.uuid4()
+    _commit_scene_patch_turn(db, cid, owner, tid, {"actors_entered": [
+        {"name": "Ash Statue", "entity_id": str(statue.id)},
+        {"name": "Nobody", "entity_id": str(ghost)},
+    ]})
+    assert _co_presence_targets_of(db, cid, statue.id) == []
+    assert _co_presence_targets_of(db, cid, ghost) == []
