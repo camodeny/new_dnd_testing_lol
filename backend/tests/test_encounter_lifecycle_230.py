@@ -548,12 +548,12 @@ def test_hidden_npc_stats_stay_dm_private():
             {"character_id": str(ctx["player_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
         ])
-        owner_view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
-        member_view = encounter_view(db, encounter, ctx["player"], is_owner=False)
+        owner_view = encounter_view(db, encounter, ctx["owner"])
+        member_view = encounter_view(db, encounter, ctx["player"])
         npc_owner = next(p for p in owner_view["participants"] if p["kind"] == "npc")
         npc_member = next(p for p in member_view["participants"] if p["kind"] == "npc")
-        assert npc_owner["initiative_modifier"] == 2
-        assert npc_owner["stat_source"]["source_type"] == "world_entity_details"
+        # The AI is the only DM: the owner is a player and gets no NPC stats.
+        assert npc_owner == npc_member
         assert "initiative_modifier" not in npc_member
         assert "stat_source" not in npc_member
         assert "raw_roll" not in npc_member
@@ -1140,7 +1140,7 @@ def test_http_private_thread_encounter_reads_hidden(monkeypatch):
 
 def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
     """Turn-order matches encounter_view: another PC's roll_request_id stays
-    with its controller (or the owner)."""
+    with its controller — the campaign owner included."""
     from fastapi.testclient import TestClient
 
     from database import get_db
@@ -1188,7 +1188,11 @@ def test_turn_order_redacts_other_controllers_roll_requests(monkeypatch):
             headers={"x-test-user": owner_id},
         )
         assert as_owner.status_code == 200, as_owner.text
-        assert all("roll_request_id" in p for p in as_owner.json()["order"])
+        owner_by_controller = {
+            p["controller_user_id"]: p for p in as_owner.json()["order"]
+        }
+        assert owner_by_controller[owner_id]["roll_request_id"]
+        assert "roll_request_id" not in owner_by_controller[player_id]
     finally:
         app.dependency_overrides.clear()
 

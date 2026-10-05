@@ -12,20 +12,23 @@ Surfaces:
   facts; kept as a separate key so UI can render them distinctly without a
   second query).
 - ``items``: item/object entities (ownership/details follow entity
-  visibility; nested rules details redacted for non-authority, so shared
+  visibility; nested DM-private rules details redacted, so shared
   appearance can differ from hidden reality).
 - ``shops``: shop entities (extensible entity type), same authorization path.
 - ``maps``: viewer-filtered encounter map when an encounter is visible to
   this viewer, else a blind ``{"visible": False}`` stub.
-- ``clocks``: viewer-filtered pressure/clock indicators.
+
+Campaign clocks are DM storytelling machinery and are never projected to
+players. The AI is the only DM, so the campaign owner gets exactly a
+member's view of every surface.
 
 Fail-closed contract:
 - Ambiguous/failed surface projections yield empty records with an
   ``error`` marker — never unfiltered data.
 - Denied rows are counted by reason server-side (logs) without leaking
-  ids or content. Serialized member payloads carry visible records plus
-  visible counts only — ``total``/``denied``/``denied_reasons`` are
-  authority-lane only, so hidden-record counts/classes cannot be inferred.
+  ids or content. Serialized payloads carry visible records plus visible
+  counts only — ``total``/``denied``/``denied_reasons`` never leave the
+  server, so hidden-record counts/classes cannot be inferred.
 - No module-level per-user cache exists here by design. Any caller-side
   cache MUST key by ``(campaign_id, viewer_id, revision)`` so one account's
   secret projection can never bleed into another session.
@@ -45,8 +48,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.combat.service import get_snapshot_encounter
-from app.visibility.access import is_campaign_participant, is_world_authority, may_user_receive
-from app.world import clocks as _clocks, facts as _facts, knowledge as _knowledge, service as _world
+from app.visibility.access import is_campaign_participant, may_user_receive
+from app.world import facts as _facts, knowledge as _knowledge, service as _world
 from models.campaigns import Campaign
 
 logger = logging.getLogger(__name__)
@@ -119,8 +122,6 @@ def _entity_surface(
     campaign: Campaign,
     viewer_id: uuid.UUID,
     entity_types: frozenset,
-    *,
-    is_authority: bool,
 ) -> dict[str, Any]:
     try:
         rows = _world.list_entities(db, campaign.id, limit=_ENTITY_SCAN_LIMIT)
@@ -145,7 +146,7 @@ def _entity_surface(
                 denied_reasons[reason] = denied_reasons.get(reason, 0) + 1
                 continue
             try:
-                records.append(_world.project_entity_for_viewer(row, is_authority))
+                records.append(_world.project_entity_for_viewer(row))
             except Exception:
                 denied_reasons["projection_failed"] = denied_reasons.get(
                     "projection_failed", 0
@@ -184,19 +185,6 @@ def _maps_surface(
     return {"visible": True, "map": encounter.get("map")}
 
 
-def _clocks_surface(
-    db: Session, campaign: Campaign, viewer_id: uuid.UUID
-) -> dict[str, Any]:
-    try:
-        return _clocks.project_clocks_for_viewer(db, campaign, viewer_id)
-    except Exception as exc:
-        logger.warning(
-            "surfaces clocks projection failed campaign_id=%s error=%s",
-            campaign.id, exc,
-        )
-        return {"clocks": [], "count": 0, "error": "projection_failed"}
-
-
 def build_surfaces_for_viewer(
     db: Session, campaign: Campaign, viewer_id: uuid.UUID
 ) -> dict[str, Any]:
@@ -215,7 +203,6 @@ def build_surfaces_for_viewer(
             "items": _empty_surface("projection_failed"),
             "shops": _empty_surface("projection_failed"),
             "maps": {"visible": False, "error": "projection_failed"},
-            "clocks": {"clocks": [], "count": 0, "error": "projection_failed"},
         }
     try:
         member = is_campaign_participant(db, campaign, viewer)
@@ -231,20 +218,12 @@ def build_surfaces_for_viewer(
             "items": _empty_surface(),
             "shops": _empty_surface(),
             "maps": {"visible": False},
-            "clocks": {"clocks": [], "count": 0},
         }
 
-    is_authority = is_world_authority(campaign, viewer)
-
     knowledge = _knowledge_surface(db, campaign, viewer)
-    items = _entity_surface(
-        db, campaign, viewer, ITEM_ENTITY_TYPES, is_authority=is_authority
-    )
-    shops = _entity_surface(
-        db, campaign, viewer, SHOP_ENTITY_TYPES, is_authority=is_authority
-    )
+    items = _entity_surface(db, campaign, viewer, ITEM_ENTITY_TYPES)
+    shops = _entity_surface(db, campaign, viewer, SHOP_ENTITY_TYPES)
     maps = _maps_surface(db, campaign, viewer)
-    clocks = _clocks_surface(db, campaign, viewer)
 
     clue_records = list((knowledge.get("facts") or {}).get("records", []))
     clues = {
@@ -263,33 +242,31 @@ def build_surfaces_for_viewer(
         "items": items,
         "shops": shops,
         "maps": maps,
-        "clocks": clocks,
     }
 
-    # Filtering counts stay server-side for observability even when they
-    # are stripped from the member payload below (no secret content logged).
+    # Filtering counts stay server-side for observability; they are stripped
+    # from the payload below (no secret content logged).
     denied_summary = {
         "knowledge_denied": knowledge.get("denied"),
         "items_denied": items.get("denied"),
         "shops_denied": shops.get("denied"),
     }
 
-    if not is_authority:
-        # Ordinary members must not infer hidden-record counts/classes:
-        # denied metadata stays server-side (logs above), never serialized.
-        # Envelope-only: visible records keep their own fields intact.
-        for envelope in (
-            knowledge, knowledge.get("facts"), knowledge.get("relations"),
-            clues, items, shops,
-        ):
-            _strip_envelope(envelope)
+    # Players must not infer hidden-record counts/classes: denied metadata
+    # stays server-side (logs below), never serialized. Envelope-only:
+    # visible records keep their own fields intact.
+    for envelope in (
+        knowledge, knowledge.get("facts"), knowledge.get("relations"),
+        clues, items, shops,
+    ):
+        _strip_envelope(envelope)
 
     logger.info(
-        "surfaces built campaign_id=%s authority=%s knowledge_visible=%s knowledge_denied=%s items_visible=%s items_denied=%s shops_visible=%s shops_denied=%s maps_visible=%s clocks=%s",
-        campaign.id, is_authority,
+        "surfaces built campaign_id=%s knowledge_visible=%s knowledge_denied=%s items_visible=%s items_denied=%s shops_visible=%s shops_denied=%s maps_visible=%s",
+        campaign.id,
         knowledge.get("visible"), denied_summary["knowledge_denied"],
         items.get("visible"), denied_summary["items_denied"],
         shops.get("visible"), denied_summary["shops_denied"],
-        maps.get("visible"), clocks.get("count"),
+        maps.get("visible"),
     )
     return surfaces

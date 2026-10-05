@@ -347,7 +347,7 @@ def test_hidden_evidence_denied_player_facing_preserved_dm_internal():
     denied = lookup_fact(db, cid, seed["secret"].id, player, dm_internal=False)
     assert denied.packets == []
     assert denied.denied == 1
-    assert denied.denied_reasons.get("dm_only_requires_authority") == 1
+    assert denied.denied_reasons.get("dm_only") == 1
     assert "Asha hides" not in str(denied.to_dict())
     # Non-members get nothing at all.
     stranger = retrieve_entity(db, cid, seed["a"].id, outsider, dm_internal=False)

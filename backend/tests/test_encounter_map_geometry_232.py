@@ -477,8 +477,7 @@ def test_reconnect_reconstructs_positions_and_terrain_from_backend():
         assert len(snapshot["map"]["zones"]) == 1
         assert snapshot["map"]["placements"][0]["col"] == 2
         view = encounter_view(
-            db2, db2.get(Encounter, uuid.UUID(snapshot["id"])),
-            ctx["owner"], is_owner=True,
+            db2, db2.get(Encounter, uuid.UUID(snapshot["id"])), ctx["owner"],
         )
         assert view["map"]["placements"][0]["row"] == 1
         assert view["turn"]["resources"][str(participant.id)]["movement_remaining"] == 20
@@ -519,14 +518,14 @@ def test_projection_hides_dm_labels_and_hidden_npc_tokens():
                         {"participant_id": str(goblin_p.id), "col": 5, "row": 5}],
             expected_revision=revision, operation_id="op-map-hidden",
         )
-        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"], is_owner=True)
-        assert owner_view["zones"][0]["label"] == "Secret pit trap"
-        assert len(owner_view["placements"]) == 2
-
-        player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
         # Issue #250 supersedes shared-mechanics visibility: dm_only zones
-        # are omitted entirely for non-owners (kind/rect/label all absent).
+        # are omitted entirely (kind/rect/label all absent). The AI is the
+        # only DM, so the owner gets exactly the same view as a member (#470).
+        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"])
+        player_view = map_projection(db, encounter, viewer_id=ctx["player"])
+        assert owner_view == player_view
         assert player_view["zones"] == []
+        assert "Secret pit trap" not in str(owner_view)
         kinds = [p["kind"] for p in player_view["placements"]]
         assert "npc" not in kinds and "monster" not in kinds  # hidden token hook
         assert len(player_view["placements"]) == 1
@@ -607,27 +606,25 @@ def _duo_map(db, ctx, encounter, pc_p, goblin_p, **kwargs):
     return ensure_map(db, encounter.id, **defaults)
 
 
-def test_hidden_npc_reachable_denied_for_non_owner():
+def test_hidden_npc_reachable_denied_for_every_player():
     from app.combat.maps import MapAuthorizationError
     fac, ctx = _fixture()
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
         _duo_map(db, ctx, encounter, owner_p, goblin_p)
-        # Owner reads the hidden token's reachable space.
-        seen = reachable_for(db, encounter.id, goblin_p.id,
-                             viewer_id=ctx["owner"], is_owner=True)
-        assert seen["from"] == {"col": 5, "row": 5}
-        # Non-owner probing the hidden token gets 403, not coordinates.
-        with pytest.raises(MapAuthorizationError):
-            reachable_for(db, encounter.id, goblin_p.id,
-                          viewer_id=ctx["player"], is_owner=False)
+        # Probing the hidden token gets 403, not coordinates — the campaign
+        # owner included (#470: the AI is the only DM).
+        for viewer in (ctx["owner"], ctx["player"]):
+            with pytest.raises(MapAuthorizationError):
+                reachable_for(db, encounter.id, goblin_p.id, viewer_id=viewer)
         # Ordinary PC reads still work for any thread reader.
         pc_seen = reachable_for(db, encounter.id, owner_p.id,
-                                viewer_id=ctx["player"], is_owner=False)
+                                viewer_id=ctx["player"])
         assert pc_seen["from"] == {"col": 0, "row": 0}
 
 
-def test_hidden_stranded_placements_filtered_for_non_owner():
+def test_hidden_stranded_placements_filtered_for_every_player():
+    from app.combat.maps import _stranded_placements, get_map
     fac, ctx = _fixture()
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
@@ -639,13 +636,15 @@ def test_hidden_stranded_placements_filtered_for_non_owner():
                     "label": "Secret pit", "visibility": "dm_only"}],
             expected_revision=revision, operation_id="op-strand-hidden",
         )
-        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"], is_owner=True)
+        # The goblin is stranded in durable state...
         assert any(s["participant_id"] == str(goblin_p.id)
-                   for s in owner_view["stranded_placements"])
-        player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
-        # The stranded flag carries the exact cell: hidden tokens stay out.
-        assert all(s["participant_id"] != str(goblin_p.id)
-                   for s in player_view["stranded_placements"])
+                   for s in _stranded_placements(db, encounter, get_map(db, encounter.id)))
+        # ...but the stranded flag carries the exact cell: hidden tokens stay
+        # out of every player's projection, the owner's included.
+        for viewer in (ctx["owner"], ctx["player"]):
+            player_view = map_projection(db, encounter, viewer_id=viewer)
+            assert all(s["participant_id"] != str(goblin_p.id)
+                       for s in player_view["stranded_placements"])
 
 
 def test_overlapping_zones_preserve_authored_order():
@@ -791,15 +790,16 @@ def test_public_npc_token_stays_visible_despite_private_stats():
                         {"participant_id": str(guard_p.id), "col": 5, "row": 0}],
             expected_revision=revision, operation_id="op-map-guard",
         )
-        player_view = map_projection(db, encounter, viewer_id=ctx["player"], is_owner=False)
+        player_view = map_projection(db, encounter, viewer_id=ctx["player"])
         assert any(p["participant_id"] == str(guard_p.id)
                    for p in player_view["placements"])
         seen = reachable_for(db, encounter.id, guard_p.id,
-                             viewer_id=ctx["player"], is_owner=False)
+                             viewer_id=ctx["player"])
         assert seen["from"] == {"col": 5, "row": 0}
 
 
 def test_shared_terrain_event_omits_hidden_stranded():
+    from app.combat.maps import _stranded_placements, get_map
     fac, ctx = _fixture()
     with fac() as db:
         encounter, owner_p, goblin_p = _active_duo(db, ctx)
@@ -812,17 +812,16 @@ def test_shared_terrain_event_omits_hidden_stranded():
         )
         # Thread-scoped history must not carry the hidden token's cell.
         assert event.payload["stranded_placements"] == []
-        # Owner projection still flags it (ledger + owner views intact).
-        owner_view = map_projection(db, encounter, viewer_id=ctx["owner"], is_owner=True)
+        # Durable state still flags it for the DM runtime.
         assert any(s["participant_id"] == str(goblin_p.id)
-                   for s in owner_view["stranded_placements"])
+                   for s in _stranded_placements(db, encounter, get_map(db, encounter.id)))
 
 
 def test_non_owner_preview_and_commit_share_hidden_occupancy():
     """Preview/commit consistency: hidden tokens neither carve the
     non-owner reachable shape nor block that actor's commits, so probing a
     hidden cell reveals nothing (no reachable-yet-unreachable oracle).
-    Owners keep the full authoritative collision."""
+    The owner is a player and gets the same reachable shape (#470)."""
     fac, ctx = _fixture()
     with fac() as db:
         encounter, player_p, goblin_p = _active_duo(
@@ -831,13 +830,13 @@ def test_non_owner_preview_and_commit_share_hidden_occupancy():
         )
         assert encounter.active_participant_id == player_p.id
         _duo_map(db, ctx, encounter, player_p, goblin_p)
-        # Owner's reachable folds every token; the non-owner shape is not
-        # carved by the hidden goblin at (5, 5).
+        # No player's reachable shape — the owner's included — is carved by
+        # the hidden goblin at (5, 5).
         owner_cells = {(c["col"], c["row"]) for c in reachable_for(
-            db, encounter.id, player_p.id, viewer_id=ctx["owner"], is_owner=True)["cells"]}
+            db, encounter.id, player_p.id, viewer_id=ctx["owner"])["cells"]}
         player_cells = {(c["col"], c["row"]) for c in reachable_for(
-            db, encounter.id, player_p.id, viewer_id=ctx["player"], is_owner=False)["cells"]}
-        assert (5, 5) not in owner_cells
+            db, encounter.id, player_p.id, viewer_id=ctx["player"])["cells"]}
+        assert owner_cells == player_cells
         assert (5, 5) in player_cells
         # The commit agrees with the preview: stepping onto the hidden cell
         # as a non-owner succeeds exactly as previewed (no oracle).

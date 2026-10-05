@@ -33,7 +33,7 @@ from app.world.facts import (  # noqa: E402
     supersede_fact,
     supersede_relation,
 )
-from app.visibility.access import is_world_authority  # noqa: E402
+from app.visibility.access import may_user_receive  # noqa: E402
 from app.world.service import create_entity  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.dm import DMStream, DMStreamChunk  # noqa: E402
@@ -549,8 +549,6 @@ def test_restricted_records_filtered_for_ordinary_member():
     db.add(CampaignMember(campaign_id=cid, user_id=member, role="player"))
     db.commit()
     campaign = db.get(Campaign, cid)
-    assert is_world_authority(campaign, owner) is True
-    assert is_world_authority(campaign, member) is False
     mara, guild, rev = _entities(db, cid, 0)
     hidden_rel, _ = commit_world_write(
         db, cid, rev, create_relation, subject_entity_id=mara.id, relation_type="spies_for",
@@ -569,6 +567,12 @@ def test_restricted_records_filtered_for_ordinary_member():
     )
     assert hidden_rel.visibility == "dm_only"
     assert open_fact.visibility == "campaign"
+    # The AI is the only DM: the owner is a player and receives no dm_only record.
+    for viewer in (owner, member):
+        assert may_user_receive(db, campaign, "relation", hidden_rel.id, viewer) == {
+            "allowed": False, "reason": "dm_only",
+        }
+        assert may_user_receive(db, campaign, "fact", open_fact.id, viewer)["allowed"] is True
 
 
 # ── staged effects + post-turn atomicity ────────────────────────────────────

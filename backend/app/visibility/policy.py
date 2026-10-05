@@ -87,11 +87,6 @@ def record_to_effect_visibility(value: Any) -> str:
     return _RECORD_TO_EFFECT.get(str(value), str(value))
 
 
-def visible_to_viewer(visibility: Any, is_authority: bool) -> bool:
-    """Coarse member gate: authority sees everything; members see unrestricted."""
-    return bool(is_authority) or visibility not in RESTRICTED_VISIBILITIES
-
-
 def world_event_visibility(record_visibility: Any) -> str:
     """Map a world-record disclosure level onto domain-event visibility.
 

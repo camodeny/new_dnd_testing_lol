@@ -3,7 +3,6 @@
 - GET/POST .../adventures — list (member-readable) / open (issue #260).
 - POST .../adventures/{adventure_id}/complete — DM-declared completion that
   also derives the AdventureSummary (best-effort, never blocks).
-- GET .../summary — durable historical summary (owner/DM-only).
 - GET .../recap — visibility-filtered player recap (member-readable).
 - POST .../summaries/generate + .../summaries/mark-stale — retry/repair.
 - .../epilogues/* — optional player epilogues (issue #262).
@@ -94,16 +93,15 @@ def list_adventures_endpoint(
     campaign: Campaign = Depends(campaign_for("participant", forbidden="Not a campaign member")),
     db: Session = Depends(get_db),
 ):
-    # Only the player-visible summary leaves the table for members; the DM's
-    # reason, metadata, provenance ids, and closing bookkeeping stay
-    # owner-visible (issue #260 security).
-    is_owner = campaign.owner_id == profile.id
+    # Only the player-visible summary leaves the table; the DM's reason,
+    # metadata, provenance ids, and closing bookkeeping never do — the owner
+    # is a player too (issue #260 security, #470).
     current = get_current_adventure(db, campaign.id)
     return {
         "campaign_id": str(campaign.id),
         "campaign_status": campaign.status,
         "current_adventure_id": str(current.id) if current else None,
-        "adventures": [a.to_dict() if is_owner else a.to_public_dict() for a in list_adventures(db, campaign.id)],
+        "adventures": [a.to_public_dict() for a in list_adventures(db, campaign.id)],
     }
 
 
@@ -241,24 +239,6 @@ def complete_adventure_endpoint(
         command_type="adventure.complete", scope_type="adventure", scope_id=adv.id,
         payload=body, execute=_execute,
     )
-
-
-@router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/summary")
-def get_summary(
-    adventure_id: str,
-    profile=Depends(current_profile),
-    camp: Campaign = Depends(adventure_owner),
-    db: Session = Depends(get_db),
-):
-    """Durable historical summary (derived; events/facts outrank it).
-
-    Owner/DM-only: the historical summary compresses hidden source evidence
-    (dm_only/private) for retrieval/context. Members use the /recap
-    projection, which is visibility-filtered.
-    """
-    adv = _adventure_or_404(db, camp, adventure_id)
-    row = _summary_or_404(db, adv)
-    return {"adventure": adv.to_dict(), "summary": row.to_dict()}
 
 
 @router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/recap")
@@ -566,7 +546,5 @@ def list_epilogues_endpoint(
 
     adv = _adventure_or_404(db, camp, adventure_id)
     aid = adv.id
-    entries = list_epilogues(
-        db, aid, viewer_id=profile.id, is_owner=(camp.owner_id == profile.id)
-    )
+    entries = list_epilogues(db, aid, viewer_id=profile.id)
     return {"epilogues": entries, "stats": epilogue_stats(db, aid)}

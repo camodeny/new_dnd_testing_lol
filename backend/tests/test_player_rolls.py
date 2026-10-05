@@ -318,3 +318,26 @@ def test_retry_endpoint_authorization_idempotency_and_post_commit_execution(roll
         assert fresh.status == 'prepared'
         assert fresh.submission_ids == db.get(DmTurnAttempt, ctx['attempt_id']).submission_ids
     assert set(ctx['executed']) == {first.json()['attempt_id']}
+
+
+def test_owner_never_receives_hidden_dc_or_other_players_private_result(roll_api):
+    """#470: the AI is the only DM — the campaign owner is a player and gets
+    no hidden DC or another player's private roll, on any read path."""
+    ctx = roll_api
+    owner_headers = {"X-Test-User": str(ctx["owner"])}
+    created = create_requests(ctx, two=True)
+    assert "dc_private" not in json.dumps(created.json())
+    player_req = created.json()["roll_requests"][1]
+    result = ctx["client"].post(
+        f'/api/campaigns/{ctx["campaign_id"]}/roll-requests/{player_req["id"]}/fulfill',
+        json={"source": "physical", "raw_rolls": [], "modifier": 4, "total": 11, "visibility": "private"},
+        headers={"Idempotency-Key": "physical-private-470", "X-Test-User": str(ctx["player"])},
+    )
+    assert result.status_code == 200, result.text
+    for path in ("snapshot", "roll-requests"):
+        body = ctx["client"].get(f'/api/campaigns/{ctx["campaign_id"]}/{path}', headers=owner_headers)
+        assert body.status_code == 200, body.text
+        encoded = json.dumps(body.json())
+        assert "dc_private" not in encoded, path
+        fulfilled = next(row for row in body.json()["roll_requests"] if row["id"] == player_req["id"])
+        assert "total" not in fulfilled["fulfillment"], path

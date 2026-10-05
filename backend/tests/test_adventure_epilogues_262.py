@@ -415,8 +415,10 @@ def test_private_epilogue_keeps_visibility_and_filters_reads(table):
         theirs = list_epilogues(db, adv_id, viewer_id=bob)
         assert "content" not in theirs[0]
         assert theirs[0]["character_id"] == str(alice_pc)
-        owner_view = list_epilogues(db, adv_id, viewer_id=owner, is_owner=True)
-        assert owner_view[0]["content"] is not None
+        # The campaign owner is a player: another player's private epilogue
+        # stays private from them too (#470).
+        owner_view = list_epilogues(db, adv_id, viewer_id=owner)
+        assert "content" not in owner_view[0]
         stats = epilogue_stats(db, adv_id)
         assert stats["private"] == 1 and stats["canonical_effects"] == 1
 

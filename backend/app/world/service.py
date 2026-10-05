@@ -64,8 +64,8 @@ def validate_entity_status(value: Any) -> str:
 
 # ── Viewer-aware reads (PR #348 re-review) ──────────────────────────────────
 
-def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
-    """Authority-safe entity dict with DM-private NPC rules state redacted (#227).
+def project_entity_for_viewer(entity: WorldEntity) -> dict:
+    """Player-safe entity dict with DM-private NPC rules state redacted (#227).
 
     Entity-level visibility still filters whole rows (see above); this
     additionally redacts nested ``details`` rules-state sections for
@@ -74,8 +74,6 @@ def project_entity_for_viewer(entity: WorldEntity, is_authority: bool) -> dict:
     decision models never see a separate path.
     """
     data = entity.to_dict()
-    if is_authority:
-        return data
     try:
         data["details"] = _project_details(data.get("details"), False)
     except Exception:

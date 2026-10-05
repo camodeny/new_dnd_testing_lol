@@ -807,7 +807,7 @@ def test_encounter_view_carries_turn_block_for_snapshot():
     fac, ctx = _fixture()
     with fac() as db:
         encounter = _ready_two_pc(db, ctx)
-        view = encounter_view(db, encounter, ctx["owner"], is_owner=True)
+        view = encounter_view(db, encounter, ctx["owner"])
         assert view["turn"] is not None
         assert view["turn"]["turn_sequence"] == 1
         assert view["turn"]["active_participant_id"] == str(encounter.active_participant_id)
@@ -815,7 +815,7 @@ def test_encounter_view_carries_turn_block_for_snapshot():
         assert view["skipped_count"] == 0
 
 
-def test_hidden_npc_speed_redacted_for_non_owners():
+def test_hidden_npc_speed_redacted_for_every_player():
     fac, ctx = _fixture()
     with fac() as db:
         swift = WorldEntity(
@@ -852,23 +852,24 @@ def test_hidden_npc_speed_redacted_for_non_owners():
         assert encounter.status == "active"
         npc_id = str(npc.id)
         owner_id, player_id = ctx["owner"], ctx["player"]
-        # Owner (DM runtime path) sees the canonical derived speed.
-        owner_proj = turn_projection(db, encounter, viewer_id=owner_id, is_owner=True)
-        assert owner_proj["resources"][npc_id]["movement_max"] == 50
-        assert owner_proj["resources"][npc_id]["movement_remaining"] == 50
-        # A thread reader who is not the owner cannot reconstruct it.
-        player_proj = turn_projection(db, encounter, viewer_id=player_id, is_owner=False)
+        # Durable turn state carries the canonical derived speed for the DM runtime.
+        from app.combat.turns import get_turn_state_row
+        state = get_turn_state_row(db, encounter.id, npc.id)
+        assert int(state.movement_max) == 50
+        assert int(state.movement_remaining) == 50
+        # No player — the owner included — can reconstruct it.
+        player_proj = turn_projection(db, encounter)
         assert player_proj["resources"][npc_id]["movement_max"] is None
         assert player_proj["resources"][npc_id]["movement_remaining"] is None
         assert player_proj["resources"][npc_id]["extra_resources"] == {}
         assert player_proj["resources"][npc_id]["movement_max"] != 50
         assert player_proj["resources"][npc_id]["movement_remaining"] != 50
-        # The PC's own budget stays visible to the non-owner.
+        # PC budgets stay visible.
         assert player_proj["resources"][str(owner_p.id)]["movement_max"] == 30
         # Same redaction rides the snapshot view and the default (fail-closed) read.
-        owner_view = encounter_view(db, encounter, owner_id, is_owner=True)
-        player_view = encounter_view(db, encounter, player_id, is_owner=False)
-        assert owner_view["turn"]["resources"][npc_id]["movement_max"] == 50
+        owner_view = encounter_view(db, encounter, owner_id)
+        player_view = encounter_view(db, encounter, player_id)
+        assert owner_view["turn"]["resources"][npc_id]["movement_max"] is None
         assert player_view["turn"]["resources"][npc_id]["movement_max"] is None
         default_proj = turn_projection(db, encounter)
         assert default_proj["resources"][npc_id]["movement_max"] is None

@@ -250,10 +250,6 @@ def test_review_available_after_continuation_and_summary_never_overrides_authori
     recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
     assert recap.status_code == 200, recap.text
     assert "Sunken Chapel" in recap.json()["recap_text"]
-    durable = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
-    assert durable.status_code == 200, durable.text
-    s = durable.json()["summary"]
-    assert s["is_derived"] is True
     # Authority precedence: source events are unchanged by derived prose.
     with factory() as db:
         rows = db.execute(select(AdventureSummary)).scalars().all()
@@ -305,7 +301,7 @@ def test_villain_victory_and_outcome_validation(api):
     assert r.status_code == 400
 
 
-def test_historical_summary_is_owner_only_while_recap_is_member_visible(api):
+def test_historical_summary_has_no_human_read_path_while_recap_is_member_visible(api):
     client, factory, actor, owner = api
     camp = _campaign(client)
     member = _make_member(factory, camp["id"])
@@ -314,10 +310,12 @@ def test_historical_summary_is_owner_only_while_recap_is_member_visible(api):
         rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
     adv = _open(client, camp["id"], key="op-open-owneronly")
     _complete(client, camp["id"], adv["id"], rev, "op-complete-owneronly")
+    # The durable summary compresses hidden sources: no human — the owner
+    # included (#470) — can read it.
+    gone = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
+    assert gone.status_code in (404, 405), gone.text
     actor["id"] = member
     try:
-        denied = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
-        assert denied.status_code == 403, denied.text
         recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
         assert recap.status_code == 200, recap.text
         assert "zxqv-secret-phylactery" not in recap.json()["recap_text"]
@@ -477,9 +475,9 @@ def test_completion_with_dm_reason_produces_summary_and_recap(api):
     assert body["is_derived"] is True
     assert "Sunken Chapel" in body["recap_text"]
     assert "the seal holds" not in body["recap_text"]
-    durable = client.get(f"/api/campaigns/{cid}/adventures/{adv['id']}/summary")
-    assert durable.status_code == 200, durable.text
-    assert durable.json()["summary"]["status"] == "current"
+    with factory() as db:
+        row = db.execute(select(AdventureSummary)).scalars().one()
+        assert row.status == "current"
 
 
 def test_recap_keeps_viewer_authorized_private_tokens(api):
