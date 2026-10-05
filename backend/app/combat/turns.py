@@ -687,19 +687,14 @@ def _advance(
 def turn_projection(
     db: Session,
     encounter: Encounter,
-    *,
-    viewer_id: uuid.UUID | None = None,
-    is_owner: bool = False,
 ) -> dict | None:
-    """Full turn/round/resource projection; None while initiative is pending.
+    """Player-facing turn/round/resource projection; None while initiative is pending.
 
-    Viewer-aware (#230 privacy): NPC/monster turn resources derived from
-    DM-private canonical stats (``movement_max`` from ``WorldEntity.details``
-    speed) are redacted for non-owners — ``movement_remaining``,
-    ``movement_max`` become None and ``extra_resources`` becomes {} — so a
-    thread reader cannot reconstruct a hidden NPC's exact speed. The AI is
-    the only DM: ownership here means the campaign owner on the DM runtime
-    path, never a separate human DM. PCs stay fully visible; owners see all.
+    #230 privacy: NPC/monster turn resources derived from DM-private
+    canonical stats (``movement_max`` from ``WorldEntity.details`` speed)
+    are redacted for every player — ``movement_remaining``, ``movement_max``
+    become None and ``extra_resources`` becomes {} — so no reader can
+    reconstruct a hidden NPC's exact speed. PCs stay fully visible.
     """
     if encounter.status != "active":
         return None
@@ -719,7 +714,6 @@ def turn_projection(
             participant is not None
             and participant.kind in ("npc", "monster")
             and participant.stat_visibility == "dm_private"
-            and not is_owner
         ):
             payload["movement_remaining"] = None
             payload["movement_max"] = None

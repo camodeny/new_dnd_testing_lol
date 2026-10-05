@@ -443,7 +443,13 @@ def get_active_participant(db: Session, encounter_id: uuid.UUID) -> EncounterPar
 # ── Viewer-filtered projection (snapshot + reads; hidden NPC stats DM-private)
 
 
-def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, is_owner: bool) -> dict:
+def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> dict:
+    """Player-facing encounter projection.
+
+    The AI is the only DM, so every human — the campaign owner included —
+    gets the same view: private stats only for participants they control,
+    no DM end reason, no hidden NPC fates, no hidden tokens or DM terrain.
+    """
     payload = encounter.to_dict()
     created_event = find_created_event(db, encounter)
     if created_event is not None:
@@ -452,7 +458,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
     viewers_parts = []
     hidden_ids: set[str] = set()
     for participant in list_participants(db, encounter.id):
-        include_private = is_owner or (
+        include_private = (
             participant.controller_user_id is not None
             and str(participant.controller_user_id) == str(viewer_id)
         )
@@ -462,8 +468,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
         viewers_parts.append(item)
         # Issue #239: DM-authored end reason/fates may name hidden NPC fates
         # (end_encounter staged effects are dm_private for this reason).
-        # Track hidden combatants so the non-owner projection below can
-        # redact their fate entries while keeping PC/public outcomes.
+        # Track hidden combatants so the projection below can redact their fate entries while keeping PC/public outcomes.
         if (
             participant.kind in ("npc", "monster")
             and participant.stat_visibility == "dm_private"
@@ -471,22 +476,19 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
         ):
             hidden_ids.add(str(participant.id))
     payload["participants"] = viewers_parts
-    if not is_owner:
-        payload["end_reason"] = None
-        outcomes = payload.get("end_participant_outcomes") or {}
-        if isinstance(outcomes, dict) and hidden_ids:
-            payload["end_participant_outcomes"] = {
-                pid: fate for pid, fate in outcomes.items() if str(pid) not in hidden_ids
-            }
+    payload["end_reason"] = None
+    outcomes = payload.get("end_participant_outcomes") or {}
+    if isinstance(outcomes, dict) and hidden_ids:
+        payload["end_participant_outcomes"] = {
+            pid: fate for pid, fate in outcomes.items() if str(pid) not in hidden_ids
+        }
     # Issue #231: durable turn/round/resource projection rides the same
     # snapshot so reconnects reconstruct mechanical state exactly. Lazy
     # import: turns.py owns these helpers and imports this module.
     try:
         from app.combat.turns import turn_projection
 
-        payload["turn"] = turn_projection(
-            db, encounter, viewer_id=viewer_id, is_owner=is_owner
-        )
+        payload["turn"] = turn_projection(db, encounter)
     except Exception:
         logger.warning("encounter turn projection skipped", exc_info=True)
         payload["turn"] = None
@@ -495,9 +497,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
     try:
         from app.combat.maps import map_projection
 
-        payload["map"] = map_projection(
-            db, encounter, viewer_id=viewer_id, is_owner=is_owner
-        )
+        payload["map"] = map_projection(db, encounter, viewer_id=viewer_id)
     except Exception:
         logger.warning("encounter map projection skipped", exc_info=True)
         payload["map"] = None
@@ -573,8 +573,7 @@ def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.
         return None
     if not can_view_encounter(db, encounter, viewer_id):
         return None
-    is_owner = str(campaign.owner_id) == str(viewer_id)
-    view = encounter_view(db, encounter, viewer_id, is_owner=is_owner)
+    view = encounter_view(db, encounter, viewer_id)
     mine = [
         p["id"] for p in view["participants"]
         if p.get("controller_user_id") == str(viewer_id) and p.get("initiative_status") == "pending"

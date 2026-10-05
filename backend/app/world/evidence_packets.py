@@ -18,8 +18,8 @@ from sqlalchemy.orm import Session
 
 from app.schema import coerce_uuid
 from app.threads.service import can_read_thread, parse_thread_id
-from app.visibility.access import is_campaign_participant, is_world_authority, may_user_receive
-from app.visibility.policy import RECORD_VISIBILITIES, evidence_bundle_visibility, visible_to_viewer
+from app.visibility.access import is_campaign_participant, may_user_receive
+from app.visibility.policy import RECORD_VISIBILITIES, RESTRICTED_VISIBILITIES, evidence_bundle_visibility
 from models.campaigns import Campaign, CampaignDomainEvent
 from models.dm import DmTurn
 from models.threads import CampaignThread, PlayerSubmission
@@ -440,9 +440,8 @@ def scene_gate(
         return True, None
     if not viewers:
         return False, "viewer_required"
-    authority = any(is_world_authority(campaign, viewer) for viewer in viewers)
     member = all(is_campaign_participant(db, campaign, viewer) for viewer in viewers)
-    if not member or not visible_to_viewer(scene.visibility, authority):
+    if not member or scene.visibility in RESTRICTED_VISIBILITIES:
         return False, "scene_not_visible"
     return True, None
 

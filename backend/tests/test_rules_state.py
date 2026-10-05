@@ -957,13 +957,13 @@ def test_campaign_visible_npc_dm_private_state_redacted_for_members():
         assert member_details["death_saves"] == {"successes": 0, "failures": 0}
         assert "rules_state_visibility" not in member_details
 
-        member_view = project_entity_for_viewer(row, False)
+        member_view = project_entity_for_viewer(row)
         assert "poisoned" not in str(member_view["details"])
         assert "Hex" not in str(member_view["details"])
         assert member_view["visibility"] == "campaign"
 
-        authority_view = project_entity_for_viewer(row, True)
-        assert has_condition(authority_view["details"]["conditions"], "poisoned") is True
+        # The DM runtime reads the row itself; full state stays there.
+        assert has_condition(row.details["conditions"], "poisoned") is True
 
 
 def test_multi_effect_mutation_is_transactional_with_source_turn():

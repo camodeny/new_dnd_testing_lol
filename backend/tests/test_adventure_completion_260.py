@@ -568,16 +568,12 @@ def test_member_sees_only_public_adventure_fields(api):
         headers={"Idempotency-Key": "adv-spoiler-done"},
     )
 
-    # Owner sees the full record.
+    # Every player — the campaign owner included (#470) — sees identity +
+    # outcome + public summary only.
     owner_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
-    assert owner_view["reason"] == "DM-only: the traitor is the castellan."
-    assert owner_view["metadata"] == {"dm_notes": "the butler did it"}
-    assert owner_view["source_turn_id"] is None
-    assert "source_event_id" in owner_view
-
-    # Members see identity + outcome + public summary only.
     actor["id"] = member_id
     member_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
+    assert owner_view == member_view
     assert member_view["title"] == "Secret arc"
     assert member_view["outcome"] == "capture"
     assert member_view["public_summary"] == "The party wakes in chains."
@@ -844,7 +840,7 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
     assert nested_secret not in blob
     assert "castellan" not in blob
 
+    # The owner is a player too: same redaction (#470).
     actor["id"] = TEST_USER_ID
     owner_body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
-    assert owner_body["attempts"][0]["staged_effects"][0]["arguments"]["reason"] == nested_secret
-    assert top_secret in json.dumps(owner_body)
+    assert owner_body["attempts"] == body["attempts"]

@@ -102,7 +102,7 @@ def create_roll_requests(
     def execute():
         try:
             rows = request_rolls(db, campaign_id=campaign.id, turn_id=turn.id, attempt_id=attempt_id, requests=raw_requests)
-            return {"roll_requests": [row.to_dict(include_private=True) for row in rows], "turn_id": str(turn.id)}
+            return {"roll_requests": [row.to_dict() for row in rows], "turn_id": str(turn.id)}
         except RollLifecycleError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -129,9 +129,8 @@ def get_roll_requests(
         except (ThreadNotFoundError, ThreadAuthorizationError):
             continue
         fulfillment = get_fulfillment(db, row.id)
-        include_private = campaign.owner_id == profile.id
-        item = row.to_dict(include_private=include_private)
-        item["fulfillment"] = fulfillment.to_dict(include_private=include_private or row.requested_user_id == profile.id) if fulfillment else None
+        item = row.to_dict()
+        item["fulfillment"] = fulfillment.to_dict(include_private=row.requested_user_id == profile.id) if fulfillment else None
         visible.append(item)
     return {"roll_requests": visible}
 
@@ -201,8 +200,8 @@ def cancel_roll_request(
         try:
             old, created, resumed = cancel_or_replace(db, request_id=rid, replacement=replacement)
             return {
-                "roll_request": old.to_dict(include_private=True),
-                "replacement": created[0].to_dict(include_private=True) if created else None,
+                "roll_request": old.to_dict(),
+                "replacement": created[0].to_dict() if created else None,
                 "resumed_attempt": resumed.to_dict() if resumed else None,
             }
         except RollLifecycleError as exc:

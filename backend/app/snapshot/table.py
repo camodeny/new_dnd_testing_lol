@@ -5,9 +5,9 @@ they are, what they know, the rolls they owe, and the fight they're in.
 Everything is filtered server-side for the viewer **as a player at the
 table**, which is stricter than the general member projections:
 
-- The campaign owner is also a player. The owner's DM-authority lane
-  (``dm_only`` world records, hidden encounter tokens and terrain, DM-only
-  NPC fields) is never used here, so the table cannot spoil what the AI DM
+- The campaign owner is a player like any other (the AI is the only DM):
+  no human receives ``dm_only`` world records, hidden encounter tokens and
+  terrain, or DM-only NPC fields, so the table cannot spoil what the AI DM
   holds back.
 - DM storytelling machinery is never projected at all: pressure clocks,
   NPC goals/dispositions, roll DCs, summaries, and epistemic bookkeeping.
@@ -49,11 +49,9 @@ _PERSON_FACT_LIMIT = 4
 def _player_may_receive(
     db: Session, campaign: Campaign, kind: str, target_id: Any, viewer: uuid.UUID,
 ) -> bool:
-    """World-record authorization without the owner's DM-authority lane."""
     from app.visibility.access import may_user_receive
 
-    verdict = may_user_receive(db, campaign, kind, target_id, viewer)
-    return bool(verdict.get("allowed")) and verdict.get("reason") != "dm_authority"
+    return bool(may_user_receive(db, campaign, kind, target_id, viewer).get("allowed"))
 
 
 # ── Characters ──────────────────────────────────────────────────────────────
@@ -358,8 +356,7 @@ def _encounter(db: Session, campaign: Campaign, viewer: uuid.UUID) -> dict[str, 
     encounter = get_active_encounter(db, campaign.id)
     if encounter is None or not can_view_encounter(db, encounter, viewer):
         return None
-    # is_owner=False also scopes the nested turn + map projections.
-    view = encounter_view(db, encounter, viewer, is_owner=False)
+    view = encounter_view(db, encounter, viewer)
     participants = view.get("participants") or []
     view["my_pending_initiative"] = [
         p["id"] for p in participants
@@ -371,7 +368,7 @@ def _encounter(db: Session, campaign: Campaign, viewer: uuid.UUID) -> dict[str, 
     if view["map"] and active and active.get("controller_user_id") == str(viewer):
         try:
             view["reachable"] = reachable_for(
-                db, encounter.id, uuid.UUID(active_id), viewer_id=viewer, is_owner=False,
+                db, encounter.id, uuid.UUID(active_id), viewer_id=viewer,
             )
         except MapError:
             view["reachable"] = None

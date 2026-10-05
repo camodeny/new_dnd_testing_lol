@@ -82,10 +82,6 @@ def _encounter_or_404(db: Session, campaign_id: uuid.UUID, encounter_id: uuid.UU
     return encounter
 
 
-def _viewer_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, is_owner: bool) -> dict:
-    return encounter_view(db, encounter, viewer_id, is_owner=is_owner)
-
-
 def _assert_encounter_visible(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> None:
     """Thread-scoped encounter read gate (#230 privacy).
 
@@ -178,7 +174,7 @@ def create_encounter(
                 commit=False,
             )
             return {
-                "encounter": _viewer_view(db, encounter, profile.id, is_owner=True),
+                "encounter": encounter_view(db, encounter, profile.id),
                 "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
             }
         except EncounterAlreadyActiveError as exc:
@@ -209,7 +205,7 @@ def read_active_encounter(
     encounter = get_active_encounter(db, campaign.id)
     if encounter is None or not can_view_encounter(db, encounter, profile.id):
         return {"encounter": None}
-    return {"encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id)}
+    return {"encounter": encounter_view(db, encounter, profile.id)}
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}")
@@ -221,7 +217,7 @@ def read_encounter(
 ):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    return {"encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id)}
+    return {"encounter": encounter_view(db, encounter, profile.id)}
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order")
@@ -233,7 +229,6 @@ def read_turn_order(
 ):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    is_owner = campaign.owner_id == profile.id
     try:
         ordered = get_turn_order(db, encounter.id)
     except EncounterNotReadyError as exc:
@@ -241,8 +236,8 @@ def read_turn_order(
     order = []
     for p in ordered:
         # Same participant redaction as encounter_view(): another PC's
-        # roll_request_id stays with its controller (or the owner).
-        privileged = is_owner or str(p.controller_user_id or "") == str(profile.id)
+        # roll_request_id stays with its controller.
+        privileged = str(p.controller_user_id or "") == str(profile.id)
         item = p.to_dict(include_private=privileged)
         if not privileged:
             item.pop("roll_request_id", None)
@@ -285,9 +280,7 @@ def fulfill_initiative(
                 "roll_request": req.to_dict(),
                 "fulfillment": fulfillment.to_dict(include_private=True),
                 "participant": participant.to_dict(include_private=True),
-                "encounter": _viewer_view(
-                    db, updated, profile.id, is_owner=campaign.owner_id == profile.id
-                ),
+                "encounter": encounter_view(db, updated, profile.id),
                 "ready_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
             }
         except EncounterAuthorizationError as exc:
@@ -342,8 +335,8 @@ def roll_npc(
                 commit=False,
             )
             return {
-                "participant": participant.to_dict(include_private=True),
-                "encounter": _viewer_view(db, updated, profile.id, is_owner=True),
+                "participant": participant.to_dict(),
+                "encounter": encounter_view(db, updated, profile.id),
                 "ready_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
             }
         except EncounterError as exc:
@@ -412,10 +405,7 @@ def read_turn_state(
 ):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    projection = turn_projection(
-        db, encounter, viewer_id=profile.id,
-        is_owner=campaign.owner_id == profile.id,
-    )
+    projection = turn_projection(db, encounter)
     if projection is None:
         raise HTTPException(status_code=409, detail="turn state becomes available when required initiative is complete")
     return {"encounter_id": str(encounter.id), "turn": projection}
@@ -449,7 +439,7 @@ def post_end_turn(
                 expected_revision=expected_revision, commit=False,
             )
             return {
-                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "encounter": encounter_view(db, updated, profile.id),
                 "ended_event": ended_event.to_dict() if hasattr(ended_event, "to_dict") else None,
                 "started_event": started_event.to_dict() if hasattr(started_event, "to_dict") else None,
                 "turn_sequence": int(updated.turn_sequence or 0),
@@ -500,7 +490,7 @@ def post_skip_vote(
                 expected_turn_sequence=expected_sequence, commit=False,
             )
             return {
-                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "encounter": encounter_view(db, updated, profile.id),
                 "tally": tally,
                 "executed": executed,
                 "skipped_event": skipped_event.to_dict() if skipped_event is not None and hasattr(skipped_event, "to_dict") else None,
@@ -554,7 +544,7 @@ def post_consume_resource(
                 expected_turn_sequence=expected_sequence, commit=False,
             )
             return {
-                "encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id),
+                "encounter": encounter_view(db, encounter, profile.id),
                 "participant_id": str(participant_id),
                 "resource": str(resource),
                 "turn_state": state.to_dict(),
@@ -645,7 +635,7 @@ def init_encounter_map(
                 operation_id=key, commit=False,
             )
             return {
-                "map": map_projection(db, encounter, viewer_id=profile.id, is_owner=True),
+                "map": map_projection(db, encounter, viewer_id=profile.id),
                 "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
             }
         except Exception as exc:
@@ -688,7 +678,7 @@ def change_encounter_terrain(
                 operation_id=key, commit=False,
             )
             return {
-                "map": map_projection(db, encounter, viewer_id=profile.id, is_owner=True),
+                "map": map_projection(db, encounter, viewer_id=profile.id),
                 "map_event": event.to_dict() if hasattr(event, "to_dict") else None,
             }
         except Exception as exc:
@@ -713,10 +703,7 @@ def read_encounter_map(
 ):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    projection = map_projection(
-        db, encounter, viewer_id=profile.id,
-        is_owner=campaign.owner_id == profile.id,
-    )
+    projection = map_projection(db, encounter, viewer_id=profile.id)
     if projection is None:
         raise HTTPException(status_code=404, detail="Encounter has no map yet")
     return {"encounter_id": str(encounter.id), "map": projection}
@@ -738,7 +725,6 @@ def read_reachable(
             db, encounter.id, _id(participant_id, "participant id"),
             movement_mode=movement_mode,
             viewer_id=profile.id,
-            is_owner=campaign.owner_id == profile.id,
         )
     except Exception as exc:
         raise _map_http_error(exc) from exc
@@ -783,7 +769,7 @@ def post_move(
             )
             return {
                 "move": move.to_dict(),
-                "encounter": _viewer_view(db, updated, profile.id, is_owner=campaign.owner_id == profile.id),
+                "encounter": encounter_view(db, updated, profile.id),
                 "moved_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
             }
         except Exception as exc:
@@ -837,7 +823,7 @@ def post_end_encounter(
                 commit=False,
             )
             return {
-                "encounter": _viewer_view(db, updated, profile.id, is_owner=True),
+                "encounter": encounter_view(db, updated, profile.id),
                 "encounter_ended_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
                 "followups": [h.to_dict() for h in hooks],
             }
@@ -909,7 +895,7 @@ def post_process_end_followup(
                 commit=False,
             )
             return {
-                "encounter": _viewer_view(db, encounter, profile.id, is_owner=True),
+                "encounter": encounter_view(db, encounter, profile.id),
                 "followup": row.to_dict(),
             }
         except Exception as exc:

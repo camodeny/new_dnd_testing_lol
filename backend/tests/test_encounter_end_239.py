@@ -469,7 +469,7 @@ def test_hidden_enemy_final_data_stays_scoped():
         )
         # Player projection never carries hidden NPC stat breakdowns.
         player_view = encounter_view(
-            db, db.get(Encounter, encounter.id), ctx["player"], is_owner=False)
+            db, db.get(Encounter, encounter.id), ctx["player"])
         goblin_view = next(p for p in player_view["participants"]
                            if p.get("npc_entity_id") == str(ctx["goblin_id"]))
         assert "initiative_modifier" not in goblin_view
@@ -483,7 +483,7 @@ def test_hidden_enemy_final_data_stays_scoped():
         assert player_view["turn"] is None
 
 
-def test_non_owner_end_projection_redacts_reason_and_hidden_fates():
+def test_end_projection_redacts_reason_and_hidden_fates_for_every_player():
     fac, ctx = _fixture()
     with fac() as db:
         encounter = _ready_party(db, ctx, with_npc=True, operation_id="op-start-redact")
@@ -502,16 +502,14 @@ def test_non_owner_end_projection_redacts_reason_and_hidden_fates():
             participant_outcomes={str(npc.id): "fled", str(owner_pc.id): "standing"},
         )
         ended = db.get(Encounter, encounter.id)
-        owner_view = encounter_view(db, ended, ctx["owner"], is_owner=True)
-        assert owner_view["end_outcome"] == "escape"
-        assert owner_view["end_reason"] == secret_reason
-        assert owner_view["end_participant_outcomes"][str(npc.id)] == "fled"
-        player_view = encounter_view(db, ended, ctx["player"], is_owner=False)
-        assert player_view["end_outcome"] == "escape"
-        assert player_view["end_reason"] is None
-        assert secret_reason not in str(player_view)
-        assert str(npc.id) not in (player_view["end_participant_outcomes"] or {})
-        assert player_view["end_participant_outcomes"][str(owner_pc.id)] == "standing"
+        # The owner is a player too: same redaction as any member.
+        for viewer in (ctx["owner"], ctx["player"]):
+            player_view = encounter_view(db, ended, viewer)
+            assert player_view["end_outcome"] == "escape"
+            assert player_view["end_reason"] is None
+            assert secret_reason not in str(player_view)
+            assert str(npc.id) not in (player_view["end_participant_outcomes"] or {})
+            assert player_view["end_participant_outcomes"][str(owner_pc.id)] == "standing"
 
 
 def test_ended_event_hidden_from_member_history():

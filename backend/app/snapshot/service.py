@@ -309,10 +309,10 @@ def build_live_table_snapshot(
         ).scalars().all()
         roll_requests: list[dict] = []
         for roll_row in roll_rows:
-            roll_item = roll_row.to_dict(include_private=campaign.owner_id == viewer_id)
+            roll_item = roll_row.to_dict()
             fulfillment = get_fulfillment(db, roll_row.id)
             roll_item["fulfillment"] = fulfillment.to_dict(
-                include_private=campaign.owner_id == viewer_id or roll_row.requested_user_id == viewer_id
+                include_private=roll_row.requested_user_id == viewer_id
             ) if fulfillment else None
             roll_requests.append(roll_item)
 

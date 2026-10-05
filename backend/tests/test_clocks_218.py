@@ -367,22 +367,6 @@ def test_terminal_clocks_never_loaded():
 
 # ── Hidden-clock secrecy ───────────────────────────────────────────────────
 
-def test_hidden_clock_projection_and_feed():
-    _F, db, c, owner, member, outsider = _setup()
-    _mkclock(db, c, name="Secret Doom", visibility="dm_only")
-    _mkclock(db, c, name="Open Siege", visibility="campaign", status="active")
-    owner_view = C.project_clocks_for_viewer(db, c, owner)
-    assert {r["name"] for r in owner_view["clocks"]} == {"Secret Doom", "Open Siege"}
-    assert owner_view["hidden_count"] == 0 or "hidden_count" in owner_view
-    member_view = C.project_clocks_for_viewer(db, c, member)
-    assert [r["name"] for r in member_view["clocks"]] == ["Open Siege"]
-    assert "advancement_criteria" in member_view["clocks"][0]  # visible-clock pressure is player-facing
-    assert "provenance" not in member_view["clocks"][0]
-    assert "completion_effect" not in member_view["clocks"][0]
-    assert C.project_clocks_for_viewer(db, c, outsider) == {"clocks": [], "count": 0}
-    db.close()
-
-
 def test_hidden_frame_redacts_name_and_mechanics():
     _F, db, c, *_ = _setup()
     clock = _mkclock(db, c, name="Secret Doom", visibility="dm_only",
@@ -411,7 +395,6 @@ def test_private_gameplay_advances_hidden_clock_without_disclosure():
     out = C.consolidate_clocks_for_range(db, c.id, lo, hi, _range(db, c, lo, hi),
                                          decision_service=DecisionService(_NeverCall()))
     assert out["results"][0]["outcome"] == "advanced"
-    assert C.project_clocks_for_viewer(db, c, member)["clocks"] == []
     member_feed = list_campaign_events(db, c.id, viewer_id=member)
     assert all(e.visibility == "public" for e in member_feed)
     assert int(db.get(CampaignClock, clock.id).progress) == 1
