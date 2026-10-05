@@ -566,7 +566,7 @@ def _coordinated_turn(db, camp_id, thread_id, raw_content="I listen at the door.
     return coordinate_turn(s, camp_id, str(thread_id))
 
 
-def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, monkeypatch):
+def test_crash_after_chunk0_leaves_visible_attempt_and_late_input_retries_it(db, monkeypatch):
     """Failure injection: crash persisting chunk 1.
 
     Chunk 0's durable commit must already have transitioned the attempt to
@@ -576,7 +576,7 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
     failure state); the input set stays locked.
     """
     import app.dm.streams as stream_svc
-    from app.dm.turns import StreamBoundaryError, coordinate_turn
+    from app.dm.turns import coordinate_turn
     from app.dm.streams import get_stream
     from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
@@ -627,7 +627,10 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
     assert fresh_attempt.status == "failed_visible"
     assert fresh_turn.status == "failed_visible"
 
-    # Input set is locked: late submissions cannot silently change it.
+    # Late input never silently rewrites the visible stream (#480): the
+    # failed stream is abandoned as non-canonical and a fresh attempt covers
+    # the original input plus the late submission, instead of the table
+    # freezing until the owner presses Retry.
     accept_submission(
         s, campaign_id=camp_id, user_id=uuid.uuid4(),
         raw_content="I barge in late.",
@@ -635,8 +638,11 @@ def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, mon
         thread_id=str(thread_id),
     )
     s.commit()
-    with pytest.raises(StreamBoundaryError):
-        coordinate_turn(s, camp_id, str(thread_id))
+    retried_turn, fresh = coordinate_turn(s, camp_id, str(thread_id))
+    assert retried_turn.id == turn_id and fresh.id != attempt_id and fresh.stream_id is None
+    assert len(fresh.submission_ids) == 2
+    assert get_stream(s, stream_id).status == "abandoned"
+    assert s.get(DmTurnAttempt, attempt_id).abandonment_reason == "new_player_input"
 
 
 # ── streaming provider contract + incremental gates (re-review finding 2) ─
@@ -745,10 +751,10 @@ def test_full_validation_failure_after_partial_delivery_fails_stream(db):
     assert "dies" in reconstruct_text(s, ei.value.stream_id)
 
 
-def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db):
+def test_execute_validated_turn_full_failure_marks_failed_visible_then_late_input_retries(db):
     """Orchestrator remediation: post-visibility full-gate failure reuses
     the #206 failed-visible state; the input set stays locked."""
-    from app.dm.turns import StreamBoundaryError, coordinate_turn
+    from app.dm.turns import coordinate_turn
     from app.dm.streams import get_stream
     from app.submissions.service import accept_submission
     from models.dm import DmTurn, DmTurnAttempt
@@ -780,8 +786,10 @@ def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db)
         thread_id=str(thread_id),
     )
     s.commit()
-    with pytest.raises(StreamBoundaryError):
-        coordinate_turn(s, camp_id, str(thread_id))
+    # #480: late input retries the failed turn with it instead of freezing.
+    retried_turn, fresh = coordinate_turn(s, camp_id, str(thread_id))
+    assert retried_turn.id == turn_id and fresh.id != attempt_id and len(fresh.submission_ids) == 2
+    assert get_stream(s, ei.value.stream_id).status == "abandoned"
 
 
 # ── crash-atomic first-chunk boundary (re-review: single shared commit) ───
