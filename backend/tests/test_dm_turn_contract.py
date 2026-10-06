@@ -468,7 +468,7 @@ def test_structural_error_shape_extracts_loc_type():
         "contract_validation_failed", "bad",
         details={"errors": [{"loc": ("roll_request", "dc_private"), "type": "int_parsing", "msg": "x"}]},
     )
-    assert _structural_error_shape(exc) == "roll_request.dc_private:int_parsing"
+    assert _structural_error_shape(exc) == "roll_request.dc_private:int_parsing (x)"
     assert _structural_error_shape(ContractValidationError("x", "y")) == "unavailable"
 
 
@@ -490,3 +490,14 @@ def test_structural_rejection_carries_real_code():
     assert report.passed
     assert len(calls) == 2
     assert calls[1] is not None and "contract/unknown_field" in calls[1]
+
+
+def test_root_rule_violation_is_not_labelled_a_version_error():
+    """A whole-contract rule's pydantic message echoes the input (including
+    contract_version); the code must reflect the real failure."""
+    with pytest.raises(ContractValidationError) as ei:
+        normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "need_evidence", "reason": "x",
+            "beats": [], "evidence_requests": [],
+        })
+    assert ei.value.code == "contract_validation_failed"

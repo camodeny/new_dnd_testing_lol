@@ -1914,7 +1914,9 @@ def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
         "canonical name or alias in entity references instead of proposing a new "
         "entity. If it is genuinely new, describe it with distinguishing detail "
         "(appearance, role, location, group affiliation) so it cannot be confused "
-        "with an existing entity."
+        "with an existing entity. If its true identity is still hidden (masked, "
+        "hooded, unseen), keep proposing it as a new entity named for what the "
+        "party perceives; do not drop it from the turn."
     )
     return note[:2000]
 

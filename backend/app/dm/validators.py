@@ -1097,8 +1097,10 @@ class RollRequestValidator:
                     code="attack_target_unregistered",
                     message=(
                         "an attack roll_request needs target_ref naming a registered creature or NPC "
-                        "(an entity id from the packet); introduce a new creature through new_entities "
-                        "and stage assign_stat_block first, then request attacks against it"
+                        "(an entity id from the packet). If the foe is not registered yet, respond this "
+                        "turn instead: decide who or what it is yourself, introduce it through "
+                        "new_entities, and narrate the clash in-fiction without a roll; attacks against "
+                        "it are rolled once it is registered. Never mention this to the players"
                     ),
                     details={"target": target_id or None},
                 ))
@@ -1483,7 +1485,8 @@ def _structural_error_shape(exc: ContractValidationError) -> str:
             if not isinstance(item, dict):
                 continue
             loc = ".".join(str(p) for p in (item.get("loc") or ()))
-            parts.append(f"{loc}:{item.get('type', '?')}")
+            message = str(item.get("msg") or "")[:120]
+            parts.append(f"{loc}:{item.get('type', '?')}" + (f" ({message})" if message else ""))
         return "; ".join(parts) if parts else "unavailable"
     except Exception:
         return "unavailable"

@@ -36,7 +36,12 @@ IDENTITY_DECISION_CLASS = "world_entity_identity"
 IDENTITY_QUESTION_ID = "resolve_world_entity_identity"
 IDENTITY_FRAME_INSTRUCTIONS = (
     "Select only a supplied existing identity or an explicit outcome. "
-    "Defer when evidence is insufficient."
+    "Reuse an existing identity only when the proposal names it, uses one of "
+    "its aliases, or its description unambiguously matches it. A figure whose "
+    "identity the fiction has not revealed (masked, hooded, unseen, an unnamed "
+    "stranger) is a new entity named for what the party perceives: choose "
+    "NEW_ENTITY or KEEP_DISTINCT; a later reveal links it. Defer only when the "
+    "proposal plausibly refers to an established entity and the match is unclear."
 )
 NEW_ENTITY = "NEW_ENTITY"
 KEEP_DISTINCT = "KEEP_DISTINCT"
@@ -264,7 +269,7 @@ def identity_revision(db: Session, campaign: Campaign) -> str:
 def build_identity_frame(
     db: Session, campaign: Campaign, *, name: str, entity_type: str,
     location_ref: str | None = None, provenance_refs: tuple[str, ...] = (),
-    is_authority: bool = True,
+    is_authority: bool = True, description: str | None = None,
 ) -> DecisionFrame:
     candidates = candidate_entities(db, campaign.id, name=name, entity_type=entity_type,
                                     location_ref=location_ref, provenance_refs=provenance_refs,
@@ -287,6 +292,7 @@ def build_identity_frame(
         decision_class=IDENTITY_DECISION_CLASS, question_id=IDENTITY_QUESTION_ID,
         instructions=IDENTITY_FRAME_INSTRUCTIONS,
         state={"proposed": {"name": name, "entity_type": entity_type, "location_ref": location_ref,
+                            "description": (description or None),
                             "provenance_refs": list(provenance_refs)}},
         state_revision=identity_revision(db, campaign), candidates=records, include_escapes=False,
     )
@@ -535,6 +541,13 @@ def _location_value(location_ref: Any) -> Any:
     return location_ref
 
 
+def _proposal_description(proposal: dict) -> str | None:
+    """Role and public summary the DM gave a new-entity proposal, for identity matching."""
+    parts = [str(proposal.get(key) or "").strip() for key in ("role", "public_summary")]
+    text = "; ".join(part for part in parts if part)
+    return text[:600] or None
+
+
 def _resolve_identity_proposal(
     db: Session,
     campaign: Campaign,
@@ -549,6 +562,7 @@ def _resolve_identity_proposal(
     identity_session_factory: Any | None = None,
     identity_telemetry_outbox: list | None = None,
     prior_deferrals: int = 0,
+    description: str | None = None,
 ) -> tuple[Any | None, str, WorldEntity | None, Any | None, bool]:
     """Run deterministic + bounded identity resolution for one proposal.
 
@@ -579,7 +593,7 @@ def _resolve_identity_proposal(
         location_ref=str(location_value) if location_value is not None else None,
         provenance_refs=tuple(filter(None, (str(turn_id) if turn_id else None,
                                             str(attempt_id) if attempt_id else None))),
-        is_authority=True,
+        is_authority=True, description=description,
     )
     if collision is not None and str(collision.id) not in {c.id for c in frame.candidates}:
         # Exact stable hit must stay a bounded candidate even when fuzzy
@@ -812,6 +826,7 @@ def resolve_new_entity_identities_pre_narration(
             frame, selected_id, reused, service, runner_up_applied = _resolve_identity_proposal(
                 db, campaign, temp_id=temp_id, kind=proposal["kind"],
                 public_name=proposal["public_name"], location_ref=proposal["location_ref"],
+                description=_proposal_description(proposal),
                 turn_id=turn_id, attempt_id=attempt_id,
                 identity_decision_service=service,
                 identity_session_factory=identity_session_factory,
@@ -948,6 +963,7 @@ def promote_new_entities_from_contract(
         frame, selected_id, reused, service, _runner_up = _resolve_identity_proposal(
             db, campaign, temp_id=temp_id, kind=proposal["kind"],
             public_name=proposal["public_name"], location_ref=proposal["location_ref"],
+                description=_proposal_description(proposal),
             turn_id=turn_id, attempt_id=attempt_id,
             identity_decision_service=service,
             identity_session_factory=identity_session_factory,

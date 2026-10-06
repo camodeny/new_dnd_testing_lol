@@ -732,3 +732,22 @@ def test_promoted_npc_gets_baseline_knowledge_and_lane_covers_it():
     # Retry must not duplicate rows (idempotency per attempt/temp_id/target).
     assert {e["target_id"] for e in value["entries"]} == {str(place.id), str(pc.id)}
     assert len(value["entries"]) == 2
+
+
+def test_identity_frame_carries_the_proposal_description_and_hidden_identity_rule():
+    """The identity judge sees what the DM said about the figure, and is told
+    a not-yet-revealed figure is a new entity rather than a deferral."""
+    from app.world.identity import IDENTITY_FRAME_INSTRUCTIONS, _proposal_description
+
+    db, campaign = setup_db()
+    make_entity(db, campaign, "Mara Venn")
+    description = _proposal_description({
+        "role": "Lantern-bearer",
+        "public_summary": "A rain-soaked, shell-masked figure carrying the false beacon.",
+    })
+    frame = build_identity_frame(db, campaign, name="Shell-Masked Lantern-Bearer",
+                                 entity_type="npc", description=description)
+    request = to_decision_request(frame)
+    assert "shell-masked figure" in str(request)
+    assert "not revealed" in IDENTITY_FRAME_INSTRUCTIONS
+    assert _proposal_description({"role": None, "public_summary": ""}) is None
