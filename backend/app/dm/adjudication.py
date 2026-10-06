@@ -154,8 +154,11 @@ unless claim_kind is roll_outcome. Put the requested roll's handle in
 roll_request.request_id. Never decide the outcome or invent the player's dice.
 An attack roll_request names its target_ref: the registered creature or NPC
 entity being attacked. Anyone the party may talk to, follow, or fight is
-introduced through new_entities the first time they appear, so they can be
-statted, attacked, and damaged later.
+introduced through new_entities the first time they appear. A new foe takes
+two turns: introduce it in a respond turn (new_entities never combine with
+await_roll, and assign_stat_block needs its registered id); from the next turn
+on, reference its id from the packet to stage assign_stat_block and request
+attacks against it.
 After fulfillment, the roll evidence states its outcome (success or failure and
 the margin, computed by code): resolve the original intent from it, with
 consequences that fit the margin, and do not request the same roll again.

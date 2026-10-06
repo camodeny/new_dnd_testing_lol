@@ -1916,7 +1916,9 @@ def build_retry_deferral_advisory(db: Session, attempt: Any) -> str | None:
         "(appearance, role, location, group affiliation) so it cannot be confused "
         "with an existing entity. If its true identity is still hidden (masked, "
         "hooded, unseen), keep proposing it as a new entity named for what the "
-        "party perceives; do not drop it from the turn."
+        "party perceives; do not drop it from the turn. This note is private "
+        "adjudication context: never narrate it or what it implies about who "
+        "the figure is."
     )
     return note[:2000]
 
