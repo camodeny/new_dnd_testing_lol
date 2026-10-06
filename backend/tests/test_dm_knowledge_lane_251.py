@@ -173,6 +173,9 @@ def _setup_repair_scene():
         knowledge_state="knows", acquisition_source="direct_observation",
         operation_id="op-know-455",
     )
+    # Commit: callers read through a fresh session, and an uncommitted row
+    # would vanish whenever this session is garbage-collected (rollback).
+    db.commit()
     return Fac, camp, npc, well
 
 

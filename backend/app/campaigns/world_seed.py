@@ -183,6 +183,74 @@ def _check_boundaries(text_fields: dict[str, str], phrases: list[str], *, source
                 )
 
 
+_NAMED = {"type": "object", "additionalProperties": False, "required": ["name", "summary"],
+          "properties": {"name": {"type": "string"}, "summary": {"type": "string"}}}
+
+#: Strict structured output for a brief-grounded setting.
+SETTING_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["location", "npcs", "faction", "pressure", "situation"],
+    "properties": {
+        "location": _NAMED,
+        "npcs": {"type": "array", "items": _NAMED},
+        "faction": _NAMED,
+        "pressure": {
+            "type": "object", "additionalProperties": False, "required": ["name", "description"],
+            "properties": {"name": {"type": "string"}, "description": {"type": "string"}},
+        },
+        "situation": {"type": "string"},
+    },
+}
+
+_SETTING_SYSTEM = """\
+You design the opening of a D&D 5e one-shot adventure from the campaign owner's
+brief. Return one JSON object for the starting setting:
+- location: the place where play begins (proper name, one-sentence summary).
+- npcs: the requested number of named people the party can meet there, each
+  with a one-sentence summary that gives them a stake in the trouble.
+- faction: one group with an agenda tied to the trouble.
+- pressure: the central threat or scheme (proper name, one-sentence
+  description) that play must resolve; it escalates if ignored.
+- situation: 1-2 sentences of the party arriving at the location as the
+  trouble is visible. Name the party, but do not give them actions, thoughts,
+  or dialogue.
+Stay faithful to the brief's setting, tone, and threat. No markdown."""
+
+
+def generate_setting(*, theme: str, brief: str, difficulty: str, pc_names: list[str], npc_count: int) -> dict:
+    """Model-generated starting setting grounded in the owner's brief/theme.
+
+    Structure is enforced by strict JSON schema and re-checked by
+    ``validate_seed_spec``; any failure is a ``WorldSeedError`` so the
+    campaign stays pre-start for a retried seed.
+    """
+    import json
+
+    from app.providers import ProviderRequest, execute_chat
+    from app.providers.areas import resolve_area
+
+    user = json.dumps({
+        "theme": theme or None, "brief": brief or None, "difficulty": difficulty,
+        "party": pc_names, "npc_count": npc_count,
+    })
+    try:
+        adapter, model, _name = resolve_area("world_seed")
+        response = execute_chat(adapter, ProviderRequest(
+            messages=[{"role": "system", "content": _SETTING_SYSTEM}, {"role": "user", "content": user}],
+            model=model, json_schema=SETTING_SCHEMA, json_schema_name="world_seed_setting",
+            timeout_seconds=90, reasoning_effort="low",
+        ))
+        setting = json.loads(response.content)
+    except Exception as exc:  # provider, transport, or malformed output
+        raise WorldSeedError(f"World seed setting generation failed; retry the seed ({type(exc).__name__})") from exc
+    npcs = [n for n in (setting.get("npcs") or []) if str(n.get("name") or "").strip()][:npc_count]
+    if not npcs:
+        raise WorldSeedError("World seed setting generation returned no NPCs; retry the seed")
+    setting["npcs"] = npcs
+    return setting
+
+
 def build_seed_spec(
     *,
     campaign_id: str,
@@ -193,11 +261,14 @@ def build_seed_spec(
     composition: dict,
     lore_bundle: list[dict],
     slot: int = 0,
+    setting: dict | None = None,
 ) -> dict:
     """Derive the versioned seed spec (pure — no DB, no side effects).
 
-    ``slot`` rotates the deterministic curated picks for bounded
-    reject/regenerate cycles; slot 0 is the primary candidate.
+    ``setting`` is the brief-grounded generated setting (``generate_setting``)
+    when the owner gave a theme or brief; without one, ``slot`` rotates the
+    deterministic curated picks for bounded reject/regenerate cycles (slot 0
+    is the primary candidate).
 
     Raises ``WorldSeedError`` when inputs cannot seed (unready party,
     malformed boundaries, boundary rejection).
@@ -222,25 +293,33 @@ def build_seed_spec(
             raise WorldSeedError("World seed requires every party character to be named")
 
     phrases = _deny_phrases(content_boundaries)
-    pick = lambda name, n: _stable_index(campaign_id, f"{name}:{slot}", n)
-    loc_name, loc_summary = _SEED_LOCATIONS[pick("location", len(_SEED_LOCATIONS))]
-    npc_pick = _SEED_NPCS[pick("npc", len(_SEED_NPCS))]
-    npc2_pick = _SEED_NPCS[(pick("npc", len(_SEED_NPCS)) + 2) % len(_SEED_NPCS)]
-    faction_name, faction_summary = _SEED_FACTIONS[pick("faction", len(_SEED_FACTIONS))]
-    pressure_name, pressure_desc = _SEED_PRESSURES[pick("pressure", len(_SEED_PRESSURES))]
-
-    # Multiplayer seeds get a second NPC so hooks can distribute; solo stays lean.
-    npc_specs = [npc_pick] if len(pcs) < 2 else [npc_pick, npc2_pick]
-
     threshold = _DIFFICULTY_THRESHOLD.get(str(difficulty or "medium").lower(), 5)
     theme_text = str(theme or "").strip()
     brief_text = str(brief or "").strip()
     grounding = theme_text or brief_text or "A frontier on the edge of strange events"
     pc_names = ", ".join(str(p["character_name"]) for p in pcs)
-    situation = (
-        f"{pc_names} arrive at {loc_name} as {pressure_desc.lower()} "
-        f"The {faction_name} watches every newcomer."
-    )
+    if setting is not None:
+        loc_name = str(setting["location"]["name"]).strip()
+        loc_summary = str(setting["location"]["summary"]).strip()
+        npc_specs = [(str(n["name"]).strip(), str(n["summary"]).strip()) for n in setting["npcs"]]
+        faction_name = str(setting["faction"]["name"]).strip()
+        faction_summary = str(setting["faction"]["summary"]).strip()
+        pressure_name = str(setting["pressure"]["name"]).strip()
+        pressure_desc = str(setting["pressure"]["description"]).strip()
+        situation = str(setting["situation"]).strip()
+    else:
+        pick = lambda name, n: _stable_index(campaign_id, f"{name}:{slot}", n)
+        loc_name, loc_summary = _SEED_LOCATIONS[pick("location", len(_SEED_LOCATIONS))]
+        npc_pick = _SEED_NPCS[pick("npc", len(_SEED_NPCS))]
+        npc2_pick = _SEED_NPCS[(pick("npc", len(_SEED_NPCS)) + 2) % len(_SEED_NPCS)]
+        faction_name, faction_summary = _SEED_FACTIONS[pick("faction", len(_SEED_FACTIONS))]
+        pressure_name, pressure_desc = _SEED_PRESSURES[pick("pressure", len(_SEED_PRESSURES))]
+        # Multiplayer seeds get a second NPC so hooks can distribute; solo stays lean.
+        npc_specs = [npc_pick] if len(pcs) < 2 else [npc_pick, npc2_pick]
+        situation = (
+            f"{pc_names} arrive at {loc_name} as {pressure_desc.lower()} "
+            f"The {faction_name} watches every newcomer."
+        )
     premise = f"{grounding}. {situation}"
 
     # Lore shapes DM-private hooks as (character, version, kind) metadata —
@@ -305,13 +384,24 @@ def generate_seed_spec(
     Tries deterministic slots in order and returns ``(spec, candidates_tried)``.
     Raises the last ``WorldSeedError`` when every candidate is rejected.
     """
+    grounded = bool(str(theme or "").strip() or str(brief or "").strip())
+    pc_names = [str(m.get("character_name")) for m in (composition or {}).get("members") or []
+                if m.get("character_id") and str(m.get("character_name") or "").strip()]
     last_error: WorldSeedError | None = None
     for slot in range(max(1, MAX_SEED_CANDIDATES)):
         try:
+            # A brief/theme grounds a freshly generated setting per candidate;
+            # without one, slots rotate the curated picks.
+            setting = generate_setting(
+                theme=str(theme or "").strip(), brief=str(brief or "").strip(),
+                difficulty=difficulty, pc_names=pc_names,
+                npc_count=1 if len(pc_names) < 2 else 2,
+            ) if grounded and pc_names else None
             spec = build_seed_spec(
                 campaign_id=campaign_id, theme=theme, brief=brief,
                 difficulty=difficulty, content_boundaries=content_boundaries,
                 composition=composition, lore_bundle=lore_bundle, slot=slot,
+                setting=setting,
             )
             validate_seed_spec(spec, required_pc_ids=required_pc_ids)
             if slot:

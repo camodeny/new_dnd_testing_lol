@@ -651,8 +651,15 @@ def run_post_turn_range(
                 "decision_distribution": consistency["decision_distribution"],
             }
             if not consistency["complete"]:
-                ids = [i["id"] for i in consistency["incidents"]
-                       if i["status"] in ("open", "deferred", "verifier_failed")]
+                from app.post_turn.incidents import unresolved_incident_ids
+
+                # Name every incident blocking the range, including ones
+                # stored by earlier runs, not only this run's findings.
+                ids = sorted({
+                    *(i["id"] for i in consistency["incidents"]
+                      if i["status"] in ("open", "deferred", "verifier_failed")),
+                    *unresolved_incident_ids(db, campaign_id, effective_from, to_sequence),
+                })
                 raise ConsistencyBlocked(
                     ids,
                     f"range {effective_from}-{to_sequence} has "

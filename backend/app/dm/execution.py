@@ -109,8 +109,17 @@ def _execute_owned_attempt(
     run = _claim(db, attempt_id, trace_id=trace_id or str(uuid.uuid4()), timeout_seconds=timeout_seconds)
     if run is None:
         return None
+    from app.dm.context import ContextBudgetError
+
     try:
         packet = _assemble_production_context(db, run.attempt_id)
+    except ContextBudgetError as exc:
+        # Over budget only because post-turn history has not been
+        # consolidated yet: that is backpressure, not failure (#222).
+        if _defer_for_post_turn_catchup(run, exc):
+            return None
+        _record_failure(run, exc, retryable=False)
+        raise
     except Exception as exc:
         # Missing authority fails identically on every retry: never requeue.
         _record_failure(run, exc, retryable=False)
@@ -389,7 +398,9 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     from app.dm.contract import ContractValidationError
     from app.dm.evidence import EvidenceLoopLimitError, run_bounded_evidence_loop
     from app.dm.rules_guidance import enrich_rules_context, check_rules_advisory
-    from app.dm.validators import attempt_pipeline, run_with_bounded_regeneration
+    from app.dm.validators import (
+        EvidenceResolvedValidator, ValidatorPipeline, attempt_pipeline, run_with_bounded_regeneration,
+    )
     from app.observability.tracing import trace_context
     from models.campaigns import Campaign
     from models.dm import DmTurn
@@ -438,7 +449,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
             logger.warning("dm_execute perspective repair failed: %s", exc)
             return None
 
-    def regenerate(pkt, initial_contract=None):
+    def regenerate(pkt, initial_contract=None, pipe=None):
         repaired_packets = []
 
         def repair_hook(report, current):
@@ -448,7 +459,7 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
             return repaired
 
         contract, _ = run_with_bounded_regeneration(
-            adjudicate, pkt, packet_repair=repair_hook, pipeline=pipeline,
+            adjudicate, pkt, packet_repair=repair_hook, pipeline=pipe or pipeline,
             initial_contract=initial_contract,
         )
         return contract, (repaired_packets[-1] if repaired_packets else pkt)
@@ -464,12 +475,25 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
             repaired, validation_packet = regenerate(enriched_packet)
             return repaired
 
-    final_contract, _bundle = run_bounded_evidence_loop(
-        initial_packet=start_packet, adjudicate=evidence_adjudicate, db=run.db,
-    )
+    # Once a turn's evidence has been gathered, a further evidence request is
+    # refused as feedback so the retry resolves the turn instead of looping.
+    resolve_now = ValidatorPipeline([*pipeline.validators, EvidenceResolvedValidator()])
+
+    def evidence_loop(packet, adjudicate_fn):
+        """Bounded evidence loop: ``(contract, None)``, or ``(None, resolve_now)`` at
+        its round limit, where the evidence gathered so far must resolve the turn."""
+        try:
+            contract, _bundle = run_bounded_evidence_loop(
+                initial_packet=packet, adjudicate=adjudicate_fn, db=run.db,
+            )
+            return contract, None
+        except EvidenceLoopLimitError:
+            return None, resolve_now
+
+    final_contract, pipe = evidence_loop(start_packet, evidence_adjudicate)
     # Validate the produced contract inside the bounded loop so a missing
     # perspective is repaired against it before any model retry.
-    regenerated, repaired_packet = regenerate(validation_packet, initial_contract=final_contract)
+    regenerated, repaired_packet = regenerate(validation_packet, initial_contract=final_contract, pipe=pipe)
     if regenerated.mode == "need_evidence":
         # A retry may answer a rejection by asking for evidence. need_evidence
         # carries no beats, so it validates, but committing it would end the
@@ -480,12 +504,10 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
             return pending.pop() if pending else evidence_adjudicate(pkt)
 
         validation_packet = repaired_packet
-        final_contract, _bundle = run_bounded_evidence_loop(
-            initial_packet=repaired_packet, adjudicate=resume, db=run.db,
+        final_contract, _pipe = evidence_loop(repaired_packet, resume)
+        regenerated, repaired_packet = regenerate(
+            validation_packet, initial_contract=final_contract, pipe=resolve_now,
         )
-        regenerated, repaired_packet = regenerate(validation_packet, initial_contract=final_contract)
-        if regenerated.mode == "need_evidence":
-            raise EvidenceLoopLimitError("DM requested evidence again after its evidence was resolved")
     return checked(regenerated, repaired_packet)
 
 
@@ -946,6 +968,55 @@ def _defer_archived(run: _Run, reason: str) -> None:
         run.attempt_id, run.campaign_id, reason,
     )
     return None
+
+
+def _defer_for_post_turn_catchup(run: _Run, exc: BaseException) -> bool:
+    """Requeue a claimed attempt whose context overflowed while post-turn lags.
+
+    The safe-lag gate estimates only the unconsolidated history, so required
+    context can still overflow (large sheets plus the lag). When post-turn
+    trails the attempt's revision, catching up shrinks history to processed
+    summaries: release the claim to ``prepared`` behind a backoff (no failure
+    marker, no retry count) and request a critical catch-up. Returns False
+    when post-turn is current, i.e. waiting cannot help.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.context import _processed_through_sequence
+    from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING
+    from app.post_turn.backpressure import request_catchup
+    from models.dm import DmTurnAttempt
+
+    db = run.db
+    try:
+        db.rollback()
+        current = db.get(DmTurnAttempt, run.attempt_id)
+        if current is None or current.status not in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+            return False
+        if _processed_through_sequence(db, run.campaign_id) >= int(current.source_revision or 0):
+            return False
+        request_catchup(db, run.campaign_id, trigger="critical", commit=False)
+        current.status = ATTEMPT_PREPARED
+        current.started_at = None
+        current.next_retry_at = datetime.now(timezone.utc) + timedelta(
+            seconds=retry_backoff_seconds(int(getattr(current, "retry_count", 0) or 0) + 1)
+        )
+        db.add(current)
+        db.commit()
+    except Exception as defer_exc:  # noqa: BLE001 — fall back to the failure path
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.warning("dm_execute post-turn deferral failed attempt_id=%s error=%s", run.attempt_id, defer_exc)
+        return False
+    structured_log(
+        logger, logging.WARNING, "backpressure_paused_progression",
+        campaign_id=str(run.campaign_id), attempt_id=str(run.attempt_id),
+        turn_id=str(run.turn_id), reason="context_over_budget_post_turn_lagging",
+        error=str(exc)[:200], catch_up_trigger="critical",
+    )
+    return True
 
 
 def _defer_backpressured_attempt(db: Session, attempt) -> None:

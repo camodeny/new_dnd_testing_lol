@@ -676,6 +676,95 @@ def test_retry_asking_for_evidence_resumes_the_evidence_loop(db):
     assert len(calls) == 3
 
 
+def test_second_evidence_request_after_resume_is_feedback_not_failure(db):
+    """After the one evidence resume, a retry that asks for evidence again is
+    told to resolve from the packet; the turn resolves instead of failing."""
+    from models.campaigns import CampaignMember
+    from models.characters import Character, Dnd5eCharacterSheet
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Hero", "total_level": 1, "armor_class": 15}, owner)
+    sheet.character_id = char.id
+    s.add(sheet)
+    s.commit()
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def unsourced(packet):
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        contract["beats"][0]["claims"][0].update(origin="resolver_evidence", evidence_refs=["unknown-source"])
+        return normalize_contract(contract)
+
+    def evidence_request(request_id):
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "need_evidence",
+            "reason": "check sheet", "beats": [], "safe_prelude": "Checking the sheet.",
+            "evidence_requests": [{"id": request_id, "tool": "ask_character_sheet",
+                                   "question": "What is AC?", "scope": "current_player"}],
+        })
+
+    def adjudicate(packet, feedback=None):
+        calls.append(feedback)
+        n = len(calls)
+        if n in (1, 3):
+            return unsourced(packet)          # rejected: cites a missing source
+        if n == 2:
+            return evidence_request("evidence_1")  # retry resumes the loop once
+        if n == 4:
+            return evidence_request("evidence_2")  # asks again after the resume
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        contract["beats"][0]["claims"][0].update(origin="resolver_evidence", evidence_refs=["evidence:evidence_1"])
+        return normalize_contract(contract)
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert result.attempt.contract_snapshot["mode"] == "respond"
+    assert len(calls) == 5
+    assert "evidence_already_resolved" in (calls[4] or "")
+
+
+def test_evidence_round_limit_resolves_from_gathered_evidence(db):
+    """A DM that keeps asking for evidence past the round limit is told to
+    resolve from what it gathered; the turn commits instead of failing."""
+    from app.dm.evidence import MAX_EVIDENCE_ROUNDS
+    from models.campaigns import CampaignMember
+    from models.characters import Character, Dnd5eCharacterSheet
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Hero", "total_level": 1, "armor_class": 15}, owner)
+    sheet.character_id = char.id
+    s.add(sheet)
+    s.commit()
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(feedback)
+        if len(calls) <= MAX_EVIDENCE_ROUNDS + 1:
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION, "mode": "need_evidence",
+                "reason": "check sheet", "beats": [], "safe_prelude": "Checking the sheet.",
+                "evidence_requests": [{"id": f"evidence_{len(calls)}", "tool": "ask_character_sheet",
+                                       "question": "What is AC?", "scope": "current_player"}],
+            })
+        assert any(r.record_id == "evidence:evidence_1" for lane in packet.lanes for r in lane.records)
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        contract["beats"][0]["claims"][0].update(origin="resolver_evidence", evidence_refs=["evidence:evidence_1"])
+        return normalize_contract(contract)
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert result.attempt.contract_snapshot["mode"] == "respond"
+
+
 def test_two_sessions_only_one_executor_reaches_adjudication(db):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
@@ -853,6 +942,66 @@ def test_await_roll_creates_request_and_resumes_on_fulfill(db):
     assert fulfillment.get("total") == 16
     # Private DC data stays adjudication-only, never narration-eligible.
     assert seen["record"].use == "adjudication_only"
+
+
+@pytest.mark.parametrize("repeat_key,repeat_skill,code", [
+    ("check_2", " acrobatics ", "roll_already_resolved"),
+    ("check_1", "Athletics", "roll_request_key_reused"),
+])
+def test_resumed_turn_cannot_reroll_its_resolved_intent(db, repeat_key, repeat_skill, code):
+    """After a fulfilled roll, a repeat request for the same skill (or a reused
+    request key) is regeneration feedback, never a new roll or a DB error."""
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.dm import PlayerRollRequest
+    from app.rolls.service import fulfill_roll
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id)
+    char_id = str(char.id)
+
+    def roll_contract(request_id, skill):
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "await_roll",
+            "reason": "uncertain footing",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "The ledge crumbles beneath your boots.", "claim_kind": "observation",
+                "origin": "dm_adjudication", "visibility": "public",
+            }]}],
+            "roll_request": {
+                "request_id": request_id, "character_id": char_id, "roll_kind": "check",
+                "ability_or_skill": skill, "label": "Keep footing",
+                "reason_public": "Roll to keep your footing.",
+            },
+        })
+
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: roll_contract("check_1", "Acrobatics"),
+                       narrator="deterministic")
+    (pending,) = s.execute(select(PlayerRollRequest).where(PlayerRollRequest.turn_id == turn.id)).scalars().all()
+    _req, _f, resumed, _e = fulfill_roll(
+        s, request_id=pending.id, actor_id=owner,
+        payload={"source": "app", "visibility": "public", "raw_rolls": [14], "modifier": 2, "total": 16},
+    )
+    s.commit()
+
+    feedback_seen = []
+
+    def resumed_adjudicate(packet, feedback=None):
+        feedback_seen.append(feedback)
+        if len(feedback_seen) == 1:
+            return roll_contract(repeat_key, repeat_skill)
+        return _fake_adjudicate("You hold your footing.")(packet)
+
+    result = execute_dm_attempt(s, resumed.id, adjudicate=resumed_adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert len(feedback_seen) == 2 and code in (feedback_seen[1] or "")
+    rows = s.execute(select(PlayerRollRequest).where(PlayerRollRequest.turn_id == turn.id)).scalars().all()
+    assert [r.request_key for r in rows] == ["check_1"]
 
 
 def test_silent_completes_without_visible_stream(db):
@@ -1097,3 +1246,97 @@ def test_perspective_repair_packet_carries_through_validation(db):
     # structural failure, then dialogue that passes once the NPC's stored
     # perspective is loaded into the packet — no further model call
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("kind,dc,total,expected", [
+    ("check", 13, 22, {"result": "success", "margin": 9}),
+    ("save", 13, 13, {"result": "success", "margin": 0}),
+    ("attack", 15, 11, {"result": "failure", "margin": -4}),
+    ("check", None, 18, None),
+    ("initiative", 10, 18, None),
+    ("check", 12, None, None),
+])
+def test_roll_evidence_states_code_computed_outcome(kind, dc, total, expected):
+    from app.dm.context import _roll_outcome
+
+    assert _roll_outcome(kind, dc, {"total": total}) == expected
+
+
+@pytest.mark.parametrize("first_target", [None, "npc:pale-thing-never-registered"])
+def test_attack_roll_must_target_a_registered_entity(db, first_target):
+    """Combat against something only narrated can never land damage: the
+    attack is refused as feedback until it targets a registered entity."""
+    from app.world.service import create_entity
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.dm import PlayerRollRequest
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.commit()
+    beast, _ = commit_world_write(
+        s, camp_id, 0, create_entity, entity_type="npc", name="Reef Horror", operation_id="op-reef-horror",
+    )
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id, text="I swing my sword at the reef horror.")
+    feedback_seen = []
+
+    def adjudicate(packet, feedback=None):
+        feedback_seen.append(feedback)
+        target = first_target if len(feedback_seen) == 1 else str(beast.id)
+        roll = {"request_id": f"attack_{len(feedback_seen)}", "character_id": str(char.id),
+                "roll_kind": "attack", "ability_or_skill": "Longsword", "label": "Sword strike",
+                "reason_public": "Roll to hit the reef horror."}
+        if target is not None:
+            roll["target_ref"] = {"type": "npc", "id": target}
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "await_roll", "reason": "attack",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "The reef horror rears up from the surf.", "claim_kind": "observation",
+                "origin": "dm_adjudication", "visibility": "public",
+            }]}],
+            "roll_request": roll,
+        })
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.mode == "await_roll"
+    assert len(feedback_seen) == 2 and "attack_target_unregistered" in (feedback_seen[1] or "")
+    (row,) = s.execute(select(PlayerRollRequest).where(PlayerRollRequest.turn_id == turn.id)).scalars().all()
+    assert row.request_key == "attack_2"
+
+
+@pytest.mark.parametrize("post_turn_current", [False, True])
+def test_context_over_budget_defers_while_post_turn_lags(db, monkeypatch, post_turn_current):
+    """Required context overflowing because post-turn trails is backpressure:
+    the attempt waits for catch-up instead of failing; with post-turn current,
+    waiting cannot help and it fails visibly as before."""
+    from app.dm import execution as ex
+    from app.dm.context import ContextBudgetError
+    from app.post_turn.service import get_checkpoint
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    # Played history the post-turn checkpoint has not consolidated yet.
+    attempt.source_revision = 21
+    cp = get_checkpoint(s, camp_id, commit=False)
+    cp.processed_through_sequence = 21 if post_turn_current else 0
+    s.commit()
+
+    def overflow(_db, _attempt_id):
+        raise ContextBudgetError("Required authoritative context is 64285 bytes, above 64000-byte budget")
+
+    monkeypatch.setattr(ex, "_assemble_production_context", overflow)
+    if post_turn_current:
+        with pytest.raises(ContextBudgetError):
+            execute_dm_attempt(s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic")
+        assert s.get(DmTurnAttempt, attempt.id).status != "prepared"
+        return
+    assert execute_dm_attempt(s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic") is None
+    s.expire_all()
+    deferred = s.get(DmTurnAttempt, attempt.id)
+    assert deferred.status == "prepared"
+    assert deferred.retry_count == 0
+    assert deferred.next_retry_at is not None

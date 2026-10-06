@@ -18,11 +18,11 @@ Alternatively, run `node tools/player-cli/bin/dnd.mjs` without installing.
 The origin may be the backend or the frontend forwarding `/api` requests.
 Do not include `/api` in `DND_BASE_URL`. HTTP is supported only on localhost.
 
-Give **each player a separate real Supabase member account**. Keep the campaign
-owner in the fixture harness: existing owner projections include hidden canon,
-DCs and NPC state. Gameplay commands refuse owner accounts rather than leaking
-that information to the AI. Creating/starting campaigns belongs to the harness;
-players can accept invitations, select an existing character, and ready up.
+Give **each player a separate real Supabase account**. The campaign owner can
+take a seat too: every human, owner included, receives the same member
+projection, so no seat sees hidden canon, DCs, or NPC state. Creating and
+starting campaigns belongs to the harness; players can accept invitations,
+select an existing character, and ready up.
 
 Set these environment variables through your normal secret store or shell:
 

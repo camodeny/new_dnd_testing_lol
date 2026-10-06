@@ -1083,6 +1083,7 @@ class RollRequest(StrictModel):
     advantage_state: Literal["normal", "advantage", "disadvantage"] = "normal"
     reason_public: str = Field(min_length=1, max_length=600)
     dc_private: int | None = Field(default=None, ge=1, le=40, description="Hidden difficulty; stripped in public projection")
+    target_ref: EntityRef | None = Field(default=None, description="Attack rolls: the registered creature or NPC being attacked")
 
     @field_validator("request_id")
     @classmethod

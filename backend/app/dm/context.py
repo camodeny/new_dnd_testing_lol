@@ -743,6 +743,21 @@ def _processed_through_sequence(db: Session, campaign_id: uuid.UUID) -> int:
         return 0
 
 
+def _roll_outcome(roll_kind, dc, fulfillment) -> dict | None:
+    """Code-owned result of a fulfilled roll against its DC (meet or beat wins).
+
+    Stated in the evidence so the DM resolves the intent from it instead of
+    re-deriving (or re-requesting) the roll. None when there is nothing to
+    compare (no DC, no numeric total, or an uncompared kind like initiative).
+    """
+    if roll_kind not in ("check", "save", "attack", "ability") or not isinstance(fulfillment, dict):
+        return None
+    total = fulfillment.get("total")
+    if isinstance(dc, bool) or isinstance(total, bool) or not isinstance(dc, int) or not isinstance(total, int):
+        return None
+    return {"result": "success" if total >= dc else "failure", "margin": total - dc}
+
+
 #: Recently active NPCs preloaded into the knowledge lane per attempt.
 RECENTLY_ACTIVE_NPC_LIMIT = 8
 
@@ -1587,6 +1602,7 @@ def assemble_attempt_context(
                     "reason_public": item.get("reason_public"),
                     "dc_private": item.get("dc_private"),
                     "fulfillment": fulfillment,
+                    "outcome": _roll_outcome(item.get("roll_kind"), item.get("dc_private"), fulfillment),
                 },
                 sources=[
                     _source(

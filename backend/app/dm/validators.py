@@ -1064,6 +1064,103 @@ class MechanicsValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
+class RollRequestValidator:
+    """A turn's roll requests resolve its intent once.
+
+    After a fulfilled roll the DM must resolve the original intent from the
+    roll evidence. Requesting the same character's same ability or skill
+    again in the same turn, or reusing a request key the turn already used,
+    is refused as regeneration feedback instead of reaching the unique
+    request-key constraint (a DB error that would retry forever).
+    """
+
+    name = "roll_request_validator"
+    category = "rules"
+
+    def __init__(self, db, turn):
+        self.db = db
+        self.turn = turn
+
+    def validate(self, contract, packet) -> ValidatorResult:
+        t0 = time.monotonic()
+        violations: list[ValidationViolation] = []
+        rr = contract.roll_request
+        if contract.mode == "await_roll" and rr is not None and rr.roll_kind == "attack":
+            # Damage needs a statted entity: an attack on something only
+            # narrated could never land, so combat would never end.
+            target = rr.target_ref
+            known = _known_entities_map_from_packet(packet)
+            target_id = str(target.id).strip().lower() if target is not None else ""
+            if not target_id or target_id not in known:
+                violations.append(ValidationViolation(
+                    validator=self.name, category=self.category,
+                    code="attack_target_unregistered",
+                    message=(
+                        "an attack roll_request needs target_ref naming a registered creature or NPC "
+                        "(an entity id from the packet); introduce a new creature through new_entities "
+                        "and stage assign_stat_block first, then request attacks against it"
+                    ),
+                    details={"target": target_id or None},
+                ))
+        if contract.mode == "await_roll" and rr is not None and self.turn is not None:
+            from sqlalchemy import select
+            from app.dm.execution import _resolve_roll_participants
+            from models.dm import PlayerRollRequest
+
+            existing = self.db.scalars(
+                select(PlayerRollRequest).where(PlayerRollRequest.turn_id == self.turn.id)
+            ).all()
+            if any(row.request_key == rr.request_id for row in existing):
+                violations.append(ValidationViolation(
+                    validator=self.name, category=self.category, code="roll_request_key_reused",
+                    message=f"roll request_id {rr.request_id!r} was already used this turn; a new roll needs a new id",
+                    details={"request_id": rr.request_id},
+                ))
+            _, character_id = _resolve_roll_participants(self.db, self.turn, contract)
+            skill = " ".join(str(rr.ability_or_skill).split()).casefold()
+            rolled = next((
+                row for row in existing
+                if row.status == "fulfilled" and row.character_id == character_id
+                and " ".join(str(row.ability_or_skill).split()).casefold() == skill
+            ), None)
+            if rolled is not None:
+                violations.append(ValidationViolation(
+                    validator=self.name, category=self.category, code="roll_already_resolved",
+                    message=(
+                        f"{rr.ability_or_skill} was already rolled for this character this turn "
+                        f"({rolled.label!r}); resolve the action with that roll evidence "
+                        "instead of requesting another roll"
+                    ),
+                    details={"roll_request_id": str(rolled.id), "ability_or_skill": rolled.ability_or_skill},
+                ))
+        latency = (time.monotonic() - t0) * 1000
+        return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
+
+
+class EvidenceResolvedValidator:
+    """Once a turn's evidence loop has run, the retry must resolve the turn.
+
+    Appended once the turn's evidence is gathered (after the single resume
+    a retry may take, or when the bounded evidence loop hits its round
+    limit): a further need_evidence is refused as regeneration feedback
+    rather than looping, failing the turn, or committing a prelude-only turn.
+    """
+
+    name = "evidence_resolved_validator"
+    category = "structure"
+
+    def validate(self, contract, packet) -> ValidatorResult:
+        violations = []
+        if contract.mode == "need_evidence":
+            violations.append(ValidationViolation(
+                validator=self.name, category=self.category, code="evidence_already_resolved",
+                message=("This turn's evidence is already resolved and in the packet; resolve the "
+                         "turn now from it (respond, clarify, or a roll not yet made) instead of "
+                         "requesting more evidence"),
+            ))
+        return ValidatorResult(validator=self.name, category=self.category, passed=not violations, violations=violations, latency_ms=0.0)
+
+
 # ── Pipeline ─────────────────────────────────────────────────────────────────
 
 DEFAULT_VALIDATORS: list[Validator] = [
@@ -1144,8 +1241,10 @@ default_pipeline = ValidatorPipeline()
 
 
 def attempt_pipeline(db, campaign, turn) -> ValidatorPipeline:
-    """Default validators plus the state-reading mechanics check for one attempt."""
-    return ValidatorPipeline([*DEFAULT_VALIDATORS, MechanicsValidator(db, campaign, turn)])
+    """Default validators plus the state-reading mechanics and roll checks for one attempt."""
+    return ValidatorPipeline([
+        *DEFAULT_VALIDATORS, MechanicsValidator(db, campaign, turn), RollRequestValidator(db, turn),
+    ])
 
 
 def validate_contract(

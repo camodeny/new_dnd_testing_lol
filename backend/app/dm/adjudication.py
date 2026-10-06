@@ -149,8 +149,13 @@ instruction actor_ref is null and the PC may be a target_ref; it is not an
 action already performed by the PC. roll_request_id on a CLAIM must be null
 unless claim_kind is roll_outcome. Put the requested roll's handle in
 roll_request.request_id. Never decide the outcome or invent the player's dice.
-After fulfillment, use the supplied roll evidence to resolve the original
-intent; do not request the same roll again.
+An attack roll_request names its target_ref: the registered creature or NPC
+entity being attacked. Anything the party fights must exist as an entity: a
+creature that appears in the fiction is introduced through new_entities (with
+assign_stat_block) before anyone can attack or damage it.
+After fulfillment, the roll evidence states its outcome (success or failure and
+the margin, computed by code): resolve the original intent from it, with
+consequences that fit the margin, and do not request the same roll again.
 """
 
 
