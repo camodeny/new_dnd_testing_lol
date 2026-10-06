@@ -40,9 +40,11 @@ from app.combat.service import (
     TURN_STARTED_EVENT,
     EncounterError,
     get_turn_order,
+    hidden_participant_ids,
     list_participants,
     lock_encounter,
     lock_playable_campaign,
+    visible_turn_order,
 )
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics
@@ -689,6 +691,7 @@ def _advance(
 def turn_projection(
     db: Session,
     encounter: Encounter,
+    viewer_id: uuid.UUID,
 ) -> dict | None:
     """Player-facing turn/round/resource projection; None while initiative is pending.
 
@@ -697,6 +700,8 @@ def turn_projection(
     are redacted for every player — ``movement_remaining``, ``movement_max``
     become None and ``extra_resources`` becomes {} — so no reader can
     reconstruct a hidden NPC's exact speed. PCs stay fully visible.
+    Hidden combatants are absent: no resources row, and their turn shows
+    no active participant.
     """
     if encounter.status != "active":
         return None
@@ -708,8 +713,12 @@ def turn_projection(
             )
         ).scalars().all()
     }
+    hidden_ids = hidden_participant_ids(db, encounter.id, viewer_id=viewer_id)
+    order = visible_turn_order(encounter, hidden_ids)
     states: dict[str, dict] = {}
     for row in list_turn_states(db, encounter.id):
+        if str(row.participant_id) in hidden_ids:
+            continue
         payload = row.to_dict()
         participant = participants.get(str(row.participant_id))
         if (
@@ -721,7 +730,7 @@ def turn_projection(
             payload["movement_max"] = None
             payload["extra_resources"] = {}
         states[str(row.participant_id)] = payload
-    active_id = str(encounter.active_participant_id) if encounter.active_participant_id else None
+    active_id = order["active_participant_id"]
     votes: list[dict] = []
     blocked_since = encounter.blocked_since.isoformat() if encounter.blocked_since else None
     if active_id is not None:
@@ -741,7 +750,7 @@ def turn_projection(
         "turn_sequence": int(encounter.turn_sequence or 0),
         "round": int(encounter.round or 1),
         "active_participant_id": active_id,
-        "active_index": int(encounter.active_index or 0),
+        "active_index": order["active_index"],
         "turn_started_at": encounter.turn_started_at.isoformat() if encounter.turn_started_at else None,
         "blocked": blocked_since is not None,
         "blocked_since": blocked_since,

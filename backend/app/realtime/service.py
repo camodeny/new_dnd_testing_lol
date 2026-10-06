@@ -487,11 +487,16 @@ def _publish_encounter_event(db: Session, encounter, payload: dict[str, Any]) ->
 
     Call AFTER db.commit() — failure leaves authoritative state intact.
     Audience safety: payloads carry turn order + display names only; hidden
-    NPC stat breakdowns never enter realtime payloads (members converge via
-    the privacy-filtered snapshot).
+    NPC stat breakdowns and hidden combatants never enter realtime payloads
+    (members converge via the privacy-filtered snapshot).
     """
     try:
+        from app.combat.service import hidden_participant_ids, redact_hidden_combatants
+
         channel = live_table_channel(encounter.campaign_id, encounter.thread_id)
+        # Thread channels are shared, so hidden combatants are removed for
+        # every subscriber; a grantee converges through the snapshot.
+        payload = redact_hidden_combatants(payload, hidden_participant_ids(db, encounter.id))
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:
@@ -576,31 +581,17 @@ def publish_encounter_map(db: Session, encounter) -> bool:
 def publish_encounter_moved(db: Session, encounter, participant_id, *, move_id: str | None = None) -> bool:
     """Publish the ``encounter.moved`` projection (best-effort, post-commit).
 
-    Hidden ``dm_private`` NPC/monster movers publish a position-free
-    invalidation (no destination cell) so the shared thread channel never
-    leaks a hidden token's coordinates; members converge via the
-    privacy-filtered snapshot projection.
+    A hidden combatant's move publishes nothing: no player payload carries
+    that combatant, so there is nothing for clients to update and any event
+    would reveal that it exists.
     """
     try:
         from app.combat.maps import get_placement
-        from models.combat import HIDDEN_ENTITY_VISIBILITIES, EncounterParticipant
-        from models.world import WorldEntity
+        from app.combat.service import hidden_participant_ids
 
-        participant = db.get(EncounterParticipant, participant_id)
-        hidden = False
-        if (
-            participant is not None
-            and participant.kind in ("npc", "monster")
-            and participant.npc_entity_id is not None
-        ):
-            # Token hiding follows the source entity visibility signal, never
-            # stat_visibility (#230 forces stats dm_private for all NPCs).
-            entity = db.get(WorldEntity, participant.npc_entity_id)
-            hidden = (
-                entity is not None
-                and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES
-            )
-        placement = None if hidden else get_placement(db, encounter.id, participant_id)
+        if str(participant_id) in hidden_participant_ids(db, encounter.id):
+            return True
+        placement = get_placement(db, encounter.id, participant_id)
         campaign = db.get(Campaign, encounter.campaign_id)
         revision = int(campaign.revision) if campaign and campaign.revision is not None else None
         payload = build_encounter_moved_event(
@@ -609,8 +600,6 @@ def publish_encounter_moved(db: Session, encounter, participant_id, *, move_id: 
             revision=revision,
             move_id=move_id,
         )
-        if hidden:
-            payload["position_redacted"] = True
         return _publish_encounter_event(db, encounter, payload)
     except Exception as exc:
         logger.warning("publish_encounter_moved failed encounter_id=%s error=%s", getattr(encounter, "id", "?"), exc)

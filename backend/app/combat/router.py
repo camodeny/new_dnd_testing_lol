@@ -25,7 +25,10 @@ from app.combat.service import (
     get_active_encounter,
     get_encounter,
     get_turn_order,
+    hidden_participant_ids,
     list_participants,
+    player_event_dict,
+    visible_turn_order,
 )
 from app.combat.turns import (
     StaleTurnError,
@@ -152,8 +155,11 @@ def read_turn_order(
         ordered = get_turn_order(db, encounter.id)
     except EncounterNotReadyError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    hidden_ids = hidden_participant_ids(db, encounter.id, viewer_id=profile.id)
     order = []
     for p in ordered:
+        if str(p.id) in hidden_ids:
+            continue
         # Same participant redaction as encounter_view(): another PC's
         # roll_request_id stays with its controller.
         privileged = str(p.controller_user_id or "") == str(profile.id)
@@ -165,7 +171,7 @@ def read_turn_order(
         "encounter_id": str(encounter.id),
         "status": encounter.status,
         "round": encounter.round,
-        "active_participant_id": str(encounter.active_participant_id) if encounter.active_participant_id else None,
+        "active_participant_id": visible_turn_order(encounter, hidden_ids)["active_participant_id"],
         "order": order,
     }
 
@@ -200,7 +206,7 @@ def fulfill_initiative(
                 "fulfillment": fulfillment.to_dict(include_private=True),
                 "participant": participant.to_dict(include_private=True),
                 "encounter": encounter_view(db, updated, profile.id),
-                "ready_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+                "ready_event": player_event_dict(db, event, profile.id) if event is not None else None,
             }
         except EncounterAuthorizationError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
@@ -274,7 +280,7 @@ def read_turn_state(
 ):
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
     _assert_encounter_visible(db, encounter, profile.id)
-    projection = turn_projection(db, encounter)
+    projection = turn_projection(db, encounter, profile.id)
     if projection is None:
         raise HTTPException(status_code=409, detail="turn state becomes available when required initiative is complete")
     return {"encounter_id": str(encounter.id), "turn": projection}
@@ -309,8 +315,8 @@ def post_end_turn(
             )
             return {
                 "encounter": encounter_view(db, updated, profile.id),
-                "ended_event": ended_event.to_dict() if hasattr(ended_event, "to_dict") else None,
-                "started_event": started_event.to_dict() if hasattr(started_event, "to_dict") else None,
+                "ended_event": player_event_dict(db, ended_event, profile.id),
+                "started_event": player_event_dict(db, started_event, profile.id),
                 "turn_sequence": int(updated.turn_sequence or 0),
             }
         except Exception as exc:
@@ -362,8 +368,8 @@ def post_skip_vote(
                 "encounter": encounter_view(db, updated, profile.id),
                 "tally": tally,
                 "executed": executed,
-                "skipped_event": skipped_event.to_dict() if skipped_event is not None and hasattr(skipped_event, "to_dict") else None,
-                "started_event": started_event.to_dict() if started_event is not None and hasattr(started_event, "to_dict") else None,
+                "skipped_event": player_event_dict(db, skipped_event, profile.id) if skipped_event is not None else None,
+                "started_event": player_event_dict(db, started_event, profile.id) if started_event is not None else None,
             }
         except Exception as exc:
             raise _turn_http_error(exc) from exc
@@ -548,7 +554,7 @@ def post_move(
             return {
                 "move": move.to_dict(),
                 "encounter": encounter_view(db, updated, profile.id),
-                "moved_event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+                "moved_event": player_event_dict(db, event, profile.id) if event is not None else None,
             }
         except Exception as exc:
             raise _map_http_error(exc) from exc

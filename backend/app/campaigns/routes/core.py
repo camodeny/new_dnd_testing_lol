@@ -262,5 +262,10 @@ def list_campaign_domain_events(
     campaign: Campaign = Depends(campaign_for("participant")),
     db: Session = Depends(get_db),
 ):
+    from app.combat.service import player_event_dict
+
     events = list_campaign_events(db, campaign.id, viewer_id=profile.id, limit=200)
-    return {"events": [event.to_dict() for event in events], "revision": campaign.revision}
+    return {
+        "events": [player_event_dict(db, event, profile.id) for event in events],
+        "revision": campaign.revision,
+    }

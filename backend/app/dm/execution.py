@@ -669,11 +669,12 @@ def _identity_repair_record(packet, conflict):
 
 
 def _await_roll_prompt_text(contract) -> str:
+    """Player-readable roll prompt: the contract's claims minus DM-private ones."""
     parts: list[str] = []
     for beat in contract.beats or []:
         for claim in beat.claims or []:
             text = (claim.text or "").strip()
-            if text:
+            if text and claim.visibility != "dm_private":
                 parts.append(text)
     return " ".join(parts).strip()
 

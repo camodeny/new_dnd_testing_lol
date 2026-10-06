@@ -475,13 +475,12 @@ def test_hidden_enemy_final_data_stays_scoped():
             db, ctx, encounter,
             participant_outcomes={str(npc.id): "slain"},
         )
-        # Player projection never carries hidden NPC stat breakdowns.
+        # A hidden combatant never reaches a player projection (#252).
         player_view = encounter_view(
             db, db.get(Encounter, encounter.id), ctx["player"])
-        goblin_view = next(p for p in player_view["participants"]
-                           if p.get("npc_entity_id") == str(ctx["goblin_id"]))
-        assert "initiative_modifier" not in goblin_view
-        assert "raw_roll" not in goblin_view
+        assert all(p.get("npc_entity_id") != str(ctx["goblin_id"])
+                   for p in player_view["participants"])
+        assert str(npc.id) not in str(player_view)
         # Final snapshot flags the redaction instead of leaking HP.
         final = build_final_snapshot(db, db.get(Encounter, encounter.id))
         final_npc = next(p for p in final["participants"]
@@ -529,18 +528,15 @@ def test_ended_event_hidden_from_member_history():
         event = _ended_event(db, ctx, encounter.id)
         assert event.visibility == "dm_only"
         assert event.actor_id == ctx["owner"]
-        # Owner and audit reads retain the full payload.
-        assert list_campaign_events(db, ctx["campaign_id"]) != []
-        owner_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
-        assert any(
-            e.event_type == ENCOUNTER_ENDED_EVENT and e.id == event.id
-            for e in owner_feed
-        )
-        # Thread members without ownership get no ended event — the secret
-        # reason and hidden fate are not recoverable through history.
-        member_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
-        assert all(e.event_type != ENCOUNTER_ENDED_EVENT for e in member_feed)
-        assert secret_reason not in str([e.payload for e in member_feed])
+        # Audit reads retain the full payload.
+        assert any(e.id == event.id for e in list_campaign_events(db, ctx["campaign_id"]))
+        # No human gets the ended event — the owner included, even though the
+        # AI's event is attributed to them (#252). The secret reason and
+        # hidden fate are not recoverable through history.
+        for viewer in (ctx["owner"], ctx["player"]):
+            feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=viewer)
+            assert all(e.event_type != ENCOUNTER_ENDED_EVENT for e in feed)
+            assert secret_reason not in str([e.payload for e in feed])
 
 
 def test_freeform_post_combat_interaction_still_available():

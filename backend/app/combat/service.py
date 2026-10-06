@@ -18,7 +18,7 @@ from app.observability.tracing import structured_log
 from app.realtime.service import publish_encounter_ended, publish_encounter_ready, publish_encounter_started
 from app.rules.mechanics import MechanicsError, ability_modifier, get_character_mechanics
 from app.threads.service import can_read_thread, parse_thread_id
-from app.visibility.access import is_campaign_participant
+from app.visibility.access import is_campaign_participant, may_user_receive
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character
 from models.combat import Encounter, EncounterParticipant
@@ -420,6 +420,115 @@ def get_active_participant(db: Session, encounter_id: uuid.UUID) -> EncounterPar
     return participant
 
 
+# ── Hidden combatants ──────────────────────────────────────────────────────
+
+
+def hidden_participant_ids(
+    db: Session, encounter_id: uuid.UUID, *, viewer_id: uuid.UUID | None = None,
+) -> set[str]:
+    """Participant ids hidden from players: NPC/monster combatants whose
+    source entity has a hidden visibility.
+
+    Hiding follows the source entity visibility, NOT ``stat_visibility``:
+    #230 forces ``stat_visibility=dm_private`` for every NPC/monster to
+    protect combat *stats*, so ordinary visible enemies stay on the board.
+    A hidden combatant is absent from every player payload: its token,
+    roster entry, turn order slot, active turn, and event references.
+
+    With ``viewer_id``, an explicit visibility grant on the entity reveals
+    it to that viewer alone (#250 player-specific reveal). Without one the
+    full hidden set is returned, for shared broadcasts and geometry.
+    """
+    from models.combat import HIDDEN_ENTITY_VISIBILITIES
+
+    hidden: dict[str, WorldEntity] = {}
+    for participant in list_participants(db, encounter_id):
+        if participant.kind not in ("npc", "monster") or participant.npc_entity_id is None:
+            continue
+        entity = db.get(WorldEntity, participant.npc_entity_id)
+        if entity is not None and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES:
+            hidden[str(participant.id)] = entity
+    if not hidden or viewer_id is None:
+        return set(hidden)
+    campaign = db.get(Campaign, next(iter(hidden.values())).campaign_id)
+    revealed = set()
+    for participant_id, entity in hidden.items():
+        verdict = may_user_receive(db, campaign, "entity", entity.id, viewer_id)
+        # Only an explicit grant reveals a hidden combatant.
+        if verdict.get("allowed") and verdict.get("reason") == "explicit_grant":
+            revealed.add(participant_id)
+    return set(hidden) - revealed
+
+
+def visible_turn_order(encounter: Encounter, hidden_ids: set[str]) -> dict:
+    """Turn order, active turn, and roster size with hidden combatants removed.
+
+    A hidden combatant's turn shows as no active participant.
+    """
+    order = [str(pid) for pid in (encounter.turn_order_ids or []) if str(pid) not in hidden_ids]
+    active = str(encounter.active_participant_id) if encounter.active_participant_id else None
+    if active in hidden_ids:
+        active = None
+    return {
+        "turn_order_ids": order,
+        "active_participant_id": active,
+        "active_index": order.index(active) if active in order else None,
+        "participant_count": max(0, int(encounter.participant_count or 0) - len(hidden_ids)),
+    }
+
+
+#: Payload keys naming one participant, redacted to None when hidden.
+_PARTICIPANT_REF_KEYS = (
+    "active_participant_id", "ended_participant_id", "next_participant_id", "participant_id",
+)
+#: Payload keys holding a map keyed by participant id.
+_PARTICIPANT_MAP_KEYS = ("roll_sources", "participant_outcomes")
+
+
+def redact_hidden_combatants(payload: Any, hidden_ids: set[str]) -> Any:
+    """Copy of an encounter event payload without hidden-combatant references."""
+    if not hidden_ids or not isinstance(payload, dict):
+        return payload
+    out = dict(payload)
+    for key in _PARTICIPANT_REF_KEYS:
+        if str(out.get(key)) in hidden_ids:
+            out[key] = None
+    for key in _PARTICIPANT_MAP_KEYS:
+        if isinstance(out.get(key), dict):
+            out[key] = {pid: v for pid, v in out[key].items() if str(pid) not in hidden_ids}
+    if isinstance(out.get("turn_order_ids"), list):
+        out["turn_order_ids"] = [pid for pid in out["turn_order_ids"] if str(pid) not in hidden_ids]
+    if isinstance(out.get("participants"), list):
+        out["participants"] = [
+            p for p in out["participants"]
+            if not (isinstance(p, dict) and str(p.get("id")) in hidden_ids)
+        ]
+    if isinstance(out.get("participant_count"), int):
+        out["participant_count"] = max(0, out["participant_count"] - len(hidden_ids))
+    if "active_index" in out:
+        # A full-order index would count the hidden slots before it.
+        order = out.get("turn_order_ids")
+        active = out.get("active_participant_id")
+        out["active_index"] = order.index(active) if isinstance(order, list) and active in order else None
+    return out
+
+
+def player_event_dict(db: Session, event, viewer_id: uuid.UUID | None = None) -> dict:
+    """A domain event as players see it: encounter events lose hidden combatants."""
+    data = event.to_dict()
+    if event.event_type not in THREAD_SCOPED_EVENT_TYPES:
+        return data
+    raw_id = (event.payload or {}).get("encounter_id") if isinstance(event.payload, dict) else None
+    try:
+        encounter_id = uuid.UUID(str(raw_id))
+    except (TypeError, ValueError):
+        return data
+    data["payload"] = redact_hidden_combatants(
+        data["payload"], hidden_participant_ids(db, encounter_id, viewer_id=viewer_id),
+    )
+    return data
+
+
 # ── Viewer-filtered projection (snapshot + reads; hidden NPC stats DM-private)
 
 
@@ -428,7 +537,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> d
 
     The AI is the only DM, so every human — the campaign owner included —
     gets the same view: private stats only for participants they control,
-    no DM end reason, no hidden NPC fates, no hidden tokens or DM terrain.
+    no DM end reason, no hidden NPC fates, no hidden combatants, no DM terrain.
     """
     payload = encounter.to_dict()
     created_event = find_created_event(db, encounter)
@@ -437,7 +546,14 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> d
         payload["created_event_sequence"] = created_event.sequence
     viewers_parts = []
     hidden_ids: set[str] = set()
+    hidden_combatants = hidden_participant_ids(db, encounter.id, viewer_id=viewer_id)
+    payload.update(visible_turn_order(encounter, hidden_combatants))
+    payload["roll_sources"] = {
+        pid: source for pid, source in payload["roll_sources"].items() if pid not in hidden_combatants
+    }
     for participant in list_participants(db, encounter.id):
+        if str(participant.id) in hidden_combatants:
+            continue
         include_private = (
             participant.controller_user_id is not None
             and str(participant.controller_user_id) == str(viewer_id)
@@ -457,6 +573,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> d
             hidden_ids.add(str(participant.id))
     payload["participants"] = viewers_parts
     payload["end_reason"] = None
+    hidden_ids |= hidden_combatants
     outcomes = payload.get("end_participant_outcomes") or {}
     if isinstance(outcomes, dict) and hidden_ids:
         payload["end_participant_outcomes"] = {
@@ -468,7 +585,7 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> d
     try:
         from app.combat.turns import turn_projection
 
-        payload["turn"] = turn_projection(db, encounter)
+        payload["turn"] = turn_projection(db, encounter, viewer_id)
     except Exception:
         logger.warning("encounter turn projection skipped", exc_info=True)
         payload["turn"] = None

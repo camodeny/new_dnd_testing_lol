@@ -37,6 +37,12 @@ from app.observability.tracing import current_trace_id
 from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 
+#: Event visibilities an actor may read on their own events. DM-only and
+#: DM-private events stay hidden even when a human is recorded as the actor:
+#: the AI is the only DM, and lifecycle events it commits are attributed to
+#: the campaign owner.
+ACTOR_READABLE_EVENT_VISIBILITIES = ("campaign", "private")
+
 logger = logging.getLogger(__name__)
 
 
@@ -293,7 +299,7 @@ def list_campaign_events(
     """Ordered history for a campaign (sequence asc).
 
     With ``viewer_id`` set this is the member-facing feed: public events,
-    the viewer's own actor events, and — for thread-scoped encounter
+    the viewer's own ``campaign``/``private`` actor events, and — for thread-scoped encounter
     lifecycle events (issue #230) — only events from threads the viewer may
     read. Callers without a viewer (provenance/audit internals) get the full
     history. Thread filtering applies after limit/offset, so feeds with
@@ -305,7 +311,8 @@ def list_campaign_events(
         query = query.where(
             or_(
                 CampaignDomainEvent.visibility == "public",
-                CampaignDomainEvent.actor_id == viewer_id,
+                (CampaignDomainEvent.actor_id == viewer_id)
+                & CampaignDomainEvent.visibility.in_(ACTOR_READABLE_EVENT_VISIBILITIES),
             )
         )
     rows = list(

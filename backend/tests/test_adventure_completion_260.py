@@ -794,19 +794,19 @@ def test_terminal_closing_job_retires_without_starving_newer_work(setup, monkeyp
         assert poisoned.closing_status == "failed"
 
 
-def test_effect_argument_redaction_unit():
-    from app.adventures.service import redact_private_effect_arguments
+def test_player_staged_effects_drop_every_argument():
+    from app.adventures.service import player_staged_effects
 
     staged = [
         {"id": "e1", "effect_type": "complete_adventure",
          "arguments": {"outcome": "victory", "reason": "secret", "public_summary": "yay"}},
-        {"id": "e2", "effect_type": "update_scene",
-         "arguments": {"scene_patch": {}, "reason": "kept"}},
+        {"id": "e2", "effect_type": "assert_fact",
+         "arguments": {"content": "dm-only truth", "visibility": "dm_only"}},
     ]
-    out = redact_private_effect_arguments(staged)
-    assert "reason" not in out[0]["arguments"]
-    assert out[0]["arguments"]["outcome"] == "victory"
-    assert out[1]["arguments"]["reason"] == "kept"
+    assert player_staged_effects(staged) == [
+        {"id": "e1", "effect_type": "complete_adventure"},
+        {"id": "e2", "effect_type": "assert_fact"},
+    ]
     # Input untouched (copy, not mutation).
     assert staged[0]["arguments"]["reason"] == "secret"
 
@@ -895,9 +895,8 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
     actor["id"] = member_id
     body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
     assert len(body["attempts"]) == 1
-    mem_args = body["attempts"][0]["staged_effects"][0]["arguments"]
-    assert "reason" not in mem_args
-    assert mem_args["outcome"] == "capture"
+    assert body["attempts"][0]["staged_effects"] == [
+        {"id": "eff_x", "effect_type": "complete_adventure"}]
     blob = json.dumps(body)
     assert top_secret not in blob
     assert nested_secret not in blob

@@ -296,6 +296,10 @@ def test_repair_marks_stale_and_regeneration_bumps_version(api):
     assert rebuilt["status"] == "current"
     assert rebuilt["version"] == v0 + 1
     assert rebuilt["rebuild_count"] >= 1
+    # The owner is a player (#252): no hidden-source text or DM close reason.
+    assert "historical_text" not in rebuilt
+    assert "reason" not in r2.json()["adventure"]
+    assert "zxqv-secret-phylactery" not in r2.text
 
 
 def test_review_available_after_continuation_and_summary_never_overrides_authority(api):

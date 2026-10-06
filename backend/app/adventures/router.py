@@ -142,7 +142,7 @@ def start_adventure_endpoint(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"adventure": adventure.to_dict(), "campaign_status": campaign.status}
+        return {"adventure": adventure.to_public_dict(), "campaign_status": campaign.status}
 
     return run_campaign_command(
         db, response, actor_id=profile.id, idempotency_key=idempotency_key,
@@ -185,7 +185,7 @@ def retry_generate(
         db, adv, actor_id=profile.id,
         force_fail=bool(body.get("force_fail")),
     )
-    return {"adventure": adv.to_dict(), "summary": row.to_dict()}
+    return {"adventure": adv.to_public_dict(), "summary": row.to_public_dict()}
 
 
 @router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/summaries/mark-stale")
@@ -205,7 +205,7 @@ def mark_stale_endpoint(
         raise HTTPException(status_code=404, detail=str(exc))
     if body.get("regenerate"):
         row = generate_summary(db, adv, actor_id=profile.id)
-    return {"adventure": adv.to_dict(), "summary": row.to_dict()}
+    return {"adventure": adv.to_public_dict(), "summary": row.to_public_dict()}
 
 
 @router.get("/api/cron/adventure-closing")
@@ -284,7 +284,7 @@ def open_epilogues_endpoint(
         db.refresh(adv)
     except Exception as exc:  # noqa: BLE001 — mapped to status codes below
         _epilogue_error_response(exc)
-    return {"adventure": adv.to_dict(), "stats": epilogue_stats(db, aid)}
+    return {"adventure": adv.to_public_dict(), "stats": epilogue_stats(db, aid)}
 
 
 @router.post("/api/campaigns/{campaign_id}/adventures/{adventure_id}/epilogues/submit")

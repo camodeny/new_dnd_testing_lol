@@ -176,7 +176,7 @@ def test_resources_initialized_full_at_ready():
             assert state.movement_remaining == state.movement_max == 30
         active_state = get_turn_state_row(db, encounter.id, encounter.active_participant_id)
         assert active_state.turn_started_at is not None
-        projection = turn_projection(db, encounter)
+        projection = turn_projection(db, encounter, ctx["owner"])
         assert projection["turn_sequence"] == 1
         assert projection["round"] == 1
         assert projection["blocked"] is False
@@ -517,7 +517,7 @@ def test_skip_threshold_partial_then_reached_with_three_members():
         assert tally["vote_count"] == 1 and tally["threshold"] == 2
         assert updated.turn_sequence == 1  # still blocked on the player
         assert updated.blocked_since is not None
-        blocked_ms = turn_projection(db, updated)
+        blocked_ms = turn_projection(db, updated, ctx["owner"])
         assert blocked_ms["blocked"] is True
         # Duplicate vote by the same voter replays the tally, no double count.
         tally2, executed2, _, _, _ = cast_skip_vote(
@@ -713,7 +713,7 @@ def test_state_reconstructs_exactly_after_reconnect(tmp_path):
         assert revived.turn_sequence == 2
         assert revived.skipped_count == 1
         assert revived.round == 1
-        projection = turn_projection(db, revived)
+        projection = turn_projection(db, revived, ctx["owner"])
         assert projection["turn_sequence"] == 2
         assert projection["skipped_count"] == 1
         owner_state = get_turn_state_row(db, encounter_id, owner_p.id)
@@ -814,7 +814,8 @@ def test_hidden_npc_speed_redacted_for_every_player():
     with fac() as db:
         swift = WorldEntity(
             campaign_id=ctx["campaign_id"], entity_type="npc", name="Swift Stalker",
-            visibility="dm_only",
+            # Seen by the party, so it is on the board; its speed stays private.
+            visibility="campaign",
             details={"initiative_modifier": 1, "dex_modifier": 0, "speed": 50},
         )
         db.add(swift)
@@ -850,7 +851,7 @@ def test_hidden_npc_speed_redacted_for_every_player():
         assert int(state.movement_max) == 50
         assert int(state.movement_remaining) == 50
         # No player — the owner included — can reconstruct it.
-        player_proj = turn_projection(db, encounter)
+        player_proj = turn_projection(db, encounter, player_id)
         assert player_proj["resources"][npc_id]["movement_max"] is None
         assert player_proj["resources"][npc_id]["movement_remaining"] is None
         assert player_proj["resources"][npc_id]["extra_resources"] == {}
@@ -858,13 +859,12 @@ def test_hidden_npc_speed_redacted_for_every_player():
         assert player_proj["resources"][npc_id]["movement_remaining"] != 50
         # PC budgets stay visible.
         assert player_proj["resources"][str(owner_p.id)]["movement_max"] == 30
-        # Same redaction rides the snapshot view and the default (fail-closed) read.
+        # Same redaction rides the snapshot view and the owner's read.
         owner_view = encounter_view(db, encounter, owner_id)
         player_view = encounter_view(db, encounter, player_id)
         assert owner_view["turn"]["resources"][npc_id]["movement_max"] is None
         assert player_view["turn"]["resources"][npc_id]["movement_max"] is None
-        default_proj = turn_projection(db, encounter)
-        assert default_proj["resources"][npc_id]["movement_max"] is None
+        assert turn_projection(db, encounter, owner_id) == player_proj
 
 
 # ── HTTP transport ──────────────────────────────────────────────────────────
