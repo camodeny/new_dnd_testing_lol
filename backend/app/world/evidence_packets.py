@@ -16,6 +16,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import ACTOR_READABLE_EVENT_VISIBILITIES
 from app.schema import coerce_uuid
 from app.threads.service import can_read_thread, parse_thread_id
 from app.visibility.access import is_campaign_participant, may_user_receive
@@ -216,13 +217,20 @@ def fact_packet(fact: Any, campaign_id: uuid.UUID, rank: int,
     )
 
 
-def event_packet(event: CampaignDomainEvent, rank: int,
+def event_packet(db: Session, event: CampaignDomainEvent, rank: int,
                   *, revealable: bool | None) -> EvidencePacket:
+    # Player-facing packets drop hidden combatants exactly like the event feed.
+    if revealable:
+        from app.combat.service import player_event_dict
+
+        content = player_event_dict(db, event)
+    else:
+        content = event.to_dict()
     return EvidencePacket(
         source_type="domain_event",
         source_id=str(event.id),
         source_version=f"seq{int(event.sequence)}",
-        content=event.to_dict(),
+        content=content,
         epistemic_state=None,
         visibility=str(getattr(event, "visibility", "public")),
         campaign_id=str(event.campaign_id),
@@ -333,7 +341,7 @@ def event_visible_player_facing(db: Session, campaign: Campaign,
                                   event: CampaignDomainEvent,
                                   viewers: list[uuid.UUID]) -> tuple[bool, str | None]:
     """Member feed rule mirroring ``list_campaign_events``: public events,
-    plus a viewer's own actor events. Anything else stays hidden.
+    plus a viewer's own ``campaign``/``private`` actor events. Anything else stays hidden.
 
     Every player-facing viewer must first pass campaign membership — an
     arbitrary user UUID plus a known campaign ID must not read that
@@ -347,7 +355,11 @@ def event_visible_player_facing(db: Session, campaign: Campaign,
     if str(getattr(event, "visibility", "public")) == "public":
         return True, None
     actor = getattr(event, "actor_id", None)
-    if actor is not None and any(str(actor) == str(viewer) for viewer in viewers):
+    if (
+        actor is not None
+        and str(getattr(event, "visibility", "")) in ACTOR_READABLE_EVENT_VISIBILITIES
+        and any(str(actor) == str(viewer) for viewer in viewers)
+    ):
         return True, None
     return False, "event_not_visible"
 

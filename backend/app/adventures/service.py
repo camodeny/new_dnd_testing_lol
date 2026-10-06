@@ -92,49 +92,18 @@ def validate_outcome(outcome: str) -> str:
     return clean
 
 
-#: Staged-effect argument keys that are DM/owner-private and must never reach
-#: members through serialized projections (issue #260 security). Members see
-#: the outcome + player-visible summary; the completion rationale stays
-#: owner-visible on the adventure record.
-PRIVATE_EFFECT_ARGUMENTS: dict[str, tuple[str, ...]] = {
-    "complete_adventure": ("reason",),
-}
+def player_staged_effects(staged_effects: list | None) -> list[dict]:
+    """Staged effects as players see them: which effects ran, never their arguments.
 
-
-def redact_private_effect_arguments(staged_effects: list | None) -> list:
-    """Return a copy of staged effects with owner-private arguments removed."""
-    redacted: list = []
-    for eff in staged_effects or []:
-        if not isinstance(eff, dict):
-            redacted.append(eff)
-            continue
-        private = PRIVATE_EFFECT_ARGUMENTS.get(eff.get("effect_type"))
-        args = eff.get("arguments")
-        # Issue #230: NPC initiative_modifier overrides are DM-only mechanics
-        # inputs. Persisted staged start_encounter effects must not leak them
-        # to non-owner members even though the encounter projection redacts.
-        if eff.get("effect_type") == "start_encounter" and isinstance(args, dict):
-            eff = dict(eff)
-            args = dict(args)
-            participants = args.get("participants")
-            if isinstance(participants, list):
-                args["participants"] = [
-                    {k: v for k, v in p.items() if k != "initiative_modifier"}
-                    if isinstance(p, dict) else p
-                    for p in participants
-                ]
-            if private:
-                args = {k: v for k, v in args.items() if k not in private}
-            eff["arguments"] = args
-            redacted.append(eff)
-            continue
-        if not private or not isinstance(args, dict):
-            redacted.append(eff)
-            continue
-        eff = dict(eff)
-        eff["arguments"] = {k: v for k, v in args.items() if k not in private}
-        redacted.append(eff)
-    return redacted
+    Effect arguments are DM authoring — dm_only fact text, hidden map labels,
+    hidden combatant ids, completion rationale — so none of them leave the
+    server. DM-internal code reads the column directly.
+    """
+    return [
+        {"id": eff.get("id"), "effect_type": eff.get("effect_type")}
+        for eff in staged_effects or []
+        if isinstance(eff, dict)
+    ]
 
 
 def redact_private_contract_snapshot(snapshot: dict | None) -> dict | None:

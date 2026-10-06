@@ -516,6 +516,25 @@ class AdventureSummary(Base):
             d["recap_text"] = self.recap_text
         return d
 
+    def to_public_dict(self):
+        """Regeneration status for the campaign owner's summary controls.
+
+        The owner is a player: no historical text (it compresses hidden
+        sources), no hidden-event counts, and no raw error (a failed leak
+        check names the leaked tokens). Players read prose through ``/recap``.
+        """
+        return {
+            "id": str(self.id),
+            "adventure_id": str(self.adventure_id),
+            "version": self.version,
+            "status": self.status,
+            "attempts": self.attempts,
+            "stale_count": self.stale_count,
+            "rebuild_count": self.rebuild_count,
+            "error": "summary generation failed" if self.status == "failed" else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
 
 class CampaignPcLifecycle(Base):
     """Replacement-character lifecycle — issue #266.
@@ -706,5 +725,9 @@ class AdventureEpilogue(Base):
         metadata.
         """
         d = self.to_dict(include_content=False)
+        # The outcome text restates the content, the roll carries its DC,
+        # and kind/has_roll say whether it needed adjudication.
+        for key in ("roll_spec", "roll_result", "outcome_text", "kind", "has_roll"):
+            d.pop(key)
         d["authority"] = "canon once resolved: adventure.epilogue domain event"
         return d

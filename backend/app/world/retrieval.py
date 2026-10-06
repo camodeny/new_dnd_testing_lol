@@ -424,7 +424,7 @@ def fact_source_evidence(
                 denied += 1
                 denied_reasons[gate[1] or "denied"] = denied_reasons.get(gate[1] or "denied", 0) + 1
             else:
-                packets.append(event_packet(event, len(packets),
+                packets.append(event_packet(db, event, len(packets),
                                              revealable=None if dm_internal else True))
     if turn_ref:
         total += 1
@@ -525,7 +525,7 @@ def query_timeline(
             outcome.denied += 1
             outcome.denied_reasons[gate[1] or "denied"] = outcome.denied_reasons.get(gate[1] or "denied", 0) + 1
             continue
-        packets.append(event_packet(event, len(packets),
+        packets.append(event_packet(db, event, len(packets),
                                      revealable=None if dm_internal else True))
     if len(packets) > limit_applied:
         packets = packets[:limit_applied]

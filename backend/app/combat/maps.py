@@ -54,13 +54,13 @@ from app.combat.geometry import (
 )
 from app.combat.service import (
     EncounterError,
+    hidden_participant_ids,
     list_participants,
     lock_encounter,
     lock_playable_campaign,
 )
 from app.observability.tracing import structured_log
 from app.realtime.service import publish_encounter_moved
-from app.visibility.access import may_user_receive
 from models.campaigns import Campaign
 from models.combat import (
     MOVEMENT_MODES,
@@ -142,59 +142,6 @@ def _next_zone_order(db: Session, map_id: uuid.UUID) -> int:
     return int(current or 0) + (1 if current is not None else 0)
 
 
-def _hidden_token_ids(
-    db: Session,
-    encounter_id: uuid.UUID,
-    *,
-    viewer_user_id: uuid.UUID | None = None,
-    campaign: Campaign | None = None,
-) -> set[str]:
-    """Participant ids whose map tokens stay hidden from the viewer.
-
-    Token hiding follows the source entity/map visibility signal — a
-    ``dm_only`` (or otherwise hidden-visibility) NPC/monster entity — and
-    NOT ``stat_visibility``: #230 forces ``stat_visibility=dm_private`` for
-    every NPC/monster because it protects combat *stats*, so ordinary
-    visible enemies must keep their tokens, reachable reads, and movement
-    (only their stats stay private). Tokens default to visible when the
-    entity row is missing.
-
-    Viewer-aware grants (issue #250): when a viewer + campaign are supplied,
-    a hidden-visibility entity explicitly granted to that viewer through a
-    #211 ``WorldVisibilityGrant`` reveals its token to them alone
-    (player-specific map reveal). Without a viewer the full hidden set is
-    returned for server-side geometry paths, which stay viewer-agnostic.
-    """
-    from models.combat import HIDDEN_ENTITY_VISIBILITIES
-    from models.world import WorldEntity
-
-    hidden: set[str] = set()
-    entity_by_participant: dict[str, WorldEntity] = {}
-    for participant in list_participants(db, encounter_id):
-        if participant.kind not in ("npc", "monster"):
-            continue
-        if participant.npc_entity_id is None:
-            continue
-        entity = db.get(WorldEntity, participant.npc_entity_id)
-        if entity is not None and str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES:
-            hidden.add(str(participant.id))
-            entity_by_participant[str(participant.id)] = entity
-    if not hidden or viewer_user_id is None or campaign is None:
-        return hidden
-    revealed: set[str] = set()
-    for participant_id, entity in entity_by_participant.items():
-        try:
-            verdict = may_user_receive(
-                db, campaign, "entity", entity.id, viewer_user_id
-            )
-        except Exception:
-            continue
-        # Only an explicit grant reveals a token.
-        if verdict.get("allowed") and verdict.get("reason") == "explicit_grant":
-            revealed.add(participant_id)
-    return hidden - revealed
-
-
 def list_placements(db: Session, encounter_id: uuid.UUID) -> list[EncounterPlacement]:
     return list(db.execute(
         select(EncounterPlacement).where(EncounterPlacement.encounter_id == encounter_id)
@@ -249,7 +196,7 @@ def _occupied_cells(
     ``include_hidden=False`` for non-owners so hidden-token cells do not
     shape the reachable set (movement commits always use the full
     authoritative set)."""
-    hidden = set() if include_hidden else _hidden_token_ids(db, encounter_id)
+    hidden = set() if include_hidden else hidden_participant_ids(db, encounter_id)
     occupied: set[tuple[int, int]] = set()
     for placement in list_placements(db, encounter_id):
         if exclude_participant_id is not None and placement.participant_id == exclude_participant_id:
@@ -623,8 +570,9 @@ def reachable_for(
     square costs only — never DM-only terrain labels — so it is safe to serve
     to any encounter reader, with one boundary: a hidden-entity NPC/monster
     token's position (``from`` + reachable cells) is never served to a
-    player. Querying a hidden token gets 403 via MapAuthorizationError, and
-    hidden tokens do not carve reachable shapes.
+    player it is hidden from. Querying a hidden token gets 403 via
+    MapAuthorizationError (a granted viewer may read it), and hidden tokens
+    do not carve reachable shapes.
     """
     mode = str(movement_mode or WALK_MODE).strip().lower()
     if mode not in MOVEMENT_MODES:
@@ -640,7 +588,7 @@ def reachable_for(
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise MapError("participant not found in this encounter", reason="no_placement")
-    if str(participant.id) in _hidden_token_ids(db, encounter.id):
+    if str(participant.id) in hidden_participant_ids(db, encounter.id, viewer_id=viewer_id):
         raise MapAuthorizationError("A hidden token's reachable space is not readable")
     placement = get_placement(db, encounter.id, participant.id)
     if placement is None:
@@ -902,16 +850,7 @@ def move_participant(
         # A hidden token's coordinates must not ride the shared/thread-scoped
         # event: players get a position-free invalidation (the movement
         # ledger row keeps the authoritative cells for the DM runtime).
-        if str(participant.id) in _hidden_token_ids(db, encounter.id):
-            return {
-                "encounter_id": str(encounter.id),
-                "thread_id": encounter.thread_id,
-                "participant_id": str(participant.id),
-                "movement_mode": mode,
-                "position_redacted": True,
-                "turn_sequence": int(encounter.turn_sequence or 0),
-                "map_revision": int(encounter_map.revision or 1),
-            }
+        if str(participant.id) in hidden_participant_ids(db, encounter.id):
             return {
                 "encounter_id": str(encounter.id),
                 "thread_id": encounter.thread_id,
@@ -1062,10 +1001,7 @@ def map_projection(
         if str(z.visibility or "") != "dm_only"
     ]
     participants = {str(p.id): p for p in list_participants(db, encounter.id)}
-    campaign = db.get(Campaign, encounter.campaign_id)
-    hidden_ids = _hidden_token_ids(
-        db, encounter.id, viewer_user_id=viewer_id, campaign=campaign
-    )
+    hidden_ids = hidden_participant_ids(db, encounter.id, viewer_id=viewer_id)
     placements = []
     for placement in list_placements(db, encounter.id):
         participant = participants.get(str(placement.participant_id))

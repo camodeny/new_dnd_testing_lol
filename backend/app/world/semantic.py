@@ -239,7 +239,7 @@ def _authorize_candidate(
 
 
 def _build_packet(
-    source_type: str, record: Any, campaign_id: uuid.UUID, rank: int,
+    db: Session, source_type: str, record: Any, campaign_id: uuid.UUID, rank: int,
     similarity: float, *, revealable: bool | None,
     embedding_model: str, embedding_version: str,
 ) -> Any:
@@ -251,7 +251,7 @@ def _build_packet(
     elif source_type == "world_fact":
         packet = fact_packet(record, campaign_id, rank, revealable=revealable)
     elif source_type == "domain_event":
-        packet = event_packet(record, rank, revealable=revealable)
+        packet = event_packet(db, record, rank, revealable=revealable)
     elif source_type == "source_turn":
         packet = turn_packet(record, rank, revealable=revealable)
     elif source_type == "scene":
@@ -406,7 +406,7 @@ def semantic_search(
             denied_reasons[reason or "denied"] = denied_reasons.get(reason or "denied", 0) + 1
             continue
         packets.append(_build_packet(
-            row.source_type, record, campaign.id, len(packets), similarity,
+            db, row.source_type, record, campaign.id, len(packets), similarity,
             revealable=None if dm_internal else True,
             embedding_model=embedding_model, embedding_version=embedding_version,
         ))

@@ -544,6 +544,10 @@ def test_state_survives_reconnect_and_restart(tmp_path):
 def test_hidden_npc_stats_stay_dm_private():
     fac, ctx = _fixture()
     with fac() as db:
+        # A goblin the party can see: present in the roster, stats still private.
+        # (Hidden-entity combatants are absent entirely — see #252's suite.)
+        db.get(WorldEntity, ctx["goblin_id"]).visibility = "campaign"
+        db.commit()
         encounter = _start(db, ctx, [
             {"character_id": str(ctx["player_pc"])},
             {"npc_entity_id": str(ctx["goblin_id"])},
