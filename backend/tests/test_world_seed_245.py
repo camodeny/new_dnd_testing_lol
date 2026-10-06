@@ -57,6 +57,29 @@ def _ready_lobby(factory, campaign_id: str, user_ids: list) -> dict:
     return chars
 
 
+SETTING_CALLS: list[dict] = []
+
+
+def _fake_setting(*, theme, brief, difficulty, pc_names, npc_count):
+    """Deterministic stand-in for the brief-grounded setting model call."""
+    SETTING_CALLS.append({"theme": theme, "brief": brief, "pc_names": pc_names, "npc_count": npc_count})
+    npcs = [{"name": "Wren Halloway", "summary": "Lighthouse keeper who saw the lamp die."},
+            {"name": "Osric Fane", "summary": "Salvager who profits from every wreck."}][:npc_count]
+    return {
+        "location": {"name": "Saltmere Light", "summary": "A storm-battered lighthouse above the reefs."},
+        "npcs": npcs,
+        "faction": {"name": "The Drowned Choir", "summary": "A sea cult that sings ships onto the rocks."},
+        "pressure": {"name": "The False Beacon", "description": "A cult lantern lures ships onto the reef."},
+        "situation": f"{', '.join(pc_names)} reach Saltmere Light as a green glow answers from the reef.",
+    }
+
+
+@pytest.fixture(autouse=True)
+def fake_setting_model(monkeypatch):
+    SETTING_CALLS.clear()
+    monkeypatch.setattr("app.campaigns.world_seed.generate_setting", _fake_setting)
+
+
 @pytest.fixture
 def api(monkeypatch):
     engine = create_engine(
@@ -550,3 +573,48 @@ def test_world_seed_relations_and_secret_motive(api):
             by_vis.setdefault(f.visibility, []).append(f)
         assert by_vis.get("campaign"), "expected a party-visible situation fact"
         assert by_vis.get("dm_only"), "expected a DM-private secret fact"
+
+
+def test_world_seed_grounds_setting_in_owner_brief(api):
+    client, factory, actor, owner_id, _, _ = api
+    brief = "Find why the Saltmere lighthouse went dark before tonight's storm."
+    campaign = _create(client, theme="Storm coast", brief=brief)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    response = _seed(client, campaign["id"], "op-seed-grounded")
+    assert response.status_code == 200, response.text
+    seed = response.json()["seed"]
+    assert seed["location"]["name"] == "Saltmere Light"
+    assert [n["name"] for n in seed["npcs"]] == ["Wren Halloway"]
+    assert SETTING_CALLS and SETTING_CALLS[0]["brief"] == brief
+    assert SETTING_CALLS[0]["npc_count"] == 1
+
+
+def test_world_seed_generation_failure_stays_prestart(api, monkeypatch):
+    from app.campaigns.world_seed import WorldSeedError
+
+    def failing(**_kwargs):
+        raise WorldSeedError("World seed setting generation failed; retry the seed (HTTPError)")
+
+    monkeypatch.setattr("app.campaigns.world_seed.generate_setting", failing)
+    client, factory, actor, owner_id, _, _ = api
+    campaign = _create(client, theme="Storm coast")
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    response = _seed(client, campaign["id"], "op-seed-gen-fail")
+    assert response.status_code == 409, response.text
+    with factory() as db:
+        from models.campaigns import Campaign
+
+        assert db.get(Campaign, uuid.UUID(campaign["id"])).status == "lobby"
+
+
+def test_world_seed_without_brief_uses_curated_setting(api):
+    client, factory, actor, owner_id, _, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    response = _seed(client, campaign["id"], "op-seed-curated")
+    assert response.status_code == 200, response.text
+    assert SETTING_CALLS == []
+    assert response.json()["seed"]["location"]["name"] != "Saltmere Light"

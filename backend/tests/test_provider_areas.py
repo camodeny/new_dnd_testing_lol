@@ -44,7 +44,7 @@ def test_lore_dm_chat_pinned(keys):
 
 
 def test_areas_known(keys):
-    assert set(AREAS) == {"dm", "narrator", "character_chat", "lore_dm_chat"}
+    assert set(AREAS) == {"dm", "narrator", "character_chat", "lore_dm_chat", "world_seed"}
 
 
 def test_missing_key_fails_clearly(keys, monkeypatch):

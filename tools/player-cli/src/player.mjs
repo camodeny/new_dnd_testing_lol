@@ -92,8 +92,9 @@ export class Player {
   path(campaign, suffix = '') { return `/campaigns/${segment(campaign)}${suffix}`; }
 
   async member(campaign) {
-    const [identity, detail] = await Promise.all([this.request('/me'), this.request(this.path(campaign))]);
-    if (identity.user.id === detail.campaign.owner_id) throw new CliError('owner_account', 'Owner projections contain hidden game state. Use a separate campaign member account for AI play.');
+    // The campaign read checks membership. Owners are ordinary seats: every
+    // human, owner included, receives the member projection (#470).
+    const [identity] = await Promise.all([this.request('/me'), this.request(this.path(campaign))]);
     return identity.user;
   }
 
@@ -102,7 +103,6 @@ export class Player {
     const query = new URLSearchParams({ thread_id: thread, limit: String(limit) });
     if (cursor) query.set('cursor', cursor);
     const snapshot = await this.request(this.path(campaign, `/snapshot?${query}`), { signal });
-    if (snapshot.campaign.owner_id === user.id) throw new CliError('owner_account', 'Campaign ownership changed; this snapshot cannot be used for player observation.');
     const required = snapshot.roll_requests.filter(r => r.status === 'pending' && r.requested_user_id === user.id);
     const observation = {
       user_id: user.id,

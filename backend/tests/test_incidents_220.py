@@ -355,6 +355,32 @@ def test_verifier_failure_recorded_operational_not_complete(monkeypatch):
     assert is_range_complete(db, c.id, e1.sequence, e1.sequence) is False
 
 
+def test_clean_reverification_supersedes_earlier_verifier_failure(monkeypatch):
+    """An operational verifier failure must not block its range forever once
+    the same range verifies cleanly (e.g. a crashed or stale-code worker)."""
+    from app.post_turn import incidents as I
+
+    _F, db, c = _setup()
+    e1 = _commit(db, c)
+    real = I.detect_canon_self_conflicts
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("canon read exploded")
+
+    monkeypatch.setattr(I, "detect_canon_self_conflicts", _boom)
+    with pytest.raises(RuntimeError):
+        verify_post_turn_consistency(db, c.id, e1.sequence, e1.sequence)
+    assert is_range_complete(db, c.id, e1.sequence, e1.sequence) is False
+
+    monkeypatch.setattr(I, "detect_canon_self_conflicts", real)
+    out = verify_post_turn_consistency(db, c.id, e1.sequence, e1.sequence)
+    assert out["complete"] is True
+    (row,) = db.execute(select(PostTurnConsistencyIncident).where(
+        PostTurnConsistencyIncident.campaign_id == c.id)).scalars().all()
+    assert row.status == "resolved"
+    assert "superseded" in (row.error or "")
+
+
 def test_dangling_source_ref_is_a_source_conflict():
     _F, db, c = _setup()
     e1 = _commit(db, c)

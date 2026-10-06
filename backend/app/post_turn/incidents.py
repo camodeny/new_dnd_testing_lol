@@ -945,6 +945,10 @@ def verify_post_turn_consistency(
                        campaign_id, from_sequence, to_sequence, exc)
         raise
 
+    # The verifier ran cleanly over this range: earlier operational failures
+    # for the same range are superseded (real contradictions still block).
+    _supersede_verifier_failures(store_db, campaign_id, from_sequence, to_sequence)
+
     if durable_db is not None:
         # Materialize payloads before the durable commit (a caller factory
         # may expire attributes on commit), then commit incidents on their
@@ -992,6 +996,39 @@ def verify_post_turn_consistency(
         "decision_model": semantic_model,
         "detection_latency_ms": _elapsed_ms(),
     }
+
+
+def _supersede_verifier_failures(db: Session, campaign_id: uuid.UUID,
+                                 from_sequence: int, to_sequence: int) -> int:
+    """Resolve this range's earlier ``verifier_failed`` incidents (flush only)."""
+    from datetime import datetime, timezone
+
+    rows = db.execute(select(PostTurnConsistencyIncident).where(
+        PostTurnConsistencyIncident.campaign_id == campaign_id,
+        PostTurnConsistencyIncident.from_sequence == from_sequence,
+        PostTurnConsistencyIncident.to_sequence == to_sequence,
+        PostTurnConsistencyIncident.incident_type == VERIFIER_FAILURE,
+        PostTurnConsistencyIncident.status == "verifier_failed",
+    )).scalars().all()
+    for row in rows:
+        row.status = RESOLVED_STATUS
+        row.error = "resolved: superseded by a clean re-verification of the range"
+        row.resolved_at = datetime.now(timezone.utc)
+        db.add(row)
+    if rows:
+        db.flush()
+    return len(rows)
+
+
+def unresolved_incident_ids(db: Session, campaign_id: uuid.UUID,
+                            from_sequence: int, to_sequence: int) -> list[str]:
+    """Ids of required unresolved incidents stored for exactly this range."""
+    return [str(i) for i in db.execute(select(PostTurnConsistencyIncident.id).where(
+        PostTurnConsistencyIncident.campaign_id == campaign_id,
+        PostTurnConsistencyIncident.from_sequence == from_sequence,
+        PostTurnConsistencyIncident.to_sequence == to_sequence,
+        PostTurnConsistencyIncident.status.in_(sorted(UNRESOLVED_STATUSES)),
+    )).scalars().all()]
 
 
 def is_range_complete(db: Session, campaign_id: uuid.UUID,

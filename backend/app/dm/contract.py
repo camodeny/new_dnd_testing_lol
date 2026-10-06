@@ -1083,6 +1083,7 @@ class RollRequest(StrictModel):
     advantage_state: Literal["normal", "advantage", "disadvantage"] = "normal"
     reason_public: str = Field(min_length=1, max_length=600)
     dc_private: int | None = Field(default=None, ge=1, le=40, description="Hidden difficulty; stripped in public projection")
+    target_ref: EntityRef | None = Field(default=None, description="Attack rolls: the registered creature or NPC being attacked")
 
     @field_validator("request_id")
     @classmethod
@@ -1280,13 +1281,22 @@ class ContractValidationError(ValueError):
 
 
 def _validation_code_from_pydantic(exc: Exception) -> str:
-    msg = str(exc).lower()
-    if "extra" in msg or "additional" in msg or "unknown" in msg:
-        return "unknown_field"
-    if "mode" in msg:
-        return "invalid_mode"
-    if "contract_version" in msg:
-        return "invalid_contract_version"
+    """Machine code from pydantic's structured errors (first error wins).
+
+    Classifies by error location and type, never by message text: a
+    whole-contract rule's message echoes the entire input (which always
+    contains ``contract_version``/``mode``), so substring matching
+    mislabels every root-level rule violation.
+    """
+    errors = exc.errors() if hasattr(exc, "errors") else []
+    for error in errors:
+        loc = tuple(str(part) for part in error.get("loc") or ())
+        if error.get("type") == "extra_forbidden":
+            return "unknown_field"
+        if loc == ("contract_version",):
+            return "invalid_contract_version"
+        if loc == ("mode",):
+            return "invalid_mode"
     return "contract_validation_failed"
 
 

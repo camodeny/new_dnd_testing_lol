@@ -44,10 +44,11 @@ test('observation reports own obligations without assigning speakers', async t =
   assert.ok(f.requests.every(r => r.headers.authorization === 'Bearer real-jwt-fixture'));
 });
 
-test('owner identity fails before requesting privileged snapshot', async t => {
+test('campaign owner observes as an ordinary seat', async t => {
   const f = await fixture(t, { user: 'owner' });
-  await assert.rejects(f.player.observe('campaign'), { code: 'owner_account' });
-  assert.equal(f.requests.some(r => r.url.includes('/snapshot')), false);
+  const seen = await f.player.observe('campaign');
+  assert.equal(seen.user_id, 'owner');
+  assert.ok(f.requests.some(r => r.url.includes('/snapshot')));
 });
 
 test('hidden revision advances do not wake a player; visible messages do', async t => {
@@ -185,13 +186,6 @@ test('move and end-turn bind observed revision/sequence; retry retains original 
   const end = f.requests.find(r => r.url.endsWith('/end-turn'));
   assert.equal(end.body.expected_revision, 2);
   assert.equal(end.body.expected_turn_sequence, 5);
-});
-
-test('ownership changes during snapshot read fail closed', async t => {
-  const f = await fixture(t, { handler(req, res) {
-    if (req.url.includes('/snapshot')) { res.end(JSON.stringify({ campaign: { owner_id: 'player' }, surfaces: { hidden: 'secret' } })); return true; }
-  } });
-  await assert.rejects(f.player.observe('campaign'), { code: 'owner_account' });
 });
 
 test('independent seats retain separate identity and journals', async t => {

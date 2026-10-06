@@ -8,6 +8,7 @@ either. Only API keys come from the environment
   narrator       — streaming turn narration (prose expander)
   character_chat — character-creator assistant
   lore_dm_chat   — lobby lore-DM setup assistant (private lore back-and-forth)
+  world_seed     — brief-grounded starting setting for a new campaign
 """
 
 AREA_CONFIG = {
@@ -15,6 +16,7 @@ AREA_CONFIG = {
     "narrator": ("openai", "gpt-6-luna"),
     "character_chat": ("meta", "muse-spark-1.3-contributor"),
     "lore_dm_chat": ("meta", "muse-spark-1.3-contributor"),
+    "world_seed": ("openai", "gpt-6-luna"),
 }
 
 AREAS = tuple(AREA_CONFIG)
