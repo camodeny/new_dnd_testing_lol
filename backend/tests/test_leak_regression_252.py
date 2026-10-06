@@ -44,7 +44,7 @@ from app.dm.execution import execute_dm_attempt  # noqa: E402
 from app.dm.narration import build_narration_projection, validate_narration_fidelity  # noqa: E402
 from app.dm.turns import coordinate_turn  # noqa: E402
 from app.realtime.channels import live_table_channel  # noqa: E402
-from app.realtime.service import set_realtime_publisher  # noqa: E402
+from app.realtime.service import publish_submission_created, set_realtime_publisher  # noqa: E402
 from app.rolls.service import fulfill_roll  # noqa: E402
 from app.snapshot.service import (  # noqa: E402
     SnapshotAuthorizationError,
@@ -114,12 +114,14 @@ def _mirela_lies(npc_id, private_truth):
 
 
 def _run_turn(db, campaign_id, thread_id, user_id, character_id, text, contract, *, audience="campaign"):
-    accept_submission(
+    submission = accept_submission(
         db, campaign_id=campaign_id, user_id=user_id, character_id=character_id,
         raw_content=text, segments=[{"type": "ic", "text": text}],
         thread_id=str(thread_id), audience=audience,
     )
     db.commit()
+    # Post-commit realtime delivery, as the submissions router does.
+    publish_submission_created(db, submission)
     turn, attempt = coordinate_turn(db, campaign_id, str(thread_id), audience=audience, commit=False)
     db.commit()
     result = execute_dm_attempt(db, attempt.id, adjudicate=lambda packet, feedback=None: contract,
@@ -266,18 +268,34 @@ def _seed(db):
     }
 
 
-@pytest.fixture(scope="module")
-def world():
+def _build_world():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False},
                            poolclass=StaticPool)
     Base.metadata.create_all(bind=engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    with factory() as db:
-        ctx = _seed(db)
-    set_realtime_publisher(None)
+    try:
+        with factory() as db:
+            ctx = _seed(db)
+    finally:
+        set_realtime_publisher(None)
     ctx["factory"] = factory
+    ctx["engine"] = engine
+    return ctx
+
+
+@pytest.fixture(scope="module")
+def world():
+    """Shared read-only scenario. Tests that write use ``fresh_world``."""
+    ctx = _build_world()
     yield ctx
-    engine.dispose()
+    ctx["engine"].dispose()
+
+
+@pytest.fixture
+def fresh_world():
+    ctx = _build_world()
+    yield ctx
+    ctx["engine"].dispose()
 
 
 @pytest.fixture
@@ -346,6 +364,9 @@ def test_dm_private_reasoning_stays_out_of_the_roller_s_own_turn(world, db):
 def test_shared_snapshot_carries_no_secret(world, db, viewer):
     snap = build_live_table_snapshot(db, world["campaign_id"], world[viewer])
     _assert_clean(_blob(snap), world, where=f"{viewer} shared snapshot")
+    # The dm_only trap zone is absent outright: kind and rect, not just its label.
+    for zones in (snap["surfaces"]["maps"]["map"]["zones"], snap["encounter"]["map"]["zones"]):
+        assert [(z["kind"], z["visibility"]) for z in zones] == [("difficult", "public")]
     # Alice's privately-rolled result stays hers.
     (roll,) = [r for r in snap["roll_requests"] if r["roll_kind"] == "check"]
     assert "total" not in roll["fulfillment"]
@@ -406,7 +427,7 @@ def test_realtime_payloads_on_readable_channels_carry_no_secret(world, db, viewe
 def test_private_action_realtime_only_on_private_channel(world):
     private_channel = live_table_channel(world["campaign_id"], world["private_id"])
     carrying = [rec for rec in world["publisher"].published if PRIVATE_ACTION in _blob(rec)]
-    assert carrying, "the private narration should have streamed to Alice"
+    assert {rec["event"] for rec in carrying} >= {"submission.created", "dm.chunk"}
     assert {rec["channel"] for rec in carrying} == {private_channel}
 
 
@@ -496,26 +517,51 @@ def test_narration_that_states_the_secret_is_rejected(secret_type):
     assert any(v["category"] == "secret_leakage" for v in violations), violations
 
 
-def test_dm_events_attributed_to_the_owner_stay_out_of_the_owner_feed(world, db):
+def test_dm_events_attributed_to_the_owner_stay_hidden_from_the_owner(fresh_world):
     """The AI's lifecycle events are committed with the owner as actor
-    (e.g. ``encounter.ended``); the actor rule must not hand them back."""
-    from app.campaigns.events import commit_campaign_mutation
+    (e.g. ``encounter.ended``). The feed, retrieval, the adventure recap and
+    the owner's summary controls must not hand them back."""
+    from types import SimpleNamespace
 
-    camp = db.get(Campaign, world["campaign_id"])
-    for visibility in ("dm_only", "dm_private"):
-        commit_campaign_mutation(
-            db, camp.id, int(camp.revision), event_type="encounter.ended",
-            payload={"reason": f"The {LURKER} slips away", "thread_id": str(world["shared_id"])},
-            operation_id=f"op-owner-actor-{visibility}-252", actor_id=world["owner"],
-            visibility=visibility,
-        )
-        db.refresh(camp)
-    events = list_campaign_events(db, camp.id, viewer_id=world["owner"], limit=500)
-    _assert_clean(_blob([player_event_dict(db, e, world["owner"]) for e in events]), world,
-                  where="owner-actor DM events")
-    timeline = _retrieval.query_timeline(db, camp.id, [world["owner"]], limit=50)
-    _assert_clean(_blob([p.to_dict() for p in timeline.packets]), world,
-                  where="owner-actor DM events in retrieval")
+    from app.adventures.router import get_recap, retry_generate
+    from app.campaigns.events import commit_campaign_mutation
+    from models.campaigns import Adventure
+
+    world = fresh_world
+    owner = world["owner"]
+    with world["factory"]() as db:
+        camp = db.get(Campaign, world["campaign_id"])
+        for visibility in ("dm_only", "dm_private"):
+            commit_campaign_mutation(
+                db, camp.id, int(camp.revision), event_type="encounter.ended",
+                payload={"summary": f"The {LURKER} slips away ({MOTIVE})",
+                         "thread_id": str(world["shared_id"])},
+                operation_id=f"op-owner-actor-{visibility}-252", actor_id=owner,
+                visibility=visibility,
+            )
+            db.refresh(camp)
+        adventure = Adventure(campaign_id=camp.id, title="The Ashen Cellar", status="completed",
+                              reason=f"The cult won ({MOTIVE})", start_sequence=0,
+                              end_sequence=int(camp.revision))
+        db.add(adventure)
+        db.commit()
+
+        events = list_campaign_events(db, camp.id, viewer_id=owner, limit=500)
+        _assert_clean(_blob([player_event_dict(db, e, owner) for e in events]), world,
+                      where="owner-actor DM events")
+        timeline = _retrieval.query_timeline(db, camp.id, [owner], limit=50)
+        _assert_clean(_blob([p.to_dict() for p in timeline.packets]), world,
+                      where="owner-actor DM events in retrieval")
+
+        profile = SimpleNamespace(id=owner)
+        generated = retry_generate(adventure_id=str(adventure.id), payload={},
+                                   profile=profile, camp=camp, db=db)
+        assert generated["summary"]["status"] == "current"
+        assert "historical_text" not in generated["summary"]
+        _assert_clean(_blob(generated), world, where="owner summary controls")
+        recap = get_recap(adventure_id=str(adventure.id), profile=profile, camp=camp, db=db)
+        assert recap["recap_text"]
+        _assert_clean(_blob(recap), world, where="owner recap")
 
 
 # ── Adventure close: private epilogues and owner summary controls ─────────
@@ -530,10 +576,12 @@ def _adventure(db, world, *, reason):
     return adventure
 
 
-def test_private_epilogue_reaches_only_its_author(world, db):
+def test_private_epilogue_reaches_only_its_author(fresh_world):
     from app.adventures.epilogues import list_epilogues
     from models.campaigns import AdventureEpilogue
 
+    world = fresh_world
+    db = world["factory"]()
     adventure = _adventure(db, world, reason="Epilogue test")
     db.add(AdventureEpilogue(
         adventure_id=adventure.id, campaign_id=world["campaign_id"],
@@ -550,8 +598,10 @@ def test_private_epilogue_reaches_only_its_author(world, db):
     for viewer in NON_GRANTEE_VIEWERS:
         (entry,) = list_epilogues(db, adventure.id, viewer_id=world[viewer])
         assert entry["status"] == "resolved"
+        assert "kind" not in entry and "has_roll" not in entry
         _assert_clean(_blob(entry), world, where=f"{viewer} epilogue roster")
         assert f"DC {PRIVATE_DC}" not in _blob(entry)
+    db.close()
 
 
 def test_owner_summary_controls_return_no_hidden_sources():
@@ -572,3 +622,21 @@ def test_owner_summary_controls_return_no_hidden_sources():
     assert MOTIVE not in blob
     assert "hidden_event_count" not in blob
     assert summary.to_public_dict()["error"] == "summary generation failed"
+
+
+def test_redaction_keeps_visible_turn_index_and_strips_nested_final_state():
+    from app.combat.service import redact_hidden_combatants
+
+    hidden = {"hidden"}
+    # Realtime turn events carry an index but no order: re-derive it from
+    # the visible order instead of counting the hidden slot.
+    turn = redact_hidden_combatants(
+        {"active_participant_id": "b", "active_index": 2}, hidden, visible_order=["a", "b"])
+    assert turn == {"active_participant_id": "b", "active_index": 1}
+    ended = redact_hidden_combatants({"final_state": {
+        "participant_count": 2,
+        "participants": [{"id": "hidden", "display_name": LURKER}, {"id": "a"}],
+    }}, hidden)
+    assert ended["final_state"] == {"participant_count": 1, "participants": [{"id": "a"}]}
+    moved = redact_hidden_combatants({"participant_id": "hidden", "position_redacted": True}, hidden)
+    assert moved == {"participant_id": None}

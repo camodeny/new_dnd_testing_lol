@@ -21,6 +21,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import ACTOR_READABLE_EVENT_VISIBILITIES
 from models.campaigns import Adventure, AdventureSummary
 
 logger = logging.getLogger(__name__)
@@ -37,10 +38,9 @@ def _is_hidden(ev) -> bool:
     """Fail-closed mirror of the canonical event-feed visibility rule.
 
     Only exactly ``"public"`` is globally visible; every other value
-    (including unknown strings, empty, or missing) requires an actor match
-    (see ``_event_visible_to`` and ``list_campaign_events``). No separate
-    hidden-string allowlist is maintained so the two read surfaces cannot
-    drift apart.
+    (including unknown strings, empty, or missing) is hidden unless the
+    viewer is its actor and the visibility is actor-readable (see
+    ``_event_visible_to`` and ``list_campaign_events``).
     """
     return getattr(ev, "visibility", None) != "public"
 
@@ -60,8 +60,13 @@ def _event_text(ev) -> str:
 def _event_visible_to(ev, viewer_id: uuid.UUID | None) -> bool:
     if not _is_hidden(ev):
         return True
-    # Actor-visible private events stay visible to their actor only.
-    return viewer_id is not None and ev.actor_id == viewer_id
+    # Same actor rule as the event feed: DM-only events attributed to a
+    # human (the AI's events carry the owner as actor) stay hidden.
+    return (
+        viewer_id is not None
+        and ev.actor_id == viewer_id
+        and ev.visibility in ACTOR_READABLE_EVENT_VISIBILITIES
+    )
 
 
 def _trusted_adventure_tokens(adventure: Adventure) -> set[str]:

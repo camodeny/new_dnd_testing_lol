@@ -435,9 +435,11 @@ def hidden_participant_ids(
     A hidden combatant is absent from every player payload: its token,
     roster entry, turn order slot, active turn, and event references.
 
-    With ``viewer_id``, an explicit visibility grant on the entity reveals
-    it to that viewer alone (#250 player-specific reveal). Without one the
-    full hidden set is returned, for shared broadcasts and geometry.
+    With ``viewer_id``, a ``private`` entity explicitly granted to that
+    viewer is revealed to them alone (#250 player-specific reveal). A
+    ``dm_only`` entity reaches no human, so no grant reveals it. Without a
+    viewer the full hidden set is returned, for shared broadcasts and
+    geometry. Any failure resolving a reveal keeps the combatant hidden.
     """
     from models.combat import HIDDEN_ENTITY_VISIBILITIES
 
@@ -451,9 +453,15 @@ def hidden_participant_ids(
     if not hidden or viewer_id is None:
         return set(hidden)
     campaign = db.get(Campaign, next(iter(hidden.values())).campaign_id)
+    if campaign is None:
+        return set(hidden)
     revealed = set()
     for participant_id, entity in hidden.items():
-        verdict = may_user_receive(db, campaign, "entity", entity.id, viewer_id)
+        try:
+            verdict = may_user_receive(db, campaign, "entity", entity.id, viewer_id)
+        except Exception:
+            logger.warning("hidden combatant reveal check failed", exc_info=True)
+            continue
         # Only an explicit grant reveals a hidden combatant.
         if verdict.get("allowed") and verdict.get("reason") == "explicit_grant":
             revealed.add(participant_id)
@@ -485,14 +493,23 @@ _PARTICIPANT_REF_KEYS = (
 _PARTICIPANT_MAP_KEYS = ("roll_sources", "participant_outcomes")
 
 
-def redact_hidden_combatants(payload: Any, hidden_ids: set[str]) -> Any:
-    """Copy of an encounter event payload without hidden-combatant references."""
+def redact_hidden_combatants(
+    payload: Any, hidden_ids: set[str], *, visible_order: list[str] | None = None,
+) -> Any:
+    """Copy of an encounter event payload without hidden-combatant references.
+
+    ``visible_order`` (the viewer's turn order) re-derives ``active_index``
+    for payloads that carry an index but no order; without either, the
+    index is dropped, since a full-order index counts hidden slots.
+    """
     if not hidden_ids or not isinstance(payload, dict):
         return payload
     out = dict(payload)
     for key in _PARTICIPANT_REF_KEYS:
         if str(out.get(key)) in hidden_ids:
             out[key] = None
+            # A hidden mover's stored event marks its redacted position.
+            out.pop("position_redacted", None)
     for key in _PARTICIPANT_MAP_KEYS:
         if isinstance(out.get(key), dict):
             out[key] = {pid: v for pid, v in out[key].items() if str(pid) not in hidden_ids}
@@ -505,16 +522,24 @@ def redact_hidden_combatants(payload: Any, hidden_ids: set[str]) -> Any:
         ]
     if isinstance(out.get("participant_count"), int):
         out["participant_count"] = max(0, out["participant_count"] - len(hidden_ids))
+    if isinstance(out.get("final_state"), dict):
+        out["final_state"] = redact_hidden_combatants(out["final_state"], hidden_ids)
     if "active_index" in out:
-        # A full-order index would count the hidden slots before it.
-        order = out.get("turn_order_ids")
+        order = out.get("turn_order_ids") if visible_order is None else visible_order
         active = out.get("active_participant_id")
         out["active_index"] = order.index(active) if isinstance(order, list) and active in order else None
     return out
 
 
-def player_event_dict(db: Session, event, viewer_id: uuid.UUID | None = None) -> dict:
-    """A domain event as players see it: encounter events lose hidden combatants."""
+def player_event_dict(
+    db: Session, event, viewer_id: uuid.UUID | None = None,
+    *, hidden_cache: dict[uuid.UUID, set[str]] | None = None,
+) -> dict:
+    """A domain event as players see it: encounter events lose hidden combatants.
+
+    Pass one ``hidden_cache`` dict across a batch of events so each
+    encounter's hidden set resolves once.
+    """
     data = event.to_dict()
     if event.event_type not in THREAD_SCOPED_EVENT_TYPES:
         return data
@@ -523,9 +548,10 @@ def player_event_dict(db: Session, event, viewer_id: uuid.UUID | None = None) ->
         encounter_id = uuid.UUID(str(raw_id))
     except (TypeError, ValueError):
         return data
-    data["payload"] = redact_hidden_combatants(
-        data["payload"], hidden_participant_ids(db, encounter_id, viewer_id=viewer_id),
-    )
+    cache = {} if hidden_cache is None else hidden_cache
+    if encounter_id not in cache:
+        cache[encounter_id] = hidden_participant_ids(db, encounter_id, viewer_id=viewer_id)
+    data["payload"] = redact_hidden_combatants(data["payload"], cache[encounter_id])
     return data
 
 

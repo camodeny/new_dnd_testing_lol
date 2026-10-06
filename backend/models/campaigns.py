@@ -725,8 +725,9 @@ class AdventureEpilogue(Base):
         metadata.
         """
         d = self.to_dict(include_content=False)
-        # The outcome text restates the content, and the roll carries its DC.
-        for key in ("roll_spec", "roll_result", "outcome_text"):
+        # The outcome text restates the content, the roll carries its DC,
+        # and kind/has_roll say whether it needed adjudication.
+        for key in ("roll_spec", "roll_result", "outcome_text", "kind", "has_roll"):
             d.pop(key)
         d["authority"] = "canon once resolved: adventure.epilogue domain event"
         return d

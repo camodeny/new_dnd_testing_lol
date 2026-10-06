@@ -491,12 +491,20 @@ def _publish_encounter_event(db: Session, encounter, payload: dict[str, Any]) ->
     (members converge via the privacy-filtered snapshot).
     """
     try:
-        from app.combat.service import hidden_participant_ids, redact_hidden_combatants
+        from app.combat.service import (
+            hidden_participant_ids,
+            redact_hidden_combatants,
+            visible_turn_order,
+        )
 
         channel = live_table_channel(encounter.campaign_id, encounter.thread_id)
         # Thread channels are shared, so hidden combatants are removed for
         # every subscriber; a grantee converges through the snapshot.
-        payload = redact_hidden_combatants(payload, hidden_participant_ids(db, encounter.id))
+        hidden = hidden_participant_ids(db, encounter.id)
+        payload = redact_hidden_combatants(
+            payload, hidden,
+            visible_order=visible_turn_order(encounter, hidden)["turn_order_ids"],
+        )
         payload["channel"] = channel
         return _publish_best_effort(channel, payload["type"], payload)
     except Exception as exc:

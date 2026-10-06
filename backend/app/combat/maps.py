@@ -570,8 +570,9 @@ def reachable_for(
     square costs only — never DM-only terrain labels — so it is safe to serve
     to any encounter reader, with one boundary: a hidden-entity NPC/monster
     token's position (``from`` + reachable cells) is never served to a
-    player. Querying a hidden token gets 403 via MapAuthorizationError, and
-    hidden tokens do not carve reachable shapes.
+    player it is hidden from. Querying a hidden token gets 403 via
+    MapAuthorizationError (a granted viewer may read it), and hidden tokens
+    do not carve reachable shapes.
     """
     mode = str(movement_mode or WALK_MODE).strip().lower()
     if mode not in MOVEMENT_MODES:
@@ -587,7 +588,7 @@ def reachable_for(
     participant = db.get(EncounterParticipant, participant_id)
     if participant is None or participant.encounter_id != encounter.id:
         raise MapError("participant not found in this encounter", reason="no_placement")
-    if str(participant.id) in hidden_participant_ids(db, encounter.id):
+    if str(participant.id) in hidden_participant_ids(db, encounter.id, viewer_id=viewer_id):
         raise MapAuthorizationError("A hidden token's reachable space is not readable")
     placement = get_placement(db, encounter.id, participant.id)
     if placement is None:
