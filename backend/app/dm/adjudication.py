@@ -33,7 +33,8 @@ schema — no markdown fences, no commentary.
 Modes:
 - respond: resolve the turn now with 1-8 beats of atomic true claims.
 - await_roll: uncertain outcome needs a player die roll; include roll_request
-  with a hidden dc_private, and no staged_effects.
+  with a hidden dc_private (null for attack and damage rolls), and no
+  staged_effects.
 - need_evidence: you lack a required fact; 1-3 evidence_requests plus a short
   safe_prelude progress update (<=240 chars), no beats.
 - clarify: player intent is ambiguous; ask via clarify_question or
@@ -152,15 +153,21 @@ instruction actor_ref is null and the PC may be a target_ref; it is not an
 action already performed by the PC. roll_request_id on a CLAIM must be null
 unless claim_kind is roll_outcome. Put the requested roll's handle in
 roll_request.request_id. Never decide the outcome or invent the player's dice.
-An attack roll_request names its target_ref: the registered creature or NPC
-entity being attacked. Anyone the party may talk to, follow, or fight is
+An attack roll_request names its target_ref (the registered creature or NPC
+entity being attacked) and attack_name (the attack from the PC's
+character_state attacks, or an attack spell like Fire Bolt), with dc_private
+null: code checks reach/range and compares the roll against the target's armor
+class. When the evidence says hit, request the damage roll next: roll_kind
+damage with attack_request_id set to the attack's request_id. Code supplies
+the dice, resolves the damage, applies it when the turn commits, and adds the
+outcome to your beats; narrate it. A miss deals no damage. Anyone the party may talk to, follow, or fight is
 introduced through new_entities the first time they appear. A new foe takes
 two turns: introduce it in a respond turn (new_entities never combine with
 await_roll, and assign_stat_block needs its registered id); from the next turn
 on, reference its id from the packet to stage assign_stat_block and request
 attacks against it.
 After fulfillment, the roll evidence states its outcome (success or failure and
-the margin, computed by code): resolve the original intent from it, with
+the margin, hit or miss for attacks, computed by code): resolve the original intent from it, with
 consequences that fit the margin, and do not request the same roll again.
 """
 

@@ -1251,7 +1251,7 @@ def test_perspective_repair_packet_carries_through_validation(db):
 @pytest.mark.parametrize("kind,dc,total,expected", [
     ("check", 13, 22, {"result": "success", "margin": 9}),
     ("save", 13, 13, {"result": "success", "margin": 0}),
-    ("attack", 15, 11, {"result": "failure", "margin": -4}),
+    ("attack", 15, 11, None),  # #234: attacks resolve against AC, never a DC
     ("check", None, 18, None),
     ("initiative", 10, 18, None),
     ("check", 12, None, None),
@@ -1268,7 +1268,7 @@ def test_attack_roll_must_target_a_registered_entity(db, first_target):
     attack is refused as feedback until it targets a registered entity."""
     from app.world.service import create_entity
     from models.campaigns import CampaignMember
-    from models.characters import Character
+    from models.characters import Character, Dnd5eCharacterSheet
     from models.dm import PlayerRollRequest
 
     s, camp_id, thread_id, _ = db
@@ -1276,9 +1276,14 @@ def test_attack_roll_must_target_a_registered_entity(db, first_target):
     s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
     char = Character(owner_id=owner, name="Hero", system="dnd5e")
     s.add(char)
+    s.flush()
+    s.add(Dnd5eCharacterSheet(character_id=char.id, owner_id=owner, character_name="Hero", weapons=[
+        {"name": "Longsword", "attack_bonus": 5, "damage": "1d8+3", "damage_type": "slashing"},
+    ]))
     s.commit()
     beast, _ = commit_world_write(
         s, camp_id, 0, create_entity, entity_type="npc", name="Reef Horror", operation_id="op-reef-horror",
+        details={"armor_class": 13, "hit_points": {"current": 20, "maximum": 20, "temporary": 0}},
     )
     s.commit()
     turn, attempt = _submit(s, camp_id, thread_id, text="I swing my sword at the reef horror.")
@@ -1306,6 +1311,7 @@ def test_attack_roll_must_target_a_registered_entity(db, first_target):
     assert len(feedback_seen) == 2 and "attack_target_unregistered" in (feedback_seen[1] or "")
     (row,) = s.execute(select(PlayerRollRequest).where(PlayerRollRequest.turn_id == turn.id)).scalars().all()
     assert row.request_key == "attack_2"
+    assert (row.target_kind, row.target_id, row.attack_name) == ("npc", str(beast.id), "Longsword")
 
 
 @pytest.mark.parametrize("post_turn_current", [False, True])

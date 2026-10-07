@@ -750,7 +750,31 @@ def _roll_outcome(roll_kind, dc, fulfillment) -> dict | None:
     re-deriving (or re-requesting) the roll. None when there is nothing to
     compare (no DC, no numeric total, or an uncompared kind like initiative).
     """
-    if roll_kind not in ("check", "save", "attack", "ability") or not isinstance(fulfillment, dict):
+    if not isinstance(fulfillment, dict):
+        return None
+    resolution = fulfillment.get("resolution") if isinstance(fulfillment.get("resolution"), dict) else None
+    if roll_kind == "attack" and resolution:
+        # Issue #234 — code compared the roll against the target's AC; the
+        # AC itself is not evidence the DM needs.
+        hit = resolution.get("outcome") in ("hit", "critical")
+        return {
+            "result": "hit" if hit else "miss",
+            "critical": bool(resolution.get("is_critical")),
+            "next": (
+                "request a damage roll (roll_kind damage, attack_request_id = this request_key); "
+                "code supplies the dice and applies the damage"
+                if hit else "the attack misses: narrate it, no damage"
+            ),
+        }
+    if roll_kind == "damage" and resolution:
+        damage = resolution.get("damage") or {}
+        return {
+            "result": "damage",
+            "damage_total": damage.get("final_total"),
+            "damage_type": damage.get("damage_type"),
+            "next": "code applies this damage when the turn commits and states it in your outcome beat; narrate it",
+        }
+    if roll_kind not in ("check", "save", "ability"):
         return None
     total = fulfillment.get("total")
     if isinstance(dc, bool) or isinstance(total, bool) or not isinstance(dc, int) or not isinstance(total, int):

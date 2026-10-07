@@ -286,6 +286,6 @@ def test_condition_and_slot_outcomes_read_as_sentences(table):
     ]))
     turn = s.get(DmTurn, _submit(s, camp_id, thread_id)[0].id)
 
-    outcomes = [text for _, text in resolve_mechanics(s, s.get(Campaign, camp_id), turn, contract).outcomes]
+    outcomes = [o.text for o in resolve_mechanics(s, s.get(Campaign, camp_id), turn, contract).outcomes]
 
     assert outcomes == ["A spider bite leaves Mira poisoned.", "Mira expends a level 1 spell slot on Healing Word."]

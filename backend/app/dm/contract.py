@@ -1077,13 +1077,15 @@ class EvidenceRequest(StrictModel):
 class RollRequest(StrictModel):
     request_id: str = Field(min_length=1, max_length=48)
     character_id: str | int | None = None
-    roll_kind: Literal["check", "save", "attack", "ability", "initiative", "other"]
+    roll_kind: Literal["check", "save", "attack", "damage", "ability", "initiative", "other"]
     ability_or_skill: str = Field(min_length=1, max_length=64)
     label: str = Field(min_length=1, max_length=120)
     advantage_state: Literal["normal", "advantage", "disadvantage"] = "normal"
     reason_public: str = Field(min_length=1, max_length=600)
     dc_private: int | None = Field(default=None, ge=1, le=40, description="Hidden difficulty; stripped in public projection")
     target_ref: EntityRef | None = Field(default=None, description="Attack rolls: the registered creature or NPC being attacked")
+    attack_name: str | None = Field(default=None, max_length=120, description="Attack rolls: the attack's name from the PC's character_state attacks (weapon or attack used)")
+    attack_request_id: str | None = Field(default=None, max_length=48, description="Damage rolls only: request_id of the hit attack roll this damage follows")
 
     @field_validator("request_id")
     @classmethod

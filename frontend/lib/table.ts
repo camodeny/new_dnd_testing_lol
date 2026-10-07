@@ -52,6 +52,8 @@ export interface TableSkill {
 export interface TableRollModifier {
   modifier: number
   label: string
+  /** Damage rolls: the dice code chose for the hit (crit dice already doubled). */
+  dice?: { count: number; sides: number }
 }
 
 export interface TableCharacter extends TablePartyMember {
@@ -242,6 +244,10 @@ export function healthText(label: HealthLabel | null): string {
 
 /** Plain-language instructions for a requested roll. */
 export function rollInstructions(roll: PlayerRollForRealtime, mod: TableRollModifier | undefined): string {
+  if (mod?.dice) {
+    const bonus = mod.modifier ? ` and add ${signed(mod.modifier)}` : ''
+    return `Roll ${mod.dice.count}d${mod.dice.sides}${bonus} for ${mod.label}.`
+  }
   const base = mod
     ? `Roll a 20-sided die and add ${signed(mod.modifier)} for ${mod.label}.`
     : 'Roll a 20-sided die and add your bonus.'
@@ -252,13 +258,15 @@ export function rollInstructions(roll: PlayerRollForRealtime, mod: TableRollModi
 
 // ── Dice ───────────────────────────────────────────────────────────────────
 
-/** Fair d20 rolls from the platform CSPRNG (rejection sampling, no bias). */
-export function rollD20s(count: number, random: (buf: Uint32Array) => Uint32Array = (b) => crypto.getRandomValues(b)): number[] {
+/** Fair dice rolls from the platform CSPRNG (rejection sampling, no bias). */
+export function rollDice(
+  count: number, sides: number, random: (buf: Uint32Array) => Uint32Array = (b) => crypto.getRandomValues(b),
+): number[] {
   const out: number[] = []
-  const limit = Math.floor(0x100000000 / 20) * 20
+  const limit = Math.floor(0x100000000 / sides) * sides
   while (out.length < count) {
     const [value] = random(new Uint32Array(1))
-    if (value < limit) out.push((value % 20) + 1)
+    if (value < limit) out.push((value % sides) + 1)
   }
   return out
 }

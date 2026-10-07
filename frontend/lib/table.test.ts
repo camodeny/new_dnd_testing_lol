@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { composeForMode } from '@/components/table/Composer'
 import {
   activeEncounter, buildTimeline, healthLabelFor, keptDie, orderedParticipants, panelTabs,
-  rechargeSentence, rollD20s, rollDiceCount, rollInstructions, statusSentence,
+  rechargeSentence, rollDice, rollDiceCount, rollInstructions, statusSentence,
   type TableCharacter, type TableProjection,
 } from './table'
 import type { PlayerRollForRealtime } from './realtime'
@@ -40,6 +40,8 @@ describe('plain language', () => {
     expect(rollInstructions(roll({ advantage_state: 'advantage' }), { modifier: 3, label: 'Insight' }))
       .toBe('Roll a 20-sided die and add +3 for Insight. You have advantage: roll twice and keep the higher one.')
     expect(rollInstructions(roll(), undefined)).toBe('Roll a 20-sided die and add your bonus.')
+    expect(rollInstructions(roll({ roll_kind: 'damage' }), { modifier: 3, label: 'Longsword damage', dice: { count: 2, sides: 8 } }))
+      .toBe('Roll 2d8 and add +3 for Longsword damage.')
   })
 })
 
@@ -48,8 +50,9 @@ describe('dice', () => {
     const values = [0xffffffff, 0, 19, 39]
     const fake = (buf: Uint32Array) => { buf[0] = values.shift()!; return buf }
     // 0xffffffff is above the unbiased limit and is redrawn.
-    expect(rollD20s(3, fake)).toEqual([1, 20, 20])
-    for (const n of rollD20s(200)) expect(n >= 1 && n <= 20).toBe(true)
+    expect(rollDice(3, 20, fake)).toEqual([1, 20, 20])
+    for (const n of rollDice(200, 20)) expect(n >= 1 && n <= 20).toBe(true)
+    for (const n of rollDice(200, 8)) expect(n >= 1 && n <= 8).toBe(true)
   })
 
   it('keeps the right die', () => {

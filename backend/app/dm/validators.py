@@ -1104,6 +1104,10 @@ class RollRequestValidator:
                     ),
                     details={"target": target_id or None},
                 ))
+            elif self.turn is not None:
+                violations += self._attack_violations(contract, rr)
+        if contract.mode == "await_roll" and rr is not None and rr.roll_kind == "damage" and self.turn is not None:
+            violations += self._damage_violations(rr)
         if contract.mode == "await_roll" and rr is not None and self.turn is not None:
             from sqlalchemy import select
             from app.dm.execution import _resolve_roll_participants
@@ -1120,12 +1124,14 @@ class RollRequestValidator:
                 ))
             _, character_id = _resolve_roll_participants(self.db, self.turn, contract)
             skill = " ".join(str(rr.ability_or_skill).split()).casefold()
-            rolled = next((
+            # Each damage roll follows its own hit (one per attack, enforced
+            # by _damage_violations), so a repeated skill is not a re-roll.
+            rolled = rr.roll_kind != "damage" and next((
                 row for row in existing
                 if row.status == "fulfilled" and row.character_id == character_id
                 and " ".join(str(row.ability_or_skill).split()).casefold() == skill
             ), None)
-            if rolled is not None:
+            if rolled:
                 violations.append(ValidationViolation(
                     validator=self.name, category=self.category, code="roll_already_resolved",
                     message=(
@@ -1137,6 +1143,43 @@ class RollRequestValidator:
                 ))
         latency = (time.monotonic() - t0) * 1000
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
+
+    def _violation(self, code: str, message: str, **details) -> ValidationViolation:
+        return ValidationViolation(validator=self.name, category=self.category, code=code, message=message, details=details)
+
+    def _attack_violations(self, contract, rr) -> list[ValidationViolation]:
+        """Issue #234 — code checks the attack itself; AC is never model-authored."""
+        from app.combat.attacks import AttackRollError, plan_attack
+        from app.dm.execution import _resolve_roll_participants
+        from models.campaigns import Campaign
+
+        if rr.dc_private is not None:
+            return [self._violation(
+                "attack_dc_forbidden",
+                "an attack roll_request never carries dc_private: code compares the roll against the "
+                "target's armor class itself. Leave dc_private null",
+            )]
+        try:
+            _, character_id = _resolve_roll_participants(self.db, self.turn, contract)
+            plan_attack(
+                self.db, self.db.get(Campaign, self.turn.campaign_id), character_id=character_id,
+                target_ref=rr.target_ref, attack_name=rr.attack_name, advantage_state=rr.advantage_state,
+            )
+        except AttackRollError as exc:
+            return [self._violation(f"attack_{exc.code}", f"attack refused: {exc}", attack_name=rr.attack_name)]
+        return []
+
+    def _damage_violations(self, rr) -> list[ValidationViolation]:
+        from app.combat.attacks import AttackRollError, plan_damage
+
+        if rr.dc_private is not None:
+            return [self._violation("damage_dc_forbidden", "a damage roll_request never carries dc_private")]
+        try:
+            plan_damage(self.db, turn_id=self.turn.id, attack_request_key=rr.attack_request_id)
+        except AttackRollError as exc:
+            return [self._violation(f"damage_{exc.code}", f"damage roll refused: {exc}",
+                                    attack_request_id=rr.attack_request_id)]
+        return []
 
 
 class EvidenceResolvedValidator:
