@@ -67,6 +67,7 @@ from typing import Any, Callable, Iterable, Iterator
 from sqlalchemy.orm import Session
 
 from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
+from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
 from app.dm.contract import DmTurnContractV1, public_projection
 from app.dm.mechanics import MechanicsResolution, issue_summary, resolve_attack_damage, resolve_mechanics, with_outcome_beat
 from app.observability.tracing import structured_log
@@ -297,7 +298,7 @@ def build_recent_conversation(
                 _PlayerSubmission.audience == audience,
                 _PlayerSubmission.resolution_status.in_(["accepted", "resolved"]),
                 _or(
-                    _PlayerSubmission.source != _OPENING_SOURCE,
+                    _PlayerSubmission.source.not_in([_OPENING_SOURCE, *DM_ONLY_SUBMISSION_SOURCES]),
                     _PlayerSubmission.source.is_(None),
                 ),
             )

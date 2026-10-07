@@ -199,7 +199,6 @@ def _encounter_advantage(
     db: Session, campaign: Any, character_id: Any, target_kind: str, target_id: str, weapon: _Weapon,
 ) -> str | None:
     """Turn/range legality inside an active encounter; returns imposed disadvantage."""
-    from app.combat.maps import list_placements
     from app.combat.service import get_active_encounter, list_participants
 
     encounter = get_active_encounter(db, campaign.id)
@@ -221,6 +220,16 @@ def _encounter_advantage(
         )
     if target is None:
         raise AttackRollError("target_not_in_encounter", "the target is not part of the active encounter")
+    return _range_advantage(db, encounter, participants, attacker, target, weapon)
+
+
+def _range_advantage(
+    db: Session, encounter: Any, participants: list[EncounterParticipant],
+    attacker: EncounterParticipant, target: EncounterParticipant, weapon: _Weapon,
+) -> str | None:
+    """Reach/range on the battle map: imposed disadvantage, or out-of-range refusal."""
+    from app.combat.maps import list_placements
+
     cells = {p.participant_id: (p.col, p.row) for p in list_placements(db, encounter.id)}
     if attacker.id not in cells or target.id not in cells or not weapon.range_known:
         return None
@@ -231,7 +240,7 @@ def _encounter_advantage(
         if weapon.normal_ft is not None and distance > weapon.normal_ft:
             return "disadvantage"
         # Ranged attacks in close combat: disadvantage within 5 ft of an enemy.
-        enemies = (p for p in participants if p.kind != "pc" and p.id in cells and _standing(db, p))
+        enemies = (p for p in participants if _hostile(attacker, p) and p.id in cells and _standing(db, p))
         if any(_feet(cells[attacker.id], cells[p.id]) <= MELEE_REACH_FT for p in enemies):
             return "disadvantage"
         return None
@@ -244,13 +253,21 @@ def _encounter_advantage(
     )
 
 
+def _hostile(attacker: EncounterParticipant, other: EncounterParticipant) -> bool:
+    """PCs and NPCs are on opposite sides (allied NPCs are not modelled yet)."""
+    return (attacker.kind == "pc") != (other.kind == "pc")
+
+
 def _feet(a: tuple[int, int], b: tuple[int, int]) -> int:
     """Chebyshev grid distance in feet (diagonals count as one square)."""
     return squares_to_feet(max(abs(a[0] - b[0]), abs(a[1] - b[1])))
 
 
 def _standing(db: Session, participant: EncounterParticipant) -> bool:
-    """An enemy still threatens unless it is down (incapacitating conditions: #235)."""
+    """A combatant still threatens unless it is down (incapacitating conditions: #235)."""
+    if participant.kind == "pc":
+        sheet = latest_sheet(db, participant.character_id) if participant.character_id else None
+        return sheet is None or int(sheet.hit_points_current or 0) > 0
     from models.world import WorldEntity
 
     entity = db.get(WorldEntity, participant.npc_entity_id) if participant.npc_entity_id else None
@@ -466,3 +483,157 @@ def attack_roll_modifier(sheet: Any, req: PlayerRollRequest) -> dict[str, Any] |
     except (AttackRollError, AttackError):
         return None
     return None
+
+
+# ── NPC attacks — issue #236 ───────────────────────────────────────────────
+#
+# NPC dice belong to the AI DM, so code rolls them: the DM names the attack
+# from the NPC's stat block, and code checks the turn and range, rolls the
+# d20 against the target's AC and the damage (riders included), and builds
+# the same ``apply_attack_damage`` effects a PC's hit produces.
+
+
+@dataclass
+class NpcAttack:
+    encounter_id: str
+    participant_id: str
+    turn_sequence: int
+    effects: list[dict[str, Any]]
+    text: str
+
+
+def npc_attack_profile(details: dict[str, Any], attack_name: str) -> dict[str, Any]:
+    """The stat-block attack the DM named; refuses unknown names with the real list."""
+    attacks = [a for a in details.get("attacks") or [] if isinstance(a, dict) and a.get("name")]
+    for attack in attacks:
+        if str(attack["name"]).strip().lower() == attack_name.strip().lower():
+            return attack
+    names = ", ".join(str(a["name"]) for a in attacks) or "none"
+    raise AttackRollError(
+        "unknown_attack", f"{attack_name!r} is not one of this NPC's stat-block attacks ({names})",
+    )
+
+
+def _npc_weapon(attack: dict[str, Any]) -> _Weapon:
+    kind = str(attack.get("kind") or "melee")
+    range_ft = attack.get("range_ft") or None
+    reach = attack.get("reach_ft")
+    return _Weapon(
+        offense=CombatantOffense(
+            attack_name=str(attack["name"]), attack_bonus=int(attack["attack_bonus"]),
+            calculation_path="stat_block", damage_expression=str(attack.get("damage") or "") or None,
+        ),
+        damage_dice=str(attack.get("damage") or "") or None,
+        damage_type=str(attack.get("damage_type") or "untyped"),
+        reach_ft=(int(reach) if reach is not None else MELEE_REACH_FT) if kind != "ranged" else None,
+        normal_ft=int(range_ft[0]) if range_ft else None,
+        long_ft=int(range_ft[1]) if range_ft else None,
+        range_known=True,
+    )
+
+
+def resolve_npc_attack(
+    db: Session,
+    campaign: Any,
+    *,
+    thread_id: str,
+    attacker: Any,
+    target: Any,
+    attack_name: str,
+    advantage_state: str,
+    attack_id: str,
+    rng: Any,
+    shared: bool,
+    target_hp: HitPoints | None,
+) -> tuple[NpcAttack, HitPoints | None]:
+    """Roll one NPC attack on its own turn; returns the attack and the target's HP after it.
+
+    ``attacker``/``target`` are ``load_state_target`` views. Pure with respect
+    to stored state: the effects apply when the DM turn commits.
+    """
+    from app.combat.service import get_active_encounter, list_participants
+
+    details = dict(attacker.details or {})
+    if not details.get("attacks"):
+        raise AttackRollError(
+            "missing_stat",
+            f"{attacker.name} has no stat block, so code cannot roll its attack: stage assign_stat_block "
+            "with a fitting SRD monster_id first",
+        )
+    profile = npc_attack_profile(details, attack_name)
+    weapon = _npc_weapon(profile)
+    encounter = get_active_encounter(db, campaign.id)
+    if encounter is None or str(encounter.thread_id) != str(thread_id):
+        raise AttackRollError(
+            "no_encounter", "NPC attacks resolve on the NPC's turn in this thread's active encounter; start one first",
+        )
+    if encounter.status != "active":
+        raise AttackRollError(
+            "initiative_pending", "the encounter is still waiting on initiative; attacks start on the first turn",
+        )
+    participants = list_participants(db, encounter.id)
+    attacker_p = _participant_for(participants, "npc", str(attacker.row.id))
+    target_id = str(target.row.id) if target.kind == "npc" else str(target.row.character_id)
+    target_p = _participant_for(participants, target.kind, target_id)
+    if attacker_p is None:
+        raise AttackRollError("attacker_not_in_encounter", f"{attacker.name} is not part of the active encounter")
+    if encounter.active_participant_id != attacker_p.id:
+        raise AttackRollError(
+            "not_attackers_turn",
+            f"it is not {attacker_p.display_name}'s turn; NPCs attack on their own turn "
+            "(reactions such as opportunity attacks are not supported yet)",
+        )
+    if target_p is None:
+        raise AttackRollError("target_not_in_encounter", f"{target.name} is not part of the active encounter")
+    if attacker.hp_current is not None and int(attacker.hp_current) <= 0:
+        raise AttackRollError("attacker_down", f"{attacker.name} is at 0 hit points and cannot attack")
+    imposed = _range_advantage(db, encounter, participants, attacker_p, target_p, weapon)
+    sources = [s for s in (advantage_state, imposed) if s and s != "normal"]
+    state = combine_advantage(sources) if sources else "normal"  # type: ignore[arg-type]
+    defense = _defense(target)
+    try:
+        roll = resolve_attack_roll(
+            attacker=weapon.offense, defender=defense, attacker_kind="npc",
+            advantage_state=state, attack_id=attack_id, rng=rng,
+        )
+    except AttackError as exc:
+        raise AttackRollError(exc.code, str(exc)) from exc
+    outcome = {"critical": "critical hit", "hit": "hit"}.get(roll.outcome, "miss")
+    text = f"{attacker.name} attacks {target.name} with {weapon.offense.attack_name}: {outcome}."
+    effects: list[dict[str, Any]] = []
+    hp = target_hp
+    if roll.outcome in ("hit", "critical"):
+        parts: list[str] = []
+        dropped = False
+        components = [(profile.get("damage"), profile.get("damage_type"))] + [
+            (rider.get("damage"), rider.get("damage_type")) for rider in profile.get("extra_damage") or []
+        ]
+        for index, (dice, damage_type) in enumerate(components):
+            if not dice:
+                continue
+            damage_id = attack_id if index == 0 else f"{attack_id}-{index}"
+            try:
+                damage = resolve_damage(
+                    spec=parse_damage_expression(str(dice), damage_type=str(damage_type or "untyped")),
+                    attacker_kind="npc", is_critical=roll.is_critical, defender=defense,
+                    damage_id=f"{damage_id}-dmg", attack_id=roll.attack_id, rng=rng,
+                )
+            except AttackError as exc:
+                raise AttackRollError(exc.code, str(exc)) from exc
+            effects.append(build_damage_effect(
+                effect_id=damage.damage_id, target_kind=target.kind, target_id=target_id, damage=damage,
+                visibility="public" if target.kind == "pc" and shared else "dm_private",
+            ))
+            parts.append(f"{damage.final_total} {damage.damage_type}")
+            if hp is not None:
+                before = hp.current
+                hp = apply_damage(hp, damage.final_total, change_id=damage.damage_id).after
+                dropped = dropped or (before > 0 and hp.current == 0)
+        if parts:
+            text += f" {target.name} takes {' and '.join(parts)} damage."
+        if dropped:
+            text += f" {target.name} drops to 0 hit points."
+    return NpcAttack(
+        encounter_id=str(encounter.id), participant_id=str(attacker_p.id),
+        turn_sequence=int(encounter.turn_sequence or 0), effects=effects, text=text,
+    ), hp

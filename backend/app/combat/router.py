@@ -3,7 +3,7 @@ turn progression — issue #231, map geometry/movement — issue #232."""
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.deps.campaign import campaign_for, run_campaign_command
@@ -39,7 +39,9 @@ from app.combat.turns import (
     end_turn,
     turn_projection,
 )
+from app.combat.npc_turns import coordinate_encounter_npc_turn
 from app.deps.auth import current_profile
+from app.dm.recovery import execute_committed_attempt
 from app.deps.idempotency import require_idempotency_key
 from app.campaigns.events import RevisionConflictError
 from app.realtime.service import (
@@ -118,6 +120,20 @@ def _publish_post_commit(db: Session, result: dict, *, replayed: bool = False) -
         logger.warning("encounter post-commit publish skipped", exc_info=True)
 
 
+def _dispatch_npc_turn(db: Session, background_tasks: BackgroundTasks, result: dict) -> None:
+    """Hand a newly started NPC turn to the AI DM after the command commits (#236).
+
+    Best effort: a cue that cannot be coordinated now stays queued for the
+    DM sweep.
+    """
+    encounter_id = (result.get("encounter") or {}).get("id") if isinstance(result, dict) else None
+    if not encounter_id:
+        return
+    attempt_id = coordinate_encounter_npc_turn(db, encounter_id)
+    if attempt_id:
+        background_tasks.add_task(execute_committed_attempt, attempt_id)
+
+
 @router.get("/api/campaigns/{campaign_id}/encounters/active")
 def read_active_encounter(
     profile=Depends(current_profile),
@@ -182,6 +198,7 @@ def fulfill_initiative(
     payload: dict,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     profile=Depends(current_profile),
     campaign: Campaign = Depends(campaign_for()),
     db: Session = Depends(get_db),
@@ -230,6 +247,7 @@ def fulfill_initiative(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
     )
+    _dispatch_npc_turn(db, background_tasks, result)
     return result
 
 
@@ -292,6 +310,7 @@ def post_end_turn(
     payload: dict,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     profile=Depends(current_profile),
     campaign: Campaign = Depends(campaign_for()),
     db: Session = Depends(get_db),
@@ -331,6 +350,7 @@ def post_end_turn(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
     )
+    _dispatch_npc_turn(db, background_tasks, result)
     return result
 
 
@@ -340,6 +360,7 @@ def post_skip_vote(
     payload: dict,
     request: Request,
     response: Response,
+    background_tasks: BackgroundTasks,
     profile=Depends(current_profile),
     campaign: Campaign = Depends(campaign_for()),
     db: Session = Depends(get_db),
@@ -383,6 +404,7 @@ def post_skip_vote(
         db, result,
         replayed=response.headers.get("X-Idempotent-Replay") == "true",
     )
+    _dispatch_npc_turn(db, background_tasks, result)
     return result
 
 

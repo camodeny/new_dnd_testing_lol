@@ -55,7 +55,8 @@ def test_parser_handles_alternate_xp_format_and_fails_closed():
     }
     block = parse_monster(raw)
     assert (block["xp"], block["initiative_modifier"]) == (700, 4)
-    assert block["attacks"] == [{"name": "Rend", "kind": "melee", "attack_bonus": 6, "damage": "1d10+4", "damage_type": "piercing", "extra_damage": []}]
+    assert block["attacks"] == [{"name": "Rend", "kind": "melee", "attack_bonus": 6, "damage": "1d10+4", "damage_type": "piercing", "extra_damage": [], "reach_ft": 5, "range_ft": None}]
+    assert block["multiattack"] == 1
     raw["tables"] = []
     with pytest.raises(ValueError, match="ability scores"):
         parse_monster(raw)
@@ -242,3 +243,26 @@ def test_search_stat_blocks_evidence_tool(table):
     assert result.status == "ok" and result.visibility == "dm_only"
     assert result.payload["creature_type_filter"] == "ooze"
     assert all("(Ooze," in line for line in result.payload["blocks"])
+
+
+@pytest.mark.parametrize("sentence,expected", [
+    ("The owlbear makes two Rend attacks.", 2),
+    ("The xorn makes one Bite attack and three Claw attacks.", 4),
+    ("The pit fiend makes one Bite attack, two Devilish Claw attacks, and one Fiery Mace attack.", 4),
+    ("The medusa makes two Claw attacks and one Snake Hair attack, or it makes three Poison Ray attacks.", 3),
+    ("The golem makes two Slam attacks, or it makes three Slam attacks if it used Hasten this turn.", 2),
+    ("The snake makes one Bite attack and uses Constrict.", 1),
+    ("The hydra makes as many Bite attacks as it has heads.", 1),
+])
+def test_multiattack_counts_attacks_per_action(sentence, expected):
+    from scripts.build_bestiary import _multiattack
+
+    assert _multiattack(f"CR 3 Actions Multiattack. {sentence} Rend. Melee Attack Roll: +7") == expected
+
+
+def test_committed_blocks_carry_multiattack_reach_and_range():
+    assert get_stat_block("goblin-warrior")["multiattack"] == 1
+    assert get_stat_block("owlbear")["multiattack"] == 2
+    javelin = get_stat_block("bugbear-stalker")["attacks"][0]
+    assert (javelin["name"], javelin["reach_ft"], javelin["range_ft"]) == ("Javelin", 10, [30, 120])
+    assert stat_block_details(get_stat_block("owlbear"))["multiattack"] == 2

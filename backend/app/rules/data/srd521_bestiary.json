@@ -21,7 +21,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tentacle"
+     "name": "Tentacle",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -32,6 +34,7 @@
    "id": "aboleth",
    "immunities": [],
    "initiative_modifier": 7,
+   "multiattack": 1,
    "name": "Aboleth",
    "resistances": [],
    "skipped_attacks": [],
@@ -63,7 +66,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -76,6 +81,7 @@
     "acid"
    ],
    "initiative_modifier": 12,
+   "multiattack": 3,
    "name": "Adult Black Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -107,7 +113,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -120,6 +128,7 @@
     "lightning"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Adult Blue Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -151,7 +160,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -164,6 +175,7 @@
     "fire"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Adult Brass Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -195,7 +207,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -208,6 +222,7 @@
     "lightning"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Adult Bronze Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -239,7 +254,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -252,6 +269,7 @@
     "acid"
    ],
    "initiative_modifier": 11,
+   "multiattack": 3,
    "name": "Adult Copper Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -283,7 +301,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -296,6 +316,7 @@
     "fire"
    ],
    "initiative_modifier": 14,
+   "multiattack": 3,
    "name": "Adult Gold Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -327,7 +348,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -342,6 +365,7 @@
     "poison"
    ],
    "initiative_modifier": 11,
+   "multiattack": 3,
    "name": "Adult Green Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -373,7 +397,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -386,6 +412,7 @@
     "fire"
    ],
    "initiative_modifier": 12,
+   "multiattack": 3,
    "name": "Adult Red Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -417,7 +444,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -430,6 +459,7 @@
     "cold"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Adult Silver Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -461,7 +491,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -474,6 +506,7 @@
     "cold"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Adult White Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -500,7 +533,9 @@
      "damage_type": "thunder",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Thunderous Slam"
+     "name": "Thunderous Slam",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -523,6 +558,7 @@
     "thunder"
    ],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Air Elemental",
    "resistances": [
     "bludgeoning",
@@ -554,7 +590,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -562,7 +600,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claws"
+     "name": "Claws",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -573,6 +613,7 @@
    "id": "allosaurus",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Allosaurus",
    "resistances": [],
    "skipped_attacks": [],
@@ -604,7 +645,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -617,6 +660,7 @@
     "acid"
    ],
    "initiative_modifier": 16,
+   "multiattack": 3,
    "name": "Ancient Black Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -648,7 +692,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -661,6 +707,7 @@
     "lightning"
    ],
    "initiative_modifier": 14,
+   "multiattack": 3,
    "name": "Ancient Blue Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -692,7 +739,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -705,6 +754,7 @@
     "fire"
    ],
    "initiative_modifier": 12,
+   "multiattack": 3,
    "name": "Ancient Brass Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -736,7 +786,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -749,6 +801,7 @@
     "lightning"
    ],
    "initiative_modifier": 14,
+   "multiattack": 3,
    "name": "Ancient Bronze Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -780,7 +833,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -793,6 +848,7 @@
     "acid"
    ],
    "initiative_modifier": 15,
+   "multiattack": 3,
    "name": "Ancient Copper Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -824,7 +880,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -837,6 +895,7 @@
     "fire"
    ],
    "initiative_modifier": 16,
+   "multiattack": 3,
    "name": "Ancient Gold Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -868,7 +927,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -883,6 +944,7 @@
     "poison"
    ],
    "initiative_modifier": 15,
+   "multiattack": 3,
    "name": "Ancient Green Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -914,7 +976,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -927,6 +991,7 @@
     "fire"
    ],
    "initiative_modifier": 14,
+   "multiattack": 3,
    "name": "Ancient Red Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -958,7 +1023,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -971,6 +1038,7 @@
     "cold"
    ],
    "initiative_modifier": 14,
+   "multiattack": 3,
    "name": "Ancient Silver Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -1002,7 +1070,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -1015,6 +1085,7 @@
     "cold"
    ],
    "initiative_modifier": 12,
+   "multiattack": 3,
    "name": "Ancient White Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -1041,7 +1112,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1063,6 +1136,7 @@
     "psychic"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Animated Armor",
    "resistances": [],
    "skipped_attacks": [],
@@ -1089,7 +1163,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slash"
+     "name": "Slash",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1111,6 +1187,7 @@
     "psychic"
    ],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Animated Flying Sword",
    "resistances": [],
    "skipped_attacks": [],
@@ -1137,7 +1214,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Smother"
+     "name": "Smother",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1159,6 +1238,7 @@
     "psychic"
    ],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Animated Rug of Smothering",
    "resistances": [],
    "skipped_attacks": [],
@@ -1190,7 +1270,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1201,6 +1283,7 @@
    "id": "ankheg",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Ankheg",
    "resistances": [],
    "skipped_attacks": [],
@@ -1227,7 +1310,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -1238,6 +1323,7 @@
    "id": "ankylosaurus",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Ankylosaurus",
    "resistances": [],
    "skipped_attacks": [],
@@ -1264,7 +1350,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Fist"
+     "name": "Fist",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -1272,7 +1360,12 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Rock (Recharge 6)"
+     "name": "Rock (Recharge 6)",
+     "range_ft": [
+      25,
+      50
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Animal",
@@ -1283,6 +1376,7 @@
    "id": "ape",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Ape",
    "resistances": [],
    "skipped_attacks": [],
@@ -1309,7 +1403,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -1320,6 +1416,7 @@
    "id": "archelon",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Archelon",
    "resistances": [],
    "skipped_attacks": [],
@@ -1346,7 +1443,12 @@
      "damage_type": "force",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Arcane Burst"
+     "name": "Arcane Burst",
+     "range_ft": [
+      150,
+      150
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1361,6 +1463,7 @@
     "psychic"
    ],
    "initiative_modifier": 7,
+   "multiattack": 4,
    "name": "Archmage",
    "resistances": [],
    "skipped_attacks": [],
@@ -1392,7 +1495,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Shortsword"
+     "name": "Shortsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -1405,7 +1510,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Light Crossbow"
+     "name": "Light Crossbow",
+     "range_ft": [
+      80,
+      320
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -1416,6 +1526,7 @@
    "id": "assassin",
    "immunities": [],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Assassin",
    "resistances": [
     "poison"
@@ -1446,6 +1557,7 @@
    "id": "awakened-shrub",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Awakened Shrub",
    "resistances": [
     "piercing"
@@ -1478,7 +1590,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -1489,6 +1603,7 @@
    "id": "awakened-tree",
    "immunities": [],
    "initiative_modifier": -2,
+   "multiattack": 1,
    "name": "Awakened Tree",
    "resistances": [
     "bludgeoning",
@@ -1520,7 +1635,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beak"
+     "name": "Beak",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1531,6 +1648,7 @@
    "id": "axe-beak",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Axe Beak",
    "resistances": [],
    "skipped_attacks": [],
@@ -1562,7 +1680,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Burning Hammer"
+     "name": "Burning Hammer",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1578,6 +1698,7 @@
     "poison"
    ],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Azer Sentinel",
    "resistances": [],
    "skipped_attacks": [],
@@ -1604,7 +1725,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -1615,6 +1738,7 @@
    "id": "baboon",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Baboon",
    "resistances": [],
    "skipped_attacks": [],
@@ -1643,6 +1767,7 @@
    "id": "badger",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Badger",
    "resistances": [
     "poison"
@@ -1678,7 +1803,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Flame Whip"
+     "name": "Flame Whip",
+     "range_ft": null,
+     "reach_ft": 30
     },
     {
      "attack_bonus": 14,
@@ -1691,7 +1818,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Lightning Blade"
+     "name": "Lightning Blade",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -1709,6 +1838,7 @@
     "poison"
    ],
    "initiative_modifier": 14,
+   "multiattack": 2,
    "name": "Balor",
    "resistances": [
     "cold",
@@ -1738,7 +1868,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scimitar"
+     "name": "Scimitar",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 3,
@@ -1746,7 +1878,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Light Crossbow"
+     "name": "Light Crossbow",
+     "range_ft": [
+      80,
+      320
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -1757,6 +1894,7 @@
    "id": "bandit",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Bandit",
    "resistances": [],
    "skipped_attacks": [],
@@ -1783,7 +1921,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scimitar"
+     "name": "Scimitar",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -1791,7 +1931,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Pistol"
+     "name": "Pistol",
+     "range_ft": [
+      30,
+      90
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -1802,6 +1947,7 @@
    "id": "bandit-captain",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Bandit Captain",
    "resistances": [],
    "skipped_attacks": [],
@@ -1828,7 +1974,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claws"
+     "name": "Claws",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -1836,7 +1984,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 5,
@@ -1844,7 +1994,12 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Hurl Flame"
+     "name": "Hurl Flame",
+     "range_ft": [
+      150,
+      150
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -1860,6 +2015,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Barbed Devil",
    "resistances": [
     "cold"
@@ -1893,7 +2049,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -1904,6 +2062,7 @@
    "id": "basilisk",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Basilisk",
    "resistances": [],
    "skipped_attacks": [],
@@ -1932,6 +2091,7 @@
    "id": "bat",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Bat",
    "resistances": [],
    "skipped_attacks": [
@@ -1960,7 +2120,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beard"
+     "name": "Beard",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -1968,7 +2130,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Infernal Glaive"
+     "name": "Infernal Glaive",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -1985,6 +2149,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Bearded Devil",
    "resistances": [
     "cold"
@@ -2018,7 +2183,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2031,6 +2198,7 @@
     "lightning"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Behir",
    "resistances": [],
    "skipped_attacks": [],
@@ -2057,7 +2225,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Greataxe"
+     "name": "Greataxe",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2068,6 +2238,7 @@
    "id": "berserker",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Berserker",
    "resistances": [],
    "skipped_attacks": [],
@@ -2094,7 +2265,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -2105,6 +2278,7 @@
    "id": "black-bear",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Black Bear",
    "resistances": [],
    "skipped_attacks": [],
@@ -2136,7 +2310,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2149,6 +2325,7 @@
     "acid"
    ],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Black Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -2175,7 +2352,9 @@
      "damage_type": "acid",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Dissolving Pseudopod"
+     "name": "Dissolving Pseudopod",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2199,6 +2378,7 @@
     "slashing"
    ],
    "initiative_modifier": -3,
+   "multiattack": 1,
    "name": "Black Pudding",
    "resistances": [],
    "skipped_attacks": [],
@@ -2225,7 +2405,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2236,6 +2418,7 @@
    "id": "blink-dog",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Blink Dog",
    "resistances": [],
    "skipped_attacks": [],
@@ -2262,7 +2445,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beak"
+     "name": "Beak",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -2273,6 +2458,7 @@
    "id": "blood-hawk",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Blood Hawk",
    "resistances": [],
    "skipped_attacks": [],
@@ -2304,7 +2490,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2317,6 +2505,7 @@
     "lightning"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Blue Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -2343,7 +2532,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -2354,6 +2545,7 @@
    "id": "boar",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Boar",
    "resistances": [],
    "skipped_attacks": [],
@@ -2380,7 +2572,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 8,
@@ -2393,7 +2587,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Infernal Sting"
+     "name": "Infernal Sting",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2409,6 +2605,7 @@
     "poison"
    ],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Bone Devil",
    "resistances": [
     "cold"
@@ -2437,7 +2634,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2450,6 +2649,7 @@
     "fire"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Brass Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -2476,7 +2676,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2489,6 +2691,7 @@
     "lightning"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Bronze Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -2515,7 +2718,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -2523,7 +2728,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -2534,6 +2741,7 @@
    "id": "brown-bear",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Brown Bear",
    "resistances": [],
    "skipped_attacks": [],
@@ -2560,7 +2768,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Javelin"
+     "name": "Javelin",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": 10
     },
     {
      "attack_bonus": 5,
@@ -2568,7 +2781,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Morningstar"
+     "name": "Morningstar",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2579,6 +2794,7 @@
    "id": "bugbear-stalker",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Bugbear Stalker",
    "resistances": [],
    "skipped_attacks": [],
@@ -2605,7 +2821,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Grab"
+     "name": "Grab",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 4,
@@ -2613,7 +2831,12 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Light Hammer"
+     "name": "Light Hammer",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2624,6 +2847,7 @@
    "id": "bugbear-warrior",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Bugbear Warrior",
    "resistances": [],
    "skipped_attacks": [],
@@ -2650,7 +2874,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2661,6 +2887,7 @@
    "id": "bulette",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Bulette",
    "resistances": [],
    "skipped_attacks": [],
@@ -2687,7 +2914,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -2698,6 +2927,7 @@
    "id": "camel",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Camel",
    "resistances": [],
    "skipped_attacks": [],
@@ -2726,6 +2956,7 @@
    "id": "cat",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Cat",
    "resistances": [],
    "skipped_attacks": [
@@ -2754,7 +2985,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pike"
+     "name": "Pike",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 4,
@@ -2762,7 +2995,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Longbow"
+     "name": "Longbow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -2773,6 +3011,7 @@
    "id": "centaur-trooper",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Centaur Trooper",
    "resistances": [],
    "skipped_attacks": [],
@@ -2799,7 +3038,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Chain"
+     "name": "Chain",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2815,6 +3056,7 @@
     "poison"
    ],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Chain Devil",
    "resistances": [
     "bludgeoning",
@@ -2846,7 +3088,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -2854,7 +3098,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -2862,7 +3108,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2873,6 +3121,7 @@
    "id": "chimera",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 3,
    "name": "Chimera",
    "resistances": [],
    "skipped_attacks": [],
@@ -2899,7 +3148,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pincer"
+     "name": "Pincer",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -2914,6 +3165,7 @@
     "poison"
    ],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Chuul",
    "resistances": [],
    "skipped_attacks": [],
@@ -2945,7 +3197,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -2967,6 +3221,7 @@
     "psychic"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Clay Golem",
    "resistances": [
     "bludgeoning",
@@ -2997,7 +3252,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Attach"
+     "name": "Attach",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -3005,7 +3262,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -3018,6 +3277,7 @@
    "id": "cloaker",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 3,
    "name": "Cloaker",
    "resistances": [],
    "skipped_attacks": [],
@@ -3049,7 +3309,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Thunderous Mace"
+     "name": "Thunderous Mace",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 12,
@@ -3057,7 +3319,12 @@
      "damage_type": "thunder",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Thundercloud"
+     "name": "Thundercloud",
+     "range_ft": [
+      240,
+      240
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -3068,6 +3335,7 @@
    "id": "cloud-giant",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Cloud Giant",
    "resistances": [],
    "skipped_attacks": [],
@@ -3094,7 +3362,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Petrifying Bite"
+     "name": "Petrifying Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3107,6 +3377,7 @@
    "id": "cockatrice",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Cockatrice",
    "resistances": [],
    "skipped_attacks": [],
@@ -3133,7 +3404,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Club"
+     "name": "Club",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3144,6 +3417,7 @@
    "id": "commoner",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Commoner",
    "resistances": [],
    "skipped_attacks": [],
@@ -3170,7 +3444,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -3181,6 +3457,7 @@
    "id": "constrictor-snake",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Constrictor Snake",
    "resistances": [],
    "skipped_attacks": [],
@@ -3207,7 +3484,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3220,6 +3499,7 @@
     "acid"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Copper Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -3246,7 +3526,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3260,6 +3542,7 @@
     "radiant"
    ],
    "initiative_modifier": 5,
+   "multiattack": 1,
    "name": "Couatl",
    "resistances": [
     "bludgeoning",
@@ -3292,6 +3575,7 @@
    "id": "crab",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Crab",
    "resistances": [],
    "skipped_attacks": [
@@ -3320,7 +3604,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -3331,6 +3617,7 @@
    "id": "crocodile",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Crocodile",
    "resistances": [],
    "skipped_attacks": [],
@@ -3357,7 +3644,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ritual Sickle"
+     "name": "Ritual Sickle",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3368,6 +3657,7 @@
    "id": "cultist",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Cultist",
    "resistances": [],
    "skipped_attacks": [],
@@ -3399,7 +3689,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Pact Blade"
+     "name": "Pact Blade",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3410,6 +3702,7 @@
    "id": "cultist-fanatic",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Cultist Fanatic",
    "resistances": [],
    "skipped_attacks": [],
@@ -3436,7 +3729,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Crush"
+     "name": "Crush",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3447,6 +3742,7 @@
    "id": "darkmantle",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Darkmantle",
    "resistances": [],
    "skipped_attacks": [],
@@ -3473,7 +3769,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3491,6 +3789,7 @@
    "id": "death-dog",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Death Dog",
    "resistances": [],
    "skipped_attacks": [],
@@ -3517,7 +3816,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -3528,6 +3829,7 @@
    "id": "deer",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Deer",
    "resistances": [],
    "skipped_attacks": [],
@@ -3559,7 +3861,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Holy Mace"
+     "name": "Holy Mace",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3574,6 +3878,7 @@
    "id": "deva",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Deva",
    "resistances": [
     "radiant"
@@ -3602,7 +3907,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -3613,6 +3920,7 @@
    "id": "dire-wolf",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Dire Wolf",
    "resistances": [],
    "skipped_attacks": [],
@@ -3644,7 +3952,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Storm Blade"
+     "name": "Storm Blade",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 9,
@@ -3652,7 +3962,12 @@
      "damage_type": "thunder",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Storm Bolt"
+     "name": "Storm Bolt",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -3666,6 +3981,7 @@
     "thunder"
    ],
    "initiative_modifier": 2,
+   "multiattack": 3,
    "name": "Djinni",
    "resistances": [],
    "skipped_attacks": [],
@@ -3692,7 +4008,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3705,6 +4023,7 @@
    "id": "doppelganger",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Doppelganger",
    "resistances": [],
    "skipped_attacks": [],
@@ -3731,7 +4050,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -3742,6 +4063,7 @@
    "id": "draft-horse",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Draft Horse",
    "resistances": [],
    "skipped_attacks": [],
@@ -3773,7 +4095,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 15
     },
     {
      "attack_bonus": 13,
@@ -3781,7 +4105,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Monster",
@@ -3792,6 +4118,7 @@
    "id": "dragon-turtle",
    "immunities": [],
    "initiative_modifier": 6,
+   "multiattack": 3,
    "name": "Dragon Turtle",
    "resistances": [
     "fire"
@@ -3820,7 +4147,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -3835,6 +4164,7 @@
     "poison"
    ],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Dretch",
    "resistances": [
     "cold",
@@ -3865,7 +4195,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Foreleg"
+     "name": "Foreleg",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 6,
@@ -3873,7 +4205,12 @@
      "damage_type": "poison",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Poison Burst"
+     "name": "Poison Burst",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -3884,6 +4221,7 @@
    "id": "drider",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Drider",
    "resistances": [],
    "skipped_attacks": [],
@@ -3915,7 +4253,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Vine Staff"
+     "name": "Vine Staff",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -3923,7 +4263,12 @@
      "damage_type": "radiant",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Verdant Wisp"
+     "name": "Verdant Wisp",
+     "range_ft": [
+      90,
+      90
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -3934,6 +4279,7 @@
    "id": "druid",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Druid",
    "resistances": [],
    "skipped_attacks": [],
@@ -3960,7 +4306,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Vine Lash"
+     "name": "Vine Lash",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 6,
@@ -3968,7 +4316,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Thorn Burst"
+     "name": "Thorn Burst",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -3979,6 +4332,7 @@
    "id": "dryad",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Dryad",
    "resistances": [],
    "skipped_attacks": [],
@@ -4005,7 +4359,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4021,6 +4377,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Dust Mephit",
    "resistances": [],
    "skipped_attacks": [],
@@ -4049,7 +4406,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Talons"
+     "name": "Talons",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -4060,6 +4419,7 @@
    "id": "eagle",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Eagle",
    "resistances": [],
    "skipped_attacks": [],
@@ -4086,7 +4446,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 8,
@@ -4094,7 +4456,12 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Rock Launch"
+     "name": "Rock Launch",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -4113,6 +4480,7 @@
     "poison"
    ],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Earth Elemental",
    "resistances": [],
    "skipped_attacks": [],
@@ -4146,7 +4514,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Heated Blade"
+     "name": "Heated Blade",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 8,
@@ -4154,7 +4524,12 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Hurl Flame"
+     "name": "Hurl Flame",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -4167,6 +4542,7 @@
     "fire"
    ],
    "initiative_modifier": 1,
+   "multiattack": 3,
    "name": "Efreeti",
    "resistances": [],
    "skipped_attacks": [],
@@ -4193,7 +4569,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -4204,6 +4582,7 @@
    "id": "elephant",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Elephant",
    "resistances": [],
    "skipped_attacks": [],
@@ -4230,7 +4609,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -4241,6 +4622,7 @@
    "id": "elk",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Elk",
    "resistances": [],
    "skipped_attacks": [],
@@ -4272,7 +4654,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Withering Sword"
+     "name": "Withering Sword",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4288,6 +4672,7 @@
     "poison"
    ],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Erinyes",
    "resistances": [
     "cold"
@@ -4321,7 +4706,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -4329,7 +4716,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4340,6 +4729,7 @@
    "id": "ettercap",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Ettercap",
    "resistances": [],
    "skipped_attacks": [],
@@ -4366,7 +4756,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Battleaxe"
+     "name": "Battleaxe",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -4374,7 +4766,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Morningstar"
+     "name": "Morningstar",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4392,6 +4786,7 @@
    "id": "ettin",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Ettin",
    "resistances": [],
    "skipped_attacks": [],
@@ -4418,7 +4813,9 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Burn"
+     "name": "Burn",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4441,6 +4838,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Fire Elemental",
    "resistances": [
     "bludgeoning",
@@ -4476,7 +4874,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Flame Sword"
+     "name": "Flame Sword",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 11,
@@ -4489,7 +4889,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Hammer Throw"
+     "name": "Hammer Throw",
+     "range_ft": [
+      60,
+      240
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -4502,6 +4907,7 @@
     "fire"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Fire Giant",
    "resistances": [],
    "skipped_attacks": [],
@@ -4533,7 +4939,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4554,6 +4962,7 @@
     "poison"
    ],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Flesh Golem",
    "resistances": [],
    "skipped_attacks": [],
@@ -4582,6 +4991,7 @@
    "id": "flying-snake",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Flying Snake",
    "resistances": [],
    "skipped_attacks": [
@@ -4612,6 +5022,7 @@
    "id": "frog",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Frog",
    "resistances": [],
    "skipped_attacks": [
@@ -4645,7 +5056,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Frost Axe"
+     "name": "Frost Axe",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 9,
@@ -4658,7 +5071,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Great Bow"
+     "name": "Great Bow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -4671,6 +5089,7 @@
     "cold"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Frost Giant",
    "resistances": [],
    "skipped_attacks": [],
@@ -4697,7 +5116,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4714,6 +5135,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Gargoyle",
    "resistances": [],
    "skipped_attacks": [],
@@ -4740,7 +5162,9 @@
      "damage_type": "acid",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pseudopod"
+     "name": "Pseudopod",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4760,6 +5184,7 @@
     "acid"
    ],
    "initiative_modifier": -4,
+   "multiattack": 1,
    "name": "Gelatinous Cube",
    "resistances": [],
    "skipped_attacks": [],
@@ -4791,7 +5216,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -4799,7 +5226,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4816,6 +5245,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Ghast",
    "resistances": [
     "necrotic"
@@ -4844,7 +5274,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Withering Touch"
+     "name": "Withering Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4868,6 +5300,7 @@
     "poison"
    ],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Ghost",
    "resistances": [
     "acid",
@@ -4908,7 +5341,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -4916,7 +5351,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -4933,6 +5370,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Ghoul",
    "resistances": [],
    "skipped_attacks": [],
@@ -4959,7 +5397,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Fist"
+     "name": "Fist",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -4970,6 +5410,7 @@
    "id": "giant-ape",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Giant Ape",
    "resistances": [],
    "skipped_attacks": [],
@@ -4996,7 +5437,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5007,6 +5450,7 @@
    "id": "giant-badger",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Giant Badger",
    "resistances": [
     "poison"
@@ -5035,7 +5479,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5046,6 +5492,7 @@
    "id": "giant-bat",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Giant Bat",
    "resistances": [],
    "skipped_attacks": [],
@@ -5072,7 +5519,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5083,6 +5532,7 @@
    "id": "giant-boar",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Giant Boar",
    "resistances": [],
    "skipped_attacks": [],
@@ -5109,7 +5559,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5120,6 +5572,7 @@
    "id": "giant-centipede",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Giant Centipede",
    "resistances": [],
    "skipped_attacks": [],
@@ -5146,7 +5599,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -5157,6 +5612,7 @@
    "id": "giant-constrictor-snake",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Giant Constrictor Snake",
    "resistances": [],
    "skipped_attacks": [],
@@ -5183,7 +5639,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5194,6 +5652,7 @@
    "id": "giant-crab",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Crab",
    "resistances": [],
    "skipped_attacks": [],
@@ -5220,7 +5679,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 8,
@@ -5228,7 +5689,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -5239,6 +5702,7 @@
    "id": "giant-crocodile",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Giant Crocodile",
    "resistances": [],
    "skipped_attacks": [],
@@ -5270,7 +5734,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5281,6 +5747,7 @@
    "id": "giant-eagle",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Giant Eagle",
    "resistances": [
     "necrotic",
@@ -5315,7 +5782,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -5326,6 +5795,7 @@
    "id": "giant-elk",
    "immunities": [],
    "initiative_modifier": 6,
+   "multiattack": 1,
    "name": "Giant Elk",
    "resistances": [
     "necrotic",
@@ -5357,6 +5827,7 @@
    "id": "giant-fire-beetle",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Giant Fire Beetle",
    "resistances": [
     "fire"
@@ -5387,7 +5858,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5398,6 +5871,7 @@
    "id": "giant-frog",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Frog",
    "resistances": [],
    "skipped_attacks": [],
@@ -5424,7 +5898,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5435,6 +5911,7 @@
    "id": "giant-goat",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Goat",
    "resistances": [],
    "skipped_attacks": [],
@@ -5461,7 +5938,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5472,6 +5951,7 @@
    "id": "giant-hyena",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Giant Hyena",
    "resistances": [],
    "skipped_attacks": [],
@@ -5498,7 +5978,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5509,6 +5991,7 @@
    "id": "giant-lizard",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Lizard",
    "resistances": [],
    "skipped_attacks": [],
@@ -5535,7 +6018,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tentacles"
+     "name": "Tentacles",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -5546,6 +6031,7 @@
    "id": "giant-octopus",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Octopus",
    "resistances": [],
    "skipped_attacks": [],
@@ -5572,7 +6058,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Talons"
+     "name": "Talons",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5583,6 +6071,7 @@
    "id": "giant-owl",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Giant Owl",
    "resistances": [
     "necrotic",
@@ -5612,7 +6101,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5623,6 +6114,7 @@
    "id": "giant-rat",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Giant Rat",
    "resistances": [],
    "skipped_attacks": [],
@@ -5649,7 +6141,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -5662,7 +6156,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Sting"
+     "name": "Sting",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5673,6 +6169,7 @@
    "id": "giant-scorpion",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 3,
    "name": "Giant Scorpion",
    "resistances": [],
    "skipped_attacks": [],
@@ -5699,7 +6196,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Ram"
+     "name": "Ram",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5710,6 +6209,7 @@
    "id": "giant-seahorse",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Seahorse",
    "resistances": [],
    "skipped_attacks": [],
@@ -5736,7 +6236,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5747,6 +6249,7 @@
    "id": "giant-shark",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Giant Shark",
    "resistances": [],
    "skipped_attacks": [],
@@ -5778,7 +6281,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5789,6 +6294,7 @@
    "id": "giant-spider",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Giant Spider",
    "resistances": [],
    "skipped_attacks": [],
@@ -5820,7 +6326,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5831,6 +6339,7 @@
    "id": "giant-toad",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Giant Toad",
    "resistances": [],
    "skipped_attacks": [],
@@ -5862,7 +6371,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -5873,6 +6384,7 @@
    "id": "giant-venomous-snake",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Giant Venomous Snake",
    "resistances": [],
    "skipped_attacks": [],
@@ -5899,7 +6411,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gouge"
+     "name": "Gouge",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5910,6 +6424,7 @@
    "id": "giant-vulture",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Giant Vulture",
    "resistances": [
     "necrotic"
@@ -5943,7 +6458,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Sting"
+     "name": "Sting",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5954,6 +6471,7 @@
    "id": "giant-wasp",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Giant Wasp",
    "resistances": [],
    "skipped_attacks": [],
@@ -5980,7 +6498,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -5991,6 +6511,7 @@
    "id": "giant-weasel",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Giant Weasel",
    "resistances": [],
    "skipped_attacks": [],
@@ -6022,7 +6543,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -6033,6 +6556,7 @@
    "id": "giant-wolf-spider",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Giant Wolf Spider",
    "resistances": [],
    "skipped_attacks": [],
@@ -6059,7 +6583,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6072,6 +6598,7 @@
    "id": "gibbering-mouther",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Gibbering Mouther",
    "resistances": [],
    "skipped_attacks": [],
@@ -6098,7 +6625,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pincer"
+     "name": "Pincer",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -6113,6 +6642,7 @@
     "poison"
    ],
    "initiative_modifier": 6,
+   "multiattack": 2,
    "name": "Glabrezu",
    "resistances": [
     "cold",
@@ -6143,7 +6673,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Spear"
+     "name": "Spear",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6154,6 +6689,7 @@
    "id": "gladiator",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 3,
    "name": "Gladiator",
    "resistances": [],
    "skipped_attacks": [],
@@ -6180,7 +6716,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 3,
@@ -6188,7 +6726,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Bone Bow"
+     "name": "Bone Bow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -6199,6 +6742,7 @@
    "id": "gnoll-warrior",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Gnoll Warrior",
    "resistances": [],
    "skipped_attacks": [],
@@ -6227,6 +6771,7 @@
    "id": "goat",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Goat",
    "resistances": [],
    "skipped_attacks": [
@@ -6255,7 +6800,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scimitar"
+     "name": "Scimitar",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -6263,7 +6810,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Shortbow"
+     "name": "Shortbow",
+     "range_ft": [
+      80,
+      320
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -6274,6 +6826,7 @@
    "id": "goblin-boss",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Goblin Boss",
    "resistances": [],
    "skipped_attacks": [],
@@ -6300,7 +6853,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Dagger"
+     "name": "Dagger",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6311,6 +6869,7 @@
    "id": "goblin-minion",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Goblin Minion",
    "resistances": [],
    "skipped_attacks": [],
@@ -6337,7 +6896,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scimitar"
+     "name": "Scimitar",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -6345,7 +6906,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Shortbow"
+     "name": "Shortbow",
+     "range_ft": [
+      80,
+      320
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -6356,6 +6922,7 @@
    "id": "goblin-warrior",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Goblin Warrior",
    "resistances": [],
    "skipped_attacks": [],
@@ -6382,7 +6949,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6395,6 +6964,7 @@
     "fire"
    ],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Gold Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -6421,7 +6991,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6435,6 +7007,7 @@
    "id": "gorgon",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Gorgon",
    "resistances": [],
    "skipped_attacks": [],
@@ -6461,7 +7034,9 @@
      "damage_type": "acid",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pseudopod"
+     "name": "Pseudopod",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6481,6 +7056,7 @@
    "id": "gray-ooze",
    "immunities": [],
    "initiative_modifier": -2,
+   "multiattack": 1,
    "name": "Gray Ooze",
    "resistances": [
     "acid",
@@ -6516,7 +7092,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6531,6 +7109,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Green Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -6562,7 +7141,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6573,6 +7154,7 @@
    "id": "green-hag",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Green Hag",
    "resistances": [],
    "skipped_attacks": [],
@@ -6599,7 +7181,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beak"
+     "name": "Beak",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -6607,7 +7191,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tentacles"
+     "name": "Tentacles",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6618,6 +7204,7 @@
    "id": "grick",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Grick",
    "resistances": [],
    "skipped_attacks": [],
@@ -6644,7 +7231,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6655,6 +7244,7 @@
    "id": "griffon",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Griffon",
    "resistances": [],
    "skipped_attacks": [],
@@ -6686,7 +7276,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bone Cudgel"
+     "name": "Bone Cudgel",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6697,6 +7289,7 @@
    "id": "grimlock",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Grimlock",
    "resistances": [],
    "skipped_attacks": [],
@@ -6723,7 +7316,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Spear"
+     "name": "Spear",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6734,6 +7332,7 @@
    "id": "guard",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Guard",
    "resistances": [],
    "skipped_attacks": [],
@@ -6760,7 +7359,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Javelin"
+     "name": "Javelin",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -6768,7 +7372,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Longsword"
+     "name": "Longsword",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6779,6 +7385,7 @@
    "id": "guard-captain",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Guard Captain",
    "resistances": [],
    "skipped_attacks": [],
@@ -6810,7 +7417,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -6828,6 +7437,7 @@
     "poison"
    ],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Guardian Naga",
    "resistances": [],
    "skipped_attacks": [],
@@ -6854,7 +7464,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -6865,6 +7477,7 @@
    "id": "half-dragon",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Half-Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -6891,7 +7504,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6902,6 +7517,7 @@
    "id": "harpy",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Harpy",
    "resistances": [],
    "skipped_attacks": [],
@@ -6930,6 +7546,7 @@
    "id": "hawk",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Hawk",
    "resistances": [],
    "skipped_attacks": [
@@ -6963,7 +7580,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -6976,6 +7595,7 @@
     "fire"
    ],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Hell Hound",
    "resistances": [],
    "skipped_attacks": [],
@@ -7007,7 +7627,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7022,6 +7644,7 @@
     "poison"
    ],
    "initiative_modifier": 6,
+   "multiattack": 3,
    "name": "Hezrou",
    "resistances": [
     "cold",
@@ -7052,7 +7675,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tree Club"
+     "name": "Tree Club",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 8,
@@ -7060,7 +7685,12 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Trash Lob"
+     "name": "Trash Lob",
+     "range_ft": [
+      60,
+      240
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7071,6 +7701,7 @@
    "id": "hill-giant",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Hill Giant",
    "resistances": [],
    "skipped_attacks": [],
@@ -7097,7 +7728,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7108,6 +7741,7 @@
    "id": "hippogriff",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Hippogriff",
    "resistances": [],
    "skipped_attacks": [],
@@ -7134,7 +7768,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -7145,6 +7781,7 @@
    "id": "hippopotamus",
    "immunities": [],
    "initiative_modifier": -2,
+   "multiattack": 2,
    "name": "Hippopotamus",
    "resistances": [],
    "skipped_attacks": [],
@@ -7176,7 +7813,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Greatsword"
+     "name": "Greatsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -7189,7 +7828,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Longbow"
+     "name": "Longbow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7200,6 +7844,7 @@
    "id": "hobgoblin-captain",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Hobgoblin Captain",
    "resistances": [],
    "skipped_attacks": [],
@@ -7226,7 +7871,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Longsword"
+     "name": "Longsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 3,
@@ -7239,7 +7886,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Longbow"
+     "name": "Longbow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7250,6 +7902,7 @@
    "id": "hobgoblin-warrior",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Hobgoblin Warrior",
    "resistances": [],
    "skipped_attacks": [],
@@ -7283,6 +7936,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Homunculus",
    "resistances": [],
    "skipped_attacks": [
@@ -7316,7 +7970,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Searing Fork"
+     "name": "Searing Fork",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 8,
@@ -7324,7 +7980,12 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Hurl Flame"
+     "name": "Hurl Flame",
+     "range_ft": [
+      150,
+      150
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7340,6 +8001,7 @@
     "poison"
    ],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Horned Devil",
    "resistances": [
     "cold"
@@ -7368,7 +8030,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -7379,6 +8043,7 @@
    "id": "hunter-shark",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Hunter Shark",
    "resistances": [],
    "skipped_attacks": [],
@@ -7405,7 +8070,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -7423,6 +8090,7 @@
    "id": "hydra",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Hydra",
    "resistances": [],
    "skipped_attacks": [],
@@ -7449,7 +8117,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -7460,6 +8130,7 @@
    "id": "hyena",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Hyena",
    "resistances": [],
    "skipped_attacks": [],
@@ -7491,7 +8162,12 @@
       }
      ],
      "kind": "melee_or_ranged",
-     "name": "Ice Spear"
+     "name": "Ice Spear",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": 5
     },
     {
      "attack_bonus": 10,
@@ -7504,7 +8180,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -7521,6 +8199,7 @@
     "poison"
    ],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Ice Devil",
    "resistances": [],
    "skipped_attacks": [],
@@ -7552,7 +8231,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7569,6 +8250,7 @@
     "poison"
    ],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Ice Mephit",
    "resistances": [],
    "skipped_attacks": [],
@@ -7602,7 +8284,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Sting"
+     "name": "Sting",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7618,6 +8302,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Imp",
    "resistances": [
     "cold"
@@ -7646,7 +8331,9 @@
      "damage_type": "psychic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Restless Touch"
+     "name": "Restless Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7657,6 +8344,7 @@
    "id": "incubus",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Incubus",
    "resistances": [
     "cold",
@@ -7688,7 +8376,9 @@
      "damage_type": "force",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Wind Swipe"
+     "name": "Wind Swipe",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7710,6 +8400,7 @@
     "poison"
    ],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Invisible Stalker",
    "resistances": [
     "bludgeoning",
@@ -7745,7 +8436,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bladed Arm"
+     "name": "Bladed Arm",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 10,
@@ -7753,7 +8446,12 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Fiery Bolt"
+     "name": "Fiery Bolt",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7775,6 +8473,7 @@
     "psychic"
    ],
    "initiative_modifier": 9,
+   "multiattack": 2,
    "name": "Iron Golem",
    "resistances": [],
    "skipped_attacks": [],
@@ -7801,7 +8500,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -7812,6 +8513,7 @@
    "id": "jackal",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Jackal",
    "resistances": [],
    "skipped_attacks": [],
@@ -7838,7 +8540,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -7849,6 +8553,7 @@
    "id": "killer-whale",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Killer Whale",
    "resistances": [],
    "skipped_attacks": [],
@@ -7880,7 +8585,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Greatsword"
+     "name": "Greatsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 2,
@@ -7893,7 +8600,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Heavy Crossbow"
+     "name": "Heavy Crossbow",
+     "range_ft": [
+      100,
+      400
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -7906,6 +8618,7 @@
    "id": "knight",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Knight",
    "resistances": [],
    "skipped_attacks": [],
@@ -7932,7 +8645,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Dagger"
+     "name": "Dagger",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -7943,6 +8661,7 @@
    "id": "kobold-warrior",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Kobold Warrior",
    "resistances": [],
    "skipped_attacks": [],
@@ -7969,7 +8688,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tentacle"
+     "name": "Tentacle",
+     "range_ft": null,
+     "reach_ft": 30
     }
    ],
    "category": "Monster",
@@ -7988,6 +8709,7 @@
     "lightning"
    ],
    "initiative_modifier": 14,
+   "multiattack": 2,
    "name": "Kraken",
    "resistances": [],
    "skipped_attacks": [],
@@ -8019,7 +8741,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8030,6 +8754,7 @@
    "id": "lamia",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Lamia",
    "resistances": [],
    "skipped_attacks": [],
@@ -8056,7 +8781,9 @@
      "damage_type": "poison",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Vile Slime"
+     "name": "Vile Slime",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8074,6 +8801,7 @@
     "poison"
    ],
    "initiative_modifier": -3,
+   "multiattack": 1,
    "name": "Lemure",
    "resistances": [
     "cold"
@@ -8102,7 +8830,12 @@
      "damage_type": "force",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Eldritch Burst"
+     "name": "Eldritch Burst",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": 5
     },
     {
      "attack_bonus": 12,
@@ -8110,7 +8843,9 @@
      "damage_type": "cold",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Paralyzing Touch"
+     "name": "Paralyzing Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8130,6 +8865,7 @@
     "poison"
    ],
    "initiative_modifier": 17,
+   "multiattack": 3,
    "name": "Lich",
    "resistances": [
     "cold",
@@ -8159,7 +8895,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -8170,6 +8908,7 @@
    "id": "lion",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Lion",
    "resistances": [],
    "skipped_attacks": [],
@@ -8198,6 +8937,7 @@
    "id": "lizard",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Lizard",
    "resistances": [],
    "skipped_attacks": [
@@ -8226,7 +8966,12 @@
      "damage_type": "force",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Arcane Burst"
+     "name": "Arcane Burst",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8237,6 +8982,7 @@
    "id": "mage",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 3,
    "name": "Mage",
    "resistances": [],
    "skipped_attacks": [],
@@ -8268,7 +9014,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8285,6 +9033,7 @@
     "poison"
    ],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Magma Mephit",
    "resistances": [],
    "skipped_attacks": [],
@@ -8313,7 +9062,9 @@
      "damage_type": "fire",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Touch"
+     "name": "Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8326,6 +9077,7 @@
     "fire"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Magmin",
    "resistances": [],
    "skipped_attacks": [],
@@ -8352,7 +9104,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -8363,6 +9117,7 @@
    "id": "mammoth",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Mammoth",
    "resistances": [],
    "skipped_attacks": [],
@@ -8389,7 +9144,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -8397,7 +9154,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Tail Spike"
+     "name": "Tail Spike",
+     "range_ft": [
+      100,
+      200
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -8408,6 +9170,7 @@
    "id": "manticore",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 3,
    "name": "Manticore",
    "resistances": [],
    "skipped_attacks": [],
@@ -8439,7 +9202,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Pact Blade"
+     "name": "Pact Blade",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8454,6 +9219,7 @@
     "poison"
    ],
    "initiative_modifier": 10,
+   "multiattack": 6,
    "name": "Marilith",
    "resistances": [
     "cold",
@@ -8484,7 +9250,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -8495,6 +9263,7 @@
    "id": "mastiff",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Mastiff",
    "resistances": [],
    "skipped_attacks": [],
@@ -8521,7 +9290,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -8534,7 +9305,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Snake Hair"
+     "name": "Snake Hair",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -8542,7 +9315,12 @@
      "damage_type": "poison",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Poison Ray"
+     "name": "Poison Ray",
+     "range_ft": [
+      150,
+      150
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -8553,6 +9331,7 @@
    "id": "medusa",
    "immunities": [],
    "initiative_modifier": 6,
+   "multiattack": 3,
    "name": "Medusa",
    "resistances": [],
    "skipped_attacks": [],
@@ -8584,7 +9363,12 @@
       }
      ],
      "kind": "melee_or_ranged",
-     "name": "Ocean Spear"
+     "name": "Ocean Spear",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8595,6 +9379,7 @@
    "id": "merfolk-skirmisher",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Merfolk Skirmisher",
    "resistances": [],
    "skipped_attacks": [],
@@ -8621,7 +9406,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -8629,7 +9416,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -8637,7 +9426,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Harpoon"
+     "name": "Harpoon",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8648,6 +9442,7 @@
    "id": "merrow",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Merrow",
    "resistances": [],
    "skipped_attacks": [],
@@ -8674,7 +9469,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -8687,7 +9484,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Pseudopod"
+     "name": "Pseudopod",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8702,6 +9501,7 @@
     "acid"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Mimic",
    "resistances": [],
    "skipped_attacks": [],
@@ -8733,7 +9533,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Abyssal Glaive"
+     "name": "Abyssal Glaive",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 6,
@@ -8741,7 +9543,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore (Recharge 5–6)"
+     "name": "Gore (Recharge 5–6)",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8752,6 +9556,7 @@
    "id": "minotaur-of-baphomet",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Minotaur of Baphomet",
    "resistances": [],
    "skipped_attacks": [],
@@ -8778,7 +9583,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -8786,7 +9593,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8802,6 +9611,7 @@
     "poison"
    ],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Minotaur Skeleton",
    "resistances": [],
    "skipped_attacks": [],
@@ -8830,7 +9640,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -8841,6 +9653,7 @@
    "id": "mule",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Mule",
    "resistances": [],
    "skipped_attacks": [],
@@ -8872,7 +9685,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rotting Fist"
+     "name": "Rotting Fist",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -8892,6 +9707,7 @@
     "poison"
    ],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Mummy",
    "resistances": [],
    "skipped_attacks": [],
@@ -8925,7 +9741,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rotting Fist"
+     "name": "Rotting Fist",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 9,
@@ -8933,7 +9751,12 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Channel Negative Energy"
+     "name": "Channel Negative Energy",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -8953,6 +9776,7 @@
     "poison"
    ],
    "initiative_modifier": 10,
+   "multiattack": 1,
    "name": "Mummy Lord",
    "resistances": [],
    "skipped_attacks": [],
@@ -8986,7 +9810,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -9002,6 +9828,7 @@
     "poison"
    ],
    "initiative_modifier": 5,
+   "multiattack": 3,
    "name": "Nalfeshnee",
    "resistances": [
     "cold",
@@ -9032,7 +9859,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9045,6 +9874,7 @@
    "id": "night-hag",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Night Hag",
    "resistances": [
     "cold",
@@ -9079,7 +9909,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9092,6 +9924,7 @@
     "fire"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Nightmare",
    "resistances": [],
    "skipped_attacks": [],
@@ -9118,7 +9951,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rapier"
+     "name": "Rapier",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9129,6 +9964,7 @@
    "id": "noble",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Noble",
    "resistances": [],
    "skipped_attacks": [],
@@ -9155,7 +9991,9 @@
      "damage_type": "acid",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Pseudopod"
+     "name": "Pseudopod",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9177,6 +10015,7 @@
     "slashing"
    ],
    "initiative_modifier": -2,
+   "multiattack": 1,
    "name": "Ochre Jelly",
    "resistances": [
     "acid"
@@ -9207,6 +10046,7 @@
    "id": "octopus",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Octopus",
    "resistances": [],
    "skipped_attacks": [
@@ -9235,7 +10075,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Greatclub"
+     "name": "Greatclub",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -9243,7 +10085,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Javelin"
+     "name": "Javelin",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9254,6 +10101,7 @@
    "id": "ogre",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Ogre",
    "resistances": [],
    "skipped_attacks": [],
@@ -9280,7 +10128,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9296,6 +10146,7 @@
     "poison"
    ],
    "initiative_modifier": -2,
+   "multiattack": 1,
    "name": "Ogre Zombie",
    "resistances": [],
    "skipped_attacks": [],
@@ -9327,7 +10178,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 5,
@@ -9335,7 +10188,12 @@
      "damage_type": "psychic",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Nightmare Ray"
+     "name": "Nightmare Ray",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -9346,6 +10204,7 @@
    "id": "oni",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Oni",
    "resistances": [
     "cold"
@@ -9374,7 +10233,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -9382,7 +10243,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tentacle"
+     "name": "Tentacle",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -9393,6 +10256,7 @@
    "id": "otyugh",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 3,
    "name": "Otyugh",
    "resistances": [],
    "skipped_attacks": [],
@@ -9421,6 +10285,7 @@
    "id": "owl",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Owl",
    "resistances": [],
    "skipped_attacks": [
@@ -9449,7 +10314,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9460,6 +10327,7 @@
    "id": "owlbear",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 2,
    "name": "Owlbear",
    "resistances": [],
    "skipped_attacks": [],
@@ -9486,7 +10354,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -9497,6 +10367,7 @@
    "id": "panther",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Panther",
    "resistances": [],
    "skipped_attacks": [],
@@ -9528,7 +10399,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9539,6 +10412,7 @@
    "id": "pegasus",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Pegasus",
    "resistances": [],
    "skipped_attacks": [],
@@ -9570,7 +10444,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9581,6 +10457,7 @@
    "id": "phase-spider",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Phase Spider",
    "resistances": [],
    "skipped_attacks": [],
@@ -9609,6 +10486,7 @@
    "id": "piranha",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Piranha",
    "resistances": [],
    "skipped_attacks": [
@@ -9637,7 +10515,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Dagger"
+     "name": "Dagger",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -9648,6 +10531,7 @@
    "id": "pirate",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Pirate",
    "resistances": [],
    "skipped_attacks": [],
@@ -9674,7 +10558,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rapier"
+     "name": "Rapier",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -9682,7 +10568,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Pistol"
+     "name": "Pistol",
+     "range_ft": [
+      30,
+      90
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -9693,6 +10584,7 @@
    "id": "pirate-captain",
    "immunities": [],
    "initiative_modifier": 7,
+   "multiattack": 3,
    "name": "Pirate Captain",
    "resistances": [],
    "skipped_attacks": [],
@@ -9719,7 +10611,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 14,
@@ -9727,7 +10621,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Devilish Claw"
+     "name": "Devilish Claw",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 14,
@@ -9740,7 +10636,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Fiery Mace"
+     "name": "Fiery Mace",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -9756,6 +10654,7 @@
     "poison"
    ],
    "initiative_modifier": 14,
+   "multiattack": 4,
    "name": "Pit Fiend",
    "resistances": [
     "cold"
@@ -9789,7 +10688,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Radiant Sword"
+     "name": "Radiant Sword",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -9804,6 +10705,7 @@
    "id": "planetar",
    "immunities": [],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Planetar",
    "resistances": [
     "radiant"
@@ -9832,7 +10734,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Animal",
@@ -9843,6 +10747,7 @@
    "id": "plesiosaurus",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Plesiosaurus",
    "resistances": [],
    "skipped_attacks": [],
@@ -9869,7 +10774,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -9880,6 +10787,7 @@
    "id": "polar-bear",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Polar Bear",
    "resistances": [
     "cold"
@@ -9908,7 +10816,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -9919,6 +10829,7 @@
    "id": "pony",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Pony",
    "resistances": [],
    "skipped_attacks": [],
@@ -9950,7 +10861,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Mace"
+     "name": "Mace",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -9958,7 +10871,12 @@
      "damage_type": "radiant",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Radiant Flame"
+     "name": "Radiant Flame",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -9969,6 +10887,7 @@
    "id": "priest",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Priest",
    "resistances": [],
    "skipped_attacks": [],
@@ -10000,7 +10919,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Mace"
+     "name": "Mace",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -10008,7 +10929,12 @@
      "damage_type": "radiant",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Radiant Flame"
+     "name": "Radiant Flame",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -10019,6 +10945,7 @@
    "id": "priest-acolyte",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Priest Acolyte",
    "resistances": [],
    "skipped_attacks": [],
@@ -10045,7 +10972,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10056,6 +10985,7 @@
    "id": "pseudodragon",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Pseudodragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -10082,7 +11012,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -10093,6 +11025,7 @@
    "id": "pteranodon",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Pteranodon",
    "resistances": [],
    "skipped_attacks": [],
@@ -10119,7 +11052,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 14,
@@ -10132,7 +11067,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Tail Stinger"
+     "name": "Tail Stinger",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -10143,6 +11080,7 @@
    "id": "purple-worm",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Purple Worm",
    "resistances": [],
    "skipped_attacks": [],
@@ -10169,7 +11107,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10184,6 +11124,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Quasit",
    "resistances": [
     "cold",
@@ -10219,7 +11160,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Cursed Touch"
+     "name": "Cursed Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10233,6 +11176,7 @@
    "id": "rakshasa",
    "immunities": [],
    "initiative_modifier": 8,
+   "multiattack": 3,
    "name": "Rakshasa",
    "resistances": [],
    "skipped_attacks": [],
@@ -10261,6 +11205,7 @@
    "id": "rat",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Rat",
    "resistances": [],
    "skipped_attacks": [
@@ -10291,6 +11236,7 @@
    "id": "raven",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Raven",
    "resistances": [],
    "skipped_attacks": [
@@ -10324,7 +11270,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10337,6 +11285,7 @@
     "fire"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Red Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -10363,7 +11312,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -10374,6 +11325,7 @@
    "id": "reef-shark",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Reef Shark",
    "resistances": [],
    "skipped_attacks": [],
@@ -10405,7 +11357,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -10419,6 +11373,7 @@
     "fire"
    ],
    "initiative_modifier": 5,
+   "multiattack": 1,
    "name": "Remorhaz",
    "resistances": [],
    "skipped_attacks": [],
@@ -10445,7 +11400,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -10456,6 +11413,7 @@
    "id": "rhinoceros",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 1,
    "name": "Rhinoceros",
    "resistances": [],
    "skipped_attacks": [],
@@ -10482,7 +11440,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -10493,6 +11453,7 @@
    "id": "riding-horse",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Riding Horse",
    "resistances": [],
    "skipped_attacks": [],
@@ -10519,7 +11480,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beak"
+     "name": "Beak",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 13,
@@ -10527,7 +11490,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Talons"
+     "name": "Talons",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10538,6 +11503,7 @@
    "id": "roc",
    "immunities": [],
    "initiative_modifier": 8,
+   "multiattack": 2,
    "name": "Roc",
    "resistances": [],
    "skipped_attacks": [],
@@ -10564,7 +11530,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10575,6 +11543,7 @@
    "id": "roper",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 4,
    "name": "Roper",
    "resistances": [],
    "skipped_attacks": [],
@@ -10601,7 +11570,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10612,6 +11583,7 @@
    "id": "rust-monster",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Rust Monster",
    "resistances": [],
    "skipped_attacks": [],
@@ -10638,7 +11610,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -10649,6 +11623,7 @@
    "id": "saber-toothed-tiger",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Saber-Toothed Tiger",
    "resistances": [],
    "skipped_attacks": [],
@@ -10675,7 +11650,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10686,6 +11663,7 @@
    "id": "sahuagin-warrior",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Sahuagin Warrior",
    "resistances": [
     "acid",
@@ -10720,7 +11698,12 @@
       }
      ],
      "kind": "melee_or_ranged",
-     "name": "Flame Spear"
+     "name": "Flame Spear",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10733,6 +11716,7 @@
     "fire"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Salamander",
    "resistances": [],
    "skipped_attacks": [],
@@ -10761,7 +11745,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10772,6 +11758,7 @@
    "id": "satyr",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Satyr",
    "resistances": [],
    "skipped_attacks": [],
@@ -10800,6 +11787,7 @@
    "id": "scorpion",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Scorpion",
    "resistances": [],
    "skipped_attacks": [
@@ -10828,7 +11816,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Shortsword"
+     "name": "Shortsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -10836,7 +11826,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Longbow"
+     "name": "Longbow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -10847,6 +11842,7 @@
    "id": "scout",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Scout",
    "resistances": [],
    "skipped_attacks": [],
@@ -10873,7 +11869,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10884,6 +11882,7 @@
    "id": "sea-hag",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Sea Hag",
    "resistances": [],
    "skipped_attacks": [],
@@ -10912,6 +11911,7 @@
    "id": "seahorse",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Seahorse",
    "resistances": [],
    "skipped_attacks": [],
@@ -10938,7 +11938,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Draining Swipe"
+     "name": "Draining Swipe",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -10962,6 +11964,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Shadow",
    "resistances": [
     "acid",
@@ -11001,7 +12004,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Charged Tendril"
+     "name": "Charged Tendril",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -11017,6 +12022,7 @@
     "lightning"
    ],
    "initiative_modifier": -1,
+   "multiattack": 3,
    "name": "Shambling Mound",
    "resistances": [
     "cold",
@@ -11051,7 +12057,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Fist"
+     "name": "Fist",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -11071,6 +12079,7 @@
     "poison"
    ],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Shield Guardian",
    "resistances": [],
    "skipped_attacks": [],
@@ -11104,6 +12113,7 @@
    "id": "shrieker-fungus",
    "immunities": [],
    "initiative_modifier": -5,
+   "multiattack": 1,
    "name": "Shrieker Fungus",
    "resistances": [],
    "skipped_attacks": [],
@@ -11130,7 +12140,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11143,6 +12155,7 @@
     "cold"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Silver Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -11169,7 +12182,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Shortsword"
+     "name": "Shortsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -11177,7 +12192,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Shortbow"
+     "name": "Shortbow",
+     "range_ft": [
+      80,
+      320
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11193,6 +12213,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Skeleton",
    "resistances": [],
    "skipped_attacks": [],
@@ -11226,7 +12247,12 @@
       }
      ],
      "kind": "melee_or_ranged",
-     "name": "Flying Sword"
+     "name": "Flying Sword",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -11245,6 +12271,7 @@
     "radiant"
    ],
    "initiative_modifier": 20,
+   "multiattack": 2,
    "name": "Solar",
    "resistances": [],
    "skipped_attacks": [],
@@ -11271,7 +12298,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Life Drain"
+     "name": "Life Drain",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11295,6 +12324,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Specter",
    "resistances": [
     "acid",
@@ -11330,7 +12360,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11346,6 +12378,7 @@
     "psychic"
    ],
    "initiative_modifier": 10,
+   "multiattack": 3,
    "name": "Sphinx of Lore",
    "resistances": [
     "necrotic",
@@ -11375,7 +12408,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11391,6 +12426,7 @@
     "psychic"
    ],
    "initiative_modifier": 12,
+   "multiattack": 2,
    "name": "Sphinx of Valor",
    "resistances": [
     "necrotic",
@@ -11425,7 +12461,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11436,6 +12474,7 @@
    "id": "sphinx-of-wonder",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Sphinx of Wonder",
    "resistances": [
     "necrotic",
@@ -11468,6 +12507,7 @@
    "id": "spider",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Spider",
    "resistances": [],
    "skipped_attacks": [
@@ -11501,7 +12541,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 6,
@@ -11509,7 +12551,12 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Necrotic Ray"
+     "name": "Necrotic Ray",
+     "range_ft": [
+      60,
+      60
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11525,6 +12572,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 3,
    "name": "Spirit Naga",
    "resistances": [],
    "skipped_attacks": [],
@@ -11551,7 +12599,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Needle Sword"
+     "name": "Needle Sword",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11562,6 +12612,7 @@
    "id": "sprite",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Sprite",
    "resistances": [],
    "skipped_attacks": [
@@ -11595,7 +12646,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Shortsword"
+     "name": "Shortsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -11608,7 +12661,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Hand Crossbow"
+     "name": "Hand Crossbow",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11619,6 +12677,7 @@
    "id": "spy",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Spy",
    "resistances": [],
    "skipped_attacks": [],
@@ -11650,7 +12709,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11667,6 +12728,7 @@
     "poison"
    ],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Steam Mephit",
    "resistances": [],
    "skipped_attacks": [],
@@ -11693,7 +12755,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Proboscis"
+     "name": "Proboscis",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11704,6 +12768,7 @@
    "id": "stirge",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Stirge",
    "resistances": [],
    "skipped_attacks": [],
@@ -11730,7 +12795,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Stone Club"
+     "name": "Stone Club",
+     "range_ft": null,
+     "reach_ft": 15
     },
     {
      "attack_bonus": 9,
@@ -11738,7 +12805,12 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Boulder"
+     "name": "Boulder",
+     "range_ft": [
+      60,
+      240
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11749,6 +12821,7 @@
    "id": "stone-giant",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Stone Giant",
    "resistances": [],
    "skipped_attacks": [],
@@ -11780,7 +12853,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 9,
@@ -11788,7 +12863,12 @@
      "damage_type": "force",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Force Bolt"
+     "name": "Force Bolt",
+     "range_ft": [
+      120,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11809,6 +12889,7 @@
     "psychic"
    ],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Stone Golem",
    "resistances": [],
    "skipped_attacks": [],
@@ -11840,7 +12921,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Storm Sword"
+     "name": "Storm Sword",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 14,
@@ -11848,7 +12931,12 @@
      "damage_type": "lightning",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Thunderbolt"
+     "name": "Thunderbolt",
+     "range_ft": [
+      500,
+      500
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -11862,6 +12950,7 @@
     "thunder"
    ],
    "initiative_modifier": 7,
+   "multiattack": 2,
    "name": "Storm Giant",
    "resistances": [
     "cold"
@@ -11890,7 +12979,9 @@
      "damage_type": "psychic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Fiendish Touch"
+     "name": "Fiendish Touch",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -11901,6 +12992,7 @@
    "id": "succubus",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Succubus",
    "resistances": [
     "cold",
@@ -11932,7 +13024,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bites"
+     "name": "Bites",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -11952,6 +13046,7 @@
    "id": "swarm-of-bats",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Swarm of Bats",
    "resistances": [
     "bludgeoning",
@@ -11982,7 +13077,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Swarm of Grasping Hands"
+     "name": "Swarm of Grasping Hands",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12008,6 +13105,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Swarm of Crawling Claws",
    "resistances": [
     "bludgeoning",
@@ -12038,7 +13136,9 @@
      "damage_type": "poison",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bites"
+     "name": "Bites",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12058,6 +13158,7 @@
    "id": "swarm-of-insects",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Swarm of Insects",
    "resistances": [
     "bludgeoning",
@@ -12088,7 +13189,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bites"
+     "name": "Bites",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12108,6 +13211,7 @@
    "id": "swarm-of-piranhas",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Swarm of Piranhas",
    "resistances": [
     "bludgeoning",
@@ -12138,7 +13242,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bites"
+     "name": "Bites",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12158,6 +13264,7 @@
    "id": "swarm-of-rats",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Swarm of Rats",
    "resistances": [
     "bludgeoning",
@@ -12188,7 +13295,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beaks"
+     "name": "Beaks",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12208,6 +13317,7 @@
    "id": "swarm-of-ravens",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Swarm of Ravens",
    "resistances": [
     "bludgeoning",
@@ -12238,7 +13348,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bites"
+     "name": "Bites",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12258,6 +13370,7 @@
    "id": "swarm-of-venomous-snakes",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 1,
    "name": "Swarm of Venomous Snakes",
    "resistances": [
     "bludgeoning",
@@ -12288,7 +13401,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 15
     },
     {
      "attack_bonus": 19,
@@ -12296,7 +13411,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 15
     },
     {
      "attack_bonus": 19,
@@ -12304,7 +13421,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 30
     }
    ],
    "category": "Monster",
@@ -12324,6 +13443,7 @@
     "poison"
    ],
    "initiative_modifier": 18,
+   "multiattack": 4,
    "name": "Tarrasque",
    "resistances": [
     "bludgeoning",
@@ -12354,7 +13474,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12365,6 +13487,7 @@
    "id": "tiger",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Tiger",
    "resistances": [],
    "skipped_attacks": [],
@@ -12391,7 +13514,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Mace"
+     "name": "Mace",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 3,
@@ -12399,7 +13524,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Heavy Crossbow"
+     "name": "Heavy Crossbow",
+     "range_ft": [
+      100,
+      400
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -12410,6 +13540,7 @@
    "id": "tough",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Tough",
    "resistances": [],
    "skipped_attacks": [],
@@ -12436,7 +13567,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Warhammer"
+     "name": "Warhammer",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -12444,7 +13577,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Heavy Crossbow"
+     "name": "Heavy Crossbow",
+     "range_ft": [
+      100,
+      400
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -12455,6 +13593,7 @@
    "id": "tough-boss",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Tough Boss",
    "resistances": [],
    "skipped_attacks": [],
@@ -12481,7 +13620,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 10,
@@ -12489,7 +13630,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Hail of Bark"
+     "name": "Hail of Bark",
+     "range_ft": [
+      180,
+      180
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -12500,6 +13646,7 @@
    "id": "treant",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Treant",
    "resistances": [
     "bludgeoning",
@@ -12531,7 +13678,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore"
+     "name": "Gore",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12542,6 +13691,7 @@
    "id": "triceratops",
    "immunities": [],
    "initiative_modifier": -1,
+   "multiattack": 2,
    "name": "Triceratops",
    "resistances": [],
    "skipped_attacks": [],
@@ -12568,7 +13718,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -12579,6 +13731,7 @@
    "id": "troll",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 3,
    "name": "Troll",
    "resistances": [],
    "skipped_attacks": [],
@@ -12605,7 +13758,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12616,6 +13771,7 @@
    "id": "troll-limb",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Troll Limb",
    "resistances": [],
    "skipped_attacks": [],
@@ -12642,7 +13798,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 10
     },
     {
      "attack_bonus": 10,
@@ -12650,7 +13808,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tail"
+     "name": "Tail",
+     "range_ft": null,
+     "reach_ft": 15
     }
    ],
    "category": "Animal",
@@ -12661,6 +13821,7 @@
    "id": "tyrannosaurus-rex",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Tyrannosaurus Rex",
    "resistances": [],
    "skipped_attacks": [],
@@ -12687,7 +13848,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -12695,7 +13858,9 @@
      "damage_type": "radiant",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Radiant Horn"
+     "name": "Radiant Horn",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12712,6 +13877,7 @@
     "poison"
    ],
    "initiative_modifier": 8,
+   "multiattack": 2,
    "name": "Unicorn",
    "resistances": [],
    "skipped_attacks": [],
@@ -12743,7 +13909,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Grave Strike (Vampire Form Only)"
+     "name": "Grave Strike (Vampire Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12754,6 +13922,7 @@
    "id": "vampire",
    "immunities": [],
    "initiative_modifier": 14,
+   "multiattack": 1,
    "name": "Vampire",
    "resistances": [
     "necrotic"
@@ -12787,7 +13956,12 @@
       }
      ],
      "kind": "melee_or_ranged",
-     "name": "Umbral Dagger"
+     "name": "Umbral Dagger",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12800,6 +13974,7 @@
    "id": "vampire-familiar",
    "immunities": [],
    "initiative_modifier": 5,
+   "multiattack": 2,
    "name": "Vampire Familiar",
    "resistances": [
     "necrotic"
@@ -12828,7 +14003,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12839,6 +14016,7 @@
    "id": "vampire-spawn",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Vampire Spawn",
    "resistances": [
     "necrotic"
@@ -12872,7 +14050,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -12883,6 +14063,7 @@
    "id": "venomous-snake",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Venomous Snake",
    "resistances": [],
    "skipped_attacks": [],
@@ -12909,7 +14090,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rotting Touch"
+     "name": "Rotting Touch",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -12925,6 +14108,7 @@
    "id": "violet-fungus",
    "immunities": [],
    "initiative_modifier": -5,
+   "multiattack": 2,
    "name": "Violet Fungus",
    "resistances": [],
    "skipped_attacks": [],
@@ -12956,7 +14140,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Shred"
+     "name": "Shred",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -12971,6 +14157,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Vrock",
    "resistances": [
     "cold",
@@ -13001,7 +14188,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Beak"
+     "name": "Beak",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -13012,6 +14201,7 @@
    "id": "vulture",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Vulture",
    "resistances": [],
    "skipped_attacks": [],
@@ -13038,7 +14228,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -13049,6 +14241,7 @@
    "id": "warhorse",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Warhorse",
    "resistances": [],
    "skipped_attacks": [],
@@ -13075,7 +14268,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Hooves"
+     "name": "Hooves",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13091,6 +14286,7 @@
     "poison"
    ],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Warhorse Skeleton",
    "resistances": [],
    "skipped_attacks": [],
@@ -13119,7 +14315,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Spear"
+     "name": "Spear",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13130,6 +14331,7 @@
    "id": "warrior-infantry",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 1,
    "name": "Warrior Infantry",
    "resistances": [],
    "skipped_attacks": [],
@@ -13156,7 +14358,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Greatsword"
+     "name": "Greatsword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 3,
@@ -13164,7 +14368,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Heavy Crossbow"
+     "name": "Heavy Crossbow",
+     "range_ft": [
+      100,
+      400
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -13175,6 +14384,7 @@
    "id": "warrior-veteran",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Warrior Veteran",
    "resistances": [],
    "skipped_attacks": [],
@@ -13201,7 +14411,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13223,6 +14435,7 @@
     "poison"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Water Elemental",
    "resistances": [
     "acid",
@@ -13254,6 +14467,7 @@
    "id": "weasel",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Weasel",
    "resistances": [],
    "skipped_attacks": [
@@ -13282,7 +14496,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite (Bear or Hybrid Form Only)"
+     "name": "Bite (Bear or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -13290,7 +14506,12 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Handaxe (Humanoid or Hybrid Form Only)"
+     "name": "Handaxe (Humanoid or Hybrid Form Only)",
+     "range_ft": [
+      20,
+      60
+     ],
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -13298,7 +14519,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend (Bear or Hybrid Form Only)"
+     "name": "Rend (Bear or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13309,6 +14532,7 @@
    "id": "werebear",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Werebear",
    "resistances": [],
    "skipped_attacks": [],
@@ -13335,7 +14559,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Gore (Boar or Hybrid Form Only)"
+     "name": "Gore (Boar or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13343,7 +14569,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee_or_ranged",
-     "name": "Javelin (Humanoid or Hybrid Form Only)"
+     "name": "Javelin (Humanoid or Hybrid Form Only)",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13351,7 +14582,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Tusk (Boar or Hybrid Form Only)"
+     "name": "Tusk (Boar or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13362,6 +14595,7 @@
    "id": "wereboar",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Wereboar",
    "resistances": [],
    "skipped_attacks": [],
@@ -13388,7 +14622,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite (Rat or Hybrid Form Only)"
+     "name": "Bite (Rat or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13396,7 +14632,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scratch"
+     "name": "Scratch",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13404,7 +14642,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Hand Crossbow (Humanoid or Hybrid Form Only)"
+     "name": "Hand Crossbow (Humanoid or Hybrid Form Only)",
+     "range_ft": [
+      30,
+      120
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -13415,6 +14658,7 @@
    "id": "wererat",
    "immunities": [],
    "initiative_modifier": 3,
+   "multiattack": 2,
    "name": "Wererat",
    "resistances": [],
    "skipped_attacks": [],
@@ -13441,7 +14685,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite (Tiger or Hybrid Form Only)"
+     "name": "Bite (Tiger or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13449,7 +14695,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scratch"
+     "name": "Scratch",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -13457,7 +14705,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Longbow (Humanoid or Hybrid Form Only)"
+     "name": "Longbow (Humanoid or Hybrid Form Only)",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -13468,6 +14721,7 @@
    "id": "weretiger",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "Weretiger",
    "resistances": [],
    "skipped_attacks": [],
@@ -13494,7 +14748,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite (Wolf or Hybrid Form Only)"
+     "name": "Bite (Wolf or Hybrid Form Only)",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 5,
@@ -13502,7 +14758,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Scratch"
+     "name": "Scratch",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -13510,7 +14768,12 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "ranged",
-     "name": "Longbow (Humanoid or Hybrid Form Only)"
+     "name": "Longbow (Humanoid or Hybrid Form Only)",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -13521,6 +14784,7 @@
    "id": "werewolf",
    "immunities": [],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Werewolf",
    "resistances": [],
    "skipped_attacks": [],
@@ -13552,7 +14816,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13565,6 +14831,7 @@
     "cold"
    ],
    "initiative_modifier": 2,
+   "multiattack": 2,
    "name": "White Dragon Wyrmling",
    "resistances": [],
    "skipped_attacks": [],
@@ -13596,7 +14863,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Necrotic Sword"
+     "name": "Necrotic Sword",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 4,
@@ -13609,7 +14878,12 @@
       }
      ],
      "kind": "ranged",
-     "name": "Necrotic Bow"
+     "name": "Necrotic Bow",
+     "range_ft": [
+      150,
+      600
+     ],
+     "reach_ft": null
     }
    ],
    "category": "Monster",
@@ -13625,6 +14899,7 @@
     "poison"
    ],
    "initiative_modifier": 4,
+   "multiattack": 2,
    "name": "Wight",
    "resistances": [
     "necrotic"
@@ -13653,7 +14928,9 @@
      "damage_type": "lightning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Shock"
+     "name": "Shock",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13676,6 +14953,7 @@
     "poison"
    ],
    "initiative_modifier": 9,
+   "multiattack": 1,
    "name": "Will-o'-Wisp",
    "resistances": [
     "acid",
@@ -13710,7 +14988,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13723,6 +15003,7 @@
     "cold"
    ],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Winter Wolf",
    "resistances": [],
    "skipped_attacks": [],
@@ -13749,7 +15030,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Animal",
@@ -13760,6 +15043,7 @@
    "id": "wolf",
    "immunities": [],
    "initiative_modifier": 2,
+   "multiattack": 1,
    "name": "Wolf",
    "resistances": [],
    "skipped_attacks": [],
@@ -13786,7 +15070,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13797,6 +15083,7 @@
    "id": "worg",
    "immunities": [],
    "initiative_modifier": 1,
+   "multiattack": 1,
    "name": "Worg",
    "resistances": [],
    "skipped_attacks": [],
@@ -13823,7 +15110,9 @@
      "damage_type": "necrotic",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Life Drain"
+     "name": "Life Drain",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13847,6 +15136,7 @@
     "poison"
    ],
    "initiative_modifier": 3,
+   "multiattack": 1,
    "name": "Wraith",
    "resistances": [
     "acid",
@@ -13880,7 +15170,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 7,
@@ -13893,7 +15185,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Sting"
+     "name": "Sting",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -13904,6 +15198,7 @@
    "id": "wyvern",
    "immunities": [],
    "initiative_modifier": 0,
+   "multiattack": 2,
    "name": "Wyvern",
    "resistances": [],
    "skipped_attacks": [],
@@ -13930,7 +15225,9 @@
      "damage_type": "piercing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Bite"
+     "name": "Bite",
+     "range_ft": null,
+     "reach_ft": 5
     },
     {
      "attack_bonus": 6,
@@ -13938,7 +15235,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Claw"
+     "name": "Claw",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -13955,6 +15254,7 @@
     "poison"
    ],
    "initiative_modifier": 0,
+   "multiattack": 4,
    "name": "Xorn",
    "resistances": [],
    "skipped_attacks": [],
@@ -13986,7 +15286,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -13999,6 +15301,7 @@
     "acid"
    ],
    "initiative_modifier": 5,
+   "multiattack": 3,
    "name": "Young Black Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14030,7 +15333,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14043,6 +15348,7 @@
     "lightning"
    ],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Young Blue Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14069,7 +15375,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14082,6 +15390,7 @@
     "fire"
    ],
    "initiative_modifier": 3,
+   "multiattack": 3,
    "name": "Young Brass Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14108,7 +15417,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14121,6 +15432,7 @@
     "lightning"
    ],
    "initiative_modifier": 3,
+   "multiattack": 3,
    "name": "Young Bronze Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14147,7 +15459,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14160,6 +15474,7 @@
     "acid"
    ],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Young Copper Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14186,7 +15501,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14199,6 +15516,7 @@
     "fire"
    ],
    "initiative_modifier": 6,
+   "multiattack": 3,
    "name": "Young Gold Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14230,7 +15548,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14245,6 +15565,7 @@
     "poison"
    ],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Young Green Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14276,7 +15597,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14289,6 +15612,7 @@
     "fire"
    ],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Young Red Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14315,7 +15639,9 @@
      "damage_type": "slashing",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14328,6 +15654,7 @@
     "cold"
    ],
    "initiative_modifier": 4,
+   "multiattack": 3,
    "name": "Young Silver Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14359,7 +15686,9 @@
       }
      ],
      "kind": "melee",
-     "name": "Rend"
+     "name": "Rend",
+     "range_ft": null,
+     "reach_ft": 10
     }
    ],
    "category": "Monster",
@@ -14372,6 +15701,7 @@
     "cold"
    ],
    "initiative_modifier": 3,
+   "multiattack": 3,
    "name": "Young White Dragon",
    "resistances": [],
    "skipped_attacks": [],
@@ -14398,7 +15728,9 @@
      "damage_type": "bludgeoning",
      "extra_damage": [],
      "kind": "melee",
-     "name": "Slam"
+     "name": "Slam",
+     "range_ft": null,
+     "reach_ft": 5
     }
    ],
    "category": "Monster",
@@ -14414,6 +15746,7 @@
     "poison"
    ],
    "initiative_modifier": -2,
+   "multiattack": 1,
    "name": "Zombie",
    "resistances": [],
    "skipped_attacks": [],

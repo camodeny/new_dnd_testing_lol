@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -114,6 +114,7 @@ def accept_submission(
     thread_id: str = "main",
     audience: str = "campaign",
     source: str | None = None,
+    default_speaker: bool = True,
 ) -> PlayerSubmission:
     started = time.monotonic()
     # The campaign lock serializes sequence allocation without treating acceptance
@@ -131,12 +132,13 @@ def accept_submission(
         character = db.get(Character, character_id)
         if character is None or character.owner_id != user_id:
             raise SubmissionValidationError("character_id must identify one of your characters")
-    else:
+    elif default_speaker:
         # Default speaker: the sender's selected launch character. A live-table
         # submission with no explicit character speaks as the sender's PC, so
         # DM context always carries the player<->character linkage (protected
         # PCs lane) even for clients holding a stale roster. Explicit claims
-        # above stay the only override path.
+        # above stay the only override path. System cues
+        # (``default_speaker=False``, e.g. an NPC turn) speak as no one.
         member = (
             db.execute(
                 select(CampaignMember).where(
@@ -219,11 +221,21 @@ def accept_submission(
     return submission
 
 
+#: System cues addressed to the AI DM alone (#236 NPC turns); players never see them.
+DM_ONLY_SUBMISSION_SOURCES = ("npc-turn-236",)
+
+
+def player_visible_submission():
+    """SQL filter for submissions players may see (drops DM-only system cues)."""
+    return or_(PlayerSubmission.source.is_(None), PlayerSubmission.source.not_in(DM_ONLY_SUBMISSION_SOURCES))
+
+
 def list_submissions(db: Session, campaign_id: uuid.UUID, thread_id: str = "main", limit: int = 200):
     submissions = db.execute(
         select(PlayerSubmission).where(
             PlayerSubmission.campaign_id == campaign_id,
             PlayerSubmission.thread_id == thread_id,
+            player_visible_submission(),
         ).order_by(PlayerSubmission.sequence).limit(limit)
     ).scalars().all()
     if not submissions:

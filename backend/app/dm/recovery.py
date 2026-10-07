@@ -387,5 +387,28 @@ def execute_committed_attempt(attempt_id):
         if SessionLocal is not None:
             with SessionLocal() as db:
                 execute_dm_attempt(db, uuid.UUID(str(attempt_id)))
+                run_npc_turns(db, attempt_id)
     except Exception:
         logger.exception("post-response DM execution failed attempt_id=%s", attempt_id)
+
+
+def run_npc_turns(db, attempt_id) -> None:
+    """Run the NPC turns that follow this attempt back to back (issue #236).
+
+    Ending an NPC's turn (or a player's) can start another NPC's turn, which
+    queues the AI DM's cue in the same thread. Each one runs now instead of
+    waiting for the cron sweep, bounded so a stuck loop cannot spin.
+    """
+    from app.combat.npc_turns import MAX_CHAINED_NPC_TURNS, coordinate_npc_turn
+    from app.dm.execution import execute_dm_attempt
+    from models.dm import DmTurnAttempt
+
+    attempt = db.get(DmTurnAttempt, uuid.UUID(str(attempt_id)))
+    if attempt is None:
+        return
+    campaign_id, thread_id = attempt.campaign_id, attempt.thread_id
+    for _ in range(MAX_CHAINED_NPC_TURNS):
+        next_id = coordinate_npc_turn(db, campaign_id, thread_id)
+        if next_id is None:
+            return
+        execute_dm_attempt(db, uuid.UUID(next_id))

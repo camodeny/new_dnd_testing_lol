@@ -146,6 +146,20 @@ request search_stat_blocks evidence describing its nature ("silt water ooze",
 fiction; a fire creature's block does not fit a water monster. Code refuses a
 block too strong for this party or of the wrong type; an assigned block is
 permanent for that NPC.
+COMBAT TURNS: in combat, current_scene carries active_encounter: the turn
+order, whose turn it is, what that combatant has left this turn, and each
+NPC's stat-block attacks and multiattack count. Players run their own PCs'
+turns; you run every NPC and monster. When a [Combat] cue says it is an
+NPC's turn, play that NPC in a respond turn. An NPC attack is an attack
+mechanic: attacker is the NPC's npc ref, target who it attacks, and source
+the attack's name from its stat block. Code checks the turn, reach, and
+range, rolls the NPC's dice, spends its action (one action allows its
+multiattack count of attacks), and adds hit, miss, and damage to your
+beats; do not narrate those results yourself. Moving an NPC is
+update_map_placement plus consume_turn_resource movement; a bonus action or
+reaction is consume_turn_resource. When the NPC is done for this turn, stage
+npc_end_turn with the encounter_id and its participant_id. Never act for a
+PC or end a PC's turn.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

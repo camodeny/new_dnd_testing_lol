@@ -56,6 +56,9 @@ from models.combat import Encounter, EncounterParticipant, EncounterSkipVote, En
 logger = logging.getLogger(__name__)
 
 CONSUMABLE_RESOURCES = ("action", "bonus_action", "movement", "reaction")
+#: ``Session.info`` outbox of DM-ended NPC turns, keyed by attempt id: the DM
+#: turn commit writes their domain events after its own event.
+NPC_TURN_TRANSITIONS_KEY = "npc_turn_transitions"
 
 # Majority of eligible voters (campaign members excluding the target's
 # controller), minimum 1. The owner holds no extra weight: one member, one
@@ -99,7 +102,8 @@ def _check_actor_for(db: Session, encounter: Encounter, participant: EncounterPa
     """Only the controlling player may execute a PC's turn-bound actions.
 
     NPC/monster turns belong to the AI DM; no human — the campaign owner
-    included — acts for them (#236 gives the DM its NPC-turn path).
+    included — acts for them. The DM runs them through staged effects
+    (:func:`dm_consume_resource`, :func:`dm_end_npc_turn`).
     """
     if participant.kind == "pc":
         if participant.controller_user_id is None or str(participant.controller_user_id) != str(actor_id):
@@ -246,6 +250,73 @@ def grant_extra_resource(
     return state
 
 
+def _parse_resource(resource: str) -> tuple[str, str, str | None]:
+    """``(resource, base, extra_name)``; raises TurnError for unknown names."""
+    resource = (resource or "").strip()
+    extra_name: str | None = None
+    if resource.startswith("extra:"):
+        extra_name = resource[len("extra:"):]
+        base = "extra"
+    else:
+        base = resource
+    if base not in CONSUMABLE_RESOURCES and base != "extra":
+        raise TurnError(f"resource must be one of {sorted(CONSUMABLE_RESOURCES)} or extra:<name>")
+    return resource, base, extra_name
+
+
+def _spend(
+    db: Session, encounter: Encounter, state: EncounterTurnState, *, is_active: bool,
+    resource: str, base: str, extra_name: str | None, amount: int, commit: bool,
+) -> int:
+    """Spend one turn resource from ``state`` under the action-economy rules.
+
+    Shared by the controller path and the AI DM path; returns the amount spent.
+    """
+    # Movement amounts are feet; everything else consumes a single unit.
+    if base == "movement":
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError) as exc:
+            raise TurnError("movement amount must be an integer number of feet") from exc
+        if amount <= 0 or amount > 500:
+            raise TurnError("movement amount must be between 1 and 500 feet")
+    else:
+        amount = 1
+
+    if base == "reaction":
+        # Explicit exception: reactions fire off-turn by design (opportunity
+        # windows themselves remain a separate issue).
+        if not state.reaction_available:
+            raise TurnError("reaction already consumed this round")
+        state.reaction_available = False
+    else:
+        if not is_active:
+            _record_invalid_attempt(db, encounter, reason="out_of_turn", commit=commit)
+            raise TurnError("only the active participant may consume turn-bound resources")
+        if base == "action":
+            if not state.action_available:
+                raise TurnError("action already consumed this turn")
+            state.action_available = False
+        elif base == "bonus_action":
+            if not state.bonus_action_available:
+                raise TurnError("bonus action already consumed this turn")
+            state.bonus_action_available = False
+        elif base == "movement":
+            if int(state.movement_remaining) < amount:
+                raise TurnError(
+                    f"insufficient movement: {state.movement_remaining} ft remaining, {amount} ft requested"
+                )
+            state.movement_remaining = int(state.movement_remaining) - amount
+        elif base == "extra":
+            extras = dict(state.extra_resources or {})
+            entry = extras.get(extra_name or "")
+            if not isinstance(entry, dict) or int(entry.get("remaining", 0)) < 1:
+                raise TurnError(f"extra resource {extra_name!r} is not available this turn")
+            extras[extra_name or ""] = {"max": int(entry.get("max", 0)), "remaining": int(entry.get("remaining", 0)) - 1}
+            state.extra_resources = extras
+    return amount
+
+
 def consume_resource(
     db: Session,
     encounter_id: uuid.UUID,
@@ -289,15 +360,7 @@ def consume_resource(
     if state is None:
         raise TurnError("participant has no turn state in this encounter")
 
-    resource = (resource or "").strip()
-    extra_name: str | None = None
-    if resource.startswith("extra:"):
-        extra_name = resource[len("extra:"):]
-        base = "extra"
-    else:
-        base = resource
-    if base not in CONSUMABLE_RESOURCES and base != "extra":
-        raise TurnError(f"resource must be one of {sorted(CONSUMABLE_RESOURCES)} or extra:<name>")
+    resource, base, extra_name = _parse_resource(resource)
 
     try:
         _check_actor_for(db, encounter, participant, actor_id)
@@ -305,49 +368,8 @@ def consume_resource(
         _record_invalid_attempt(db, encounter, reason="wrong_actor", commit=commit)
         raise
 
-    is_active = participant.id == active.id
-    # Movement amounts are feet; everything else consumes a single unit.
-    if base == "movement":
-        try:
-            amount = int(amount)
-        except (TypeError, ValueError) as exc:
-            raise TurnError("movement amount must be an integer number of feet") from exc
-        if amount <= 0 or amount > 500:
-            raise TurnError("movement amount must be between 1 and 500 feet")
-    else:
-        amount = 1
-
-    if base == "reaction":
-        # Explicit exception: reactions fire off-turn by design (opportunity
-        # windows themselves remain a separate issue).
-        if not state.reaction_available:
-            raise TurnError("reaction already consumed this round")
-        state.reaction_available = False
-    else:
-        if not is_active:
-            _record_invalid_attempt(db, encounter, reason="out_of_turn", commit=commit)
-            raise TurnError("only the active participant may consume turn-bound resources")
-        if base == "action":
-            if not state.action_available:
-                raise TurnError("action already consumed this turn")
-            state.action_available = False
-        elif base == "bonus_action":
-            if not state.bonus_action_available:
-                raise TurnError("bonus action already consumed this turn")
-            state.bonus_action_available = False
-        elif base == "movement":
-            if int(state.movement_remaining) < amount:
-                raise TurnError(
-                    f"insufficient movement: {state.movement_remaining} ft remaining, {amount} ft requested"
-                )
-            state.movement_remaining = int(state.movement_remaining) - amount
-        elif base == "extra":
-            extras = dict(state.extra_resources or {})
-            entry = extras.get(extra_name or "")
-            if not isinstance(entry, dict) or int(entry.get("remaining", 0)) < 1:
-                raise TurnError(f"extra resource {extra_name!r} is not available this turn")
-            extras[extra_name or ""] = {"max": int(entry.get("max", 0)), "remaining": int(entry.get("remaining", 0)) - 1}
-            state.extra_resources = extras
+    amount = _spend(db, encounter, state, is_active=participant.id == active.id,
+                    resource=resource, base=base, extra_name=extra_name, amount=amount, commit=commit)
     db.flush()
     structured_log(
         logger, logging.INFO, "encounter_turn_consumed",
@@ -597,6 +619,27 @@ def _advance(
     commit: bool = False,
 ) -> tuple[Encounter, Any, Any]:
     """Advance to the next turn in initiative order (round rollover included)."""
+    transition = _advance_state(db, encounter, skipped=skipped, end_turn_latency_ms=end_turn_latency_ms)
+    end_event, start_event = _emit_turn_events(
+        db, campaign.id, encounter, transition,
+        expected_revision=int(expected_revision), operation_id=operation_id, actor_id=actor_id,
+    )
+    from app.combat.npc_turns import queue_npc_turn
+
+    queue_npc_turn(db, campaign, encounter)
+    if commit:
+        db.commit()
+        db.refresh(encounter)
+    return encounter, end_event, start_event
+
+
+def _advance_state(
+    db: Session, encounter: Encounter, *, skipped: bool, end_turn_latency_ms: int = 0,
+) -> dict[str, Any]:
+    """Move the active turn to the next participant; returns the transition.
+
+    State only: :func:`_emit_turn_events` writes the matching domain events.
+    """
     order = get_turn_order(db, encounter.id)
     if not order:
         raise TurnError("cannot advance: turn order is empty")
@@ -640,7 +683,32 @@ def _advance(
     if skipped:
         encounter.skipped_count = int(encounter.skipped_count or 0) + 1
     db.flush()
+    return {
+        "source_sequence": source_sequence,
+        "ended_participant_id": str(ended_participant.id),
+        "next_participant_id": str(next_participant.id),
+        "round": next_round,
+        "rolled_over": rolled_over,
+        "skipped": skipped,
+        "turn_duration_ms": turn_duration_ms,
+        "end_turn_latency_ms": int(end_turn_latency_ms),
+    }
 
+
+def _emit_turn_events(
+    db: Session,
+    campaign_id: uuid.UUID,
+    encounter: Encounter,
+    transition: dict[str, Any],
+    *,
+    expected_revision: int,
+    operation_id: str | None,
+    actor_id: uuid.UUID | None,
+    provenance: dict[str, Any] | None = None,
+) -> tuple[Any, Any]:
+    """``turn_ended``/``turn_skipped`` then ``turn_started``, one revision each."""
+    source_sequence = int(transition["source_sequence"])
+    skipped = bool(transition["skipped"])
     end_kind = TURN_SKIPPED_EVENT if skipped else TURN_ENDED_EVENT
     end_operation_id = (operation_id or "").strip()[:128] or (
         f"encounter:{encounter.id}:turn:{source_sequence}:{'skip' if skipped else 'end'}"
@@ -651,38 +719,155 @@ def _advance(
         "thread_id": encounter.thread_id,
         "source_turn_sequence": source_sequence,
         "next_turn_sequence": source_sequence + 1,
-        "ended_participant_id": str(ended_participant.id),
-        "next_participant_id": str(next_participant.id),
-        "round": next_round,
-        "rolled_over": rolled_over,
+        "ended_participant_id": transition["ended_participant_id"],
+        "next_participant_id": transition["next_participant_id"],
+        "round": transition["round"],
+        "rolled_over": transition["rolled_over"],
         "skipped": skipped,
-        "turn_duration_ms": turn_duration_ms,
-        "end_turn_latency_ms": int(end_turn_latency_ms),
+        "turn_duration_ms": transition["turn_duration_ms"],
+        "end_turn_latency_ms": transition["end_turn_latency_ms"],
     }
+    extra = {"provenance": provenance} if provenance is not None else {}
     _, end_event = commit_campaign_mutation(
-        db, campaign.id, expected_revision=int(expected_revision),
+        db, campaign_id, expected_revision=int(expected_revision),
         event_type=end_kind, payload=ended_payload,
         operation_id=end_operation_id, actor_id=actor_id,
-        commit=False,
+        commit=False, **extra,
     )
     _, start_event = commit_campaign_mutation(
-        db, campaign.id, expected_revision=int(expected_revision) + 1,
+        db, campaign_id, expected_revision=int(expected_revision) + 1,
         event_type=TURN_STARTED_EVENT,
         payload={
             "encounter_id": str(encounter.id),
             "thread_id": encounter.thread_id,
             "turn_sequence": source_sequence + 1,
-            "active_participant_id": str(next_participant.id),
-            "round": next_round,
-            "rolled_over": rolled_over,
+            "active_participant_id": transition["next_participant_id"],
+            "round": transition["round"],
+            "rolled_over": transition["rolled_over"],
         },
         operation_id=start_operation_id, actor_id=actor_id,
-        commit=False,
+        commit=False, **extra,
     )
-    if commit:
-        db.commit()
-        db.refresh(encounter)
-    return encounter, end_event, start_event
+    return end_event, start_event
+
+
+# ── AI DM turn path — issue #236 ────────────────────────────────────────────
+#
+# NPC/monster turns belong to the AI DM. Its staged effects reach these
+# functions inside the DM turn commit (``app.dm.effects``): code checks the
+# action economy and the active turn exactly as for a player's command, but
+# the authority is the DM, not a human actor. PCs are never driven here.
+
+
+def _dm_npc_participant(
+    db: Session, encounter: Encounter, participant_id: Any, *, expected_turn_sequence: int | None,
+) -> tuple[EncounterParticipant, EncounterParticipant]:
+    """``(participant, active)`` for a DM command; refuses PCs and stale turns."""
+    if encounter.status == "ended":
+        raise TurnError("encounter has ended; turns are frozen")
+    if expected_turn_sequence is not None and int(expected_turn_sequence) != int(encounter.turn_sequence or 0):
+        raise StaleTurnError(int(expected_turn_sequence), int(encounter.turn_sequence or 0))
+    try:
+        pid = participant_id if isinstance(participant_id, uuid.UUID) else uuid.UUID(str(participant_id))
+    except ValueError as exc:
+        raise TurnError("participant_id must be a UUID") from exc
+    participant = db.get(EncounterParticipant, pid)
+    if participant is None or participant.encounter_id != encounter.id:
+        raise TurnError("participant not found in this encounter")
+    if participant.kind == "pc":
+        raise TurnAuthorizationError(
+            f"{participant.display_name} is a player character; only their player acts on their turn"
+        )
+    return participant, _active_or_raise(db, encounter)
+
+
+def dm_consume_resource(
+    db: Session,
+    encounter: Encounter,
+    participant_id: Any,
+    *,
+    resource: str,
+    amount: int = 1,
+    expected_turn_sequence: int | None = None,
+) -> EncounterTurnState:
+    """The AI DM spends an NPC's turn resource (flush-only, caller holds the lock).
+
+    Same rules as :func:`consume_resource`: turn-bound resources need the
+    NPC's own active turn and each is spent at most once per turn; a
+    reaction may be spent off-turn, once per round.
+    """
+    participant, active = _dm_npc_participant(
+        db, encounter, participant_id, expected_turn_sequence=expected_turn_sequence,
+    )
+    state = get_turn_state_row(db, encounter.id, participant.id)
+    if state is None:
+        raise TurnError("participant has no turn state in this encounter")
+    resource, base, extra_name = _parse_resource(resource)
+    amount = _spend(db, encounter, state, is_active=participant.id == active.id,
+                    resource=resource, base=base, extra_name=extra_name, amount=amount, commit=False)
+    db.flush()
+    structured_log(
+        logger, logging.INFO, "encounter_turn_consumed",
+        encounter_id=str(encounter.id), participant_id=str(participant.id),
+        resource=resource, amount=amount, turn_sequence=int(encounter.turn_sequence or 0),
+        actor="ai_dm",
+    )
+    return state
+
+
+def dm_end_npc_turn(
+    db: Session,
+    encounter: Encounter,
+    participant_id: Any,
+    *,
+    expected_turn_sequence: int | None = None,
+) -> dict[str, Any]:
+    """The AI DM ends the active NPC's turn; returns the transition.
+
+    State only, inside the DM turn commit: the turn events follow the turn's
+    own domain event (:func:`emit_dm_turn_transitions`), one revision each.
+    """
+    participant, active = _dm_npc_participant(
+        db, encounter, participant_id, expected_turn_sequence=expected_turn_sequence,
+    )
+    if participant.id != active.id:
+        raise TurnError(f"it is not {participant.display_name}'s turn, so the DM cannot end it")
+    transition = _advance_state(db, encounter, skipped=False)
+    structured_log(
+        logger, logging.INFO, "encounter_turn_ended",
+        encounter_id=str(encounter.id), actor="ai_dm",
+        turn_sequence=int(encounter.turn_sequence or 0),
+        turn_duration_ms=int(transition["turn_duration_ms"]), round=int(encounter.round or 1),
+    )
+    return transition
+
+
+def emit_dm_turn_transitions(
+    db: Session,
+    campaign: Campaign,
+    encounter: Encounter,
+    transitions: list[dict[str, Any]],
+    *,
+    actor_id: uuid.UUID | None,
+    provenance: dict[str, Any],
+) -> list[Any]:
+    """Domain events for DM-ended turns, chained after the DM turn's event.
+
+    Queues the AI DM's next NPC turn when one starts. Returns the started events.
+    """
+    from app.combat.npc_turns import queue_npc_turn
+
+    started = []
+    for transition in transitions:
+        _, start_event = _emit_turn_events(
+            db, campaign.id, encounter, transition,
+            expected_revision=int(campaign.revision or 0), operation_id=None,
+            actor_id=actor_id, provenance=provenance,
+        )
+        started.append(start_event)
+    if transitions:
+        queue_npc_turn(db, campaign, encounter)
+    return started
 
 
 # ── Read projection (reconnect-safe) ────────────────────────────────────────

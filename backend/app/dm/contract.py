@@ -293,6 +293,8 @@ STAGED_EFFECT_TYPES = (
     "apply_healing",
     "assign_stat_block",
     "reveal_entity_name",
+    "npc_end_turn",
+    "consume_turn_resource",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -817,6 +819,58 @@ class UpdateMapPlacementArgs(StrictModel):
         return str(v)
 
 
+class NpcEndTurnArgs(StrictModel):
+    """The AI DM ends the active NPC's combat turn — issue #236.
+
+    Code checks the participant is an NPC holding the active turn, then
+    advances initiative exactly like a player's end-turn. PCs end their own
+    turns; this never applies to them.
+    """
+    encounter_id: str = Field(min_length=1, max_length=160, description="Encounter UUID from active_encounter")
+    participant_id: str = Field(min_length=1, max_length=160, description="The active NPC's participant_id from active_encounter")
+
+    @field_validator("encounter_id", "participant_id")
+    @classmethod
+    def _valid_ids(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("encounter_id and participant_id must be UUIDs") from exc
+        return str(v)
+
+
+class ConsumeTurnResourceArgs(StrictModel):
+    """The AI DM spends an NPC's turn resource — issue #236.
+
+    Code enforces the action economy: one action and one bonus action per
+    turn on the NPC's own turn, movement up to its speed, one reaction per
+    round (the only resource spendable off-turn). Attacks spend the action
+    themselves; do not also stage it here.
+    """
+    encounter_id: str = Field(min_length=1, max_length=160, description="Encounter UUID from active_encounter")
+    participant_id: str = Field(min_length=1, max_length=160, description="The NPC's participant_id from active_encounter")
+    resource: Literal["action", "bonus_action", "movement", "reaction"]
+    amount: int | None = Field(default=None, ge=1, le=500, description="movement only: feet moved")
+    turn_sequence: int | None = Field(default=None, ge=1, description="Set by code for attack-spent actions")
+
+    @field_validator("encounter_id", "participant_id")
+    @classmethod
+    def _valid_ids(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("encounter_id and participant_id must be UUIDs") from exc
+        return str(v)
+
+    @model_validator(mode="after")
+    def _amount_for_movement(self) -> "ConsumeTurnResourceArgs":
+        if self.resource == "movement" and self.amount is None:
+            raise ValueError("movement requires amount (feet)")
+        if self.resource != "movement" and self.amount not in (None, 1):
+            raise ValueError("only movement takes an amount")
+        return self
+
+
 class TransferKnowledgeArgs(StrictModel):
     """Explicit in-fiction disclosure — issue #251.
 
@@ -871,7 +925,7 @@ class TransferKnowledgeArgs(StrictModel):
 
 # ── Mechanics intents (code builds the rules effects) ───────────────────────
 
-MechanicKind = Literal["damage", "heal", "condition", "spend"]
+MechanicKind = Literal["damage", "heal", "condition", "spend", "attack"]
 
 
 class MechanicIntent(StrictModel):
@@ -890,11 +944,18 @@ class MechanicIntent(StrictModel):
     - ``condition``: ``condition_op`` add/remove of a named 2024 condition.
     - ``spend``: the target spends a tracked ``resource`` (``amount``) or one
       ``spell_slot_level`` slot.
+    - ``attack`` (#236): an NPC ``attacker`` attacks ``target`` with the
+      stat-block attack named in ``source``. Code checks the NPC's turn,
+      reach/range, and Multiattack count, rolls the NPC's d20 and damage,
+      spends its action, and applies the damage. PCs attack with roll
+      requests instead: players roll their own dice.
     """
     id: str = Field(min_length=1, max_length=40, description="Stable id within this contract, e.g. mech_1")
     kind: MechanicKind
-    target: EntityRef = Field(description="PC (type=character) or NPC (type=npc) affected; for spend, who spends")
-    source: str = Field(min_length=1, max_length=160, description="Short noun phrase, read inside a sentence: the cause for damage/heal/condition ('the collapsing ceiling', 'a spider bite', 'Hold Person'), or for spend what it is spent on ('Healing Word', 'inspiring Brannoc')")
+    target: EntityRef = Field(description="PC (type=character) or NPC (type=npc) affected; for spend, who spends; for attack, who is attacked")
+    source: str = Field(min_length=1, max_length=160, description="Short noun phrase, read inside a sentence: the cause for damage/heal/condition ('the collapsing ceiling', 'a spider bite', 'Hold Person'), or for spend what it is spent on ('Healing Word', 'inspiring Brannoc'); for attack, the attack's name from the NPC's stat-block attacks ('Scimitar')")
+    attacker: EntityRef | None = Field(default=None, description="attack only: the NPC (type=npc) whose turn it is")
+    advantage_state: Literal["normal", "advantage", "disadvantage"] | None = Field(default=None, description="attack only: circumstances you judge (code adds range effects)")
     damage_dice: str | None = Field(default=None, max_length=32, description="damage only: dice expression like 2d6 or 1d8+2")
     damage_type: str | None = Field(default=None, max_length=32, description="damage only: e.g. fire, bludgeoning")
     heal_dice: str | None = Field(default=None, max_length=32, description="heal only: dice expression like 2d4+3 or 1d10+3")
@@ -920,7 +981,14 @@ class MechanicIntent(StrictModel):
         heal = (self.heal_dice,)
         condition = (self.condition, self.condition_op, self.duration_rounds)
         spend = (self.resource, self.spell_slot_level, self.amount)
-        if self.kind == "damage":
+        if self.kind != "attack" and (self.attacker is not None or self.advantage_state is not None):
+            raise ValueError("attacker/advantage_state are only valid on attack mechanics")
+        if self.kind == "attack":
+            if self.attacker is None or self.attacker.type != "npc":
+                raise ValueError("attack mechanic requires attacker type=npc; a PC attack is a player roll_request")
+            if any(v is not None for v in damage + heal + condition + spend):
+                raise ValueError("attack mechanic must not set damage/heal/condition/spend fields: code reads the stat block")
+        elif self.kind == "damage":
             if not self.damage_dice or not self.damage_type:
                 raise ValueError("damage mechanic requires damage_dice and damage_type")
             if any(v is not None for v in heal + condition + spend):
@@ -947,7 +1015,7 @@ class MechanicIntent(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | RevealEntityNameArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | RevealEntityNameArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs | NpcEndTurnArgs | ConsumeTurnResourceArgs
 
 
 #: Typed argument model per effect type: validation and the provider-facing
@@ -972,13 +1040,15 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
     "update_map_terrain": UpdateMapTerrainArgs,
     "update_map_placement": UpdateMapPlacementArgs,
     "transfer_knowledge": TransferKnowledgeArgs,
+    "npc_end_turn": NpcEndTurnArgs,
+    "consume_turn_resource": ConsumeTurnResourceArgs,
 }
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "reveal_entity_name", "update_map_terrain", "update_map_placement", "transfer_knowledge"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "reveal_entity_name", "update_map_terrain", "update_map_placement", "transfer_knowledge", "npc_end_turn", "consume_turn_resource"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -1136,7 +1206,7 @@ class DmTurnContractV1(StrictModel):
     # Effects — typed, no generic mutation
     staged_effects: list[StagedEffect] = Field(default_factory=list, max_length=4)
     # Mechanics intents — code resolves and builds the rules effects (#229)
-    mechanics: list[MechanicIntent] = Field(default_factory=list, max_length=4)
+    mechanics: list[MechanicIntent] = Field(default_factory=list, max_length=6)
     # Evidence / rolls
     evidence_requests: list[EvidenceRequest] = Field(default_factory=list, max_length=3)
     roll_request: RollRequest | None = None

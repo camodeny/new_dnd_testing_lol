@@ -1410,6 +1410,10 @@ def commit_turn(
         db.flush()
 
     is_completion = event_type == "adventure.completed"
+    if staged_list:
+        from app.dm.effects import lock_turn_economy_encounters
+
+        lock_turn_economy_encounters(db, staged_list)
     try:
         campaign_after, event = commit_campaign_mutation(
             db,
