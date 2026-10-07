@@ -179,6 +179,13 @@ export class Player {
       const request = rolls.find(r => r.id === requestId && r.requested_user_id === user.id);
       if (!request || request.status !== 'pending') throw new CliError('invalid_roll', 'No pending roll owned by this player with that ID.');
       if (request.roll_kind === 'other') throw new CliError('unsupported_roll', 'This request does not specify a standard d20 roll. Clarify with the AI DM.');
+      if (request.roll_kind === 'damage') {
+        // Damage dice come from code (the hit's weapon, crits already doubled); they are summed.
+        const match = /^(\d+)d(\d+)([+-]\d+)?$/.exec(request.damage_dice ?? '');
+        if (!match) throw new CliError('unsupported_roll', 'This damage roll has no dice code. Clarify with the AI DM.');
+        const dice = Array.from({ length: Number(match[1]) }, () => randomInt(1, Number(match[2]) + 1));
+        return { source: 'app', raw_rolls: dice, modifier, total: dice.reduce((sum, d) => sum + d, 0) + modifier, visibility };
+      }
       if (!['normal', 'advantage', 'disadvantage'].includes(request.advantage_state)) throw new CliError('unsupported_roll', 'Unknown advantage state.');
       const dice = Array.from({ length: request.advantage_state === 'normal' ? 1 : 2 }, () => randomInt(1, 21));
       const die = request.advantage_state === 'disadvantage' ? Math.min(...dice) : Math.max(...dice);

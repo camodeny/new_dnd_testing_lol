@@ -149,10 +149,15 @@ class DmTurnAttempt(Base):
         evidence = []
         for source in self.roll_evidence or []:
             item = dict(source)
-            item.pop("dc_private", None)
+            for key in ("dc_private", "target_kind", "target_id", "attack_request_id"):
+                item.pop(key, None)
             fulfillment = item.get("fulfillment")
             if isinstance(fulfillment, dict) and fulfillment.get("visibility") == "private":
                 item["fulfillment"] = {key: fulfillment.get(key) for key in ("id", "roll_request_id", "submitted_by", "source", "visibility", "submitted_at")}
+            elif isinstance(fulfillment, dict):
+                # Issue #234 — attack/damage resolution (mitigation labels,
+                # pre-mitigation totals) is DM evidence, never player-facing.
+                item["fulfillment"] = {k: v for k, v in fulfillment.items() if k != "resolution"}
             evidence.append(item)
         from app.adventures.service import player_staged_effects, redact_private_contract_snapshot
 
@@ -201,9 +206,12 @@ class PlayerRollRequest(Base):
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self, *, include_private: bool = False):
-        value = {"id": str(self.id), "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "turn_id": str(self.turn_id), "attempt_id": str(self.attempt_id), "request_key": self.request_key, "requested_user_id": str(self.requested_user_id), "character_id": str(self.character_id), "roll_kind": self.roll_kind, "ability_or_skill": self.ability_or_skill, "label": self.label, "advantage_state": self.advantage_state, "reason_public": self.reason_public, "status": self.status, "replacement_of_id": str(self.replacement_of_id) if self.replacement_of_id else None, "requested_at": self.requested_at.isoformat() if self.requested_at else None, "fulfilled_at": self.fulfilled_at.isoformat() if self.fulfilled_at else None, "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None, "attack_name": self.attack_name, "damage_dice": self.damage_dice, "attack_request_id": str(self.attack_request_id) if self.attack_request_id else None}
+        value = {"id": str(self.id), "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "turn_id": str(self.turn_id), "attempt_id": str(self.attempt_id), "request_key": self.request_key, "requested_user_id": str(self.requested_user_id), "character_id": str(self.character_id), "roll_kind": self.roll_kind, "ability_or_skill": self.ability_or_skill, "label": self.label, "advantage_state": self.advantage_state, "reason_public": self.reason_public, "status": self.status, "replacement_of_id": str(self.replacement_of_id) if self.replacement_of_id else None, "requested_at": self.requested_at.isoformat() if self.requested_at else None, "fulfilled_at": self.fulfilled_at.isoformat() if self.fulfilled_at else None, "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None, "attack_name": self.attack_name, "damage_dice": self.damage_dice}
         if include_private:
-            value.update(dc_private=self.dc_private, target_kind=self.target_kind, target_id=self.target_id)
+            value.update(
+                dc_private=self.dc_private, target_kind=self.target_kind, target_id=self.target_id,
+                attack_request_id=str(self.attack_request_id) if self.attack_request_id else None,
+            )
         return value
 
 
@@ -220,6 +228,7 @@ class PlayerRollFulfillment(Base):
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     # Issue #234 — code-owned attack/damage resolution; DM-only (never AC).
+    # Never in to_dict: only DM roll evidence carries it.
     resolution: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
@@ -227,6 +236,4 @@ class PlayerRollFulfillment(Base):
         value = {"id": str(self.id), "roll_request_id": str(self.roll_request_id), "submitted_by": str(self.submitted_by), "source": self.source, "visibility": self.visibility, "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None}
         if include_private or self.visibility == "public":
             value.update(raw_rolls=self.raw_rolls or [], modifier=self.modifier, total=self.total, raw_metadata=self.raw_metadata)
-        if include_private:
-            value["resolution"] = self.resolution
         return value

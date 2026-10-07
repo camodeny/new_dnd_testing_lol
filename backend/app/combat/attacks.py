@@ -33,6 +33,8 @@ from app.rules.attacks import (
     AttackError,
     CombatantOffense,
     DamageResolution,
+    HitPoints,
+    apply_damage,
     attacker_from_sheet,
     build_damage_effect,
     defender_from_npc,
@@ -45,15 +47,27 @@ from app.rules.attacks import (
 from app.rules.mechanics import get_character_mechanics_for_sheet
 from app.rules.resolution import combine_advantage
 from models.combat import EncounterParticipant
-from models.dm import PlayerRollFulfillment, PlayerRollRequest
+from models.dm import DmTurnAttempt, PlayerRollFulfillment, PlayerRollRequest
 
 MELEE_REACH_FT = 5
 REACH_PROPERTY_FT = 10
 
-_RANGE_RE = re.compile(r"range\s*\(?\s*(\d+)\s*(?:/\s*(\d+))?", re.IGNORECASE)
-# Weapons that only attack at range; with no range in their properties the
-# distance cannot be checked, so it is not refused.
-_RANGED_NAME_RE = re.compile(r"bow|sling|dart|blowgun|musket|pistol", re.IGNORECASE)
+_RANGE_RE = re.compile(r"range\s*:?\s*\(?\s*(\d+)\s*(?:/\s*(\d+))?", re.IGNORECASE)
+# SRD 5.2.1 ranges for ranged weapons whose sheet properties omit them,
+# matched on the weapon name (most specific first).
+_DEFAULT_RANGES: tuple[tuple[re.Pattern, int, int], ...] = tuple(
+    (re.compile(pattern, re.IGNORECASE), normal, long) for pattern, normal, long in (
+        (r"hand\s*crossbow", 30, 120), (r"heavy\s*crossbow", 100, 400), (r"crossbow", 80, 320),
+        (r"long\s*bow", 150, 600), (r"short\s*bow", 80, 320), (r"sling", 30, 120), (r"dart", 20, 60),
+        (r"blowgun", 25, 100), (r"musket", 40, 120), (r"pistol", 30, 90),
+    )
+)
+# Sheet damage is often written with its type ("1d8+3 slashing").
+_SHEET_DAMAGE_RE = re.compile(r"^\s*(\d+\s*d\s*\d+(?:\s*[+-]\s*\d+)?)\s*([a-z]+)?\s*$", re.IGNORECASE)
+# Eldritch Blast scales by beams, each its own attack roll (PHB 2024), not by dice.
+_PER_BEAM_SPELLS = {"eldritch_blast"}
+# Other bow-like names with no stated range cannot be checked, so they are not refused.
+_RANGED_NAME_RE = re.compile(r"\bbow\b", re.IGNORECASE)
 
 
 class AttackRollError(ValueError):
@@ -108,9 +122,12 @@ def _weapon(sheet: Any, attack_name: str | None) -> _Weapon:
         try:
             offense = spell_attacker(sheet, attack_name)
             spell = get_spell_def(attack_name)
-            dice = damage_expression_for_slot(
-                spell, None if spell.level == 0 else spell.level, character_level=int(sheet.level or 1),
-            ) if spell.damage_base else None
+            if spell.key in _PER_BEAM_SPELLS:
+                dice = spell.damage_base
+            else:
+                dice = damage_expression_for_slot(
+                    spell, None if spell.level == 0 else spell.level, character_level=int(sheet.level or 1),
+                ) if spell.damage_base else None
         except SpellError as spell_exc:
             raise AttackRollError(spell_exc.code, str(spell_exc)) from spell_exc
         return _Weapon(
@@ -125,13 +142,23 @@ def _weapon(sheet: Any, attack_name: str | None) -> _Weapon:
     match = _RANGE_RE.search(properties)
     normal = int(match.group(1)) if match else None
     long = int(match.group(2)) if match and match.group(2) else normal
-    ranged_only = bool(match) and "thrown" not in properties.lower()
+    if match is None:
+        default = next((r for r in _DEFAULT_RANGES if r[0].search(offense.attack_name)), None)
+        if default is not None:
+            normal, long = default[1], default[2]
+    ranged = normal is not None
+    ranged_only = ranged and "thrown" not in properties.lower()
     reach = None if ranged_only else (REACH_PROPERTY_FT if "reach" in properties.lower() else MELEE_REACH_FT)
+    damage_dice, damage_type = offense.damage_expression, getattr(detail, "damage_type", None)
+    written = _SHEET_DAMAGE_RE.match(damage_dice or "")
+    if written:
+        damage_dice = re.sub(r"\s+", "", written.group(1))
+        damage_type = damage_type or written.group(2)
     return _Weapon(
-        offense=offense, damage_dice=offense.damage_expression,
-        damage_type=str(getattr(detail, "damage_type", None) or "untyped"),
+        offense=offense, damage_dice=damage_dice,
+        damage_type=str(damage_type or "untyped").lower(),
         reach_ft=reach, normal_ft=normal, long_ft=long,
-        range_known=bool(match) or not _RANGED_NAME_RE.search(offense.attack_name),
+        range_known=ranged or not _RANGED_NAME_RE.search(offense.attack_name),
     )
 
 
@@ -176,8 +203,12 @@ def _encounter_advantage(
     from app.combat.service import get_active_encounter, list_participants
 
     encounter = get_active_encounter(db, campaign.id)
-    if encounter is None or encounter.status != "active":
+    if encounter is None:
         return None
+    if encounter.status != "active":
+        raise AttackRollError(
+            "initiative_pending", "the encounter is still waiting on initiative; attacks start on the first turn",
+        )
     participants = list_participants(db, encounter.id)
     attacker = _participant_for(participants, "pc", str(character_id))
     target = _participant_for(participants, target_kind, target_id)
@@ -193,12 +224,17 @@ def _encounter_advantage(
     cells = {p.participant_id: (p.col, p.row) for p in list_placements(db, encounter.id)}
     if attacker.id not in cells or target.id not in cells or not weapon.range_known:
         return None
-    (ac, ar), (tc, tr) = cells[attacker.id], cells[target.id]
-    distance = squares_to_feet(max(abs(ac - tc), abs(ar - tr)))
+    distance = _feet(cells[attacker.id], cells[target.id])
     if weapon.reach_ft is not None and distance <= weapon.reach_ft:
         return None
     if weapon.long_ft is not None and distance <= weapon.long_ft:
-        return "disadvantage" if weapon.normal_ft is not None and distance > weapon.normal_ft else None
+        if weapon.normal_ft is not None and distance > weapon.normal_ft:
+            return "disadvantage"
+        # Ranged attacks in close combat: disadvantage within 5 ft of an enemy.
+        enemies = (p for p in participants if p.kind != "pc" and p.id in cells and _standing(db, p))
+        if any(_feet(cells[attacker.id], cells[p.id]) <= MELEE_REACH_FT for p in enemies):
+            return "disadvantage"
+        return None
     limit = weapon.long_ft if weapon.long_ft is not None else weapon.reach_ft
     raise AttackRollError(
         "out_of_range",
@@ -208,6 +244,20 @@ def _encounter_advantage(
     )
 
 
+def _feet(a: tuple[int, int], b: tuple[int, int]) -> int:
+    """Chebyshev grid distance in feet (diagonals count as one square)."""
+    return squares_to_feet(max(abs(a[0] - b[0]), abs(a[1] - b[1])))
+
+
+def _standing(db: Session, participant: EncounterParticipant) -> bool:
+    """An enemy still threatens unless it is down (incapacitating conditions: #235)."""
+    from models.world import WorldEntity
+
+    entity = db.get(WorldEntity, participant.npc_entity_id) if participant.npc_entity_id else None
+    hp = ((entity.details or {}).get("hit_points") if entity is not None else None) or {}
+    return not (isinstance(hp, dict) and hp.get("current") == 0)
+
+
 def plan_attack(
     db: Session, campaign: Any, *, character_id: Any, target_ref: Any, attack_name: str | None,
     advantage_state: str = "normal",
@@ -215,6 +265,8 @@ def plan_attack(
     """Check an attack roll request; raises :class:`AttackRollError`."""
     if target_ref is None:
         raise AttackRollError("missing_target", "an attack roll_request needs target_ref")
+    # The attacker must be on this campaign's active roster, like any target.
+    _load_target(db, campaign, "pc", character_id)
     sheet = _sheet(db, character_id)
     weapon = _weapon(sheet, attack_name)
     kind = target_kind_for(str(target_ref.type))
@@ -238,7 +290,7 @@ def _fulfillment(db: Session, request_id: Any) -> PlayerRollFulfillment | None:
     ).scalars().first()
 
 
-def plan_damage(db: Session, *, turn_id: Any, attack_request_key: str | None) -> PlayerRollRequest:
+def plan_damage(db: Session, *, turn_id: Any, character_id: Any, attack_request_key: str | None) -> PlayerRollRequest:
     """The hit attack a damage roll follows; raises :class:`AttackRollError`."""
     if not attack_request_key:
         raise AttackRollError("missing_attack", "a damage roll_request needs attack_request_id naming the hit attack roll")
@@ -249,6 +301,8 @@ def plan_damage(db: Session, *, turn_id: Any, attack_request_key: str | None) ->
     ).scalars().first()
     if attack is None or attack.roll_kind != "attack":
         raise AttackRollError("unknown_attack", f"no attack roll {attack_request_key!r} in this turn")
+    if str(attack.character_id) != str(character_id):
+        raise AttackRollError("wrong_roller", "the attacker rolls the damage for their own hit")
     fulfillment = _fulfillment(db, attack.id)
     resolution = (fulfillment.resolution or {}) if fulfillment is not None else {}
     if resolution.get("outcome") not in ("hit", "critical"):
@@ -322,7 +376,9 @@ def resolve_damage_fulfillment(
 ) -> tuple[int, dict[str, Any]]:
     """``(modifier, resolution)`` for a fulfilled damage roll (applied at commit)."""
     attack = db.get(PlayerRollRequest, req.attack_request_id)
-    attack_fulfillment = _fulfillment(db, req.attack_request_id) if attack is not None else None
+    if attack is None or attack.turn_id != req.turn_id or attack.character_id != req.character_id:
+        raise AttackRollError("unknown_attack", "this damage roll's attack is not part of its turn")
+    attack_fulfillment = _fulfillment(db, req.attack_request_id)
     attack_resolution = (attack_fulfillment.resolution or {}) if attack_fulfillment is not None else {}
     spec = parse_damage_expression(req.damage_dice or "", damage_type=attack_resolution.get("damage_type") or "untyped")
     if raw_rolls and modifier != spec.modifier:
@@ -357,11 +413,14 @@ def attack_damage_effects(db: Session, campaign: Any, turn: Any) -> list[tuple[d
     rows = db.execute(
         select(PlayerRollRequest, PlayerRollFulfillment)
         .join(PlayerRollFulfillment, PlayerRollFulfillment.roll_request_id == PlayerRollRequest.id)
+        # Requesting attempts number the turn's rolls in order; timestamps can tie.
+        .join(DmTurnAttempt, DmTurnAttempt.id == PlayerRollRequest.attempt_id)
         .where(PlayerRollRequest.turn_id == turn.id, PlayerRollRequest.roll_kind == "damage")
-        .order_by(PlayerRollRequest.requested_at, PlayerRollRequest.id)
+        .order_by(DmTurnAttempt.attempt_number, PlayerRollRequest.requested_at, PlayerRollRequest.id)
     ).all()
     shared = (getattr(turn, "audience", None) or "campaign") == "campaign"
     out = []
+    running: dict[tuple[str, str], HitPoints] = {}  # HP after this turn's earlier hits
     for req, fulfillment in rows:
         resolution = fulfillment.resolution or {}
         damage = DamageResolution.model_validate(resolution["damage"])
@@ -372,21 +431,24 @@ def attack_damage_effects(db: Session, campaign: Any, turn: Any) -> list[tuple[d
             visibility="public" if kind == "pc" and shared else "dm_private",
         )
         text = f"{target.name} takes {damage.final_total} {damage.damage_type} damage from {resolution['attack_name']}."
-        current = target.hp_current if kind == "pc" else (
-            hp_from_npc(current=target.hp_current, details=dict(target.details)).current
-            if target.hp_current is not None else None
-        )
-        if current is not None and current > 0 and damage.final_total >= current + _temp_hp(target):
-            text += f" {target.name} drops to 0 hit points."
+        hp = running.get((kind, target_id)) or _hit_points(target)
+        if hp is not None:
+            after = apply_damage(hp, damage.final_total, change_id=damage.damage_id).after
+            running[(kind, target_id)] = after
+            if hp.current > 0 and after.current == 0:
+                text += f" {target.name} drops to 0 hit points."
         out.append((effect, text, EntityRef(type="character" if kind == "pc" else "npc", id=target_id)))
     return out
 
 
-def _temp_hp(target: Any) -> int:
+def _hit_points(target: Any) -> HitPoints | None:
     if target.kind == "pc":
-        return int(target.row.hit_points_temp or 0)
-    hp = (target.details or {}).get("hit_points") or {}
-    return int(hp.get("temporary") or 0) if isinstance(hp, dict) else 0
+        row = target.row
+        return HitPoints(current=int(row.hit_points_current), maximum=int(row.hit_points_max),
+                         temporary=int(row.hit_points_temp or 0))
+    if target.hp_current is None:
+        return None
+    return hp_from_npc(current=target.hp_current, details=dict(target.details))
 
 
 def attack_roll_modifier(sheet: Any, req: PlayerRollRequest) -> dict[str, Any] | None:

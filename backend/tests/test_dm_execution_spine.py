@@ -1273,10 +1273,10 @@ def test_attack_roll_must_target_a_registered_entity(db, first_target):
 
     s, camp_id, thread_id, _ = db
     owner = s.get(Campaign, camp_id).owner_id
-    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
     char = Character(owner_id=owner, name="Hero", system="dnd5e")
     s.add(char)
     s.flush()
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner", selected_character_id=char.id))
     s.add(Dnd5eCharacterSheet(character_id=char.id, owner_id=owner, character_name="Hero", weapons=[
         {"name": "Longsword", "attack_bonus": 5, "damage": "1d8+3", "damage_type": "slashing"},
     ]))

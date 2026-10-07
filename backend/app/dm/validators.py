@@ -1107,7 +1107,7 @@ class RollRequestValidator:
             elif self.turn is not None:
                 violations += self._attack_violations(contract, rr)
         if contract.mode == "await_roll" and rr is not None and rr.roll_kind == "damage" and self.turn is not None:
-            violations += self._damage_violations(rr)
+            violations += self._damage_violations(contract, rr)
         if contract.mode == "await_roll" and rr is not None and self.turn is not None:
             from sqlalchemy import select
             from app.dm.execution import _resolve_roll_participants
@@ -1125,8 +1125,9 @@ class RollRequestValidator:
             _, character_id = _resolve_roll_participants(self.db, self.turn, contract)
             skill = " ".join(str(rr.ability_or_skill).split()).casefold()
             # Each damage roll follows its own hit (one per attack, enforced
-            # by _damage_violations), so a repeated skill is not a re-roll.
-            rolled = rr.roll_kind != "damage" and next((
+            # by _damage_violations), and a second attack with the same weapon
+            # is a new swing (Extra Attack), so neither is a re-roll.
+            rolled = rr.roll_kind not in {"attack", "damage"} and next((
                 row for row in existing
                 if row.status == "fulfilled" and row.character_id == character_id
                 and " ".join(str(row.ability_or_skill).split()).casefold() == skill
@@ -1169,13 +1170,15 @@ class RollRequestValidator:
             return [self._violation(f"attack_{exc.code}", f"attack refused: {exc}", attack_name=rr.attack_name)]
         return []
 
-    def _damage_violations(self, rr) -> list[ValidationViolation]:
+    def _damage_violations(self, contract, rr) -> list[ValidationViolation]:
         from app.combat.attacks import AttackRollError, plan_damage
+        from app.dm.execution import _resolve_roll_participants
 
         if rr.dc_private is not None:
             return [self._violation("damage_dc_forbidden", "a damage roll_request never carries dc_private")]
         try:
-            plan_damage(self.db, turn_id=self.turn.id, attack_request_key=rr.attack_request_id)
+            _, character_id = _resolve_roll_participants(self.db, self.turn, contract)
+            plan_damage(self.db, turn_id=self.turn.id, character_id=character_id, attack_request_key=rr.attack_request_id)
         except AttackRollError as exc:
             return [self._violation(f"damage_{exc.code}", f"damage roll refused: {exc}",
                                     attack_request_id=rr.attack_request_id)]

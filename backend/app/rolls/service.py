@@ -166,6 +166,8 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
         item = req.to_dict(include_private=True)
         fulfillment = get_fulfillment(db, req.id)
         item["fulfillment"] = fulfillment.to_dict(include_private=True) if fulfillment else None
+        if fulfillment is not None and fulfillment.resolution is not None:
+            item["fulfillment"]["resolution"] = fulfillment.resolution
         evidence.append(item)
     parent_attempt.status = "superseded"
     parent_attempt.invalidation_reason = "player_roll_input_available"

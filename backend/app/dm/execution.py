@@ -742,7 +742,7 @@ def _attack_roll_fields(db: Session, turn, character_id, rr) -> dict:
     if rr.roll_kind == "damage":
         from app.rolls.service import get_fulfillment
 
-        attack = plan_damage(db, turn_id=turn.id, attack_request_key=rr.attack_request_id)
+        attack = plan_damage(db, turn_id=turn.id, character_id=character_id, attack_request_key=rr.attack_request_id)
         return {
             "attack_request_id": attack.id, "attack_name": attack.attack_name,
             "damage_dice": get_fulfillment(db, attack.id).resolution["damage_dice"],

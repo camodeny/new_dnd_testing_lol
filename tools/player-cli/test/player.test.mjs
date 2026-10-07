@@ -100,6 +100,16 @@ test('advantage dice arithmetic and retries are stable even after fulfillment', 
   assert.equal(payload.total, Math.max(...payload.raw_rolls) + 3);
 });
 
+test('rolls a damage request\'s dice and sums them', async t => {
+  const f = await fixture(t);
+  f.snapshot.roll_requests = [{ id: 'dmg', status: 'pending', requested_user_id: 'player', roll_kind: 'damage', advantage_state: 'normal', damage_dice: '2d8+3' }];
+  await f.player.roll('campaign', 'dmg', { modifier: 3, operationId: 'damage-dice' });
+  const payload = f.requests.filter(r => r.url.endsWith('/fulfill'))[0].body;
+  assert.equal(payload.raw_rolls.length, 2);
+  assert.ok(payload.raw_rolls.every(d => d >= 1 && d <= 8));
+  assert.equal(payload.total, payload.raw_rolls[0] + payload.raw_rolls[1] + 3);
+});
+
 test('cannot roll for another player', async t => {
   const f = await fixture(t);
   f.snapshot.roll_requests = [{ id: 'roll', status: 'pending', requested_user_id: 'other', advantage_state: 'normal' }];

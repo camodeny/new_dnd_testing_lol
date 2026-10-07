@@ -24,7 +24,7 @@ Commands:
   dm                            Open your private AI-DM thread
   direct <user-id>              Open a direct player thread
   rolls                         List visible roll requests
-  roll <request-id> --modifier N Roll d20 with request advantage; calculate in code
+  roll <request-id> --modifier N Roll d20 with request advantage (damage: its dice); calculate in code
   encounter                     Read active encounter
   map <encounter-id>            Read visible map
   reachable <encounter-id> --participant <id>

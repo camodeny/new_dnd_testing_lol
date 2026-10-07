@@ -30,6 +30,7 @@ WEAPONS = [
     {"name": "Longsword", "attack_bonus": 5, "damage": "1d8+3", "damage_type": "slashing"},
     {"name": "Longbow", "attack_bonus": 4, "damage": "1d8+2", "damage_type": "piercing",
      "properties": "Ammunition (Range 150/600), Heavy, Two-Handed"},
+    {"name": "Shortbow", "attack_bonus": 4, "damage": "1d6+2", "damage_type": "piercing"},
 ]
 
 
@@ -259,7 +260,7 @@ def _encounter(t, *, pc_first=True, beast_cell=(1, 0)):
     encounter = dm_start_encounter(
         s, t["camp_id"], turn.id, attempt.id,
         [{"character_id": str(t["char_id"])}, {"npc_entity_id": str(t["beast"].id)}],
-        map={"width": 40, "height": 40}, npc_d20=1 if pc_first else 20,
+        map={"width": 80, "height": 40}, npc_d20=1 if pc_first else 20,
     )
     pc = s.execute(select(EncounterParticipant).where(EncounterParticipant.character_id == t["char_id"])).scalars().one()
     beast = s.execute(select(EncounterParticipant).where(EncounterParticipant.npc_entity_id == t["beast"].id)).scalars().one()
@@ -291,6 +292,8 @@ def test_encounter_checks_turn_reach_and_range(table):
     ((2, 0), "Longsword", "out_of_range"),
     ((20, 20), "Longbow", "normal"),  # 100 ft, inside 150 ft normal range
     ((35, 0), "Longbow", "disadvantage"),  # 175 ft: long range
+    ((20, 0), "Shortbow", "disadvantage"),  # no stated range: SRD 80/320 by name
+    ((70, 0), "Shortbow", "out_of_range"),  # 350 ft
 ])
 def test_range_uses_grid_distance(table, cell, attack_name, expected):
     t = table
@@ -298,7 +301,7 @@ def test_range_uses_grid_distance(table, cell, attack_name, expected):
     if expected == "out_of_range":
         with pytest.raises(AttackRollError) as exc:
             _plan(t, attack_name)
-        assert exc.value.code == "out_of_range" and "10 ft away" in str(exc.value)
+        assert exc.value.code == "out_of_range" and f"{max(cell) * 5} ft away" in str(exc.value)
     else:
         assert _plan(t, attack_name).advantage_state == expected
 
@@ -345,3 +348,110 @@ def test_damage_respects_target_resistance(table):
     _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [8], "modifier": 3, "total": 11})
     execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _narrate("The blade skids."), narrator="deterministic")
     assert _hp(t) == 15  # 11 halved, rounded down
+
+
+def test_attempt_projection_hides_resolution_and_target(table):
+    """Roll evidence keeps the resolution for the DM; players never see it."""
+    t, s = table, table["s"]
+    t["beast"].details = {**t["beast"].details, "resistances": ["slashing"]}
+    s.commit()
+    turn, attempt = _submit(t)
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _attack(t), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [15], "modifier": 5, "total": 20})
+    execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _damage(t), narrator="deterministic")
+    damage_req = _only_pending(s, turn.id)
+    fulfillment, resumed = _fulfill(t, damage_req, {"source": "app", "raw_rolls": [8], "modifier": 3, "total": 11})
+    evidence = json.dumps(resumed.roll_evidence)
+    assert "resistance" in evidence and str(t["beast"].id) in evidence  # DM-side evidence is complete
+    public = json.dumps([resumed.to_dict(), fulfillment.to_dict(include_private=True), damage_req.to_dict()])
+    for hidden in ("resolution", "mitigation", "pre_mitigation", "target_id", "target_kind",
+                   "attack_request_id", "armor_class", str(t["beast"].id)):
+        assert hidden not in public
+
+
+def test_damage_roll_belongs_to_the_attacker(table):
+    from app.combat.attacks import plan_damage
+
+    t, s = table, table["s"]
+    turn, attempt = _submit(t)
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _attack(t), narrator="deterministic")
+    _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [15], "modifier": 5, "total": 20})
+    with pytest.raises(AttackRollError) as exc:
+        plan_damage(s, turn_id=turn.id, character_id=uuid.uuid4(), attack_request_key="atk_1")
+    assert exc.value.code == "wrong_roller"
+    assert plan_damage(s, turn_id=turn.id, character_id=t["char_id"], attack_request_key="atk_1").request_key == "atk_1"
+
+
+def test_second_attack_with_the_same_weapon_is_allowed(table):
+    """Extra Attack: a second Longsword swing in the same turn is a new roll."""
+    t, s = table, table["s"]
+    turn, attempt = _submit(t)
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _attack(t), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [2], "modifier": 5, "total": 7})
+    feedback_seen = []
+
+    def adjudicate(packet, feedback=None):
+        feedback_seen.append(feedback)
+        return _attack(t, request_id="atk_2")
+
+    execute_dm_attempt(s, resumed.id, adjudicate=adjudicate, narrator="deterministic")
+    assert feedback_seen == [None]
+    assert _only_pending(s, turn.id).request_key == "atk_2"
+
+
+def test_ranged_attack_in_close_combat_has_disadvantage(table):
+    t = table
+    _encounter(t, beast_cell=(1, 0))
+    assert _plan(t, "Longbow").advantage_state == "disadvantage"
+    assert _plan(t, "Longsword").advantage_state == "normal"
+
+
+def test_attacks_wait_for_initiative(table):
+    t, s = table, table["s"]
+    turn, attempt = _submit(t, "Steel rings out.")
+    dm_start_encounter(s, t["camp_id"], turn.id, attempt.id,
+                       [{"character_id": str(t["char_id"])}, {"npc_entity_id": str(t["beast"].id)}],
+                       map={"width": 10, "height": 10}, npc_d20=5)
+    with pytest.raises(AttackRollError) as exc:
+        _plan(t, "Longsword")
+    assert exc.value.code == "initiative_pending"
+
+
+def test_sheet_damage_with_its_type_written_in(table):
+    from app.combat.attacks import _weapon
+
+    sheet = table["s"].execute(select(Dnd5eCharacterSheet)).scalars().one()
+    sheet.weapons = [{"name": "Warhammer", "attack_bonus": 5, "damage": "1d8 + 3 Bludgeoning"}]
+    weapon = _weapon(sheet, "Warhammer")
+    assert (weapon.damage_dice, weapon.damage_type) == ("1d8+3", "bludgeoning")
+
+
+def test_drop_to_zero_counts_temp_hp_and_earlier_hits(table):
+    """One HP track across the turn's hits, with NPC temp HP stored as temp_hp."""
+    t, s = table, table["s"]
+    t["beast"].details = {**t["beast"].details, "hit_points": {"current": 10, "maximum": 10, "temp_hp": 6}}
+    s.commit()
+    turn, attempt = _submit(t)
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _attack(t), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [15], "modifier": 5, "total": 20})
+    execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _damage(t), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [8], "modifier": 3, "total": 11})
+    execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _attack(t, request_id="atk_2"), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [15], "modifier": 5, "total": 20})
+    execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _damage(t, "atk_2"), narrator="deterministic")
+    _, resumed = _fulfill(t, _only_pending(s, turn.id), {"source": "app", "raw_rolls": [3], "modifier": 3, "total": 6})
+    execute_dm_attempt(s, resumed.id, adjudicate=lambda p, f=None: _narrate("Two blows land."), narrator="deterministic")
+    snapshot = json.dumps(s.get(DmTurnAttempt, resumed.id).contract_snapshot)
+    # 11 → 6 temp absorbed, HP 5; then 6 → HP 0: only the second hit drops it.
+    assert snapshot.count("drops to 0 hit points") == 1
+    assert "takes 6 slashing damage from Longsword. Reef Horror drops to 0" in snapshot
+    assert _hp(t) == 0
+
+
+def test_eldritch_blast_rolls_one_beam_per_attack(table):
+    from app.combat.attacks import _weapon
+
+    sheet = table["s"].execute(select(Dnd5eCharacterSheet)).scalars().one()
+    sheet.level, sheet.spellcasting_ability, sheet.charisma = 5, "charisma", 16
+    assert _weapon(sheet, "Eldritch Blast").damage_dice == "1d10"  # beams are separate attacks
+    assert _weapon(sheet, "Fire Bolt").damage_dice == "2d10"  # single-roll cantrips scale dice
