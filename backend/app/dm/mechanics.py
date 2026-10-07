@@ -69,9 +69,18 @@ class MechanicIssue:
 
 
 @dataclass
+class Outcome:
+    """One code-resolved consequence the narrator must state."""
+
+    evidence_ref: str
+    target: EntityRef
+    text: str
+
+
+@dataclass
 class MechanicsResolution:
     effects: list[dict[str, Any]] = field(default_factory=list)
-    outcomes: list[tuple[MechanicIntent, str]] = field(default_factory=list)
+    outcomes: list[Outcome] = field(default_factory=list)
     issues: list[MechanicIssue] = field(default_factory=list)
 
 
@@ -214,8 +223,21 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
             resolution.issues.append(MechanicIssue(intent.id, exc.code, str(exc)))
             continue
         resolution.effects.append(effect)
-        resolution.outcomes.append((intent, outcome))
+        resolution.outcomes.append(Outcome(f"mechanic:{intent.id}", EntityRef(type=intent.target.type, id=intent.target.id), outcome))
     return resolution
+
+
+def resolve_attack_damage(db: Session, campaign: Any, turn: Any, resolution: MechanicsResolution) -> None:
+    """Add this turn's player-rolled attack damage (issue #234) to ``resolution``.
+
+    Applied however the DM's contract reads: the hit and the damage dice are
+    settled facts once the player rolled them.
+    """
+    from app.combat.attacks import attack_damage_effects
+
+    for effect, text, target in attack_damage_effects(db, campaign, turn):
+        resolution.effects.append(effect)
+        resolution.outcomes.append(Outcome(f"player_roll:{effect['id']}", target, text))
 
 
 def _overlay_stat_block(db: Session, campaign: Any, target: Any, monster_id: str, creature_type: str | None) -> None:
@@ -239,13 +261,13 @@ def with_outcome_beat(contract: DmTurnContractV1, resolution: MechanicsResolutio
             type="narration",
             claims=[
                 Claim(
-                    text=text,
+                    text=outcome.text,
                     claim_kind="world_fact",
-                    target_refs=[EntityRef(type=intent.target.type, id=intent.target.id)],
-                    evidence_refs=[f"mechanic:{intent.id}"],
+                    target_refs=[outcome.target],
+                    evidence_refs=[outcome.evidence_ref],
                     origin="resolver_evidence",
                 )
-                for intent, text in resolution.outcomes
+                for outcome in resolution.outcomes
             ],
         ))
     return contract.model_copy(update={"beats": beats})

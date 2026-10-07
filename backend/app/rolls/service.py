@@ -29,8 +29,10 @@ from models.dm import PlayerRollRequest
 
 logger = logging.getLogger(__name__)
 
-ROLL_KINDS = {"check", "save", "attack", "ability", "initiative", "other"}
+ROLL_KINDS = {"check", "save", "attack", "damage", "ability", "initiative", "other"}
 ADVANTAGE_STATES = {"normal", "advantage", "disadvantage"}
+# Issue #234 — set only by code (``app.combat.attacks`` plans), never the model.
+_ATTACK_FIELDS = ("target_kind", "target_id", "attack_name", "damage_dice", "attack_request_id")
 
 
 class RollLifecycleError(ValueError):
@@ -90,11 +92,17 @@ def _validate_request(db: Session, campaign_id: uuid.UUID, payload: dict) -> dic
             raise RollLifecycleError("dc_private must be an integer") from exc
         if not 1 <= dc <= 1000:
             raise RollLifecycleError("dc_private must be between 1 and 1000")
+    attack_fields = {name: payload.get(name) for name in _ATTACK_FIELDS if payload.get(name) is not None}
+    if kind == "attack" and not {"target_kind", "target_id", "attack_name"} <= attack_fields.keys():
+        raise RollLifecycleError("attack rolls require a code-planned target and attack")
+    if kind == "damage" and not {"attack_request_id", "damage_dice"} <= attack_fields.keys():
+        raise RollLifecycleError("damage rolls require a code-planned attack and dice")
     return {
         "request_key": key, "requested_user_id": requested_user_id, "character_id": character_id,
         "roll_kind": kind, "ability_or_skill": _text(payload, "ability_or_skill", 64),
         "label": _text(payload, "label", 120), "advantage_state": advantage,
         "reason_public": _text(payload, "reason_public", 600), "dc_private": dc,
+        **attack_fields,
     }
 
 
@@ -158,6 +166,8 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
         item = req.to_dict(include_private=True)
         fulfillment = get_fulfillment(db, req.id)
         item["fulfillment"] = fulfillment.to_dict(include_private=True) if fulfillment else None
+        if fulfillment is not None and fulfillment.resolution is not None:
+            item["fulfillment"]["resolution"] = fulfillment.resolution
         evidence.append(item)
     parent_attempt.status = "superseded"
     parent_attempt.invalidation_reason = "player_roll_input_available"
@@ -262,9 +272,24 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     metadata = payload.get("raw_metadata")
     if metadata is not None and not isinstance(metadata, dict):
         raise RollLifecycleError("raw_metadata must be an object")
+    resolution = None
+    if req.roll_kind in {"attack", "damage"}:
+        # Issue #234 — code resolves hit/miss against the target's AC and the
+        # damage against its defenses; the modifier is the sheet's, so a
+        # physical total-only roll is resolved with the code-owned bonus.
+        from app.combat.attacks import AttackRollError, resolve_attack_fulfillment, resolve_damage_fulfillment
+
+        resolve = resolve_attack_fulfillment if req.roll_kind == "attack" else resolve_damage_fulfillment
+        try:
+            modifier, resolution = resolve(
+                db, db.get(Campaign, req.campaign_id), req, raw_rolls=raw_rolls,
+                modifier=modifier if raw_rolls else None, total=total,
+            )
+        except AttackRollError as exc:
+            raise RollLifecycleError(str(exc)) from exc
     fulfillment = PlayerRollFulfillment(
         roll_request_id=req.id, submitted_by=actor_id, source=source, visibility=visibility,
-        raw_rolls=raw_rolls, modifier=modifier, total=total, raw_metadata=metadata,
+        raw_rolls=raw_rolls, modifier=modifier, total=total, raw_metadata=metadata, resolution=resolution,
     )
     db.add(fulfillment)
     req.status = "fulfilled"

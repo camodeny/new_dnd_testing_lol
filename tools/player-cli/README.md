@@ -110,11 +110,13 @@ dnd --profile alice end-turn 'encounter-uuid'
 ```
 
 The CLI generates d20 dice using cryptographic randomness, applies the request's
-advantage/disadvantage, and computes the total in code. `--modifier` is required:
-take it from the actual character sheet. Generic roll endpoints currently accept
-client-supplied modifiers; the CLI does not add authoritative sheet-modifier
-validation. Encounter initiative additionally validates the canonical modifier
-in the backend. Nonstandard `other` roll requests require clarification instead
+advantage/disadvantage, and computes the total in code. A `damage` request rolls
+its `damage_dice` (chosen by the backend from the hit's weapon, crits already
+doubled) and sums them. `--modifier` is required: take it from the actual
+character sheet. Check, save, and ability endpoints accept client-supplied
+modifiers; attack and damage rolls must use the sheet's attack bonus or damage
+modifier, and encounter initiative validates the canonical modifier, in the
+backend. Nonstandard `other` roll requests require clarification instead
 of a guessed die. `--visibility private` restricts the submitted roll result.
 
 Map geometry, participant control, movement budgets, and turn progression stay

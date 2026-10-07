@@ -62,3 +62,16 @@ it('only offers typed totals when the modifier is unknown', async () => {
   await act(async () => container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })))
   expect(JSON.parse(String(vi.mocked(apiFetch).mock.calls[0][1]?.body))).toEqual({ source: 'physical', total: 14 })
 })
+
+it('rolls a hit\'s damage dice and sums them', async () => {
+  vi.mocked(apiFetch).mockResolvedValueOnce({})
+  const damage = { ...roll, label: 'Longsword damage', advantage_state: 'normal', roll_kind: 'damage' }
+  const modifier = { modifier: 3, label: 'Longsword damage', dice: { count: 2, sides: 8 } }
+  await act(async () => root.render(<RollCard campaignId="c" roll={damage} modifier={modifier} refresh={refresh} />))
+  expect(container.textContent).toContain('Roll 2d8 and add +3 for Longsword damage.')
+  await act(async () => button('Roll for me').click())
+  const body = JSON.parse(String(vi.mocked(apiFetch).mock.calls[0][1]?.body))
+  expect(body.raw_rolls).toHaveLength(2)
+  for (const n of body.raw_rolls) expect(n >= 1 && n <= 8).toBe(true)
+  expect(body.total).toBe(body.raw_rolls[0] + body.raw_rolls[1] + 3)
+})

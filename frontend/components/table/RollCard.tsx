@@ -3,7 +3,7 @@
 import { useRef, useState } from 'react'
 import { apiFetch } from '@/lib/api'
 import type { PlayerRollForRealtime } from '@/lib/realtime'
-import { keptDie, rollD20s, rollDiceCount, rollInstructions, signed, type TableRollModifier } from '@/lib/table'
+import { keptDie, rollDice, rollDiceCount, rollInstructions, signed, type TableRollModifier } from '@/lib/table'
 
 interface RollCardProps {
   campaignId: string
@@ -17,7 +17,8 @@ type Command = { key: string; body: Record<string, unknown> }
 
 /**
  * A roll the AI DM asked this player for, in the conversation. "Roll for me"
- * rolls fair d20s on this device; "I rolled my own dice" takes a typed total.
+ * rolls fair dice on this device (d20s, or a hit's damage dice); "I rolled my
+ * own dice" takes a typed total.
  * Private DCs are never part of the projection, so nothing here can show one.
  */
 export default function RollCard({ campaignId, roll, modifier, refresh }: RollCardProps) {
@@ -48,13 +49,13 @@ export default function RollCard({ campaignId, roll, modifier, refresh }: RollCa
   const rollForMe = () => {
     if (pending || !modifier) return
     if (!appCommand.current) {
-      const rawRolls = rollD20s(rollDiceCount(roll.advantage_state))
+      // Damage dice are summed; a d20 roll keeps one die.
+      const { dice } = modifier
+      const rawRolls = dice ? rollDice(dice.count, dice.sides) : rollDice(rollDiceCount(roll.advantage_state), 20)
+      const rolled = dice ? rawRolls.reduce((sum, n) => sum + n, 0) : keptDie(rawRolls, roll.advantage_state)
       appCommand.current = {
         key: crypto.randomUUID(),
-        body: {
-          source: 'app', raw_rolls: rawRolls, modifier: modifier.modifier,
-          total: keptDie(rawRolls, roll.advantage_state) + modifier.modifier,
-        },
+        body: { source: 'app', raw_rolls: rawRolls, modifier: modifier.modifier, total: rolled + modifier.modifier },
       }
     }
     void send(appCommand.current)

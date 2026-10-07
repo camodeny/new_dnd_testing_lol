@@ -149,10 +149,15 @@ class DmTurnAttempt(Base):
         evidence = []
         for source in self.roll_evidence or []:
             item = dict(source)
-            item.pop("dc_private", None)
+            for key in ("dc_private", "target_kind", "target_id", "attack_request_id"):
+                item.pop(key, None)
             fulfillment = item.get("fulfillment")
             if isinstance(fulfillment, dict) and fulfillment.get("visibility") == "private":
                 item["fulfillment"] = {key: fulfillment.get(key) for key in ("id", "roll_request_id", "submitted_by", "source", "visibility", "submitted_at")}
+            elif isinstance(fulfillment, dict):
+                # Issue #234 — attack/damage resolution (mitigation labels,
+                # pre-mitigation totals) is DM evidence, never player-facing.
+                item["fulfillment"] = {k: v for k, v in fulfillment.items() if k != "resolution"}
             evidence.append(item)
         from app.adventures.service import player_staged_effects, redact_private_contract_snapshot
 
@@ -166,10 +171,11 @@ class PlayerRollRequest(Base):
     __table_args__ = (
         UniqueConstraint("turn_id", "request_key", name="uq_player_roll_requests_turn_key"),
         CheckConstraint("status IN ('pending','fulfilled','cancelled','replaced')", name="ck_player_roll_requests_status"),
-        CheckConstraint("roll_kind IN ('check','save','attack','ability','initiative','other')", name="ck_player_roll_requests_kind"),
+        CheckConstraint("roll_kind IN ('check','save','attack','damage','ability','initiative','other')", name="ck_player_roll_requests_kind"),
         CheckConstraint("advantage_state IN ('normal','advantage','disadvantage')", name="ck_player_roll_requests_advantage"),
         Index("ix_player_roll_requests_campaign_thread_status", "campaign_id", "thread_id", "status"),
         Index("ix_player_roll_requests_player_status", "requested_user_id", "status"),
+        Index("uq_player_roll_requests_attack_damage", "attack_request_id", unique=True),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True)
@@ -187,14 +193,25 @@ class PlayerRollRequest(Base):
     dc_private: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", index=True)
     replacement_of_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="SET NULL"), nullable=True)
+    # Issue #234 — attack rolls name their target (DM-only) and the sheet
+    # attack used; a damage roll links to its hit attack (one damage roll per
+    # attack) and carries the weapon's dice code, doubled on a critical hit.
+    target_kind: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    attack_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    damage_dice: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    attack_request_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="CASCADE", name="fk_player_roll_requests_attack_request"), nullable=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     def to_dict(self, *, include_private: bool = False):
-        value = {"id": str(self.id), "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "turn_id": str(self.turn_id), "attempt_id": str(self.attempt_id), "request_key": self.request_key, "requested_user_id": str(self.requested_user_id), "character_id": str(self.character_id), "roll_kind": self.roll_kind, "ability_or_skill": self.ability_or_skill, "label": self.label, "advantage_state": self.advantage_state, "reason_public": self.reason_public, "status": self.status, "replacement_of_id": str(self.replacement_of_id) if self.replacement_of_id else None, "requested_at": self.requested_at.isoformat() if self.requested_at else None, "fulfilled_at": self.fulfilled_at.isoformat() if self.fulfilled_at else None, "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None}
+        value = {"id": str(self.id), "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "turn_id": str(self.turn_id), "attempt_id": str(self.attempt_id), "request_key": self.request_key, "requested_user_id": str(self.requested_user_id), "character_id": str(self.character_id), "roll_kind": self.roll_kind, "ability_or_skill": self.ability_or_skill, "label": self.label, "advantage_state": self.advantage_state, "reason_public": self.reason_public, "status": self.status, "replacement_of_id": str(self.replacement_of_id) if self.replacement_of_id else None, "requested_at": self.requested_at.isoformat() if self.requested_at else None, "fulfilled_at": self.fulfilled_at.isoformat() if self.fulfilled_at else None, "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None, "attack_name": self.attack_name, "damage_dice": self.damage_dice}
         if include_private:
-            value["dc_private"] = self.dc_private
+            value.update(
+                dc_private=self.dc_private, target_kind=self.target_kind, target_id=self.target_id,
+                attack_request_id=str(self.attack_request_id) if self.attack_request_id else None,
+            )
         return value
 
 
@@ -210,6 +227,9 @@ class PlayerRollFulfillment(Base):
     modifier: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     total: Mapped[int] = mapped_column(Integer, nullable=False)
     raw_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Issue #234 — code-owned attack/damage resolution; DM-only (never AC).
+    # Never in to_dict: only DM roll evidence carries it.
+    resolution: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     def to_dict(self, *, include_private: bool = False):

@@ -107,8 +107,9 @@ def _skill_label(key: str) -> str:
 def roll_modifier(mechanics: Any, roll_kind: str, ability_or_skill: str) -> dict[str, Any] | None:
     """Authoritative d20 modifier for a requested roll, or None if unresolvable.
 
-    Attack/other rolls depend on the chosen weapon or effect, so they are
-    never resolved here; players enter those totals themselves.
+    Attack and damage rolls resolve from their code-planned weapon
+    (``app.combat.attacks.attack_roll_modifier``); "other" rolls are never
+    resolved, so players enter those totals themselves.
     """
     from app.rules.mechanics import _norm_ability, _norm_skill_name
 
@@ -161,7 +162,12 @@ def _own_character(db: Session, campaign: Campaign, viewer: uuid.UUID, sheet: An
     ).scalars().all()
     roll_modifiers = {}
     for req in pending:
-        resolved = roll_modifier(mechanics, req.roll_kind, req.ability_or_skill)
+        if req.roll_kind in {"attack", "damage"}:
+            from app.combat.attacks import attack_roll_modifier
+
+            resolved = attack_roll_modifier(sheet, req)
+        else:
+            resolved = roll_modifier(mechanics, req.roll_kind, req.ability_or_skill)
         if resolved is not None:
             roll_modifiers[str(req.id)] = resolved
     return {

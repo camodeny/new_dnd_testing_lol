@@ -721,6 +721,36 @@ def _resolve_roll_participants(db: Session, turn, contract):
     raise ValueError("await_roll requires a player-owned character to request the roll")
 
 
+def _attack_roll_fields(db: Session, turn, character_id, rr) -> dict:
+    """Issue #234 — code-owned target/weapon/dice for attack and damage rolls.
+
+    The validator already accepted the request; this re-derives the same
+    plan at persist time so the stored row never trusts model numbers.
+    """
+    from app.combat.attacks import plan_attack, plan_damage
+    from models.campaigns import Campaign
+
+    if rr.roll_kind == "attack":
+        plan = plan_attack(
+            db, db.get(Campaign, turn.campaign_id), character_id=character_id,
+            target_ref=rr.target_ref, attack_name=rr.attack_name, advantage_state=str(rr.advantage_state or "normal"),
+        )
+        return {
+            "target_kind": plan.target_kind, "target_id": plan.target_id, "attack_name": plan.attack_name,
+            "advantage_state": plan.advantage_state, "dc_private": None,
+        }
+    if rr.roll_kind == "damage":
+        from app.rolls.service import get_fulfillment
+
+        attack = plan_damage(db, turn_id=turn.id, character_id=character_id, attack_request_key=rr.attack_request_id)
+        return {
+            "attack_request_id": attack.id, "attack_name": attack.attack_name,
+            "damage_dice": get_fulfillment(db, attack.id).resolution["damage_dice"],
+            "advantage_state": "normal", "dc_private": None,
+        }
+    return {}
+
+
 def _complete_await_roll(db: Session, run: _Run, contract) -> NonNarratedResult:
     """Persist a player-owned roll request and leave the same turn open."""
     from app.rolls.service import request_rolls
@@ -739,6 +769,7 @@ def _complete_await_roll(db: Session, run: _Run, contract) -> NonNarratedResult:
         "reason_public": str(rr.reason_public),
         "dc_private": rr.dc_private,
     }
+    payload.update(_attack_roll_fields(db, turn, character_id, rr))
     rows = request_rolls(
         db, campaign_id=turn.campaign_id, turn_id=turn.id,
         attempt_id=attempt.id, requests=[payload],
@@ -768,9 +799,14 @@ def _complete_silent(db: Session, run: _Run, contract) -> NonNarratedResult:
     path (revision bump + completion event, timestamps, submission
     resolution) so consumed input is never re-adjudicated.
     """
+    from app.dm.mechanics import MechanicsResolution, resolve_attack_damage
     from app.dm.turns import commit_turn, stage_validated_attempt
+    from models.campaigns import Campaign
 
-    stage_validated_attempt(db, run.attempt_id, contract)
+    # Issue #234 — player-rolled damage applies even when the DM stays silent.
+    damage = MechanicsResolution()
+    resolve_attack_damage(db, db.get(Campaign, run.turn.campaign_id), run.turn, damage)
+    stage_validated_attempt(db, run.attempt_id, contract, code_built_effects=damage.effects)
     turn, attempt, event = commit_turn(db, run.turn_id, run.attempt_id, silent=True)
     structured_log(
         logger, logging.INFO, "dm_execute_silent",
