@@ -18,6 +18,7 @@ from app.characters.router import router as characters_router
 from app.combat.router import router as combat_router
 from app.dm.router import router as dm_router
 from app.health.router import APP_NAME, APP_VERSION, router as health_router
+from app.loot.router import router as loot_router
 from app.observability.router import router as observability_router
 from app.observability.tracing import TraceMiddleware
 from app.post_turn.router import router as post_turn_cron_router
@@ -63,6 +64,7 @@ def create_app() -> FastAPI:
     app.include_router(realtime_router)
     app.include_router(dm_router)
     app.include_router(rolls_router)
+    app.include_router(loot_router)
     app.include_router(rules_router)
     app.include_router(post_turn_cron_router)
 

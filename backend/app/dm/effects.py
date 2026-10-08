@@ -133,6 +133,10 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # an ended turn carry their own thread-scoped projection.
     "npc_end_turn": "dm_private",
     "consume_turn_resource": "dm_private",
+    # Loot boxes (#463) are owned by their character; the box's own
+    # audience scopes who sees it opened.
+    "award_loot_box": "dm_private",
+    "decline_loot": "dm_private",
 }
 
 #: Applied after every other effect of the commit: an NPC's actions this turn
@@ -765,6 +769,32 @@ def _handle_npc_end_turn(db: Session, campaign: Campaign, effect: dict[str, Any]
         raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
     outbox = db.info.setdefault(NPC_TURN_TRANSITIONS_KEY, {})
     outbox.setdefault(str(attempt.id), []).append({**transition, "encounter_id": str(encounter.id)})
+
+
+@register("award_loot_box")
+def _handle_award_loot_box(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Seal one loot box per recipient inside the turn-commit txn (issue #463).
+
+    Rarity ceilings, items per box, and the hook completion are code-owned
+    (:mod:`app.loot.service`); a replayed commit finds its boxes by key.
+    """
+    from app.loot.service import LootError, award_loot_boxes_inline
+
+    try:
+        award_loot_boxes_inline(db, campaign, turn, effect.get("arguments") or {}, _resolve_effect_key(attempt, effect))
+    except LootError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
+
+
+@register("decline_loot")
+def _handle_decline_loot(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Close an ended encounter's loot as declined (issue #463)."""
+    from app.loot.service import LootError, decline_loot_inline
+
+    try:
+        decline_loot_inline(db, campaign, turn, effect.get("arguments") or {})
+    except LootError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
 
 
 @register("apply_attack_damage")

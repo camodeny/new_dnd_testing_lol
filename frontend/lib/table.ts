@@ -56,6 +56,37 @@ export interface TableRollModifier {
   dice?: { count: number; sides: number }
 }
 
+export type LootRarity = 'common' | 'uncommon' | 'rare' | 'very_rare' | 'legendary'
+
+export interface TableItem {
+  name: string
+  quantity?: number
+  rarity?: LootRarity
+  kind?: string
+  description?: string
+}
+
+/** A loot box the AI DM awarded (#463): sealed shows its odds, opened its haul. */
+export interface TableLootBox {
+  id: string
+  title: string
+  status: 'sealed' | 'opened'
+  draws: number
+  pool_size: number
+  pool_rarities: Partial<Record<LootRarity, number>>
+  contents?: { items: TableItem[]; gp: number }
+}
+
+export interface TableInventory {
+  coins: { cp: number; sp: number; ep: number; gp: number; pp: number }
+  items: TableItem[]
+  loot_boxes: TableLootBox[]
+}
+
+export function rarityLabel(rarity: LootRarity | undefined): string {
+  return (rarity ?? 'common').replace('_', ' ')
+}
+
 export interface TableCharacter extends TablePartyMember {
   hp?: { current: number; max: number; temp: number }
   armor_class?: number
@@ -65,6 +96,7 @@ export interface TableCharacter extends TablePartyMember {
   skills?: TableSkill[]
   /** Server-derived modifiers for the viewer's pending rolls, by request id. */
   roll_modifiers?: Record<string, TableRollModifier>
+  inventory?: TableInventory
 }
 
 export interface TableScene {

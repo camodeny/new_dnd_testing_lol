@@ -120,6 +120,19 @@ def check_stat_block_assignment(
     return target.row, block
 
 
+def loot_issues(db: Session, campaign: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
+    """Refusals for the contract's ``award_loot_box`` / ``decline_loot`` effects (#463)."""
+    from app.loot.service import check_award, pending_hook
+
+    issues: list[MechanicIssue] = []
+    for effect in contract.staged_effects:
+        if effect.effect_type == "award_loot_box":
+            issues += [MechanicIssue(effect.id, "loot_refused", p) for p in check_award(db, campaign, effect.arguments)]
+        elif effect.effect_type == "decline_loot" and pending_hook(db, campaign.id, effect.arguments.get("encounter_id")) is None:
+            issues.append(MechanicIssue(effect.id, "no_pending_loot", "that encounter has no loot waiting to be awarded"))
+    return issues
+
+
 def stat_block_issues(db: Session, campaign: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
     """Refusals for the contract's ``assign_stat_block`` effects."""
     issues: list[MechanicIssue] = []

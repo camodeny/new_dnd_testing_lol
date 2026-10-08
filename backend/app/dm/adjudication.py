@@ -160,6 +160,15 @@ update_map_placement plus consume_turn_resource movement; a bonus action or
 reaction is consume_turn_resource. When the NPC is done for this turn, stage
 npc_end_turn with the encounter_id and its participant_id. Never act for a
 PC or end a PC's turn.
+LOOT: treasure comes as loot boxes. When the party earns loot (a won fight,
+a searched hoard, a quest reward), stage award_loot_box for the characters
+who get it: a title naming the find, and a pool of 6-20 items that fit the
+fiction, mostly common with a few rarer pieces, never above each
+character's max_rarity in loot. Code decides how many items each box gives
+and draws them when the player opens it; never narrate what is inside.
+difficulty's loot lists ended encounters awaiting loot: award a box with
+that encounter_id, or stage decline_loot with the reason when there is
+nothing to find.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

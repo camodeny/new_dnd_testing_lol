@@ -2,17 +2,20 @@
 
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
+import LootBoxCard from '@/components/table/LootBoxCard'
 import {
   conditionMeaning,
   healthText,
   healthy,
   isProjectionError,
+  rarityLabel,
   rechargeSentence,
   signed,
   statusSentence,
   type PanelTab,
   type ProjectionError,
   type TableCharacter,
+  type TableInventory,
   type TableJournal,
   type TablePartyMember,
   type TableShop,
@@ -31,7 +34,49 @@ function Unavailable() {
 
 // ── Character ──────────────────────────────────────────────────────────────
 
-function CharacterView({ character }: { character: TableCharacter | ProjectionError | null }) {
+function coinLine(coins: TableInventory['coins']): string | null {
+  const parts = (['pp', 'gp', 'ep', 'sp', 'cp'] as const)
+    .filter((k) => coins[k] > 0)
+    .map((k) => `${coins[k]} ${{ pp: 'platinum', gp: 'gold', ep: 'electrum', sp: 'silver', cp: 'copper' }[k]}`)
+  return parts.length ? parts.join(', ') : null
+}
+
+function InventoryView({ campaignId, inventory, refresh }: {
+  campaignId: string; inventory: TableInventory; refresh?: () => Promise<unknown>
+}) {
+  const sealed = inventory.loot_boxes.filter((b) => b.status === 'sealed')
+  const recent = inventory.loot_boxes.filter((b) => b.status === 'opened').slice(0, 2)
+  const coins = coinLine(inventory.coins)
+  return (
+    <>
+      {(sealed.length > 0 || recent.length > 0) && (
+        <section className="tv-section">
+          <h4>Loot</h4>
+          {[...sealed, ...recent].map((box) => <LootBoxCard key={box.id} campaignId={campaignId} box={box} refresh={refresh} />)}
+        </section>
+      )}
+      {(coins || inventory.items.length > 0) && (
+        <section className="tv-section">
+          <h4>What you carry</h4>
+          {coins && <p className="tv-plain">{coins}</p>}
+          {inventory.items.map((item, index) => (
+            <div className="tv-entry" key={`${item.name}-${index}`}>
+              <div className="tv-entry-top">
+                <b>{item.quantity && item.quantity > 1 ? `${item.quantity} × ` : ''}{item.name}</b>
+                {item.rarity && item.rarity !== 'common' && <span className={`tv-rarity-tag ${item.rarity}`}>{rarityLabel(item.rarity)}</span>}
+              </div>
+              {item.description && <p>{item.description}</p>}
+            </div>
+          ))}
+        </section>
+      )}
+    </>
+  )
+}
+
+function CharacterView({ campaignId, character, refresh }: {
+  campaignId: string; character: TableCharacter | ProjectionError | null; refresh?: () => Promise<unknown>
+}) {
   const [allSkills, setAllSkills] = useState(false)
   if (character === null) return <p className="tv-muted">You don’t have a character seated at this table.</p>
   if (isProjectionError(character) || character.error) return <Unavailable />
@@ -111,6 +156,7 @@ function CharacterView({ character }: { character: TableCharacter | ProjectionEr
           )}
         </section>
       )}
+      {character.inventory && <InventoryView campaignId={campaignId} inventory={character.inventory} refresh={refresh} />}
       <Link className="tv-link" href={`/characters/${character.character_id}`}>Open full character sheet</Link>
     </>
   )
@@ -249,10 +295,12 @@ interface SidePanelProps {
   shops: TableShop[]
   /** Prefill the composer from a panel action. */
   onSuggest: (text: string) => void
+  /** Reload the table projection (e.g. after opening a loot box). */
+  onRefresh?: () => Promise<unknown>
 }
 
 export default function SidePanel({
-  campaignId, userId, tabs, tab, onTab, onClose, character, party, journal, members, shops, onSuggest,
+  campaignId, userId, tabs, tab, onTab, onClose, character, party, journal, members, shops, onSuggest, onRefresh,
 }: SidePanelProps) {
   const shopFor = (t: PanelTab) => shops.find((shop) => `shop:${shop.entity_id}` === t) ?? null
   const activeShop = shopFor(tab)
@@ -317,7 +365,7 @@ export default function SidePanel({
         </button>
       </div>
       <div className="tv-view" role="tabpanel">
-        {tab === 'character' && <CharacterView character={character} />}
+        {tab === 'character' && <CharacterView campaignId={campaignId} character={character} refresh={onRefresh} />}
         {tab === 'journal' && <JournalView journal={journalData} fresh={fresh} />}
         {tab === 'party' && <PartyView party={party} members={members} />}
         {activeShop && <ShopView shop={activeShop} onSuggest={onSuggest} />}
