@@ -1,7 +1,7 @@
 """Loot boxes (issue #463).
 
 Revision ID: l463loot01
-Revises: a234attack01
+Revises: c261xp01
 
 The AI DM awards sealed boxes with a generated item pool; the character's
 player opens them and code draws the contents onto the sheet.
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision = "l463loot01"
-down_revision = "a234attack01"
+down_revision = "c261xp01"
 branch_labels = None
 depends_on = None
 
