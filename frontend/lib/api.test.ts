@@ -113,6 +113,7 @@ describe('exported API surface', () => {
       'characters',
       'funding',
       'gameplayThreads',
+      'playerNotes',
     ])
     expect(Object.keys(api.auth).sort()).toEqual(['getConfig', 'me'])
     expect(Object.keys(api.campaigns).sort()).toEqual([
@@ -164,6 +165,12 @@ describe('exported API surface', () => {
       'submit',
     ])
     expect(Object.keys(api.capacity)).toEqual(['getState'])
+    expect(Object.keys(api.playerNotes).sort()).toEqual([
+      'create',
+      'list',
+      'remove',
+      'update',
+    ])
     // Issue #256: member-safe funding projections only (Stripe-hosted
     // checkout; card data never touches this app).
     expect(Object.keys(api.funding).sort()).toEqual([

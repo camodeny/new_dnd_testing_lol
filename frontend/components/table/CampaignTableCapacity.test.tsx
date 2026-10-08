@@ -15,6 +15,7 @@ vi.mock('@/lib/api', () => ({
     getOrCreateDirect: vi.fn(),
     submit: vi.fn(),
   },
+  playerNotes: { list: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
 }))
 
 let container: HTMLDivElement

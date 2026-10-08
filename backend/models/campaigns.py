@@ -248,6 +248,44 @@ class CampaignLoreChatMessage(Base):
         return d
 
 
+class CampaignPlayerNote(Base):
+    """Private per-player scratch notes, one player's own journal.
+
+    Unlike the auto DM journal (WorldFact projections), these rows are
+    player-authored and visible only to their author — never to other
+    players, the campaign owner (unless same user), or the AI retrieval
+    paths. Scoped by (campaign, user), writable at any campaign status.
+    """
+
+    __tablename__ = "campaign_player_notes"
+    __table_args__ = (
+        Index("ix_player_notes_campaign_user", "campaign_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "user_id": str(self.user_id),
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class CampaignInvite(Base):
     """Shareable lobby invitation — issue #242.
 

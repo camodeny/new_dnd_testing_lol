@@ -334,6 +334,36 @@ export const funding = {
     ),
 }
 
+// ── Private player notes (own journal scratch space) ────────────────────
+
+export interface PlayerNote {
+  id: string
+  campaign_id: string
+  user_id: string
+  content: string
+  created_at: string | null
+  updated_at: string | null
+}
+
+export const playerNotes = {
+  list: (campaignId: string | number) =>
+    apiFetch<{ notes: PlayerNote[] }>(`/campaigns/${campaignId}/notes`),
+  create: (campaignId: string | number, content: string) =>
+    apiFetch<{ note: PlayerNote }>(`/campaigns/${campaignId}/notes`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
+  update: (campaignId: string | number, noteId: string, content: string) =>
+    apiFetch<{ note: PlayerNote }>(`/campaigns/${campaignId}/notes/${encodeURIComponent(noteId)}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ content }),
+    }),
+  remove: (campaignId: string | number, noteId: string) =>
+    apiFetch<{ deleted: string }>(`/campaigns/${campaignId}/notes/${encodeURIComponent(noteId)}`, {
+      method: 'DELETE',
+    }),
+}
+
 // ── Encounter maps ────────────────────────────────────────────────────────
 // No client API: the player's view of the active encounter and its map
 // arrives in the live-table snapshot's `table.encounter` projection.
