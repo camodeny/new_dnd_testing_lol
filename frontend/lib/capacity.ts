@@ -19,11 +19,12 @@ export interface CapacityStatePayload {
   ai_paused?: boolean
   grace_active?: boolean
   gate_reason?: string
-  funded_cents?: number
-  consumed_cents?: number
-  remaining_cents?: number
+  /** Ledger amounts are integer micro-USD (1e-6 USD). */
+  funded_micros?: number
+  consumed_micros?: number
+  remaining_micros?: number
   contributor_count?: number
-  overage_allowance_cents?: number
+  overage_allowance_micros?: number
 }
 
 /** Simple UI states. `low` is a quiet heads-up; `grace` means the table is

@@ -76,16 +76,16 @@ def test_single_player_allocation_and_spend():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=5_000_000,
                  idempotency_key="alloc-1")
     db.commit()
     run = _run(db, cost_usd=1.25, campaign_id=camp)
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
     db.commit()
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 500
-    assert summary["consumed_cents"] == 125  # actual run cost, not token counts
-    assert summary["remaining_cents"] == 375
+    assert summary["funded_micros"] == 5_000_000
+    assert summary["consumed_micros"] == 1_250_000  # actual run cost, not token counts
+    assert summary["remaining_micros"] == 3_750_000
     assert summary["percent_used"] == 25.0
     assert reconcile(db, camp) == []
     db.close()
@@ -97,20 +97,20 @@ def test_multiplayer_contributions_share_one_pool():
     factory = _factory()
     db = factory()
     camp, users = _seed(db, members=3)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=200,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=2_000_000,
                  idempotency_key="alloc-1", contributor_user_id=users[0])
-    record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=300,
+    record_entry(db, campaign_id=camp, entry_type="contribution", amount_micros=3_000_000,
                  idempotency_key="contrib-2", contributor_user_id=users[1])
-    record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=500,
+    record_entry(db, campaign_id=camp, entry_type="contribution", amount_micros=5_000_000,
                  idempotency_key="contrib-3", contributor_user_id=users[2])
     db.commit()
     run = _run(db, cost_usd=2.00, campaign_id=camp)
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
     db.commit()
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 1000
-    assert summary["consumed_cents"] == 200
-    assert summary["remaining_cents"] == 800
+    assert summary["funded_micros"] == 10_000_000
+    assert summary["consumed_micros"] == 2_000_000
+    assert summary["remaining_micros"] == 8_000_000
     assert summary["percent_used"] == 20.0
     assert len(summary["contributors"]) == 3
     # Gameplay authority untouched: owner still owns the campaign.
@@ -124,7 +124,7 @@ def test_recovery_runs_cannot_reduce_capacity():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     db.commit()
     recovery = _run(db, classification="recovery", billable=False, cost_usd=5.00,
@@ -139,8 +139,8 @@ def test_recovery_runs_cannot_reduce_capacity():
         record_ai_spend_for_run(db, campaign_id=camp, ai_run=sneaky)
     db.rollback()
     summary = get_capacity_summary(db, camp)
-    assert summary["consumed_cents"] == 0
-    assert summary["remaining_cents"] == 1000
+    assert summary["consumed_micros"] == 0
+    assert summary["remaining_micros"] == 10_000_000
     # Recovery cost tracked separately, still free.
     assert summary["recovery_cost_usd"] == pytest.approx(5.00)
     assert db.query(CampaignUsageEntry).count() == 1
@@ -153,7 +153,7 @@ def test_reprocessing_same_run_never_double_charges():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     db.commit()
     run = _run(db, cost_usd=1.00, campaign_id=camp)
@@ -165,18 +165,18 @@ def test_reprocessing_same_run_never_double_charges():
                                        idempotency_key=f"ai_spend:{run.id}")
     db.commit()
     assert again.id == first.id and explicit.id == first.id
-    assert get_capacity_summary(db, camp)["consumed_cents"] == 100
+    assert get_capacity_summary(db, camp)["consumed_micros"] == 1_000_000
     assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
     # Same idempotency key, same payload → same row (failed-write retry path).
-    same = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+    same = record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=5_000_000,
                         idempotency_key="alloc-retry")
     db.commit()
-    same_again = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+    same_again = record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=5_000_000,
                               idempotency_key="alloc-retry")
     assert same_again.id == same.id
     # Same key, conflicting payload → surfaced, not double-posted.
     with pytest.raises(LedgerConflictError):
-        record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=999,
+        record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=9_990_000,
                      idempotency_key="alloc-retry")
     db.rollback()
     db.close()
@@ -188,23 +188,23 @@ def test_recredit_and_refund_are_compensating_entries():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     run = _run(db, cost_usd=4.00, campaign_id=camp)
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
     db.commit()
     before = db.query(CampaignUsageEntry).count()
-    record_entry(db, campaign_id=camp, entry_type="refund", amount_cents=400,
+    record_entry(db, campaign_id=camp, entry_type="refund", amount_micros=4_000_000,
                  idempotency_key="refund-1", note="double-charge goodwill")
-    record_entry(db, campaign_id=camp, entry_type="recredit", amount_cents=100,
+    record_entry(db, campaign_id=camp, entry_type="recredit", amount_micros=1_000_000,
                  idempotency_key="recredit-1")
     db.commit()
     # History grew; nothing was edited or deleted.
     assert db.query(CampaignUsageEntry).count() == before + 2
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 1500
-    assert summary["consumed_cents"] == 400
-    assert summary["remaining_cents"] == 1100
+    assert summary["funded_micros"] == 15_000_000
+    assert summary["consumed_micros"] == 4_000_000
+    assert summary["remaining_micros"] == 11_000_000
     db.close()
 
 
@@ -214,19 +214,19 @@ def test_admin_adjustment_signed_correction():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     db.commit()
-    record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_cents=-150,
+    record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_micros=-1_500_000,
                  idempotency_key="adj-1", note="over-grant correction")
-    record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_cents=50,
+    record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_micros=500_000,
                  idempotency_key="adj-2", note="goodwill")
     db.commit()
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 900
-    assert summary["remaining_cents"] == 900
+    assert summary["funded_micros"] == 9_000_000
+    assert summary["remaining_micros"] == 9_000_000
     with pytest.raises(AccountingError):
-        record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_cents=0,
+        record_entry(db, campaign_id=camp, entry_type="admin_adjustment", amount_micros=0,
                      idempotency_key="adj-zero")
     db.rollback()
     db.close()
@@ -238,19 +238,19 @@ def test_percentage_from_ledger_with_grace_and_added_funds():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=400,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=4_000_000,
                  idempotency_key="alloc-1")
-    record_entry(db, campaign_id=camp, entry_type="added_funds", amount_cents=400,
+    record_entry(db, campaign_id=camp, entry_type="added_funds", amount_micros=4_000_000,
                  idempotency_key="funds-1")
-    record_entry(db, campaign_id=camp, entry_type="grace", amount_cents=200,
+    record_entry(db, campaign_id=camp, entry_type="grace", amount_micros=2_000_000,
                  idempotency_key="grace-1")
     db.commit()
     run = _run(db, cost_usd=2.50, campaign_id=camp)
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
     db.commit()
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 1000
-    assert summary["consumed_cents"] == 250
+    assert summary["funded_micros"] == 10_000_000
+    assert summary["consumed_micros"] == 2_500_000
     assert summary["percent_used"] == 25.0
     # Empty ledger edge: nothing funded, nothing spent → 0%.
     camp2, _ = _seed(db)
@@ -261,8 +261,8 @@ def test_percentage_from_ledger_with_grace_and_added_funds():
     assert get_capacity_summary(db, camp2)["percent_used"] == 100.0
     # Public projection is aggregates only.
     public = public_capacity(db, camp)
-    assert set(public) == {"campaign_id", "funded_cents", "consumed_cents",
-                           "remaining_cents", "percent_used", "contributor_count"}
+    assert set(public) == {"campaign_id", "funded_micros", "consumed_micros",
+                           "remaining_micros", "percent_used", "contributor_count"}
     db.close()
 
 
@@ -272,7 +272,7 @@ def test_ambiguous_cost_surfaced_and_gameplay_untouched():
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     db.commit()
     name_before = db.get(Campaign, camp).name
@@ -289,7 +289,7 @@ def test_ambiguous_cost_surfaced_and_gameplay_untouched():
     db.commit()
     entry = record_ai_spend_for_run(db, campaign_id=camp, ai_run=bad)
     db.commit()
-    assert entry.amount_cents == -75
+    assert entry.amount_micros == -750_000
     assert record_ai_spend_for_run(db, campaign_id=camp, ai_run=bad).id == entry.id
     # Reconcile flags the earlier gap style: uncharged billable run.
     run2 = _run(db, cost_usd=1.00, campaign_id=camp)
@@ -315,10 +315,10 @@ def test_billing_state_not_in_dm_or_rules_inputs():
     db = factory()
     camp, _ = _seed(db)
     with pytest.raises(AccountingError):
-        record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=-5,
+        record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=-50_000,
                      idempotency_key="bad-sign")
     with pytest.raises(AccountingError):
-        record_entry(db, campaign_id=camp, entry_type="unsupported", amount_cents=10,
+        record_entry(db, campaign_id=camp, entry_type="unsupported", amount_micros=100_000,
                      idempotency_key="unknown-type")
     db.rollback()
     db.close()
@@ -341,7 +341,7 @@ def test_raw_ai_spend_rejected_and_cross_campaign_charge_refused():
     run = _run(db, cost_usd=1.00, campaign_id=camp)
     db.commit()  # durable run + trace before the refused charge attempts
     with pytest.raises(AccountingError):
-        record_entry(db, campaign_id=camp, entry_type="ai_spend", amount_cents=-100,
+        record_entry(db, campaign_id=camp, entry_type="ai_spend", amount_micros=-1_000_000,
                      idempotency_key="raw-spend", ai_run_id=run.id)
     db.rollback()
     # A run cannot be charged to a different campaign than its trace.
@@ -356,7 +356,7 @@ def test_raw_ai_spend_rejected_and_cross_campaign_charge_refused():
     assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 0
     # The correctly attributed charge still works.
     entry = record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
-    assert entry.amount_cents == -100
+    assert entry.amount_micros == -1_000_000
     db.close()
 
 
@@ -367,23 +367,23 @@ def test_uniqueness_conflict_returns_matching_winner_without_poisoning_session()
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
-    first = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+    first = record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=5_000_000,
                          idempotency_key="race-1")
     db.commit()
     # Bypass the precheck to simulate a lost update race: the insert hits the
     # unique constraint, the savepoint rolls back, and the matching winner is
     # returned — the session must stay usable afterwards.
-    winner = _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=500,
+    winner = _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=5_000_000,
                            idempotency_key="race-1")
     assert winner.id == first.id
     assert db.query(CampaignUsageEntry).filter_by(idempotency_key="race-1").count() == 1
     # Session usable: a fresh key still writes.
-    second = record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=100,
+    second = record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=1_000_000,
                           idempotency_key="race-2")
     assert second.id != first.id
     # Same key, conflicting payload → surfaced, never silent replay.
     with pytest.raises(LedgerConflictError):
-        _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=999,
+        _insert_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=9_990_000,
                       idempotency_key="race-1")
     db.rollback()
     db.close()
@@ -395,16 +395,16 @@ def test_contributor_mismatch_and_zero_cost_collision_are_conflicts():
     factory = _factory()
     db = factory()
     camp, users = _seed(db, members=2)
-    record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=300,
+    record_entry(db, campaign_id=camp, entry_type="contribution", amount_micros=3_000_000,
                  idempotency_key="contrib-1", contributor_user_id=users[0])
     db.commit()
     # Same key, same amount, different contributor → conflict, not replay.
     with pytest.raises(LedgerConflictError):
-        record_entry(db, campaign_id=camp, entry_type="contribution", amount_cents=300,
+        record_entry(db, campaign_id=camp, entry_type="contribution", amount_micros=3_000_000,
                      idempotency_key="contrib-1", contributor_user_id=users[1])
     db.rollback()
     # Zero-cost spend colliding with an existing non-spend key → conflict.
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="ai_spend:zero-run")
     db.commit()
     free = _run(db, cost_usd=0.0, campaign_id=camp)
@@ -415,7 +415,7 @@ def test_contributor_mismatch_and_zero_cost_collision_are_conflicts():
     db.rollback()
     # Genuine zero-cost marker under its own key still records exactly once.
     marker = record_ai_spend_for_run(db, campaign_id=camp, ai_run=free)
-    assert marker.amount_cents == 0
+    assert marker.amount_micros == 0
     assert record_ai_spend_for_run(db, campaign_id=camp, ai_run=free).id == marker.id
     db.close()
 
@@ -442,7 +442,7 @@ def test_finish_ai_run_charges_primary_run_exactly_once():
     db = factory()
     entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
     assert len(entries) == 1
-    assert entries[0].amount_cents == -125
+    assert entries[0].amount_micros == -1_250_000
     assert str(entries[0].ai_run_id) == str(run.id)
     assert reconcile(db, camp) == []
     db.close()
@@ -469,7 +469,7 @@ def test_reconcile_flags_none_cost_spend_even_at_zero_amount():
     db = factory()
     camp, _ = _seed(db)
     run = _run(db, cost_usd=None, campaign_id=camp)  # succeeded primary, no cost
-    db.add(CampaignUsageEntry(campaign_id=camp, entry_type="ai_spend", amount_cents=0,
+    db.add(CampaignUsageEntry(campaign_id=camp, entry_type="ai_spend", amount_micros=0,
                              ai_run_id=run.id, idempotency_key=f"ai_spend:{run.id}"))
     db.commit()
     errors = reconcile(db, camp)
@@ -477,20 +477,71 @@ def test_reconcile_flags_none_cost_spend_even_at_zero_amount():
     db.close()
 
 
-# ── 15. canonical pricing: usage + env config → USD ─────────────────────────
+# ── 15. canonical pricing: usage + pinned per-model prices → USD ────────────
 
-def test_cost_usd_for_uses_configured_pricing(monkeypatch):
+def test_cost_usd_for_uses_pinned_model_prices(monkeypatch):
     from app.billing import config
-    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
-    monkeypatch.setattr(config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    monkeypatch.setattr(config, "MODEL_PRICES_PER_MTOK_USD", {("p", "m"): (2.0, 2.0, 8.0)})
     assert config.cost_usd_for("p", "m", {"prompt_tokens": 1_000_000,
                                          "completion_tokens": 500_000}) == 6.0
     assert config.tokens_from_usage({"prompt_tokens": 10, "completion_tokens": 5}) == (10, 5)
-    # Unknown usage or unpriced model → None (ambiguous, never zero-guessed).
+    # Unknown usage or unpriced provider/model → None (ambiguous, never zero-guessed).
     assert config.cost_usd_for("p", "m", {}) is None
     assert config.cost_usd_for("p", "m", None) is None
-    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", None)
-    assert config.cost_usd_for("p", "m", {"prompt_tokens": 100}) is None
+    assert config.cost_usd_for("other", "m", {"prompt_tokens": 100}) is None
+    assert config.cost_usd_for("p", "other", {"prompt_tokens": 100}) is None
+
+
+def test_every_pinned_area_model_is_priced():
+    from app.billing import config
+    from app.providers.areas import AREA_CONFIG
+    usage = {"prompt_tokens": 8_000, "completion_tokens": 1_000}
+    for area, (provider, model) in AREA_CONFIG.items():
+        cost = config.cost_usd_for(provider, model, usage)
+        assert cost is not None and cost > 0, f"{area}: {provider}/{model} is unpriced"
+
+
+def test_live_model_prices():
+    from app.billing import config
+    per_mtok = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+    assert config.cost_usd_for("openai", "gpt-6-luna", per_mtok) == pytest.approx(0.60)
+    assert config.cost_usd_for(
+        "meta", "muse-spark-1.3-contributor", per_mtok) == pytest.approx(0.30)
+
+
+def test_cached_input_tokens_bill_at_cached_rate():
+    from app.billing import config
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 0,
+             "prompt_tokens_details": {"cached_tokens": 800_000}}
+    # 200k uncached at $0.10 + 800k cached at $0.01 per 1M.
+    assert config.cost_usd_for("openai", "gpt-6-luna", usage) == pytest.approx(0.028)
+    responses_shape = {"input_tokens": 1_000_000, "output_tokens": 0,
+                       "input_tokens_details": {"cached_tokens": 800_000}}
+    assert config.cost_usd_for("openai", "gpt-6-luna", responses_shape) == pytest.approx(0.028)
+    # A cached count above the input count is clamped, never negative.
+    over = {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 500}}
+    assert config.cost_usd_for("openai", "gpt-6-luna", over) == pytest.approx(100 * 0.01 / 1_000_000)
+
+
+def test_sub_cent_runs_still_consume_capacity():
+    # A real turn costs a fraction of a cent (8k in / 1k out on gpt-6-luna is
+    # $0.0013); whole-cent rounding would make every one of them free.
+    from app.billing import config
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=1_000_000,
+                 idempotency_key="alloc-sub-cent")
+    cost = config.cost_usd_for("openai", "gpt-6-luna",
+                               {"prompt_tokens": 8_000, "completion_tokens": 1_000})
+    for _ in range(3):
+        record_ai_spend_for_run(db, campaign_id=camp, ai_run=_run(db, cost_usd=cost, campaign_id=camp))
+    db.commit()
+    summary = get_capacity_summary(db, camp)
+    assert summary["consumed_micros"] == 3 * 1_300
+    assert summary["remaining_micros"] == 1_000_000 - 3 * 1_300
+    assert reconcile(db, camp) == []
+    db.close()
 
 
 # ── 16. production narration: streamed usage is charged exactly once ────────
@@ -503,8 +554,7 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
     from app.providers import registry as reg
     from app.providers.contracts import NormalizedStreamEvent
 
-    monkeypatch.setattr(billing_config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
-    monkeypatch.setattr(billing_config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD", {("p1", "m"): (2.0, 2.0, 8.0)})
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)
@@ -531,7 +581,7 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
     entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
     assert len(entries) == 1
     # Actual streamed cost: 2.0 * 1M input + 8.0 * 0.5M output = $6.00.
-    assert entries[0].amount_cents == -600
+    assert entries[0].amount_micros == -6_000_000
     assert reconcile(db, camp) == []
 
     # Recovery narration finalizes observability with no spend entry.

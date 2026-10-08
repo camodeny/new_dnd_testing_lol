@@ -32,6 +32,7 @@ from models.world import CampaignClock  # noqa: E402
 
 from app.billing.ledger import (  # noqa: E402
     NonBillableRunError,
+    cents_to_micros,
     get_capacity_summary,
     record_ai_spend_for_run,
     record_entry,
@@ -81,7 +82,7 @@ def _setup():
 
 def _fund(db, camp, cents, key="alloc-1", entry_type="allocation"):
     record_entry(db, campaign_id=camp, entry_type=entry_type,
-                 amount_cents=cents, idempotency_key=key)
+                 amount_micros=cents_to_micros(cents), idempotency_key=key)
     db.commit()
 
 
@@ -168,7 +169,7 @@ def test_accepted_resolution_completes_past_100():
     # Cost crosses 100% mid-resolution (owed work already accepted).
     db = Fac()
     _spend(db, cid, 1.50, tag="cross1")
-    assert get_capacity_summary(db, cid)["remaining_cents"] == -50
+    assert get_capacity_summary(db, cid)["remaining_micros"] == -500_000
     # New work is now blocked …
     assert evaluate_new_work(db, cid, tid)["allowed"] is False
     # … but the owed turn still streams and commits completely.
@@ -238,7 +239,7 @@ def test_required_post_turn_after_threshold():
     db.commit()
     mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
     commit_turn(db, turn.id, attempt.id)
-    assert get_capacity_summary(db, cid)["remaining_cents"] == 50
+    assert get_capacity_summary(db, cid)["remaining_micros"] == 500_000
     # Exhaust, then prove the owed post-turn range still consolidates.
     _spend(db, cid, 5.00, tag="cross3")
     db = Fac()
@@ -270,12 +271,12 @@ def test_high_intensity_grace(monkeypatch):
     commit_turn(db, turn.id, attempt.id)
     _spend(db, cid, 10.00, tag="topline")  # consumed == funded exactly
     db = Fac()
-    assert get_capacity_summary(db, cid)["remaining_cents"] == 0
+    assert get_capacity_summary(db, cid)["remaining_micros"] == 0
     # Rapid follow-up: bounded grace allows the next obligation.
     fast = evaluate_new_work(db, cid, tid)
     assert fast["allowed"] is True and fast["grace_active"] is True
     assert fast["reason"] == "high_intensity_grace"
-    assert fast["overage_allowance_cents"] == 100  # 10% of 1000
+    assert fast["overage_allowance_micros"] == 1_000_000  # 10% of 1000
     assert is_high_intensity(db, cid, tid) is True
     # Slow follow-up: same ledger, no grace — new work pauses.
     slow = evaluate_new_work(db, cid, tid, now=datetime.now(timezone.utc) + timedelta(hours=1))
@@ -327,7 +328,7 @@ def test_non_ai_access_usable_while_paused():
     # (any member can read it, including members outside private threads).
     state = capacity_state_payload(db, cid)
     assert state["ai_paused"] is True
-    assert set(state) >= {"funded_cents", "consumed_cents", "remaining_cents",
+    assert set(state) >= {"funded_micros", "consumed_micros", "remaining_micros",
                           "percent_used", "contributor_count", "ai_paused",
                           "grace_active", "gate_reason"}
     assert "owed" not in state and "has_owed_work" not in state
@@ -335,7 +336,7 @@ def test_non_ai_access_usable_while_paused():
     assert "idempotency_key" not in str(state)
     rows = list_submissions(db, cid, thread_id=tid)
     assert any(r["id"] == str(sub.id) for r in rows)
-    assert get_capacity_summary(db, cid)["remaining_cents"] < 0
+    assert get_capacity_summary(db, cid)["remaining_micros"] < 0
     db.close()
 
 
@@ -413,7 +414,7 @@ def test_duplicate_evaluation_grants_nothing_twice(monkeypatch):
     first = evaluate_new_work(db, cid, tid)
     second = evaluate_new_work(db, cid, tid)
     assert first["allowed"] is True and second["allowed"] is True
-    assert first["overage_allowance_cents"] == second["overage_allowance_cents"] == 100
+    assert first["overage_allowance_micros"] == second["overage_allowance_micros"] == 1_000_000
     after = db.execute(select(func.count()).select_from(CampaignUsageEntry)
                        .where(CampaignUsageEntry.campaign_id == cid)).scalar()
     assert after == before  # read-only gate: no grace rows minted, no duplicates possible
@@ -484,8 +485,8 @@ def test_owed_retry_is_non_billable_recovery():
     with pytest.raises(NonBillableRunError):
         record_ai_spend_for_run(db, campaign_id=cid, ai_run=recovery)
     db.rollback()
-    assert get_capacity_summary(db, cid)["consumed_cents"] == 0
-    assert get_capacity_summary(db, cid)["remaining_cents"] == 1000
+    assert get_capacity_summary(db, cid)["consumed_micros"] == 0
+    assert get_capacity_summary(db, cid)["remaining_micros"] == 10_000_000
     db.close()
 
 
@@ -497,14 +498,14 @@ def test_decisions_carry_observability_and_no_narrative():
     _fund(db, cid, 1000)
     open_decision = evaluate_new_work(db, cid, tid)
     assert set(open_decision) == {
-        "funded_cents", "consumed_cents", "remaining_cents", "percent_used",
-        "overage_allowance_cents", "grace_cadence_seconds", "grace_overage_pct",
+        "funded_micros", "consumed_micros", "remaining_micros", "percent_used",
+        "overage_allowance_micros", "grace_cadence_seconds", "grace_overage_pct",
         "allowed", "reason", "ai_paused", "grace_active",
     }
     _spend(db, cid, 10.00, tag="obs1")
     paused = evaluate_new_work(db, cid, tid)
-    assert paused["funded_cents"] == 1000 and paused["consumed_cents"] == 1000
-    assert paused["remaining_cents"] == 0
+    assert paused["funded_micros"] == 10_000_000 and paused["consumed_micros"] == 10_000_000
+    assert paused["remaining_micros"] == 0
     # Cost/timing/entitlement aggregates only — never narrative content.
     blob = str(open_decision) + str(paused)
     for banned in ("raw_content", "narration", "prompt", "backstory", "segment"):
@@ -519,10 +520,10 @@ def test_grace_config_is_policy_not_story(monkeypatch):
     monkeypatch.setenv("RESOLUTION_GRACE_OVERAGE_PCT", "-5")
     assert guarantee.grace_cadence_seconds() == 120.0  # safe default on bad config
     assert guarantee.grace_overage_pct() == 0.0  # clamped, never negative
-    assert guarantee.grace_overage_cents(1000) == 0
+    assert guarantee.grace_overage_micros(10_000_000) == 0
     monkeypatch.setenv("RESOLUTION_GRACE_OVERAGE_PCT", "10")
-    assert guarantee.grace_overage_cents(1000) == 100
-    assert guarantee.grace_overage_cents(0) == 0  # no funding → no overage
+    assert guarantee.grace_overage_micros(10_000_000) == 1_000_000
+    assert guarantee.grace_overage_micros(0) == 0  # no funding → no overage
 
 
 # ── 15. paused awaiting-roll refuses new submissions ─────────────────────────
@@ -633,7 +634,7 @@ def paused_direct_api(monkeypatch):
         ])
         db.commit()
         record_entry(db, campaign_id=campaign_id, entry_type="allocation",
-                     amount_cents=100, idempotency_key="direct-fund-1")
+                     amount_micros=1_000_000, idempotency_key="direct-fund-1")
         db.commit()
     # Exhaust capacity with no DM response yet → AI-paused, no grace.
     with factory() as db:
@@ -769,7 +770,7 @@ def open_api(monkeypatch):
         ])
         db.commit()
         record_entry(db, campaign_id=campaign_id, entry_type="allocation",
-                     amount_cents=100, idempotency_key="replay-fund-1")
+                     amount_micros=1_000_000, idempotency_key="replay-fund-1")
         db.commit()
 
     def override_db():

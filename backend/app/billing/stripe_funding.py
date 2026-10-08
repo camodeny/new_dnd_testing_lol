@@ -472,7 +472,7 @@ def confirm_funding_operation(
         db,
         campaign_id=operation.campaign_id,
         entry_type="added_funds",
-        amount_cents=operation.amount_cents,
+        amount_micros=_ledger.cents_to_micros(operation.amount_cents),
         idempotency_key=key,
         contributor_user_id=operation.contributor_user_id,
         note="Stripe-confirmed campaign funds",
@@ -873,15 +873,15 @@ def _refund_items(obj: dict[str, Any]) -> tuple[list[tuple[str, int, str | None,
     return items, payment_intent_id
 
 
-def _mirrored_refund_total_cents(db: Session, operation: CampaignFundingOperation) -> int:
-    """Cumulative already-mirrored refund cents for one funding operation."""
+def _mirrored_refund_total_micros(db: Session, operation: CampaignFundingOperation) -> int:
+    """Cumulative already-mirrored refund micro-USD for one funding operation."""
     from models.usage import CampaignUsageEntry
 
     candidates = db.scalars(
         select(CampaignUsageEntry).where(
             CampaignUsageEntry.campaign_id == operation.campaign_id,
             CampaignUsageEntry.entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT,
-            CampaignUsageEntry.amount_cents < 0,
+            CampaignUsageEntry.amount_micros < 0,
         )
     ).all()
     total = 0
@@ -889,7 +889,7 @@ def _mirrored_refund_total_cents(db: Session, operation: CampaignFundingOperatio
         metadata = entry.entry_metadata or {}
         if (str(metadata.get("funding_operation_id") or "") == str(operation.id)
                 and metadata.get("stripe_refund_id")):
-            total += abs(int(entry.amount_cents))
+            total += abs(int(entry.amount_micros))
     return total
 
 
@@ -935,7 +935,8 @@ def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: d
         raise FundingValidationError("stripe refund event carries no refund identifier")
     from models.usage import CampaignUsageEntry
 
-    mirrored_total = _mirrored_refund_total_cents(db, operation)
+    mirrored_total = _mirrored_refund_total_micros(db, operation)
+    funded_micros = _ledger.cents_to_micros(operation.amount_cents)
     mirrored_new = 0
     replayed = 0
     for refund_id, refund_amount, refund_currency, moves_money in items:
@@ -960,7 +961,8 @@ def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: d
                          stripe_event_id=event_id, stripe_refund_id=refund_id)
             replayed += 1
             continue
-        if mirrored_total + refund_amount > operation.amount_cents:
+        refund_micros = _ledger.cents_to_micros(refund_amount)
+        if mirrored_total + refund_micros > funded_micros:
             _funding_log(logging.WARNING, "funding.reconciliation_failed", operation,
                          stripe_event_id=event_id, detail="refund_exceeds_funding")
             raise FundingValidationError(
@@ -970,7 +972,7 @@ def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: d
             db,
             campaign_id=operation.campaign_id,
             entry_type=ENTRY_TYPE_ADMIN_ADJUSTMENT,
-            amount_cents=-refund_amount,
+            amount_micros=-refund_micros,
             idempotency_key=key,
             contributor_user_id=operation.contributor_user_id,
             note="Stripe refund mirrored: funds returned to payer",
@@ -981,7 +983,7 @@ def _mirror_stripe_refund(db: Session, *, event_id: str, event_type: str, obj: d
             },
         )
         db.flush()
-        mirrored_total += refund_amount
+        mirrored_total += refund_micros
         mirrored_new += 1
         _funding_log(logging.INFO, "funding.refund_mirrored", operation,
                      stripe_event_id=event_id, stripe_refund_id=refund_id,
@@ -1078,7 +1080,7 @@ def recredit_failed_run(
         raise _ledger.LedgerConflictError(
             f"run {ai_run_id} was already re-credited (entry {duplicate.id}): refusing a second re-credit"
         )
-    amount = abs(int(spend.amount_cents))
+    amount = abs(int(spend.amount_micros))
     if amount <= 0:
         raise FundingValidationError(f"run {ai_run_id} counted no spend: nothing to re-credit")
     key = (idempotency_key or f"recredit:{ai_run_id}").strip()
@@ -1090,7 +1092,7 @@ def recredit_failed_run(
         db,
         campaign_id=campaign_id,
         entry_type=ENTRY_TYPE_RECREDIT,
-        amount_cents=amount,
+        amount_micros=amount,
         idempotency_key=key,
         contributor_user_id=actor_user_id,
         note=note or f"Re-credit for {reason} AI run",
@@ -1104,5 +1106,5 @@ def recredit_failed_run(
     db.flush()
     _funding_log(logging.INFO, "funding.recredit", campaign_id=str(campaign_id),
                  ai_run_id=str(ai_run_id), recredit_entry_id=str(entry.id),
-                 amount_cents=amount, failure_reason=reason)
+                 amount_micros=amount, failure_reason=reason)
     return entry

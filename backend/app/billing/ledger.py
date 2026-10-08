@@ -3,7 +3,7 @@
 Deterministic accounting authority (code-owned, never delegated to a model):
 
 - Capacity derives from ledger entries + actual primary AI-run cost
-  (``AIRun.cost_usd`` → cents), never message/token counts.
+  (``AIRun.cost_usd`` → integer micro-USD), never message/token counts.
 - Recovery / non-billable runs are excluded: attempting to charge one
   raises :class:`NonBillableRunError` and writes nothing.
 - Each primary billable run maps to exactly one ``ai_spend`` entry
@@ -51,6 +51,8 @@ from sqlalchemy.orm import Session
 from models.reliability import AIRun, OperationTrace
 from models.usage import (
     ENTRY_TYPES,
+    MICROS_PER_CENT,
+    MICROS_PER_USD,
     FUNDED_CREDIT_TYPES,
     ENTRY_TYPE_ADMIN_ADJUSTMENT,
     ENTRY_TYPE_AI_SPEND,
@@ -83,31 +85,36 @@ _POSITIVE_TYPES = FUNDED_CREDIT_TYPES
 _AMOUNT_RULES = "positive-funding / negative-spend / nonzero-admin"
 
 
-def usd_to_cents(cost_usd: float | Decimal | None) -> int:
-    """Convert an AI-run USD cost to integer cents (half-up)."""
+def cents_to_micros(cents: int) -> int:
+    """Convert integer cents (payments boundary) to ledger micro-USD exactly."""
+    return int(cents) * MICROS_PER_CENT
+
+
+def usd_to_micros(cost_usd: float | Decimal | None) -> int:
+    """Convert an AI-run USD cost to integer micro-USD (half-up)."""
     if cost_usd is None:
         raise AmbiguousCostError("primary billable run has no cost_usd; refusing to guess zero")
     try:
-        cents = int((Decimal(str(cost_usd)) * 100).to_integral_value(rounding=ROUND_HALF_UP))
+        micros = int((Decimal(str(cost_usd)) * MICROS_PER_USD).to_integral_value(rounding=ROUND_HALF_UP))
     except Exception as exc:
         raise AmbiguousCostError(f"unusable cost_usd {cost_usd!r}: {exc}") from exc
-    if cents < 0:
+    if micros < 0:
         raise AmbiguousCostError(f"negative cost_usd {cost_usd!r} is ambiguous")
-    return cents
+    return micros
 
 
-def _validate_amount(entry_type: str, amount_cents: int) -> None:
+def _validate_amount(entry_type: str, amount_micros: int) -> None:
     if entry_type not in ENTRY_TYPES:
         raise AccountingError(f"unknown entry_type: {entry_type}")
     if entry_type in _POSITIVE_TYPES:
-        if amount_cents <= 0:
-            raise AccountingError(f"{entry_type} requires amount_cents > 0, got {amount_cents}")
+        if amount_micros <= 0:
+            raise AccountingError(f"{entry_type} requires amount_micros > 0, got {amount_micros}")
     elif entry_type == ENTRY_TYPE_AI_SPEND:
-        if amount_cents >= 0:
-            raise AccountingError(f"ai_spend requires amount_cents < 0, got {amount_cents}")
+        if amount_micros >= 0:
+            raise AccountingError(f"ai_spend requires amount_micros < 0, got {amount_micros}")
     elif entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT:
-        if amount_cents == 0:
-            raise AccountingError("admin_adjustment requires nonzero amount_cents")
+        if amount_micros == 0:
+            raise AccountingError("admin_adjustment requires nonzero amount_micros")
     else:  # pragma: no cover — guarded by entry-type check above
         raise AccountingError(f"unhandled entry_type: {entry_type}")
 
@@ -122,7 +129,7 @@ def _idempotent_get(db: Session, campaign_id, idempotency_key: str) -> CampaignU
 
 
 def _payload_matches(
-    existing: CampaignUsageEntry, *, entry_type: str, amount_cents: int,
+    existing: CampaignUsageEntry, *, entry_type: str, amount_micros: int,
     ai_run_id=None, contributor_user_id=None,
 ) -> bool:
     """One strict matcher for idempotency replay: every persisted field that
@@ -134,7 +141,7 @@ def _payload_matches(
     wanted_contrib = str(contributor_user_id) if contributor_user_id else None
     return (
         existing.entry_type == entry_type
-        and existing.amount_cents == amount_cents
+        and existing.amount_micros == amount_micros
         and existing_run == wanted_run
         and existing_contrib == wanted_contrib
     )
@@ -145,7 +152,7 @@ def _insert_entry(
     *,
     campaign_id,
     entry_type: str,
-    amount_cents: int,
+    amount_micros: int,
     idempotency_key: str,
     contributor_user_id=None,
     ai_run_id=None,
@@ -162,7 +169,7 @@ def _insert_entry(
     entry = CampaignUsageEntry(
         campaign_id=campaign_id,
         entry_type=entry_type,
-        amount_cents=amount_cents,
+        amount_micros=amount_micros,
         ai_run_id=ai_run_id,
         contributor_user_id=contributor_user_id,
         idempotency_key=idempotency_key,
@@ -178,7 +185,7 @@ def _insert_entry(
         winner = _idempotent_get(db, campaign_id, idempotency_key)
         if winner is not None:
             if not _payload_matches(
-                winner, entry_type=entry_type, amount_cents=amount_cents,
+                winner, entry_type=entry_type, amount_micros=amount_micros,
                 ai_run_id=ai_run_id, contributor_user_id=contributor_user_id,
             ):
                 raise LedgerConflictError(
@@ -193,7 +200,7 @@ def _insert_entry(
             )
             if by_run is not None:
                 if not _payload_matches(
-                    by_run, entry_type=entry_type, amount_cents=amount_cents,
+                    by_run, entry_type=entry_type, amount_micros=amount_micros,
                     ai_run_id=ai_run_id, contributor_user_id=contributor_user_id,
                 ):
                     raise LedgerConflictError(
@@ -209,7 +216,7 @@ def record_entry(
     *,
     campaign_id,
     entry_type: str,
-    amount_cents: int,
+    amount_micros: int,
     idempotency_key: str,
     contributor_user_id=None,
     ai_run_id=None,
@@ -231,14 +238,14 @@ def record_entry(
         raise AccountingError("idempotency_key is required")
     if entry_type == ENTRY_TYPE_AI_SPEND:
         raise AccountingError("ai_spend must go through record_ai_spend_for_run")
-    _validate_amount(entry_type, amount_cents)
+    _validate_amount(entry_type, amount_micros)
     if ai_run_id is not None:
         raise AccountingError(f"{entry_type} must not carry ai_run_id")
 
     existing = _idempotent_get(db, campaign_id, idempotency_key)
     if existing is not None:
         if not _payload_matches(
-            existing, entry_type=entry_type, amount_cents=amount_cents,
+            existing, entry_type=entry_type, amount_micros=amount_micros,
             ai_run_id=None, contributor_user_id=contributor_user_id,
         ):
             raise LedgerConflictError(
@@ -250,7 +257,7 @@ def record_entry(
         db,
         campaign_id=campaign_id,
         entry_type=entry_type,
-        amount_cents=amount_cents,
+        amount_micros=amount_micros,
         idempotency_key=idempotency_key,
         contributor_user_id=contributor_user_id,
         note=note,
@@ -293,19 +300,17 @@ def record_ai_spend_for_run(
     charged = db.scalar(select(CampaignUsageEntry).where(CampaignUsageEntry.ai_run_id == ai_run.id))
     if charged is not None:
         return charged
-    cents = usd_to_cents(ai_run.cost_usd)
-    if cents == 0:
-        # A $0.00 primary run still gets its exactly-one marker entry so
-        # reprocessing stays idempotent without moving capacity.
-        cents = 0
-    # Zero-cost marker: ai_spend normally negative; allow 0 only here.
+    micros = usd_to_micros(ai_run.cost_usd)
+    # Zero-cost marker: ai_spend normally negative; allow 0 only here. A
+    # $0 primary run still gets its exactly-one marker entry so reprocessing
+    # stays idempotent without moving capacity.
     key = idempotency_key or f"ai_spend:{ai_run.id}"
     metadata = {"cost_usd": ai_run.cost_usd}
-    if cents == 0:
+    if micros == 0:
         existing = _idempotent_get(db, campaign_id, key)
         if existing is not None:
             if not _payload_matches(
-                existing, entry_type=ENTRY_TYPE_AI_SPEND, amount_cents=0,
+                existing, entry_type=ENTRY_TYPE_AI_SPEND, amount_micros=0,
                 ai_run_id=ai_run.id, contributor_user_id=None,
             ):
                 raise LedgerConflictError(
@@ -316,7 +321,7 @@ def record_ai_spend_for_run(
             db,
             campaign_id=campaign_id,
             entry_type=ENTRY_TYPE_AI_SPEND,
-            amount_cents=0,
+            amount_micros=0,
             idempotency_key=key,
             ai_run_id=ai_run.id,
             note=note,
@@ -326,7 +331,7 @@ def record_ai_spend_for_run(
         db,
         campaign_id=campaign_id,
         entry_type=ENTRY_TYPE_AI_SPEND,
-        amount_cents=-cents,
+        amount_micros=-micros,
         idempotency_key=key,
         ai_run_id=ai_run.id,
         note=note,
@@ -339,8 +344,9 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
 
     Flush-only (no commit): call from an independent, fail-soft accounting
     transaction *after* the run row commits, so accounting failure can never
-    rewrite gameplay. Returns ``None`` for runs that are not chargeable by
-    policy (not succeeded / recovery / non-billable). Raises
+    rewrite gameplay. Attributes the run's trace to ``campaign_id`` (so
+    recovery cost is tracked), then returns ``None`` for runs that are not
+    chargeable by policy (not succeeded / recovery / non-billable). Raises
     :class:`AmbiguousCostError` for a chargeable run with no usable cost and
     :class:`LedgerConflictError` when the trace does not attribute the run
     to ``campaign_id`` — both surfaced, never silent. Exactly-once per run
@@ -349,8 +355,8 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
     run = db.get(AIRun, run_id)
     if run is None:
         raise AccountingError(f"AI run {run_id} not found")
-    if run.status != "succeeded" or run.classification != "primary" or not run.billable:
-        return None
+    # Attribute every finished run (recovery included) to the campaign so
+    # recovery cost stays visible to :func:`recovery_cost_usd`.
     trace = db.get(OperationTrace, run.trace_id) if run.trace_id else None
     if trace is None:
         trace = OperationTrace(
@@ -364,6 +370,8 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
     elif trace.campaign_id is None:
         trace.campaign_id = campaign_id
         db.flush()
+    if run.status != "succeeded" or run.classification != "primary" or not run.billable:
+        return None
     return record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
 
 
@@ -417,9 +425,9 @@ def recovery_cost_usd(db: Session, campaign_id) -> float:
 def get_capacity_summary(db: Session, campaign_id) -> dict:
     """Derive funded / consumed / remaining / display percentage from ledger.
 
-    - ``funded_cents``: sum of credit types + signed admin adjustments.
-    - ``consumed_cents``: abs sum of ``ai_spend`` (billable actuals only).
-    - ``remaining_cents``: funded − consumed.
+    - ``funded_micros``: sum of credit types + signed admin adjustments.
+    - ``consumed_micros``: abs sum of ``ai_spend`` (billable actuals only).
+    - ``remaining_micros``: funded − consumed.
     - ``percent_used``: consumed/funded·100 clamped to [0, 100]; 0.0 when
       nothing is funded and nothing spent, 100.0 when spent with no funding.
     - ``recovery_cost_usd``: separately tracked non-billable cost (free).
@@ -433,14 +441,14 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
     contributors: dict[str, int] = {}
     for e in entries:
         if e.entry_type in FUNDED_CREDIT_TYPES:
-            funded += e.amount_cents
+            funded += e.amount_micros
             if e.contributor_user_id is not None:
                 key = str(e.contributor_user_id)
-                contributors[key] = contributors.get(key, 0) + e.amount_cents
+                contributors[key] = contributors.get(key, 0) + e.amount_micros
         elif e.entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT:
-            funded += e.amount_cents  # signed operator correction
+            funded += e.amount_micros  # signed operator correction
         elif e.entry_type == ENTRY_TYPE_AI_SPEND:
-            consumed += abs(e.amount_cents)
+            consumed += abs(e.amount_micros)
             spend_count += 1
 
     remaining = funded - consumed
@@ -452,9 +460,9 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
 
     return {
         "campaign_id": str(campaign_id),
-        "funded_cents": funded,
-        "consumed_cents": consumed,
-        "remaining_cents": remaining,
+        "funded_micros": funded,
+        "consumed_micros": consumed,
+        "remaining_micros": remaining,
         "percent_used": percent,
         "entry_count": len(entries),
         "spend_entry_count": spend_count,
@@ -468,9 +476,9 @@ def public_capacity(db: Session, campaign_id) -> dict:
     summary = get_capacity_summary(db, campaign_id)
     return {
         "campaign_id": summary["campaign_id"],
-        "funded_cents": summary["funded_cents"],
-        "consumed_cents": summary["consumed_cents"],
-        "remaining_cents": summary["remaining_cents"],
+        "funded_micros": summary["funded_micros"],
+        "consumed_micros": summary["consumed_micros"],
+        "remaining_micros": summary["remaining_micros"],
         "percent_used": summary["percent_used"],
         "contributor_count": len(summary["contributors"]),
     }
@@ -502,7 +510,7 @@ def reconcile(db: Session, campaign_id) -> list[str]:
             errors.append(f"spend entry {e.id} references non-billable run {run.id}")
             continue
         try:
-            expected = usd_to_cents(run.cost_usd)
+            expected = usd_to_micros(run.cost_usd)
         except AmbiguousCostError:
             # None is always ambiguous for a persisted spend entry: a genuine
             # zero-cost run carries cost_usd=0.0, which converts cleanly, so a
@@ -511,9 +519,9 @@ def reconcile(db: Session, campaign_id) -> list[str]:
                 f"spend entry {e.id} references run {run.id} with ambiguous cost"
             )
             continue
-        if abs(e.amount_cents) != expected:
+        if abs(e.amount_micros) != expected:
             errors.append(
-                f"spend entry {e.id} amount {e.amount_cents} != run cost {expected}c"
+                f"spend entry {e.id} amount {e.amount_micros} != run cost {expected} micros"
             )
 
     # Uncharged billable runs attributable to this campaign (via traces).

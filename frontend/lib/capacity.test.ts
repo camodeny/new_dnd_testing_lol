@@ -37,7 +37,7 @@ describe('deriveCapacityView', () => {
 
   it('keeps funded payloads percentage-only', () => {
     // Funding and spend project to a simple view without raw accounting.
-    expect(deriveCapacityView({ percent_used: 12, funded_cents: 500, contributor_count: 2 }))
+    expect(deriveCapacityView({ percent_used: 12, funded_micros: 5_000_000, contributor_count: 2 }))
       .toEqual({ state: 'normal', percent: 12 })
   })
 
@@ -52,11 +52,11 @@ describe('deriveCapacityView', () => {
     const view = deriveCapacityView({
       campaign_id: 'c',
       percent_used: 55,
-      funded_cents: 1000,
-      consumed_cents: 550,
-      remaining_cents: 450,
+      funded_micros: 10_000_000,
+      consumed_micros: 5_500_000,
+      remaining_micros: 4_500_000,
       contributor_count: 3,
-      overage_allowance_cents: 100,
+      overage_allowance_micros: 1_000_000,
       ai_paused: false,
       grace_active: false,
     })

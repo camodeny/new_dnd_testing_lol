@@ -91,11 +91,11 @@ def grace_overage_pct() -> float:
     return max(0.0, value)
 
 
-def grace_overage_cents(funded_cents: int) -> int:
-    """Deterministic overage allowance in cents for a funded threshold."""
-    if funded_cents <= 0:
+def grace_overage_micros(funded_micros: int) -> int:
+    """Deterministic overage allowance in micro-USD for a funded threshold."""
+    if funded_micros <= 0:
         return 0
-    return int(funded_cents * grace_overage_pct() / 100.0)
+    return int(funded_micros * grace_overage_pct() / 100.0)
 
 
 # ── Owed-work detection (existing durable state only) ─────────────────────────
@@ -292,10 +292,10 @@ def evaluate_new_work(
                 "ai_paused": True,
                 "grace_active": False,
                 "policy_error": str(exc)[:300],
-                "funded_cents": None,
-                "consumed_cents": None,
-                "remaining_cents": None,
-                "overage_allowance_cents": 0,
+                "funded_micros": None,
+                "consumed_micros": None,
+                "remaining_micros": None,
+                "overage_allowance_micros": 0,
             }
         return {
             "allowed": True,
@@ -303,23 +303,23 @@ def evaluate_new_work(
             "ai_paused": False,
             "grace_active": False,
             "policy_error": str(exc)[:300],
-            "funded_cents": None,
-            "consumed_cents": None,
-            "remaining_cents": None,
-            "overage_allowance_cents": 0,
+            "funded_micros": None,
+            "consumed_micros": None,
+            "remaining_micros": None,
+            "overage_allowance_micros": 0,
         }
 
-    funded = int(summary["funded_cents"])
-    consumed = int(summary["consumed_cents"])
-    remaining = int(summary["remaining_cents"])
-    overage = grace_overage_cents(funded)
+    funded = int(summary["funded_micros"])
+    consumed = int(summary["consumed_micros"])
+    remaining = int(summary["remaining_micros"])
+    overage = grace_overage_micros(funded)
 
     base: dict[str, Any] = {
-        "funded_cents": funded,
-        "consumed_cents": consumed,
-        "remaining_cents": remaining,
+        "funded_micros": funded,
+        "consumed_micros": consumed,
+        "remaining_micros": remaining,
         "percent_used": summary["percent_used"],
-        "overage_allowance_cents": overage,
+        "overage_allowance_micros": overage,
         "grace_cadence_seconds": grace_cadence_seconds(),
         "grace_overage_pct": grace_overage_pct(),
     }
@@ -345,9 +345,9 @@ def evaluate_new_work(
             "resolution.grace_activated",
             campaign_id=str(campaign_id),
             thread_id=str(thread_id) if thread_id else None,
-            consumed_cents=consumed,
-            funded_cents=funded,
-            overage_allowance_cents=overage,
+            consumed_micros=consumed,
+            funded_micros=funded,
+            overage_allowance_micros=overage,
             cadence_seconds=grace_cadence_seconds(),
         )
         return {**base, "allowed": True, "reason": "high_intensity_grace",
@@ -359,8 +359,8 @@ def evaluate_new_work(
         "resolution.paused",
         campaign_id=str(campaign_id),
         thread_id=str(thread_id) if thread_id else None,
-        consumed_cents=consumed,
-        funded_cents=funded,
+        consumed_micros=consumed,
+        funded_micros=funded,
     )
     return {**base, "allowed": False, "reason": "capacity_exhausted_paused",
             "ai_paused": True, "grace_active": False}
@@ -410,5 +410,5 @@ def capacity_state_payload(
         "ai_paused": bool(decision["ai_paused"]),
         "grace_active": bool(decision.get("grace_active", False)),
         "gate_reason": decision["reason"],
-        "overage_allowance_cents": decision.get("overage_allowance_cents", 0),
+        "overage_allowance_micros": decision.get("overage_allowance_micros", 0),
     }
