@@ -1,5 +1,6 @@
 'use client'
 
+import ContinueCampaignControl from '@/components/dashboard/ContinueCampaignControl'
 import DmTurnControls from '@/components/dashboard/DmTurnControls'
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams, useRouter } from 'next/navigation'
@@ -487,8 +488,12 @@ export default function CampaignViewPage() {
           aiThinking={aiThinking}
           aiThinkingStatus={aiThinkingStatus}
           activeDmText={streamingDmText}
-          turnControls={<DmTurnControls key={`${id}:${activeThreadId}`} campaignId={String(id)} dmState={liveTable.dmState}
-            rolls={liveTable.rollRequests} userId={user?.id} refresh={liveTable.refresh} />}
+          turnControls={<>
+            <DmTurnControls key={`${id}:${activeThreadId}`} campaignId={String(id)} dmState={liveTable.dmState}
+              rolls={liveTable.rollRequests} userId={user?.id} refresh={liveTable.refresh} />
+            <ContinueCampaignControl campaignId={String(id)} isOwner={isOwner}
+              refreshKey={liveTable.dmMessages.length} />
+          </>}
           liveStatus={liveStatus}
           liveError={liveError}
           loadingOlderMessages={liveTable.loadingOlder}
