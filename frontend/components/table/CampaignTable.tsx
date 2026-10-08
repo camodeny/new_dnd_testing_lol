@@ -280,7 +280,7 @@ export default function CampaignTable({
       onTab={setTab} onClose={() => (inCombat ? setCombatPanelOpen(false) : setPanelOpen(false))}
       character={table ? table.character : null} party={table ? table.party : null}
       journal={table ? table.journal : null} members={members}
-      shops={shops} onSuggest={suggest}
+      shops={shops} onSuggest={suggest} onRefresh={onRefresh}
     />
   )
 

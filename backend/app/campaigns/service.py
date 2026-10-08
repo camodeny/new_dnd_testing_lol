@@ -45,10 +45,9 @@ CAMPAIGN_TRANSITIONS = {
     "archived": frozenset({"lobby", "starting", "active"}),
 }
 DIFFICULTIES = frozenset({"easy", "medium", "hard", "deadly"})
-LOOT_MODES = frozenset({
-    "frequent_gamble", "rare_treasure", "generous", "scarce",
-    "rare_quality", "frequent", "rare",
-})
+#: How generous loot boxes are (#463); ``app.loot.service.LOOT_MODE_RULES``
+#: gives each its draws, rarity odds, and coin purse.
+LOOT_MODES = frozenset({"frequent_gamble", "rare_treasure", "generous", "scarce"})
 
 
 def generate_invite_code(length: int = 8) -> str:

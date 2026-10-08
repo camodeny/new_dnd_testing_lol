@@ -29,6 +29,7 @@ from app.adventures.service import get_current_adventure
 from app.dm.turns import DM_TURN_RESOLVED
 from app.characters.service import latest_sheet
 from app.combat.npc_turns import active_encounter_context, encounter_character_ids
+from app.loot.service import loot_context
 from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics_for_sheet
@@ -1349,6 +1350,19 @@ def assemble_attempt_context(
                 authorization=scope,
             )
         )
+    # Loot (#463): loot mode, each PC's rarity ceiling, and ended encounters
+    # whose loot the DM has yet to award or decline. DM-only.
+    records[LaneName.DIFFICULTY].append(
+        ContextRecord(
+            record_id=f"loot-status:{campaign.id}",
+            priority=60,
+            value={"loot": loot_context(db, campaign, attempt.thread_id)},
+            sources=[_source("campaign", campaign.id, campaign.revision, campaign.revision, field="loot_mode")],
+            authorization=scope,
+            visibility="dm_only",
+            use="adjudication_only",
+        )
+    )
     timings[LaneName.DIFFICULTY] = (time.monotonic() - lane_started) * 1000
 
     lane_started = time.monotonic()

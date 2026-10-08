@@ -1199,6 +1199,11 @@ def stage_turn_encounter_events(
             if current.id not in turn_ids:
                 turn_ids.append(current.id)
 
+    # Post-combat loot the DM never awarded or declined closes as declined (#463).
+    from app.loot.service import settle_loot_hooks
+
+    settle_loot_hooks(db, turn.campaign_id, turn.thread_id)
+
     # Only encounters this attempt's own end_encounter effects targeted: the
     # API end path stages its event immediately, and a turn must never claim
     # provenance for an end it did not cause.

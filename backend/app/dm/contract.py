@@ -295,6 +295,9 @@ STAGED_EFFECT_TYPES = (
     "reveal_entity_name",
     "npc_end_turn",
     "consume_turn_resource",
+    "award_loot_box",
+    "decline_loot",
+    "purchase",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -871,6 +874,75 @@ class ConsumeTurnResourceArgs(StrictModel):
         return self
 
 
+class LootItem(StrictModel):
+    """One candidate item the DM generates for a loot box pool (#463)."""
+    name: str = Field(min_length=1, max_length=80)
+    rarity: Literal["common", "uncommon", "rare", "very_rare", "legendary"]
+    kind: Literal["weapon", "armor", "potion", "scroll", "wand", "ring", "wondrous", "gear", "trinket", "gem", "art"] = "gear"
+    description: str = Field(default="", max_length=240, description="What it is and does, in a sentence or two")
+    quantity: int = Field(default=1, ge=1, le=20)
+
+
+class AwardLootBoxArgs(StrictModel):
+    """The AI DM awards sealed loot boxes — issue #463.
+
+    The DM generates the pool (6-20 items of varying rarity, fitting the
+    fiction); each recipient PC gets a box drawing from it. Code checks
+    rarity against each character's level, sets how many items a box gives
+    (the campaign's loot_mode), and draws them when the player opens it.
+    """
+    character_ids: list[str] = Field(min_length=1, max_length=8, description="Player characters who each get a box")
+    title: str = Field(min_length=1, max_length=80, description="What the box is in the fiction, e.g. 'The bandit chief's strongbox'")
+    items: list[LootItem] = Field(min_length=6, max_length=20, description="The pool: mostly common, a few rarer finds")
+    encounter_id: str | None = Field(default=None, max_length=160, description="The ended encounter this loot comes from, if any")
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("character_ids")
+    @classmethod
+    def _valid_ids(cls, v: list[str]) -> list[str]:
+        for raw in v:
+            try:
+                uuid.UUID(str(raw))
+            except ValueError as exc:
+                raise ValueError("character_ids must be character UUIDs") from exc
+        if len(set(v)) != len(v):
+            raise ValueError("character_ids must be unique")
+        return v
+
+
+class DeclineLootArgs(StrictModel):
+    """The AI DM decides an ended encounter yields no loot (#463)."""
+    encounter_id: str = Field(min_length=1, max_length=160)
+    reason: str = Field(min_length=1, max_length=400, description="Why there is nothing to find")
+
+
+class PurchasePrice(StrictModel):
+    gp: int = Field(default=0, ge=0, le=1_000_000)
+    sp: int = Field(default=0, ge=0, le=1_000_000)
+    cp: int = Field(default=0, ge=0, le=1_000_000)
+
+
+class PurchaseArgs(StrictModel):
+    """A player character buys an item at the price the seller asked — issue #464.
+
+    Code checks the character can afford it, pays from their coins (making
+    change), and adds the item to their sheet in one commit.
+    """
+    character_id: str = Field(min_length=1, max_length=160, description="The buying player character")
+    item: LootItem
+    price: PurchasePrice = Field(description="Total price for the item (all of its quantity)")
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+    @field_validator("character_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        try:
+            uuid.UUID(str(v))
+        except ValueError as exc:
+            raise ValueError("character_id must be a character UUID") from exc
+        return v
+
+
 class TransferKnowledgeArgs(StrictModel):
     """Explicit in-fiction disclosure — issue #251.
 
@@ -1015,7 +1087,7 @@ class MechanicIntent(StrictModel):
         return self
 
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | RevealEntityNameArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs | NpcEndTurnArgs | ConsumeTurnResourceArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs | StartEncounterArgs | EndEncounterArgs | ApplyAttackDamageArgs | ApplyConditionArgs | ApplyResourceArgs | ApplyConcentrationArgs | ApplyDeathSaveArgs | ApplyHealingArgs | AssignStatBlockArgs | RevealEntityNameArgs | UpdateMapTerrainArgs | UpdateMapPlacementArgs | TransferKnowledgeArgs | NpcEndTurnArgs | ConsumeTurnResourceArgs | AwardLootBoxArgs | DeclineLootArgs | PurchaseArgs
 
 
 #: Typed argument model per effect type: validation and the provider-facing
@@ -1042,13 +1114,16 @@ EFFECT_ARGS_MODELS: dict[str, type[StrictModel]] = {
     "transfer_knowledge": TransferKnowledgeArgs,
     "npc_end_turn": NpcEndTurnArgs,
     "consume_turn_resource": ConsumeTurnResourceArgs,
+    "award_loot_box": AwardLootBoxArgs,
+    "decline_loot": DeclineLootArgs,
+    "purchase": PurchaseArgs,
 }
 
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "reveal_entity_name", "update_map_terrain", "update_map_placement", "transfer_knowledge", "npc_end_turn", "consume_turn_resource"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "assert_fact", "upsert_relation", "complete_adventure", "start_encounter", "end_encounter", "apply_attack_damage", "apply_condition", "apply_resource", "apply_concentration", "apply_death_save", "apply_healing", "assign_stat_block", "reveal_entity_name", "update_map_terrain", "update_map_placement", "transfer_knowledge", "npc_end_turn", "consume_turn_resource", "award_loot_box", "decline_loot", "purchase"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")

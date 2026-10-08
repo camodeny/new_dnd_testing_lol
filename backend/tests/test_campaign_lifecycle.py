@@ -110,7 +110,7 @@ def test_launch_settings_are_structured_and_player_range_is_strict(api):
         brief="A watchtower has gone silent.",
         difficulty="Hard",
         content_boundaries={"lines": ["harm to children"], "veils": ["romance"]},
-        loot_mode="rare_quality",
+        loot_mode="rare_treasure",
     )
     assert campaign["status"] == "lobby"
     assert campaign["required_players"] == 6

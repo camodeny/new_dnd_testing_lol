@@ -1050,6 +1050,7 @@ class MechanicsValidator:
     def validate(self, contract, packet) -> ValidatorResult:
         from app.dm.mechanics import (
             canon_supersede_issues,
+            loot_issues,
             npc_turn_issues,
             resolve_mechanics,
             reveal_issues,
@@ -1061,7 +1062,8 @@ class MechanicsValidator:
         issues = (stat_block_issues(self.db, self.campaign, contract)
                   + reveal_issues(self.db, self.campaign, self.turn, contract)
                   + canon_supersede_issues(self.db, self.campaign, contract)
-                  + npc_turn_issues(self.db, self.campaign, self.turn, contract))
+                  + npc_turn_issues(self.db, self.campaign, self.turn, contract)
+                  + loot_issues(self.db, self.campaign, contract))
         if contract.mechanics:
             issues += resolve_mechanics(self.db, self.campaign, self.turn, contract).issues
         for issue in issues:

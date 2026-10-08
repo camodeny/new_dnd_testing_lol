@@ -31,6 +31,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.loot.service import character_loot_boxes
 from models.campaigns import Campaign
 
 logger = logging.getLogger(__name__)
@@ -189,6 +190,15 @@ def _own_character(db: Session, campaign: Campaign, viewer: uuid.UUID, sheet: An
         ],
         "skills": skills,
         "roll_modifiers": roll_modifiers,
+        # Inventory (#463): what the character carries and their loot boxes.
+        "inventory": {
+            "coins": {k: int(getattr(sheet, k) or 0) for k in ("cp", "sp", "ep", "gp", "pp")},
+            "items": [
+                {key: e.get(key) for key in ("name", "quantity", "rarity", "kind", "description") if e.get(key) is not None}
+                for e in (sheet.equipment or []) if isinstance(e, dict) and e.get("name")
+            ],
+            "loot_boxes": character_loot_boxes(db, campaign.id, sheet.character_id),
+        },
     }
 
 
