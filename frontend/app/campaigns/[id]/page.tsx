@@ -13,8 +13,9 @@ import {
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
 import { useCampaignCapacity } from '@/hooks/useCampaignCapacity'
 import { useCampaignFunding } from '@/hooks/useCampaignFunding'
+import { useLowCapacityDismissal } from '@/hooks/useLowCapacityDismissal'
 import { CapacityMeterView } from '@/components/dashboard/CapacityMeter'
-import { isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
+import { capacityNeedsNotice, isCapacityPausedError, type CapacityUiEvent } from '@/lib/capacity'
 import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
 import { parseQuotedSegments } from '@/lib/icOoc'
 import { mergeOptimisticMessages } from '@/lib/optimisticMessages'
@@ -95,6 +96,7 @@ export default function CampaignViewPage() {
     enabled: Boolean(session),
   })
   const capacityPaused = capacity.view.state === 'paused'
+  const lowCapacity = useLowCapacityDismissal(id ? String(id) : null, capacity.view.state)
 
   const handleCapacityEvent = useCallback((event: CapacityUiEvent) => {
     // Resync from the authoritative projection on paused submit attempts
@@ -499,13 +501,14 @@ export default function CampaignViewPage() {
           loadingOlderMessages={liveTable.loadingOlder}
           isOwner={isOwner}
           aiPaused={capacityPaused}
-          capacitySlot={session ? (
+          capacitySlot={session && capacityNeedsNotice(capacity.view, lowCapacity.dismissed) ? (
             <CapacityMeterView
               view={capacity.view}
               loading={capacity.loading}
               error={capacity.error}
               hasProjection={capacity.payload !== null}
               onRetry={() => void capacity.refresh()}
+              onDismiss={lowCapacity.dismiss}
               funding={{
                 onStartFunding: (amountCents) => void funding.startAddFunds(amountCents),
                 fundingBusy: funding.starting,

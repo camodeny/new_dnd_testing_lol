@@ -55,6 +55,14 @@ export function deriveCapacityView(payload: CapacityStatePayload | null | undefi
   return { state: 'normal', percent }
 }
 
+/** Whether capacity warrants a notice at the live table. Normal play,
+ *  loading, and an unavailable projection stay out of the way. The low
+ *  heads-up can be dismissed; grace and pause cannot. */
+export function capacityNeedsNotice(view: CapacityView, lowDismissed = false): boolean {
+  if (view.state === 'low') return !lowDismissed
+  return view.state === 'grace' || view.state === 'paused'
+}
+
 /** Whether an API failure is the #254 pause signal (HTTP 409,
  *  `ai_paused_capacity`): the unsent text stays an editable local draft and
  *  the client should resync from the capacity-state hook, not clear the draft
