@@ -272,6 +272,70 @@ def test_hidden_npc_truth_is_adjudication_only_and_deterministic():
     assert first == second
 
 
+def test_recent_conversation_lane_carries_the_visible_chat_oldest_first():
+    from datetime import datetime, timedelta, timezone
+
+    from models.dm import DMStream
+    from models.threads import PlayerSubmission
+
+    factory, campaign_id, owner, _other, thread_id = _campaign()
+    db = factory()
+    character = _add_character(db, owner)
+    base = datetime(2026, 10, 8, 3, 50, tzinfo=timezone.utc)
+    earlier = accept_submission(
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        character_id=character.id,
+        raw_content="Am I responsible for the debt?",
+        segments=[{"type": "ooc", "text": "Am I responsible for the debt?"}],
+        thread_id=thread_id,
+    )
+    earlier_row = db.get(PlayerSubmission, earlier.id)
+    earlier_row.accepted_at = base
+    earlier_row.resolution_status = "resolved"
+    for status, audience, text, minutes in (
+        ("completed", "campaign", "The riders want the town's coin, not yours.", 1),
+        ("failed", "campaign", "Failed draft.", 2),
+        ("completed", "private", "Private aside.", 3),
+    ):
+        db.add(DMStream(
+            campaign_id=campaign_id, thread_id=uuid.UUID(thread_id),
+            turn_id=f"t{minutes}", attempt_id=f"a{minutes}",
+            status=status, audience=audience, final_text=text,
+            completed_at=base + timedelta(minutes=minutes),
+        ))
+    current = accept_submission(
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        character_id=character.id,
+        raw_content="And am I from this town?",
+        segments=[{"type": "ooc", "text": "And am I from this town?"}],
+        thread_id=thread_id,
+    )
+    db.get(PlayerSubmission, current.id).accepted_at = base + timedelta(minutes=4)
+    db.commit()
+    _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
+
+    packet = assemble_attempt_context(
+        db, attempt.id, supplemental_status=_not_applicable_for_empty_stub()
+    )
+
+    lane = next(lane for lane in packet.lanes if lane.name == LaneName.RECENT_CONVERSATION)
+    assert [(r.value["role"], r.value["speaker"], r.value["text"]) for r in lane.records] == [
+        ("player", "Aria", "Am I responsible for the debt?"),
+        ("dm", "Dungeon Master", "The riders want the town's coin, not yours."),
+        ("player", "Aria", "And am I from this town?"),
+    ]
+    assert [r.sources[0].source_type for r in lane.records] == [
+        "player_submission", "dm_stream", "player_submission",
+    ]
+    assert lane.records[0].sources[0].source_id == str(earlier.id)
+    assert all(not r.required and r.visibility == "campaign" for r in lane.records)
+    assert all(r.authorization.thread_ids == [thread_id] for r in lane.records)
+
+
 def test_private_audience_fixture_is_scoped_and_campaign_attempt_cannot_receive_it():
     case = _fixture("private_audience")
     campaign_id, private_thread, member = (
