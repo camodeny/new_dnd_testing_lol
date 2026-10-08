@@ -3,8 +3,9 @@
 The campaign is the durable continuity boundary and stays active when an
 adventure completes. Completion is a DM narrative decision committed as an
 authoritative fictional mutation (``adventure.completed`` domain event tied
-to source turn/event provenance); downstream closing work (recap/rewards)
-is best-effort and never invalidates the committed completion.
+to source turn/event provenance); downstream closing work (recap, XP awards in
+``app.adventures.rewards``) is best-effort and never invalidates the
+committed completion.
 
 Completion has one path: the AI DM's ``complete_adventure`` staged effect,
 committed through ``complete_adventure_inline`` inside the turn's
@@ -447,6 +448,12 @@ def handle_adventure_closing(envelope, db: Session | None = None) -> dict:
         except RetriableError:
             raise
         except Exception as exc:
+            # Discard partial follow-up writes (XP, hooks) so a retry starts
+            # clean; only the failure bookkeeping commits.
+            attempts = adventure.closing_attempts
+            db.rollback()
+            adventure = db.get(Adventure, adventure.id)
+            adventure.closing_attempts = attempts
             adventure.closing_status = "failed"
             adventure.closing_error = str(exc)[:1000]
             db.flush()
@@ -471,12 +478,15 @@ def handle_adventure_closing(envelope, db: Session | None = None) -> dict:
 
 
 def _run_closing_followups(db: Session, adventure: Adventure) -> None:
-    """Placeholder closing follow-ups (recap/reward derivation).
+    """Closing consequences: duration/outcome record + exactly-once XP (#261).
 
-    Computes a duration + outcome record into adventure metadata. Derived
-    bookkeeping only — intentionally side-effect free beyond the adventure
-    row so failures stay contained and retryable.
+    XP is the only authoritative mutation (``app.adventures.rewards``);
+    clocks, world state and every other character field persist as-is.
+    Flush-only — the handler commits or rolls back the whole follow-up.
     """
+    from app.adventures.rewards import award_adventure_xp
+
+    xp = award_adventure_xp(db, adventure)
     meta = dict(adventure.adventure_metadata or {})
     closing = dict(meta.get("closing") or {})
     started = adventure.started_at
@@ -490,6 +500,7 @@ def _run_closing_followups(db: Session, adventure: Adventure) -> None:
         "duration_seconds": duration_s,
         "source_turn_id": str(adventure.source_turn_id) if adventure.source_turn_id else None,
         "source_event_id": str(adventure.source_event_id) if adventure.source_event_id else None,
+        "xp": {"total_awarded": xp["total_awarded"], "awards": xp["awards"]},
     })
     meta["closing"] = closing
     adventure.adventure_metadata = meta

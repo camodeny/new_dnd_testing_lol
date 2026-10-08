@@ -426,6 +426,58 @@ class Adventure(Base):
         }
 
 
+class AdventureXpAward(Base):
+    """Exactly-once XP ledger row per (adventure, character) — issue #261.
+
+    The adventure-closing sweep writes this row in the same transaction that
+    adds ``xp_awarded`` to the character's sheet, so the unique key is the
+    durable idempotency fence: a re-run closing sweep (or a concurrent one)
+    can never award the same character twice for the same adventure.
+    ``breakdown`` records the code math (per-encounter share) for audit.
+    """
+
+    __tablename__ = "adventure_xp_awards"
+    __table_args__ = (
+        UniqueConstraint("adventure_id", "character_id", name="uq_adventure_xp_awards_adventure_character"),
+        CheckConstraint("xp_awarded >= 0", name="ck_adventure_xp_awards_nonnegative"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    adventure_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("adventures.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    xp_awarded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Sheet XP before/after the award; null when the character had no sheet
+    # to award onto (the row still fences the pair).
+    xp_before: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    xp_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Level the new XP total qualifies for (2024 advancement table); level-up
+    # itself is a separate player-driven step.
+    qualifies_for_level: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    breakdown: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "adventure_id": str(self.adventure_id),
+            "campaign_id": str(self.campaign_id),
+            "character_id": str(self.character_id),
+            "xp_awarded": int(self.xp_awarded or 0),
+            "xp_before": self.xp_before,
+            "xp_after": self.xp_after,
+            "qualifies_for_level": self.qualifies_for_level,
+            "breakdown": list(self.breakdown or []),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class AdventureSummary(Base):
     """Derived summary/recap artifact — explicitly NOT authoritative (issue #263).
 
