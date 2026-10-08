@@ -8,9 +8,11 @@ Code-owned rule (2024 rules, "Experience Points" for defeated monsters):
   after the ``adventure.completed`` event, so it carries the completion
   event as ``provenance.turn_event_id``).
 - In each encounter, every NPC/monster participant whose recorded fate is
-  in :data:`DEFEATED_FATES` contributes its SRD stat block's XP. Participants
-  still ``standing`` or that ``retreated`` in good order were not overcome
-  and award nothing; NPCs without an SRD stat block have no CR and award 0.
+  in :data:`DEFEATED_FATES` contributes its SRD stat block's XP, as does one
+  left at 0 hit points, or one still ``standing`` (the default fate) when
+  the encounter ended in a party win (:data:`PARTY_WIN_OUTCOMES`). Foes
+  that ``retreated``, or stood when the party lost or fled, award nothing;
+  NPCs without an SRD stat block have no CR and award 0.
   XP is re-read from the committed bestiary by ``monster_id``, never from a
   model-editable number.
 - Each encounter's XP is divided evenly (floored) among the PCs that took
@@ -50,6 +52,9 @@ XP_LEVEL_THRESHOLDS = (
 #: as the party overcoming that foe.
 DEFEATED_FATES = frozenset({"slain", "unconscious", "surrendered", "captured", "fled"})
 
+#: Encounter outcomes where the party overcame the opposition outright.
+PARTY_WIN_OUTCOMES = frozenset({"victory", "surrender", "capture"})
+
 XP_HOOK = "xp_progression"
 
 
@@ -72,6 +77,26 @@ def participant_xp(db: Session, participant) -> int:
         return 0
     block = get_stat_block(section.get("monster_id"))
     return int(block["xp"]) if block is not None else 0
+
+
+def _defeated(db: Session, encounter: Encounter, participant, fate: str | None) -> bool:
+    """Whether the party overcame this foe.
+
+    An explicit defeated fate counts; so does a foe left at 0 hit points, or
+    one still ``standing`` (the default fate) when the party won outright —
+    the DM rarely lists every fallen goblin when it ends a fight in victory.
+    """
+    from models.world import WorldEntity
+
+    if fate in DEFEATED_FATES:
+        return True
+    if fate not in (None, "standing"):
+        return False
+    entity = db.get(WorldEntity, participant.npc_entity_id) if participant.npc_entity_id else None
+    hp = (entity.details or {}).get("hit_points") if entity is not None and isinstance(entity.details, dict) else None
+    if isinstance(hp, dict) and hp.get("current") == 0:
+        return True
+    return encounter.end_outcome in PARTY_WIN_OUTCOMES
 
 
 def adventure_encounters(db: Session, adventure: Adventure) -> list[Encounter]:
@@ -141,7 +166,7 @@ def award_adventure_xp(db: Session, adventure: Adventure) -> dict:
         pcs = [p for p in participants if p.kind == "pc" and p.character_id is not None]
         defeated = [
             p for p in participants
-            if p.kind in ("npc", "monster") and fates.get(str(p.id)) in DEFEATED_FATES
+            if p.kind in ("npc", "monster") and _defeated(db, encounter, p, fates.get(str(p.id)))
         ]
         encounter_xp = sum(participant_xp(db, p) for p in defeated)
         share = encounter_xp // len(pcs) if pcs else 0

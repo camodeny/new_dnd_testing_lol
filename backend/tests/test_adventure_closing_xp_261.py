@@ -69,9 +69,10 @@ def _npc(db, camp_id, name, monster_id=None):
     return ent.id
 
 
-def _ended_encounter(db, camp_id, *, sequence, pcs, foes, provenance=None):
+def _ended_encounter(db, camp_id, *, sequence, pcs, foes, provenance=None, outcome="retreat"):
     """An ended encounter: ``pcs`` character ids, ``foes`` (entity_id, fate) pairs."""
-    enc = Encounter(id=uuid.uuid4(), campaign_id=camp_id, thread_id="t", status="ended", ended_at=utcnow())
+    enc = Encounter(id=uuid.uuid4(), campaign_id=camp_id, thread_id="t", status="ended", ended_at=utcnow(),
+                    end_outcome=outcome)
     db.add(enc)
     db.flush()
     fates = {}
@@ -272,3 +273,27 @@ def test_failed_closing_rolls_back_partial_awards(world, monkeypatch):
     with world.factory() as db:
         assert _xp(db, world.ana) == 300
         assert db.get(Adventure, world.adv_id).closing_status == "succeeded"
+
+
+def test_victory_and_downed_foes_count_without_listed_fates():
+    from app.adventures.rewards import _defeated
+    from models.combat import EncounterParticipant
+
+    factory = _factory()
+    with factory() as db:
+        owner, camp_id = uuid.uuid4(), uuid.uuid4()
+        db.add(Profile(id=owner, email="o@example.com"))
+        db.add(Campaign(id=camp_id, owner_id=owner, name="C", status="active", revision=1))
+        db.commit()
+        ana = _pc(db, camp_id, owner, "Ana")
+        ogre = _npc(db, camp_id, "Ogre", "ogre")
+        won = db.get(Encounter, _ended_encounter(db, camp_id, sequence=1, pcs=[ana], foes=[(ogre, "standing")], outcome="victory"))
+        fled = db.get(Encounter, _ended_encounter(db, camp_id, sequence=2, pcs=[ana], foes=[(ogre, "standing")], outcome="escape"))
+        foe = lambda enc: db.execute(select(EncounterParticipant).where(  # noqa: E731
+            EncounterParticipant.encounter_id == enc.id, EncounterParticipant.kind == "npc")).scalar_one()
+        assert _defeated(db, won, foe(won), "standing") is True
+        assert _defeated(db, fled, foe(fled), "standing") is False
+        assert _defeated(db, won, foe(won), "retreated") is False
+        entity = db.get(WorldEntity, ogre)
+        entity.details = {**entity.details, "hit_points": {"current": 0, "maximum": 59, "temporary": 0}}
+        assert _defeated(db, fled, foe(fled), "standing") is True
