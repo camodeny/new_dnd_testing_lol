@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   CAPACITY_LOW_THRESHOLD_PCT,
+  capacityNeedsNotice,
   deriveCapacityView,
   isCapacityPausedError,
 } from './capacity'
@@ -60,6 +61,26 @@ describe('deriveCapacityView', () => {
       grace_active: false,
     })
     expect(Object.keys(view).sort()).toEqual(['percent', 'state'])
+  })
+})
+
+describe('capacityNeedsNotice', () => {
+  it('stays out of the way during normal play and when the projection is unavailable', () => {
+    expect(capacityNeedsNotice({ state: 'normal', percent: 0 })).toBe(false)
+    expect(capacityNeedsNotice({ state: 'normal', percent: 79 })).toBe(false)
+    expect(capacityNeedsNotice({ state: 'unavailable', percent: null })).toBe(false)
+  })
+
+  it('surfaces low, grace, and paused capacity', () => {
+    expect(capacityNeedsNotice({ state: 'low', percent: 85 })).toBe(true)
+    expect(capacityNeedsNotice({ state: 'grace', percent: 99 })).toBe(true)
+    expect(capacityNeedsNotice({ state: 'paused', percent: 100 })).toBe(true)
+  })
+
+  it('lets the low heads-up be dismissed but never grace or pause', () => {
+    expect(capacityNeedsNotice({ state: 'low', percent: 85 }, true)).toBe(false)
+    expect(capacityNeedsNotice({ state: 'grace', percent: 99 }, true)).toBe(true)
+    expect(capacityNeedsNotice({ state: 'paused', percent: 100 }, true)).toBe(true)
   })
 })
 

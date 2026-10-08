@@ -49,6 +49,8 @@ interface CapacityMeterViewProps {
   hasProjection: boolean
   onRetry: () => void
   funding?: FundingControls
+  /** Hides the low-capacity heads-up. Grace and pause are never dismissible. */
+  onDismiss?: () => void
 }
 
 /** Amount choice + Stripe handoff for the shared pool. Renders only when
@@ -100,7 +102,7 @@ function AddFundsRow({ controls }: { controls: FundingControls }) {
 
 /** Pure presentational view: renders only the derived percentage/state, so
  *  tests and the live-table page can drive it without fetching. */
-export function CapacityMeterView({ view, loading, error, hasProjection, onRetry, funding }: CapacityMeterViewProps) {
+export function CapacityMeterView({ view, loading, error, hasProjection, onRetry, funding, onDismiss }: CapacityMeterViewProps) {
   // No projection yet and no failure: render a quiet placeholder rather than
   // inventing a percentage.
   if (loading && !hasProjection && !error) {
@@ -128,7 +130,14 @@ export function CapacityMeterView({ view, loading, error, hasProjection, onRetry
     <div aria-label="Shared campaign capacity" style={styles.wrap}>
       <div style={styles.row}>
         <span style={styles.label}>Shared campaign capacity</span>
-        {percentLabel && <span style={styles.percent}>{percentLabel}</span>}
+        <span style={styles.rowEnd}>
+          {percentLabel && <span style={styles.percent}>{percentLabel}</span>}
+          {view.state === 'low' && onDismiss && (
+            <button type="button" aria-label="Dismiss capacity notice" onClick={onDismiss} style={styles.dismiss}>
+              <i className="bi bi-x-lg" aria-hidden="true" />
+            </button>
+          )}
+        </span>
       </div>
       {view.percent !== null && (
         <div
@@ -193,6 +202,20 @@ const styles: Record<string, React.CSSProperties> = {
     letterSpacing: '0.08em',
     textTransform: 'uppercase',
     color: 'var(--text-dim)',
+  },
+  rowEnd: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 10,
+  },
+  dismiss: {
+    background: 'none',
+    border: 'none',
+    padding: 0,
+    cursor: 'pointer',
+    color: 'var(--text-dim)',
+    fontSize: '0.72rem',
+    lineHeight: 1,
   },
   percent: {
     fontSize: '0.72rem',

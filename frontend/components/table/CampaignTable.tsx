@@ -46,7 +46,7 @@ interface CampaignTableProps {
    *  Non-AI surfaces stay usable; the composer stays editable but
    *  submissions are held as a local draft. */
   aiPaused?: boolean
-  /** Issue #255: quiet capacity meter / pause notice above the composer. */
+  /** Issue #255: low/grace/pause capacity notice above the composer. */
   capacitySlot?: ReactNode
   /** Issue #255: telemetry for submission attempts made while paused. */
   onCapacityEvent?: (event: CapacityUiEvent) => void

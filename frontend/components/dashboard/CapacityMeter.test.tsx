@@ -44,6 +44,20 @@ describe('CapacityMeterView', () => {
     expect(container.textContent).toContain('Shared campaign capacity is getting low.')
   })
 
+  it('offers a dismiss only on the low heads-up', async () => {
+    const onDismiss = vi.fn()
+    await renderView({ view: { state: 'low', percent: 85 }, loading: false, error: null, hasProjection: true, onRetry: noop, onDismiss })
+    const dismiss = container.querySelector('button[aria-label="Dismiss capacity notice"]') as HTMLButtonElement
+    expect(dismiss).not.toBeNull()
+    await act(async () => { dismiss.click() })
+    expect(onDismiss).toHaveBeenCalledOnce()
+
+    for (const view of [{ state: 'grace', percent: 99 }, { state: 'paused', percent: 100 }] as const) {
+      await renderView({ view, loading: false, error: null, hasProjection: true, onRetry: noop, onDismiss })
+      expect(container.querySelector('button[aria-label="Dismiss capacity notice"]')).toBeNull()
+    }
+  })
+
   it('explains grace without gameplay-alarm language', async () => {
     await renderView({ view: { state: 'grace', percent: 99 }, loading: false, error: null, hasProjection: true, onRetry: noop })
     expect(container.textContent).toContain('The current moment will finish')
