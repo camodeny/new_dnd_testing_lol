@@ -15,7 +15,12 @@ from app.campaigns.replacements import TERMINAL_PC_STATUSES, get_lifecycle
 from app.campaigns.service import lock_campaign_row, require_playable_campaign
 from app.clock import ms_between, utcnow
 from app.observability.tracing import structured_log
-from app.realtime.service import publish_encounter_ended, publish_encounter_ready, publish_encounter_started
+from app.realtime.service import (
+    publish_encounter_ended,
+    publish_encounter_ready,
+    publish_encounter_started,
+    publish_encounter_turn,
+)
 from app.rules.mechanics import MechanicsError, ability_modifier, get_character_mechanics
 from app.threads.service import can_read_thread, parse_thread_id
 from app.visibility.access import is_campaign_participant, may_user_receive
@@ -929,6 +934,11 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
         actor_id=campaign.owner_id,
         commit=commit,
     )
+    # Issue #236: an NPC that wins initiative opens with the AI DM's turn.
+    from app.combat.npc_turns import queue_npc_turn
+
+    if queue_npc_turn(db, campaign, encounter) is not None and commit:
+        db.commit()
     return event
 
 
@@ -1106,7 +1116,7 @@ def _turn_lifecycle_event(db: Session, campaign_id: uuid.UUID, operation_id, eve
 
 def stage_turn_encounter_events(
     db: Session, *, turn: DmTurn, attempt: DmTurnAttempt, turn_event, campaign_after: Campaign,
-) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
+) -> tuple[list[uuid.UUID], list[uuid.UUID], list[uuid.UUID]]:
     """Stage encounter lifecycle events for encounters this attempt started/ended.
 
     The turn commit IS the fictional mutation of a ``start_encounter`` /
@@ -1115,7 +1125,7 @@ def stage_turn_encounter_events(
     preserving the sequence == revision invariant). Fail-closed: a staging
     failure propagates and aborts the turn commit — a durable start or end
     without its lifecycle event must never commit. Returns the (started,
-    ended) encounter ids for post-commit realtime delivery.
+    ended, turn-advanced) encounter ids for post-commit realtime delivery.
     """
     provenance = {
         "source": "dm_effect",
@@ -1158,6 +1168,36 @@ def stage_turn_encounter_events(
             )
         encounter.created_event_id = lifecycle.id
         started_ids.append(encounter.id)
+
+    # NPC turns the DM ended (#236): their turn events follow the turn's own.
+    from app.combat.turns import NPC_TURN_TRANSITIONS_KEY, emit_dm_turn_transitions
+
+    transitions = db.info.get(NPC_TURN_TRANSITIONS_KEY, {}).pop(str(attempt.id), [])
+    by_encounter: dict[str, list[dict]] = {}
+    for transition in transitions:
+        by_encounter.setdefault(transition["encounter_id"], []).append(transition)
+    turn_ids: list[uuid.UUID] = []
+    for encounter_id, items in by_encounter.items():
+        encounter = db.get(Encounter, uuid.UUID(encounter_id))
+        emit_dm_turn_transitions(
+            db, campaign_after, encounter, items,
+            actor_id=campaign_after.owner_id, provenance=provenance,
+        )
+        turn_ids.append(encounter.id)
+    # A DM turn that answered an NPC's cue but left its turn open: remind
+    # once, then code ends the turn so combat never stalls.
+    from app.combat.npc_turns import settle_npc_turn
+
+    current = get_active_encounter(db, turn.campaign_id)
+    if current is not None and str(current.thread_id) == str(turn.thread_id):
+        auto_ended = settle_npc_turn(db, campaign_after, current, attempt)
+        if auto_ended is not None:
+            emit_dm_turn_transitions(
+                db, campaign_after, current, [auto_ended],
+                actor_id=campaign_after.owner_id, provenance=provenance,
+            )
+            if current.id not in turn_ids:
+                turn_ids.append(current.id)
 
     # Only encounters this attempt's own end_encounter effects targeted: the
     # API end path stages its event immediately, and a turn must never claim
@@ -1217,13 +1257,14 @@ def stage_turn_encounter_events(
             )
         encounter.ended_event_id = lifecycle.id
         ended_ids.append(encounter.id)
-    if started_ids or ended_ids:
+    if started_ids or ended_ids or turn_ids:
         db.flush()
-    return started_ids, ended_ids
+    return started_ids, ended_ids, turn_ids
 
 
 def publish_turn_encounter_events(
     db: Session, started_ids: list[uuid.UUID], ended_ids: list[uuid.UUID],
+    turn_ids: list[uuid.UUID] = (),
 ) -> None:
     """Post-commit realtime delivery for staged lifecycle events.
 
@@ -1232,6 +1273,8 @@ def publish_turn_encounter_events(
     """
     for ids, publish, label in (
         (started_ids, publish_encounter_started, "start"),
+        (turn_ids, lambda db, row: (publish_encounter_turn(db, row, "ended"),
+                                    publish_encounter_turn(db, row, "started")), "turn"),
         (ended_ids, publish_encounter_ended, "end"),
     ):
         if not ids:

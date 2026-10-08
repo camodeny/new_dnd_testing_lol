@@ -9,6 +9,7 @@ from app.combat.service import get_encounter
 from app.deps.campaign import campaign_for, run_campaign_command
 from app.deps.auth import current_profile
 from app.deps.idempotency import require_idempotency_key
+from app.combat.npc_turns import coordinate_encounter_npc_turn
 from app.dm.recovery import execute_committed_attempt
 from app.realtime.service import publish_encounter_ready, publish_encounter_turn
 from app.rolls.service import (
@@ -133,4 +134,10 @@ def fulfill_roll_request(
     resumed = result.get("resumed_attempt")
     if resumed:
         background_tasks.add_task(execute_committed_attempt, resumed["id"])
+    ready = result.get("encounter_ready") or {}
+    if ready.get("ready"):
+        # Issue #236: an NPC that wins initiative opens with the AI DM's turn.
+        npc_attempt = coordinate_encounter_npc_turn(db, ready.get("encounter_id"))
+        if npc_attempt:
+            background_tasks.add_task(execute_committed_attempt, npc_attempt)
     return result

@@ -212,6 +212,13 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
                         for actor in v.get("present_actors") or []:
                             if isinstance(actor, dict) and actor.get("entity_id") and actor.get("kind") == "npc":
                                 out[str(actor["entity_id"]).strip().lower()] = "npc"
+                        # Combatants in the active encounter (#236) are identity
+                        # authority for the attacks the DM rolls for NPCs.
+                        encounter = v.get("active_encounter")
+                        for entry in (encounter or {}).get("turn_order") or []:
+                            ref = entry.get("ref") if isinstance(entry, dict) else None
+                            if isinstance(ref, dict) and ref.get("type") == "npc" and ref.get("id"):
+                                out.setdefault(str(ref["id"]).strip().lower(), "npc")
                     # A code-owned identity repair can name a canonical
                     # entity even when the optional registry was budgeted
                     # out. Its required record is identity authority for the
@@ -1041,13 +1048,20 @@ class MechanicsValidator:
         self.turn = turn
 
     def validate(self, contract, packet) -> ValidatorResult:
-        from app.dm.mechanics import canon_supersede_issues, resolve_mechanics, reveal_issues, stat_block_issues
+        from app.dm.mechanics import (
+            canon_supersede_issues,
+            npc_turn_issues,
+            resolve_mechanics,
+            reveal_issues,
+            stat_block_issues,
+        )
 
         t0 = time.monotonic()
         violations: list[ValidationViolation] = []
         issues = (stat_block_issues(self.db, self.campaign, contract)
                   + reveal_issues(self.db, self.campaign, self.turn, contract)
-                  + canon_supersede_issues(self.db, self.campaign, contract))
+                  + canon_supersede_issues(self.db, self.campaign, contract)
+                  + npc_turn_issues(self.db, self.campaign, self.turn, contract))
         if contract.mechanics:
             issues += resolve_mechanics(self.db, self.campaign, self.turn, contract).issues
         for issue in issues:

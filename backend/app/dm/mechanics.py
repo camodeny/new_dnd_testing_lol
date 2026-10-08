@@ -15,6 +15,10 @@ never the numbers. :func:`resolve_mechanics` turns them into the
   turn all see identical dice;
 - returns public outcome claims so narration describes what code resolved.
 
+NPC attacks (#236) resolve here too: the NPC's dice belong to the AI DM, so
+code rolls them (seeded like damage dice) and spends the NPC's action once
+per turn, up to its Multiattack count.
+
 Illegal intents come back as :class:`MechanicIssue` records. The validator
 pipeline turns them into regeneration feedback before anything is visible,
 and nothing is consumed. Commit-time handlers re-check overdrafts under the
@@ -24,12 +28,14 @@ from __future__ import annotations
 
 import json
 import random
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.characters.service import roster_levels
+from app.combat.attacks import AttackRollError, resolve_npc_attack
 from app.dm.contract import Beat, Claim, DmTurnContractV1, EntityRef, MechanicIntent
 from app.rules.attacks import (
     AttackError,
@@ -193,17 +199,30 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
     targets: dict[tuple[str, str], Any] = {}
     pending = _pending_stat_blocks(contract)
     shared = (getattr(turn, "audience", None) or "campaign") == "campaign"
+    attacks = _AttackBudget()
+
+    def load(ref: EntityRef, label: str):
+        kind = "pc" if ref.type == "character" else "npc"
+        key = (kind, str(ref.id))
+        if key not in targets:
+            targets[key] = load_state_target(db, campaign, kind, ref.id, label=label)
+            if kind == "npc" and key[1] in pending:
+                _overlay_stat_block(db, campaign, targets[key], *pending[key[1]])
+        return targets[key]
+
     for intent in contract.mechanics:
         kind = "pc" if intent.target.type == "character" else "npc"
-        key = (kind, str(intent.target.id))
         try:
-            if key not in targets:
-                targets[key] = load_state_target(db, campaign, kind, intent.target.id, label=f"mechanic {intent.id!r}")
-                if kind == "npc" and key[1] in pending:
-                    _overlay_stat_block(db, campaign, targets[key], *pending[key[1]])
-            target = targets[key]
+            target = load(intent.target, f"mechanic {intent.id!r}")
+            attacker = load(intent.attacker, f"mechanic {intent.id!r} attacker") if intent.attacker else None
         except (ValueError, StatBlockError) as exc:
             resolution.issues.append(MechanicIssue(intent.id, getattr(exc, "code", "unknown_target"), str(exc)))
+            continue
+        if intent.kind == "attack":
+            try:
+                _resolve_npc_attack(db, campaign, turn, intent, attacker, target, kind, shared, attacks, resolution)
+            except (AttackRollError, AttackError) as exc:
+                resolution.issues.append(MechanicIssue(intent.id, exc.code, str(exc)))
             continue
         # A PC's own state is table-visible on a shared turn; NPC rules state
         # stays DM-only (the outcome claim carries the public part).
@@ -225,6 +244,135 @@ def resolve_mechanics(db: Session, campaign: Any, turn: Any, contract: DmTurnCon
         resolution.effects.append(effect)
         resolution.outcomes.append(Outcome(f"mechanic:{intent.id}", EntityRef(type=intent.target.type, id=intent.target.id), outcome))
     return resolution
+
+
+# ── NPC attacks and turn economy (#236) ────────────────────────────────────
+
+
+@dataclass
+class _AttackBudget:
+    """Attacks each NPC made in this contract: one action, up to its Multiattack."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+
+
+def _resolve_npc_attack(db, campaign, turn, intent: MechanicIntent, attacker, target, kind: str,
+                        shared: bool, budget: _AttackBudget, resolution: MechanicsResolution) -> None:
+    from app.combat.turns import get_turn_state_row
+
+    allowed = int(attacker.details.get("multiattack") or 1)
+    made = budget.counts.get(str(attacker.row.id), 0)
+    if made >= allowed:
+        raise AttackRollError(
+            "attacks_exhausted",
+            f"{attacker.name}'s action allows {allowed} attack{'s' if allowed != 1 else ''} "
+            "(Multiattack) this turn; it has no attacks left",
+        )
+    hp = _target_hp(target, kind)
+    seed = f"{turn.id}:{json.dumps(intent.model_dump(mode='json'), sort_keys=True)}"
+    attack, after = resolve_npc_attack(
+        db, campaign, thread_id=str(turn.thread_id), attacker=attacker, target=target,
+        attack_name=intent.source, advantage_state=intent.advantage_state or "normal",
+        attack_id=f"mech-{intent.id}", rng=random.Random(seed), shared=shared, target_hp=hp,
+    )
+    if made == 0:
+        # The first attack spends the NPC's action; later ones are Multiattack.
+        from models.combat import Encounter
+
+        encounter = db.get(Encounter, uuid.UUID(attack.encounter_id))
+        state = get_turn_state_row(db, encounter.id, uuid.UUID(attack.participant_id))
+        if state is None or not state.action_available:
+            raise AttackRollError(
+                "action_spent", f"{attacker.name} already used its action this turn, so it cannot attack again",
+            )
+        resolution.effects.append(npc_action_effect(f"mech-{intent.id}-action", attack))
+    budget.counts[str(attacker.row.id)] = made + 1
+    if after is not None:
+        target.hp_current = after.current
+    resolution.effects.extend(attack.effects)
+    resolution.outcomes.append(Outcome(f"mechanic:{intent.id}", EntityRef(type=intent.target.type, id=intent.target.id), attack.text))
+
+
+def npc_action_effect(effect_id: str, attack: Any) -> dict[str, Any]:
+    """Code-built spend of the attacking NPC's action, bound to the turn it saw."""
+    return {
+        "id": effect_id,
+        "effect_type": "consume_turn_resource",
+        "arguments": {
+            "encounter_id": attack.encounter_id,
+            "participant_id": attack.participant_id,
+            "resource": "action",
+            "turn_sequence": attack.turn_sequence,
+        },
+    }
+
+
+def npc_turn_issues(db: Session, campaign: Any, turn: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
+    """Pre-narration checks for ``npc_end_turn`` / ``consume_turn_resource`` effects.
+
+    Mirrors the commit-time rules (``combat.turns``) so a refused NPC action
+    is regeneration feedback instead of a failed commit.
+    """
+    from app.combat.service import list_participants
+    from app.combat.turns import get_turn_state_row
+    from models.combat import Encounter
+
+    issues: list[MechanicIssue] = []
+    attackers = {str(i.attacker.id) for i in contract.mechanics if i.kind == "attack" and i.attacker}
+    ending = [e for e in contract.staged_effects if e.effect_type == "end_encounter"]
+    ends = 0
+    spent: dict[tuple[str, str], int] = {}
+    for effect in contract.staged_effects:
+        if effect.effect_type not in ("npc_end_turn", "consume_turn_resource"):
+            continue
+        args = effect.arguments
+        encounter = db.get(Encounter, uuid.UUID(str(args["encounter_id"])))
+        if encounter is None or str(encounter.campaign_id) != str(campaign.id):
+            issues.append(MechanicIssue(effect.id, "unknown_encounter", "that encounter is not in this campaign"))
+            continue
+        if encounter.status != "active" or str(encounter.thread_id) != str(turn.thread_id):
+            issues.append(MechanicIssue(effect.id, "no_active_turn", "that encounter has no active turn in this thread"))
+            continue
+        participant = next((p for p in list_participants(db, encounter.id) if str(p.id) == str(args["participant_id"])), None)
+        if participant is None:
+            issues.append(MechanicIssue(effect.id, "unknown_participant", "participant_id is not in that encounter; use active_encounter ids"))
+            continue
+        if participant.kind == "pc":
+            issues.append(MechanicIssue(
+                effect.id, "player_character",
+                f"{participant.display_name} is a player character: only their player acts on or ends their turn",
+            ))
+            continue
+        is_active = encounter.active_participant_id == participant.id
+        if effect.effect_type == "npc_end_turn":
+            ends += 1
+            if not is_active:
+                issues.append(MechanicIssue(effect.id, "not_npcs_turn", f"it is not {participant.display_name}'s turn"))
+            elif any(str(e.arguments.get("encounter_id")) == str(encounter.id) for e in ending):
+                issues.append(MechanicIssue(effect.id, "encounter_ending", "the encounter ends in this turn; drop npc_end_turn"))
+            continue
+        resource = str(args["resource"])
+        state = get_turn_state_row(db, encounter.id, participant.id)
+        if state is None:
+            issues.append(MechanicIssue(effect.id, "no_turn_state", "that participant has no turn resources"))
+            continue
+        key = (str(participant.id), resource)
+        amount = int(args.get("amount") or 1)
+        spent[key] = spent.get(key, 0) + amount
+        if resource == "action" and is_active and str(participant.npc_entity_id) in attackers:
+            issues.append(MechanicIssue(effect.id, "action_spent_by_attack", "this NPC's attack already spends its action; drop this effect"))
+        elif resource != "reaction" and not is_active:
+            issues.append(MechanicIssue(effect.id, "not_npcs_turn", f"it is not {participant.display_name}'s turn"))
+        elif resource == "movement" and spent[key] > int(state.movement_remaining):
+            issues.append(MechanicIssue(effect.id, "insufficient_movement", f"{participant.display_name} has {state.movement_remaining} ft of movement left"))
+        elif resource != "movement" and (spent[key] > 1 or not {
+            "action": state.action_available, "bonus_action": state.bonus_action_available,
+            "reaction": state.reaction_available,
+        }[resource]):
+            issues.append(MechanicIssue(effect.id, "resource_spent", f"{participant.display_name} has no {resource.replace('_', ' ')} left"))
+    if ends > 1:
+        issues.append(MechanicIssue("npc_end_turn", "duplicate_end_turn", "end one NPC turn per contract"))
+    return issues
 
 
 def resolve_attack_damage(db: Session, campaign: Any, turn: Any, resolution: MechanicsResolution) -> None:

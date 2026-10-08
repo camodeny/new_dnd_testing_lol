@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from app.combat.service import get_snapshot_encounter
 from app.dm.turns import ACTIVE_TURN_STATUSES
 from app.rolls.service import get_fulfillment
+from app.submissions.service import player_visible_submission
 from app.threads.service import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
@@ -198,6 +199,7 @@ def _fetch_history(
     base_q = select(PlayerSubmission).where(
         PlayerSubmission.campaign_id == campaign_id,
         PlayerSubmission.thread_id == thread_id,
+        player_visible_submission(),
     )
     if cursor_seq is not None:
         base_q = base_q.where(PlayerSubmission.sequence < cursor_seq)
@@ -296,6 +298,7 @@ def build_live_table_snapshot(
             select(func.count()).select_from(PlayerSubmission).where(
                 PlayerSubmission.campaign_id == campaign_id,
                 PlayerSubmission.thread_id == thread_id_str,
+                player_visible_submission(),
             )
         ) or 0
 

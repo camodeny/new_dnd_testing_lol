@@ -46,7 +46,7 @@ STAT_BLOCK_SECTION = "stat_block"
 STAT_BLOCK_KEYS = (
     STAT_BLOCK_SECTION, "hit_points", "armor_class", "initiative_modifier", "dexterity",
     "abilities", "attacks", "attack_name", "attack_bonus", "damage", "resistances",
-    "vulnerabilities", "immunities", "condition_immunities",
+    "vulnerabilities", "immunities", "condition_immunities", "multiattack",
 )
 
 
@@ -185,6 +185,8 @@ def stat_block_details(block: dict[str, Any]) -> dict[str, Any]:
         "dexterity": block["abilities"]["dex"],
         "abilities": dict(block["abilities"]),
         "attacks": [dict(a) for a in block["attacks"]],
+        # Attacks one Attack action makes (Multiattack); code enforces it (#236).
+        "multiattack": int(block.get("multiattack") or 1),
         "resistances": list(block["resistances"]),
         "vulnerabilities": list(block["vulnerabilities"]),
         "immunities": list(block["immunities"]),

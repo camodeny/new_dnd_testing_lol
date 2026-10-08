@@ -28,6 +28,8 @@ from sqlalchemy.orm import Session
 from app.adventures.service import get_current_adventure
 from app.dm.turns import DM_TURN_RESOLVED
 from app.characters.service import latest_sheet
+from app.combat.npc_turns import active_encounter_context, encounter_character_ids
+from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics_for_sheet
 from app.schema import StrictModel
@@ -1140,11 +1142,21 @@ def assemble_attempt_context(
                 ],
                 authorization=_scope(campaign.id, thread_ids=[attempt.thread_id]),
                 visibility="private" if attempt.audience == "private" else "campaign",
+                # System cues for the DM alone (#236 NPC turns) carry
+                # internal ids and instructions, never narration material.
+                use="adjudication_only" if submission.source in DM_ONLY_SUBMISSION_SOURCES else "narration_eligible",
             )
         )
     timings[LaneName.PLAYER_INPUTS] = (time.monotonic() - lane_started) * 1000
 
     lane_started = time.monotonic()
+    # NPC turns (#236): the DM acts against the encounter's PCs even when no
+    # player spoke this turn, so their sheets join the PC lanes (within the
+    # attempt's audience).
+    for character_id in encounter_character_ids(db, campaign.id, attempt.thread_id):
+        character = db.get(Character, character_id)
+        if character is not None and str(character.owner_id) in audience.user_ids:
+            character_ids.add(character_id)
     for character_id in sorted(character_ids, key=str):
         character = db.get(Character, character_id)
         if character is None:
@@ -1405,6 +1417,29 @@ def assemble_attempt_context(
                 # adjudication-only so narration_projection() can never carry
                 # it to a player audience (mirrors RECENT_HISTORY lane).
                 use="adjudication_only" if scene_visibility == "dm_only" else "narration_eligible",
+            )
+        )
+    # Active encounter (#236): whose turn it is, what they have left, and the
+    # NPCs' stat-block attacks, so the DM can run NPC turns. DM-only and
+    # adjudication-only: it carries hidden combatants and NPC stats.
+    encounter_value = active_encounter_context(db, campaign.id, attempt.thread_id)
+    if encounter_value is not None:
+        records[LaneName.CURRENT_SCENE].append(
+            ContextRecord(
+                record_id=f"active-encounter:{encounter_value['encounter_id']}",
+                priority=90,
+                value={"active_encounter": encounter_value},
+                sources=[
+                    _source(
+                        "encounter",
+                        encounter_value["encounter_id"],
+                        encounter_value["turn_sequence"],
+                        campaign.revision,
+                    )
+                ],
+                authorization=scope,
+                visibility="dm_only",
+                use="adjudication_only",
             )
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000

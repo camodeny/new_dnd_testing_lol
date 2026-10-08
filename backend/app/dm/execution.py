@@ -1282,6 +1282,15 @@ def run_dm_execute_sweep(
         logger.warning("dm_execute_sweep recover failed error=%s", exc)
         recovered = 0
     outcome: dict = {"executed": [], "failed": [], "skipped": [], "recovered": recovered}
+    # #236: NPC turns that started while AI-paused get their cue now.
+    from app.combat.npc_turns import queue_missing_npc_turns
+
+    try:
+        outcome["npc_turns_queued"] = queue_missing_npc_turns(db, limit=limit)
+    except Exception as exc:
+        db.rollback()
+        logger.warning("dm_execute_sweep npc turn queue failed error=%s", exc)
+        outcome["npc_turns_queued"] = []
     outcome["coordinated"] = coordinate_stranded_submissions(db, limit=limit)
     # #480: a failed turn gets one automatic retry, executed by the
     # prepared-attempt loop below in this same sweep.

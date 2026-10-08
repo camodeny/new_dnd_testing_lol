@@ -48,6 +48,12 @@ ABILITY_OVERRIDES: dict[str, dict[str, int]] = {
 }
 _SECTION_SPLIT = re.compile(r"(?:^|\s)(?:Legendary Actions|Bonus Actions|Reactions|Actions|Traits)\s")
 _RIDER_RE = re.compile(r"^,? plus \d+ \((?P<dice>\d+d\d+(?: [+\-−] \d+)?)\) (?P<type>[A-Z][a-z]+) damage")
+_REACH_RE = re.compile(r"reach (\d+) f(?:ee)?t")
+# "range 30/120 ft." (normal/long) or a single "range 90 ft." (no long range).
+_RANGE_RE = re.compile(r"range (\d+)(?:/(\d+))? f(?:ee)?t")
+_MULTIATTACK_RE = re.compile(r"Multiattack\. ([^.]*)\.")
+_COUNT_WORDS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+_ATTACK_COUNT_RE = re.compile(r"\b(one|two|three|four|five|six)\b[^,.]*?\battacks?\b")
 
 
 class BestiaryParseError(ValueError):
@@ -101,15 +107,41 @@ def _attacks(content: str) -> tuple[list[dict[str, Any]], list[str]]:
                 "damage": rider.group("dice").replace("−", "-").replace(" ", ""),
                 "damage_type": rider.group("type").lower(),
             })
+        reach = _REACH_RE.search(match.group(0))
+        ranged = _RANGE_RE.search(match.group(0))
         attacks.append({
             "name": name,
             "extra_damage": riders,
+            "reach_ft": int(reach.group(1)) if reach else None,
+            "range_ft": [int(ranged.group(1)), int(ranged.group(2) or ranged.group(1))] if ranged else None,
             "kind": {"Melee": "melee", "Ranged": "ranged"}.get(match.group("kind"), "melee_or_ranged"),
             "attack_bonus": _int(match.group("bonus")),
             "damage": dice.group("dice").replace("−", "-").replace(" ", ""),
             "damage_type": damage_type,
         })
     return attacks, skipped
+
+
+def _multiattack(content: str) -> int:
+    """Attacks one Multiattack action makes; 1 when there is none or it is irregular.
+
+    "makes one Bite attack and three Claw attacks" sums to 4; alternatives
+    ("…, or it makes three Poison Ray attacks") take the larger count.
+    Counts that are not written as a number ("as many Bite attacks as it
+    has heads") fall back to 1 rather than guess.
+    """
+    match = _MULTIATTACK_RE.search(content)
+    if match is None:
+        return 1
+    # Conditional attack counts ("… three Slam attacks if it used Hasten") are
+    # not a flat property of the action, like conditional damage riders; a
+    # condition on another rider ("uses Unsettling Visage if available") is.
+    counts = [
+        sum(_COUNT_WORDS[word] for word in _ATTACK_COUNT_RE.findall(option))
+        for option in re.split(r",? or (?:it )?(?=makes|uses)", match.group(1))
+        if not re.search(r"\battacks? if\b", option)
+    ]
+    return max([1, *counts])
 
 
 def _abilities(tables: list[dict[str, Any]]) -> dict[str, int]:
@@ -175,6 +207,7 @@ def parse_monster(raw: dict[str, Any]) -> dict[str, Any]:
         "initiative_modifier": _int(initiative.group(1)),
         "abilities": abilities,
         "attacks": attacks,
+        "multiattack": _multiattack(content),
         "skipped_attacks": skipped,
         "resistances": resist,
         "vulnerabilities": vulnerable,

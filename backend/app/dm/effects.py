@@ -129,7 +129,15 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # fictional-knowledge stance, never human disclosure — visibility grants
     # remain a separate explicit act.
     "transfer_knowledge": "dm_private",
+    # NPC turn economy (#236) is DM-side state: the turn events that follow
+    # an ended turn carry their own thread-scoped projection.
+    "npc_end_turn": "dm_private",
+    "consume_turn_resource": "dm_private",
 }
+
+#: Applied after every other effect of the commit: an NPC's actions this turn
+#: (code-built action spends included) resolve before its turn ends.
+_LAST_EFFECT_TYPES = ("npc_end_turn",)
 
 def _is_shared_audience(audience: str) -> bool:
     return (audience or "campaign") == "campaign"
@@ -210,8 +218,15 @@ def apply_staged_effects(
 
     _reject_duplicate_damage_ids(staged_effects)
     _reject_duplicate_state_mutations(staged_effects)
+    if sum(1 for e in staged_effects if e.get("effect_type") == "npc_end_turn") > 1:
+        # Ending A's turn makes B active, so a second end would skip B's turn.
+        raise ValueError("one npc_end_turn per turn commit: a second would skip the next combatant's turn")
+    from app.combat.turns import NPC_TURN_TRANSITIONS_KEY
 
-    for eff in staged_effects:
+    db.info.setdefault(NPC_TURN_TRANSITIONS_KEY, {}).pop(str(attempt.id), None)
+
+    ordered = sorted(staged_effects, key=lambda e: e.get("effect_type") in _LAST_EFFECT_TYPES)
+    for eff in ordered:
         eff_id = eff.get("id", "<unknown>")
         eff_type = eff.get("effect_type")
         if eff_type not in _REGISTRY:
@@ -657,6 +672,99 @@ def _handle_update_map_placement(db: Session, campaign: Campaign, effect: dict[s
         "effect update_map_placement effect_id=%s encounter_id=%s map_revision=%s op=%s",
         effect.get("id"), encounter.id, encounter_map.revision, operation_key,
     )
+
+
+def lock_turn_economy_encounters(db: Session, staged_effects: list[dict[str, Any]], *, turn: DmTurn) -> None:
+    """Row-lock encounters whose turn economy this commit may change, before the campaign.
+
+    Encounter commands lock the encounter, then the campaign; the turn
+    commit takes the campaign lock in ``commit_campaign_mutation``. Locking
+    these encounters (and the thread's active one, whose NPC turn the
+    commit may settle) first keeps one lock order, so a DM commit and a
+    player's end-turn never deadlock.
+    """
+    from app.combat.service import get_active_encounter
+
+    import uuid as _uuid
+
+    from sqlalchemy import select as _select
+
+    from models.combat import Encounter as _Encounter
+
+    ids = set()
+    for eff in staged_effects or []:
+        if eff.get("effect_type") in ("npc_end_turn", "consume_turn_resource"):
+            try:
+                ids.add(_uuid.UUID(str((eff.get("arguments") or {}).get("encounter_id"))))
+            except ValueError:
+                continue
+    current = get_active_encounter(db, turn.campaign_id)
+    if current is not None and str(current.thread_id) == str(turn.thread_id):
+        ids.add(current.id)
+    for encounter_id in sorted(ids, key=str):
+        db.execute(_select(_Encounter).where(_Encounter.id == encounter_id).with_for_update()).first()
+
+
+def _encounter_for_effect(db: Session, campaign: Campaign, effect: dict[str, Any]):
+    """The effect's encounter, locked and scoped to this campaign."""
+    import uuid as _uuid
+
+    from app.combat.service import lock_encounter
+    from app.combat.turns import TurnError
+
+    args = effect.get("arguments") or {}
+    try:
+        encounter_id = _uuid.UUID(str(args.get("encounter_id") or ""))
+    except ValueError:
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter_id must be a UUID")
+    try:
+        encounter = lock_encounter(db, encounter_id, TurnError)
+    except TurnError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r}: {exc}") from exc
+    if str(encounter.campaign_id) != str(campaign.id):
+        raise ValueError(f"Staged effect {effect.get('id')!r} encounter {encounter_id} not found in this campaign")
+    return encounter
+
+
+@register("consume_turn_resource")
+def _handle_consume_turn_resource(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Spend an NPC's turn resource inside the turn-commit txn (issue #236).
+
+    Action economy stays code-owned (:func:`app.combat.turns.dm_consume_resource`):
+    an overdraft or an out-of-turn spend fails the whole commit.
+    """
+    from app.combat.turns import TurnAuthorizationError, TurnError, dm_consume_resource
+
+    args = effect.get("arguments") or {}
+    encounter = _encounter_for_effect(db, campaign, effect)
+    try:
+        dm_consume_resource(
+            db, encounter, args.get("participant_id"),
+            resource=str(args.get("resource") or ""), amount=int(args.get("amount") or 1),
+            expected_turn_sequence=args.get("turn_sequence"),
+        )
+    except (TurnError, TurnAuthorizationError) as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
+
+
+@register("npc_end_turn")
+def _handle_npc_end_turn(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """End the active NPC's turn inside the turn-commit txn (issue #236).
+
+    Advances initiative now (state only); the turn's commit then writes the
+    ``turn_ended``/``turn_started`` events after its own event, one
+    revision each, and queues the DM's next NPC turn.
+    """
+    from app.combat.turns import NPC_TURN_TRANSITIONS_KEY, TurnAuthorizationError, TurnError, dm_end_npc_turn
+
+    args = effect.get("arguments") or {}
+    encounter = _encounter_for_effect(db, campaign, effect)
+    try:
+        transition = dm_end_npc_turn(db, encounter, args.get("participant_id"))
+    except (TurnError, TurnAuthorizationError) as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
+    outbox = db.info.setdefault(NPC_TURN_TRANSITIONS_KEY, {})
+    outbox.setdefault(str(attempt.id), []).append({**transition, "encounter_id": str(encounter.id)})
 
 
 @register("apply_attack_damage")
