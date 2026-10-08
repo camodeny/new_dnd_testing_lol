@@ -250,7 +250,9 @@ def build_narrator_prompt(
 # submissions + completed narrations in the same thread/audience — the
 # same chat the player sees), never private lanes: failed streams stay
 # excluded (failed-visible audit is never promoted to history) and the
-# campaign-start system opener is not conversation.
+# campaign-start system opener is not conversation. The forward-DM context
+# packet carries the same window as its ``recent_conversation`` lane, so the
+# adjudicator and the narrator see the same chat.
 
 #: Visible messages supplied to the narrator for coherence.
 RECENT_HISTORY_MESSAGE_LIMIT = 8
@@ -269,7 +271,8 @@ def build_recent_conversation(
 ) -> list[dict[str, str]]:
     """Return the last ``limit`` visible chat messages, oldest first.
 
-    Each entry is ``{"speaker": ..., "role": "player"|"dm", "text": ...}``.
+    Each entry is ``{"speaker": ..., "role": "player"|"dm", "text": ...}``
+    plus its ``source_type``/``source_id``/``source_version`` provenance.
     Player entries carry the raw message verbatim (OOC table talk included —
     the narrator needs the literal question a table-chat turn answers);
     speaker is the character name when the submission links one, else the
@@ -364,6 +367,9 @@ def build_recent_conversation(
             "speaker": _player_speaker(submission),
             "role": "player",
             "text": text[:RECENT_HISTORY_CHARS_PER_MESSAGE],
+            "source_type": "player_submission",
+            "source_id": str(submission.id),
+            "source_version": str(submission.sequence),
         }))
     for stream in streams:
         text = (stream.final_text or "").strip()
@@ -374,6 +380,9 @@ def build_recent_conversation(
             "speaker": "Dungeon Master",
             "role": "dm",
             "text": text[:RECENT_HISTORY_CHARS_PER_MESSAGE],
+            "source_type": "dm_stream",
+            "source_id": str(stream.id),
+            "source_version": when.isoformat() if when is not None else "unknown",
         }))
     merged.sort(key=lambda item: (
         item[0].isoformat() if item[0] is not None else "",

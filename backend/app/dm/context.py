@@ -68,6 +68,7 @@ class LaneName(str, Enum):
     RELEVANT_CANON = "relevant_canon_relations"
     KNOWLEDGE_VISIBILITY = "knowledge_visibility"
     RECENT_HISTORY = "recent_unprocessed_history"
+    RECENT_CONVERSATION = "recent_conversation"
     REPAIR_DIRECTIVES = "repair_directives"
     CONTENT_BOUNDARIES = "content_boundaries"
     DIFFICULTY = "difficulty"
@@ -1326,6 +1327,41 @@ def assemble_attempt_context(
                     continue
                 records[LaneName.RECENT_HISTORY].append(record)
     timings[LaneName.RECENT_HISTORY] = (time.monotonic() - lane_started) * 1000
+
+    lane_started = time.monotonic()
+    # The visible chat the narrator already gets: domain events carry ids,
+    # not words, so without it the DM adjudicates blind to what it just
+    # narrated and what the player said a moment ago. Optional records, so
+    # budget pressure drops the oldest messages first.
+    from app.dm.narration import build_recent_conversation
+
+    conversation = build_recent_conversation(
+        db, campaign_id=campaign.id, thread_id=attempt.thread_id, audience=attempt.audience,
+    )
+    for position, message in enumerate(conversation):
+        records[LaneName.RECENT_CONVERSATION].append(
+            ContextRecord(
+                record_id=f"conversation:{message['source_id']}",
+                priority=70,
+                sort_key=f"{position:04d}",
+                value={
+                    "speaker": message["speaker"],
+                    "role": message["role"],
+                    "text": message["text"],
+                },
+                sources=[
+                    _source(
+                        message["source_type"],
+                        message["source_id"],
+                        message["source_version"],
+                        attempt.source_revision,
+                    )
+                ],
+                authorization=_scope(campaign.id, thread_ids=[attempt.thread_id]),
+                visibility="private" if attempt.audience == "private" else "campaign",
+            )
+        )
+    timings[LaneName.RECENT_CONVERSATION] = (time.monotonic() - lane_started) * 1000
 
     # Populate authoritative campaign-level lanes directly from the campaign row.
     # These are read-only authoritative sources for difficulty / content boundaries.
