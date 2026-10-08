@@ -3,7 +3,7 @@ import React, { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import CampaignTable from './CampaignTable'
-import { campaignMembers, gameplayThreads } from '@/lib/api'
+import { campaignMembers, gameplayThreads, playerNotes } from '@/lib/api'
 import type { TableEncounter, TableProjection } from '@/lib/table'
 import type { PlayerRollForRealtime } from '@/lib/realtime'
 import type { Campaign, Message, Session, User } from '@/types'
@@ -14,6 +14,7 @@ vi.mock('@/lib/api', () => ({
   apiFetch: vi.fn(),
   campaignMembers: { listMembers: vi.fn() },
   gameplayThreads: { list: vi.fn(), getOrCreateDm: vi.fn(), getOrCreateDirect: vi.fn() },
+  playerNotes: { list: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
 }))
 if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = function () {}
 
@@ -48,6 +49,7 @@ beforeEach(() => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
   vi.mocked(campaignMembers.listMembers).mockResolvedValue({ members: [] })
   vi.mocked(gameplayThreads.list).mockResolvedValue({ threads: [] })
+  vi.mocked(playerNotes.list).mockResolvedValue({ notes: [] })
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -159,6 +161,31 @@ it('announces a shop in the story and opens its contextual tab as a placeholder'
   const ask = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Ask what’s for sale')!
   await act(async () => ask.click())
   expect(container.querySelector('textarea')!.value).toBe('I ask what they have for sale.')
+})
+
+it('shows the player’s own notes in the journal and adds one', async () => {
+  vi.mocked(playerNotes.list).mockResolvedValue({
+    notes: [{ id: 'n1', campaign_id: 'c', user_id: 'me', content: 'Marta owes me coin', created_at: null, updated_at: null }],
+  })
+  vi.mocked(playerNotes.create).mockResolvedValue({
+    note: { id: 'n2', campaign_id: 'c', user_id: 'me', content: 'New lead', created_at: null, updated_at: null },
+  })
+  await render({})
+  await act(async () => tab('Journal')!.click())
+  await act(async () => {})
+  expect(container.querySelector('.tv-view')?.textContent).toContain('My notes')
+  expect(container.querySelector('.tv-view')?.textContent).toContain('Marta owes me coin')
+  const box = container.querySelector('textarea[aria-label="New note"]') as HTMLTextAreaElement
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(box, 'New lead')
+    box.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  // React state drives the textarea; set it through the native setter then fire input.
+  // Fallback: the button enables once draft state updates.
+  await act(async () => {})
+  const add = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Add note') as HTMLButtonElement
+  await act(async () => { add.click() })
+  expect(playerNotes.create).toHaveBeenCalledWith('c', 'New lead')
 })
 
 it('marks unbuilt features as coming soon instead of faking them', async () => {

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import LootBoxCard from '@/components/table/LootBoxCard'
+import { playerNotes, type PlayerNote } from '@/lib/api'
 import {
   conditionMeaning,
   healthText,
@@ -174,12 +175,110 @@ function GoalsPlaceholder() {
   )
 }
 
-function JournalView({ journal, fresh }: { journal: TableJournal | null; fresh: Set<string> }) {
+function PlayerNotes({ campaignId }: { campaignId: string }) {
+  const [notes, setNotes] = useState<PlayerNote[]>([])
+  const [draft, setDraft] = useState('')
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingText, setEditingText] = useState('')
+  const [error, setError] = useState('')
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    playerNotes.list(campaignId)
+      .then((data) => { if (!cancelled) setNotes(data?.notes ?? []) })
+      .catch(() => { if (!cancelled) setNotes([]) })
+    return () => { cancelled = true }
+  }, [campaignId])
+
+  const add = async () => {
+    const content = draft.trim()
+    if (!content || saving) return
+    setSaving(true)
+    setError('')
+    try {
+      const { note } = await playerNotes.create(campaignId, content)
+      setNotes((current) => [...current, note])
+      setDraft('')
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const saveEdit = async (id: string) => {
+    const content = editingText.trim()
+    if (!content || saving) return
+    setSaving(true)
+    setError('')
+    try {
+      const { note } = await playerNotes.update(campaignId, id, content)
+      setNotes((current) => current.map((n) => (n.id === id ? note : n)))
+      setEditingId(null)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const remove = async (id: string) => {
+    setError('')
+    try {
+      await playerNotes.remove(campaignId, id)
+      setNotes((current) => current.filter((n) => n.id !== id))
+    } catch (e) {
+      setError((e as Error).message)
+    }
+  }
+
+  return (
+    <section className="tv-section first">
+      <h4>My notes</h4>
+      <p className="tv-muted">Only you can see these.</p>
+      {notes.map((n) => (
+        <div className="tv-entry" key={n.id}>
+          {editingId === n.id ? (
+            <>
+              <textarea aria-label="Edit note" value={editingText} maxLength={2000}
+                onChange={(e) => setEditingText(e.target.value)} rows={2} />
+              <div>
+                <button type="button" className="tv-btn ghost small" disabled={saving || !editingText.trim()}
+                  onClick={() => void saveEdit(n.id)}>Save</button>{' '}
+                <button type="button" className="tv-link" onClick={() => setEditingId(null)}>Cancel</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="tv-fact">{n.content}</p>
+              <div>
+                <button type="button" className="tv-link" onClick={() => { setEditingId(n.id); setEditingText(n.content) }}>Edit</button>{' '}
+                <button type="button" className="tv-link" onClick={() => void remove(n.id)}>Delete</button>
+              </div>
+            </>
+          )}
+        </div>
+      ))}
+      <textarea aria-label="New note" placeholder="Jot something down…" value={draft} maxLength={2000}
+        onChange={(e) => setDraft(e.target.value)} rows={2} />
+      <div>
+        <button type="button" className="tv-btn ghost small" disabled={saving || !draft.trim()} onClick={() => void add()}>
+          Add note
+        </button>
+      </div>
+      {error && <p className="tv-error" role="alert">{error}</p>}
+    </section>
+  )
+}
+
+function JournalView({ campaignId, journal, fresh }: { campaignId: string; journal: TableJournal | null; fresh: Set<string> }) {
   if (!journal) return <Unavailable />
   if (journal.people.length === 0 && journal.facts.length === 0) {
     return (
       <>
         <GoalsPlaceholder />
+        <PlayerNotes campaignId={campaignId} />
         <p className="tv-muted tv-section">Nothing else here yet. People you meet and things you learn will collect here.</p>
       </>
     )
@@ -188,6 +287,7 @@ function JournalView({ journal, fresh }: { journal: TableJournal | null; fresh: 
   return (
     <>
       <GoalsPlaceholder />
+      <PlayerNotes campaignId={campaignId} />
       {journal.people.length > 0 && (
         <section className="tv-section">
           <h4>People you know of</h4>
@@ -366,7 +466,7 @@ export default function SidePanel({
       </div>
       <div className="tv-view" role="tabpanel">
         {tab === 'character' && <CharacterView campaignId={campaignId} character={character} refresh={onRefresh} />}
-        {tab === 'journal' && <JournalView journal={journalData} fresh={fresh} />}
+        {tab === 'journal' && <JournalView campaignId={campaignId} journal={journalData} fresh={fresh} />}
         {tab === 'party' && <PartyView party={party} members={members} />}
         {activeShop && <ShopView shop={activeShop} onSuggest={onSuggest} />}
       </div>
