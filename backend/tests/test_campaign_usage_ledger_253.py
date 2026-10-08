@@ -477,20 +477,36 @@ def test_reconcile_flags_none_cost_spend_even_at_zero_amount():
     db.close()
 
 
-# ── 15. canonical pricing: usage + env config → USD ─────────────────────────
+# ── 15. canonical pricing: usage + pinned per-model prices → USD ────────────
 
-def test_cost_usd_for_uses_configured_pricing(monkeypatch):
+def test_cost_usd_for_uses_pinned_model_prices(monkeypatch):
     from app.billing import config
-    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
-    monkeypatch.setattr(config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    monkeypatch.setattr(config, "MODEL_PRICES_PER_MTOK_USD", {("p", "m"): (2.0, 8.0)})
     assert config.cost_usd_for("p", "m", {"prompt_tokens": 1_000_000,
                                          "completion_tokens": 500_000}) == 6.0
     assert config.tokens_from_usage({"prompt_tokens": 10, "completion_tokens": 5}) == (10, 5)
-    # Unknown usage or unpriced model → None (ambiguous, never zero-guessed).
+    # Unknown usage or unpriced provider/model → None (ambiguous, never zero-guessed).
     assert config.cost_usd_for("p", "m", {}) is None
     assert config.cost_usd_for("p", "m", None) is None
-    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", None)
-    assert config.cost_usd_for("p", "m", {"prompt_tokens": 100}) is None
+    assert config.cost_usd_for("other", "m", {"prompt_tokens": 100}) is None
+    assert config.cost_usd_for("p", "other", {"prompt_tokens": 100}) is None
+
+
+def test_every_pinned_area_model_is_priced():
+    from app.billing import config
+    from app.providers.areas import AREA_CONFIG
+    usage = {"prompt_tokens": 8_000, "completion_tokens": 1_000}
+    for area, (provider, model) in AREA_CONFIG.items():
+        cost = config.cost_usd_for(provider, model, usage)
+        assert cost is not None and cost > 0, f"{area}: {provider}/{model} is unpriced"
+
+
+def test_live_model_prices():
+    from app.billing import config
+    per_mtok = {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+    assert config.cost_usd_for("openai", "gpt-6-luna", per_mtok) == pytest.approx(0.60)
+    assert config.cost_usd_for(
+        "meta", "muse-spark-1.3-contributor", per_mtok) == pytest.approx(0.30)
 
 
 # ── 16. production narration: streamed usage is charged exactly once ────────
@@ -503,8 +519,7 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
     from app.providers import registry as reg
     from app.providers.contracts import NormalizedStreamEvent
 
-    monkeypatch.setattr(billing_config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
-    monkeypatch.setattr(billing_config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD", {("p1", "m"): (2.0, 8.0)})
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)

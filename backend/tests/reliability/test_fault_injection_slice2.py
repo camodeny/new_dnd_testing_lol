@@ -12,11 +12,10 @@ Covered here:
 - Stale concurrent campaign mutation loses cleanly via revision conflict.
 - Terminal poison work stays durable/inspectable (dead letter).
 - Provider-like transient failure recovers through worker retry; terminal
-  failure goes straight to dead letter (billing assertions skipped: #259 open).
+  failure goes straight to dead letter.
+- Provider failover and explicit retry are recorded at cost but never spend
+  campaign capacity (#259).
 - Telemetry failure cannot corrupt gameplay.
-
-Billing / recovery-accounting assertions are out of scope for this slice
-(open #259); the placeholder below is skipped with reason.
 """
 from __future__ import annotations
 
@@ -375,9 +374,72 @@ def test_provider_terminal_failure_goes_straight_to_dead_letter(tmp_path):
     scenario.record("converged", attempts=execution.attempts, retried=False)
 
 
-@pytest.mark.skip(reason="Billing/recovery-accounting assertions depend on open #259")
-def test_provider_failure_non_billing_accounting():
-    raise AssertionError("unreachable: skipped pending #259")
+def test_provider_failure_non_billing_accounting(tmp_path, monkeypatch):
+    from app.billing import config as billing_config
+    from app.billing.ledger import reconcile, recovery_cost_usd
+    from app.dm import adjudication
+    from app.dm.narration import NarratorRequest
+    from app.providers import policy as role_policy
+    from app.providers import registry as reg
+    from app.providers.contracts import NormalizedStreamEvent, ProviderError
+    from models.reliability import AIRun
+    from models.usage import CampaignUsageEntry
+
+    scenario = FaultScenario("provider_failure_non_billing")
+    engine = _safe_engine(tmp_path)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    campaign_id, _ = _seed_campaign(factory)
+
+    class _Adapter:
+        def __init__(self, name):
+            self.name = name
+
+        def require_config(self, model):
+            return None
+
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 500_000}
+
+    def _stream(adapter, request):
+        if adapter.name == "p1" and scenario.hit_once("primary_timeout"):
+            raise ProviderError("synthetic timeout", provider="p1",
+                                retryable=True, kind="timeout")
+        yield NormalizedStreamEvent(kind="token", text="recovered narration")
+        yield NormalizedStreamEvent(kind="done", usage=usage)
+
+    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD",
+                        {("p1", "m"): (2.0, 8.0), ("p2", "m"): (2.0, 8.0)})
+    monkeypatch.setattr(adjudication, "stream_chat", _stream)
+    monkeypatch.setattr(role_policy, "execution_path", lambda role: [("p1", "m"), ("p2", "m")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    monkeypatch.setattr(reg.provider_registry, "get", lambda name: _Adapter(name))
+    monkeypatch.setattr("app.providers.areas.resolve_area",
+                        lambda area: (_Adapter("p1"), "m", "p1"))
+
+    def _narrate(db, *, is_retry=False):
+        narrate = adjudication.build_provider_narrator(
+            db=db, campaign_id=campaign_id, is_retry=is_retry)
+        return "".join(narrate(NarratorRequest(prompt="p", projection={})))
+
+    with factory() as db:
+        # Primary times out before any output; same-model failover answers.
+        assert _narrate(db) == "recovered narration"
+        # A player-requested retry of the same work is recovery too.
+        assert _narrate(db, is_retry=True) == "recovered narration"
+
+    with factory() as db:
+        runs = db.query(AIRun).all()
+        by_status = sorted((r.provider, r.status, r.classification, r.billable) for r in runs)
+        assert by_status == [
+            ("p1", "failed", "primary", True),
+            ("p1", "succeeded", "recovery", False),
+            ("p2", "succeeded", "recovery", False),
+        ]
+        # Recovery spends nothing but is still costed for platform analysis:
+        # two recovered runs at $6.00 each.
+        assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 0
+        assert recovery_cost_usd(db, campaign_id) == pytest.approx(12.0)
+        assert reconcile(db, campaign_id) == []
+    scenario.record("converged", spend_entries=0, recovery_runs=2)
 
 
 # ── Telemetry failure cannot corrupt gameplay ─────────────────────────────────

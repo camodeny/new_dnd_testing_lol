@@ -339,8 +339,9 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
 
     Flush-only (no commit): call from an independent, fail-soft accounting
     transaction *after* the run row commits, so accounting failure can never
-    rewrite gameplay. Returns ``None`` for runs that are not chargeable by
-    policy (not succeeded / recovery / non-billable). Raises
+    rewrite gameplay. Attributes the run's trace to ``campaign_id`` (so
+    recovery cost is tracked), then returns ``None`` for runs that are not
+    chargeable by policy (not succeeded / recovery / non-billable). Raises
     :class:`AmbiguousCostError` for a chargeable run with no usable cost and
     :class:`LedgerConflictError` when the trace does not attribute the run
     to ``campaign_id`` — both surfaced, never silent. Exactly-once per run
@@ -349,8 +350,8 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
     run = db.get(AIRun, run_id)
     if run is None:
         raise AccountingError(f"AI run {run_id} not found")
-    if run.status != "succeeded" or run.classification != "primary" or not run.billable:
-        return None
+    # Attribute every finished run (recovery included) to the campaign so
+    # recovery cost stays visible to :func:`recovery_cost_usd`.
     trace = db.get(OperationTrace, run.trace_id) if run.trace_id else None
     if trace is None:
         trace = OperationTrace(
@@ -364,6 +365,8 @@ def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEn
     elif trace.campaign_id is None:
         trace.campaign_id = campaign_id
         db.flush()
+    if run.status != "succeeded" or run.classification != "primary" or not run.billable:
+        return None
     return record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
 
 
