@@ -169,6 +169,9 @@ and draws them when the player opens it; never narrate what is inside.
 difficulty's loot lists ended encounters awaiting loot: award a box with
 that encounter_id, or stage decline_loot with the reason when there is
 nothing to find.
+SHOPPING: when a PC buys something, stage purchase with the item and the
+price the seller asked. Code checks they can afford it, pays from their
+coins, and adds the item; if they cannot afford it, the feedback says so.
 
 ROLLS:
 await_roll requires a public roll_instruction beat and roll_request. On that

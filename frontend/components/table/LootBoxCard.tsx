@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import { apiFetch } from '@/lib/api'
 import { rarityLabel, type LootRarity, type TableLootBox } from '@/lib/table'
 
@@ -21,18 +21,18 @@ export default function LootBoxCard({ campaignId, box, refresh }: LootBoxCardPro
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
   const [opened, setOpened] = useState<TableLootBox | null>(null)
-  // One key per box: a retried open after a lost response replays it.
-  const key = useRef<string | null>(null)
   const shown = opened ?? box
+  // A box opens once, so its key is the box itself: a retry after a lost
+  // response (even from a remounted panel) replays the same opening.
+  const key = `loot-box-open:${box.id}`
 
   const open = async () => {
     if (pending) return
-    key.current ??= crypto.randomUUID()
     setPending(true)
     setError('')
     try {
       const result = await apiFetch<{ loot_box: TableLootBox }>(`/campaigns/${campaignId}/loot-boxes/${box.id}/open`, {
-        method: 'POST', headers: { 'Idempotency-Key': key.current }, body: JSON.stringify({ operation_id: key.current }),
+        method: 'POST', headers: { 'Idempotency-Key': key }, body: JSON.stringify({ operation_id: key }),
       })
       setOpened(result.loot_box)
       await refresh?.()
@@ -46,7 +46,7 @@ export default function LootBoxCard({ campaignId, box, refresh }: LootBoxCardPro
   if (shown.status === 'opened' && shown.contents) {
     const { items, gp } = shown.contents
     return (
-      <div className={`tv-entry tv-loot opened${opened ? ' fresh' : ''}`}>
+      <div className={`tv-entry tv-loot opened${opened ? ' fresh' : ''}`} aria-live="polite">
         <b>{shown.title}</b>
         <ul className="tv-loot-haul">
           {items.map((item, index) => (

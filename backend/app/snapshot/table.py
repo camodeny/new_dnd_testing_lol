@@ -197,7 +197,7 @@ def _own_character(db: Session, campaign: Campaign, viewer: uuid.UUID, sheet: An
                 {key: e.get(key) for key in ("name", "quantity", "rarity", "kind", "description") if e.get(key) is not None}
                 for e in (sheet.equipment or []) if isinstance(e, dict) and e.get("name")
             ],
-            "loot_boxes": character_loot_boxes(db, sheet.character_id),
+            "loot_boxes": character_loot_boxes(db, campaign.id, sheet.character_id),
         },
     }
 

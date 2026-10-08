@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.clock import utcnow
+from app.loot.inventory import add_items
 from app.observability.tracing import structured_log
 from models.campaigns import Campaign, CampaignMember
 from models.characters import Character, Dnd5eCharacterSheet
@@ -98,6 +99,9 @@ def check_award(db: Session, campaign: Campaign, args: dict[str, Any]) -> list[s
     """Problems with an ``award_loot_box`` (empty when legal); DM-facing feedback."""
     problems: list[str] = []
     rarities = [str(item.get("rarity")) for item in args.get("items") or []]
+    unknown = sorted({r for r in rarities if r not in RARITIES})
+    if unknown:
+        return [f"unknown rarity {', '.join(unknown)}; use one of {', '.join(RARITIES)}"]
     for character_id in args.get("character_ids") or []:
         try:
             character = _roster_character(db, campaign, character_id)
@@ -256,22 +260,6 @@ def _draw(pool: list[dict[str, Any]], draws: int, boost: float, rng: Any) -> lis
     return drawn
 
 
-def _add_to_equipment(sheet: Dnd5eCharacterSheet, items: list[dict[str, Any]], box_id: str) -> None:
-    equipment = [dict(e) for e in (sheet.equipment or []) if isinstance(e, dict)]
-    for item in items:
-        match = next(
-            (e for e in equipment if e.get("name") == item["name"] and e.get("rarity") == item["rarity"]), None,
-        )
-        if match is not None:
-            match["quantity"] = int(match.get("quantity") or 1) + int(item["quantity"])
-            continue
-        equipment.append({
-            "name": item["name"], "quantity": int(item["quantity"]), "rarity": item["rarity"],
-            "kind": item["kind"], "description": item["description"], "source": f"loot_box:{box_id}",
-        })
-    sheet.equipment = equipment
-
-
 def open_loot_box(
     db: Session, campaign: Campaign, box_id: Any, *, actor_id: uuid.UUID, rng: Any | None = None,
 ) -> tuple[LootBox, Any]:
@@ -306,7 +294,7 @@ def open_loot_box(
     contents = {"items": items, "gp": gold}
 
     def _mutate(_locked):
-        _add_to_equipment(sheet, items, str(box.id))
+        add_items(sheet, items, source=f"loot_box:{box.id}")
         sheet.gp = int(sheet.gp or 0) + gold
         box.status = "opened"
         box.contents = contents
@@ -361,9 +349,10 @@ def box_view(box: LootBox) -> dict[str, Any]:
     return view
 
 
-def character_loot_boxes(db: Session, character_id: Any) -> list[dict[str, Any]]:
+def character_loot_boxes(db: Session, campaign_id: Any, character_id: Any) -> list[dict[str, Any]]:
     rows = db.execute(
-        select(LootBox).where(LootBox.character_id == character_id).order_by(LootBox.created_at.desc()).limit(20)
+        select(LootBox).where(LootBox.campaign_id == campaign_id, LootBox.character_id == character_id)
+        .order_by(LootBox.created_at.desc()).limit(20)
     ).scalars().all()
     return [box_view(b) for b in rows]
 
@@ -403,3 +392,57 @@ def loot_context(db: Session, campaign: Campaign, thread_id: str) -> dict[str, A
         "party": party,
         "encounters_awaiting_loot": [str(e) for e in pending],
     }
+
+
+# ── Purchases (#464) ───────────────────────────────────────────────────────
+
+
+def price_cp(price: dict[str, Any]) -> int:
+    return sum(int(price.get(coin) or 0) * value for coin, value in (("gp", 100), ("sp", 10), ("cp", 1)))
+
+
+def check_purchases(db: Session, campaign: Campaign, purchases: list[dict[str, Any]]) -> list[str]:
+    """Problems with a contract's purchases, cumulative per buyer (empty when legal)."""
+    from app.loot.inventory import describe_cp, wallet_cp
+
+    problems: list[str] = []
+    owed: dict[uuid.UUID, int] = {}
+    for args in purchases:
+        try:
+            character = _roster_character(db, campaign, args.get("character_id"))
+        except LootError as exc:
+            problems.append(str(exc))
+            continue
+        sheet = _sheet(db, character.id)
+        if sheet is None:
+            problems.append(f"{character.name} has no sheet to buy with")
+            continue
+        owed[character.id] = owed.get(character.id, 0) + price_cp(args.get("price") or {})
+        if owed[character.id] > wallet_cp(sheet):
+            problems.append(
+                f"{character.name} cannot afford {args['item']['name']}: it costs "
+                f"{describe_cp(price_cp(args.get('price') or {}))} and they have {describe_cp(wallet_cp(sheet))}"
+                + (" left after their other purchases" if owed[character.id] != price_cp(args.get("price") or {}) else "")
+            )
+    return problems
+
+
+def purchase_inline(db: Session, campaign: Campaign, args: dict[str, Any]) -> None:
+    """Pay and take the item, inside the DM turn commit (turn idempotency guards replays)."""
+    from app.loot.inventory import InventoryError, add_items, pay
+
+    character = _roster_character(db, campaign, args.get("character_id"))
+    sheet = _sheet(db, character.id)
+    if sheet is None:
+        raise LootError(f"{character.name} has no sheet to buy with")
+    cost = price_cp(args.get("price") or {})
+    try:
+        spent = pay(sheet, cost)
+    except InventoryError as exc:
+        raise LootError(f"{character.name}: {exc}") from exc
+    add_items(sheet, [dict(args["item"])], source="purchase")
+    structured_log(
+        logger, logging.INFO, "purchase_completed",
+        campaign_id=str(campaign.id), character_id=str(character.id), item=args["item"]["name"],
+        price_cp=cost, spent=spent,
+    )

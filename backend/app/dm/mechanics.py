@@ -121,10 +121,16 @@ def check_stat_block_assignment(
 
 
 def loot_issues(db: Session, campaign: Any, contract: DmTurnContractV1) -> list[MechanicIssue]:
-    """Refusals for the contract's ``award_loot_box`` / ``decline_loot`` effects (#463)."""
-    from app.loot.service import check_award, pending_hook
+    """Refusals for the contract's loot (#463) and ``purchase`` (#464) effects."""
+    from app.loot.service import check_award, check_purchases, pending_hook
 
     issues: list[MechanicIssue] = []
+    purchases = [e for e in contract.staged_effects if e.effect_type == "purchase"]
+    if purchases:
+        issues += [
+            MechanicIssue(purchases[0].id, "purchase_refused", p)
+            for p in check_purchases(db, campaign, [e.arguments for e in purchases])
+        ]
     for effect in contract.staged_effects:
         if effect.effect_type == "award_loot_box":
             issues += [MechanicIssue(effect.id, "loot_refused", p) for p in check_award(db, campaign, effect.arguments)]

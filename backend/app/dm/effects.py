@@ -137,6 +137,8 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     # audience scopes who sees it opened.
     "award_loot_box": "dm_private",
     "decline_loot": "dm_private",
+    # A purchase (#464) changes only the buyer's own sheet.
+    "purchase": "dm_private",
 }
 
 #: Applied after every other effect of the commit: an NPC's actions this turn
@@ -793,6 +795,17 @@ def _handle_decline_loot(db: Session, campaign: Campaign, effect: dict[str, Any]
 
     try:
         decline_loot_inline(db, campaign, turn, effect.get("arguments") or {})
+    except LootError as exc:
+        raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
+
+
+@register("purchase")
+def _handle_purchase(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """A PC buys an item inside the turn-commit txn (issue #464): code pays and adds it."""
+    from app.loot.service import LootError, purchase_inline
+
+    try:
+        purchase_inline(db, campaign, effect.get("arguments") or {})
     except LootError as exc:
         raise ValueError(f"Staged effect {effect.get('id')!r} refused: {exc}") from exc
 

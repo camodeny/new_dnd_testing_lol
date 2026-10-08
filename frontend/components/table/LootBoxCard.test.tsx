@@ -43,7 +43,7 @@ it('opens the box, reveals the haul, and retries with the same key', async () =>
   expect(container.textContent).toContain('would not open')
   await act(async () => button('Open').click())
   const keys = vi.mocked(apiFetch).mock.calls.map(([, init]) => (init?.headers as Record<string, string>)['Idempotency-Key'])
-  expect(keys[0]).toBe(keys[1])
+  expect(keys).toEqual(['loot-box-open:b1', 'loot-box-open:b1'])
   expect(vi.mocked(apiFetch).mock.calls[0][0]).toBe('/campaigns/c/loot-boxes/b1/open')
   expect(container.textContent).toContain('Flame Tongue')
   expect(container.textContent).toContain('2 × Garnet')
