@@ -1053,6 +1053,7 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
     executed: list[str] = []
     failed: list[dict] = []
     deferred: list[str] = []
+    swept_campaigns: set = set()
     for run in candidates:
         if dm_turn_commit_gate(db, run.campaign_id):
             # Cheap pre-claim check: no worker claim, no attempt spent.
@@ -1074,10 +1075,36 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, l
                 deferred.append(str(run.id))
             else:
                 executed.append(str(run.id))
+                swept_campaigns.add(run.campaign_id)
         except Exception as exc:  # noqa: BLE001 — sweep must survive bad runs
             db.rollback()
             logger.warning("post_turn sweep run_failed run=%s error=%s", run.id, exc)
             failed.append({"run_id": str(run.id), "error": str(exc)[:300]})
-    logger.info("post_turn sweep repaired=%s executed=%s deferred=%s failed=%s",
-                len(repaired), len(executed), len(deferred), len(failed))
-    return {"repaired": repaired, "executed": executed, "failed": failed, "deferred": deferred}
+    ledger_mismatches = _reconcile_ledgers(db, swept_campaigns)
+    logger.info("post_turn sweep repaired=%s executed=%s deferred=%s failed=%s ledger_mismatches=%s",
+                len(repaired), len(executed), len(deferred), len(failed), ledger_mismatches)
+    return {"repaired": repaired, "executed": executed, "failed": failed, "deferred": deferred,
+            "ledger_mismatches": ledger_mismatches}
+
+
+def _reconcile_ledgers(db: Session, campaign_ids) -> int:
+    """Alert-only #259 capacity-ledger reconciliation for swept campaigns.
+
+    Logs every AI-run/ledger mismatch; never writes, re-credits, or charges.
+    Accounting failures never fail the sweep. Returns the mismatch count.
+    """
+    from app.billing.ledger import reconcile
+
+    total = 0
+    for campaign_id in campaign_ids:
+        try:
+            errors = reconcile(db, campaign_id)
+        except Exception as exc:  # noqa: BLE001 — accounting must not fail the sweep
+            db.rollback()
+            logger.warning("ledger_reconcile_failed campaign_id=%s error_type=%s",
+                           campaign_id, type(exc).__name__)
+            continue
+        for error in errors:
+            logger.warning("ledger_reconcile_mismatch campaign_id=%s detail=%s", campaign_id, error)
+        total += len(errors)
+    return total

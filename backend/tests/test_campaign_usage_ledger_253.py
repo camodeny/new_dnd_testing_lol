@@ -481,7 +481,7 @@ def test_reconcile_flags_none_cost_spend_even_at_zero_amount():
 
 def test_cost_usd_for_uses_pinned_model_prices(monkeypatch):
     from app.billing import config
-    monkeypatch.setattr(config, "MODEL_PRICES_PER_MTOK_USD", {("p", "m"): (2.0, 8.0)})
+    monkeypatch.setattr(config, "MODEL_PRICES_PER_MTOK_USD", {("p", "m"): (2.0, 2.0, 8.0)})
     assert config.cost_usd_for("p", "m", {"prompt_tokens": 1_000_000,
                                          "completion_tokens": 500_000}) == 6.0
     assert config.tokens_from_usage({"prompt_tokens": 10, "completion_tokens": 5}) == (10, 5)
@@ -507,6 +507,20 @@ def test_live_model_prices():
     assert config.cost_usd_for("openai", "gpt-6-luna", per_mtok) == pytest.approx(0.60)
     assert config.cost_usd_for(
         "meta", "muse-spark-1.3-contributor", per_mtok) == pytest.approx(0.30)
+
+
+def test_cached_input_tokens_bill_at_cached_rate():
+    from app.billing import config
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 0,
+             "prompt_tokens_details": {"cached_tokens": 800_000}}
+    # 200k uncached at $0.10 + 800k cached at $0.01 per 1M.
+    assert config.cost_usd_for("openai", "gpt-6-luna", usage) == pytest.approx(0.028)
+    responses_shape = {"input_tokens": 1_000_000, "output_tokens": 0,
+                       "input_tokens_details": {"cached_tokens": 800_000}}
+    assert config.cost_usd_for("openai", "gpt-6-luna", responses_shape) == pytest.approx(0.028)
+    # A cached count above the input count is clamped, never negative.
+    over = {"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 500}}
+    assert config.cost_usd_for("openai", "gpt-6-luna", over) == pytest.approx(100 * 0.01 / 1_000_000)
 
 
 def test_sub_cent_runs_still_consume_capacity():
@@ -540,7 +554,7 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
     from app.providers import registry as reg
     from app.providers.contracts import NormalizedStreamEvent
 
-    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD", {("p1", "m"): (2.0, 8.0)})
+    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD", {("p1", "m"): (2.0, 2.0, 8.0)})
     factory = _factory()
     db = factory()
     camp, _ = _seed(db)

@@ -16,14 +16,17 @@ PERCENT_DECIMALS = 1
 # counts. Neither production provider reports cost (only token usage), so
 # per-model list prices are pinned here, keyed by the exact provider/model
 # pins in ``app.providers.areas.AREA_CONFIG``. Reasoning tokens arrive in the
-# provider's output count and bill at the output rate. A provider/model not
+# provider's output count and bill at the output rate; cache-hit input tokens
+# (reported inside the input count) bill at the cached-input rate. A
+# provider/model not
 # in this table is unpriced: cost resolution returns ``None`` and the ledger
 # surfaces the run as ambiguous rather than guessing zero.
 #
-# (input, output) list prices as of 2026-10-08:
-MODEL_PRICES_PER_MTOK_USD: dict[tuple[str, str], tuple[float, float]] = {
-    ("openai", "gpt-6-luna"): (0.10, 0.50),
-    ("meta", "muse-spark-1.3-contributor"): (0.10, 0.20),
+# (input, cached input, output) list prices as of 2026-10-08. Meta publishes
+# no Contributor-tier cache rate, so its cache hits bill at the input rate.
+MODEL_PRICES_PER_MTOK_USD: dict[tuple[str, str], tuple[float, float, float]] = {
+    ("openai", "gpt-6-luna"): (0.10, 0.01, 0.50),
+    ("meta", "muse-spark-1.3-contributor"): (0.10, 0.10, 0.20),
 }
 
 
@@ -45,6 +48,17 @@ def _tokens_from_usage(usage: dict | None) -> tuple[int | None, int | None]:
     )
 
 
+def _cached_input_tokens(usage: dict, input_tokens: int) -> int:
+    """Cache-hit input tokens (a subset of the input count), clamped to it."""
+    for key in ("prompt_tokens_details", "input_tokens_details"):
+        details = usage.get(key)
+        if isinstance(details, dict):
+            value = details.get("cached_tokens")
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                return min(int(value), input_tokens)
+    return 0
+
+
 def tokens_from_usage(usage: dict | None) -> tuple[int | None, int | None]:
     """Public accessor for normalized (input, output) token counts."""
     return _tokens_from_usage(usage)
@@ -62,5 +76,11 @@ def cost_usd_for(provider: str | None, model: str | None, usage: dict | None) ->
     prices = MODEL_PRICES_PER_MTOK_USD.get((provider or "", model or ""))
     if prices is None:
         return None
-    price_in, price_out = prices
-    return (input_tokens or 0) * price_in / 1_000_000 + (output_tokens or 0) * price_out / 1_000_000
+    price_in, price_cached, price_out = prices
+    input_tokens = input_tokens or 0
+    cached = _cached_input_tokens(usage, input_tokens)
+    return (
+        (input_tokens - cached) * price_in
+        + cached * price_cached
+        + (output_tokens or 0) * price_out
+    ) / 1_000_000

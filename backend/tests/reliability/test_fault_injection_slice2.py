@@ -407,7 +407,7 @@ def test_provider_failure_non_billing_accounting(tmp_path, monkeypatch):
         yield NormalizedStreamEvent(kind="done", usage=usage)
 
     monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD",
-                        {("p1", "m"): (2.0, 8.0), ("p2", "m"): (2.0, 8.0)})
+                        {("p1", "m"): (2.0, 2.0, 8.0), ("p2", "m"): (2.0, 2.0, 8.0)})
     monkeypatch.setattr(adjudication, "stream_chat", _stream)
     monkeypatch.setattr(role_policy, "execution_path", lambda role: [("p1", "m"), ("p2", "m")])
     monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)

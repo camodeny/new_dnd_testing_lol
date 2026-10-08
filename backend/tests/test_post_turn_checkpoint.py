@@ -607,3 +607,36 @@ def test_audited_skip_reuses_failed_same_span_run():
     db.expire_all()
     assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 4
     db.close()
+
+
+def test_sweep_reconciles_ledger_alert_only(caplog):
+    """#259: the sweep reports AI-run/ledger mismatches without writing."""
+    import logging
+    from datetime import datetime, timezone
+    from models.reliability import AIRun, OperationTrace
+    from models.usage import CampaignUsageEntry
+
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(4):
+        _commit(db, c.id, i)
+    maybe_trigger_post_turn(db, c.id, trigger="force")
+    # A succeeded primary billable run attributed to the campaign but never
+    # charged (e.g. a dropped ledger write).
+    now = datetime.now(timezone.utc)
+    db.add(OperationTrace(trace_id="t-uncharged", operation_id="op-uncharged",
+                          campaign_id=c.id, submitted_at=now))
+    db.add(AIRun(trace_id="t-uncharged", operation_id="op-uncharged",
+                 logical_operation="narrate", role="narration", provider="openai",
+                 model="gpt-6-luna", attempt=1, classification="primary", billable=True,
+                 status="succeeded", started_at=now, completed_at=now, cost_usd=0.0013))
+    db.commit()
+    with caplog.at_level(logging.WARNING, logger="app.post_turn.service"):
+        sweep = run_post_turn_sweep(db, limit=10)
+    assert not sweep["failed"], sweep["failed"]
+    assert sweep["ledger_mismatches"] == 1
+    assert "ledger_reconcile_mismatch" in caplog.text
+    # Alert only: no auto-charge, no auto-credit.
+    assert db.query(CampaignUsageEntry).count() == 0
+    db.close()
