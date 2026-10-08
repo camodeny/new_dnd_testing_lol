@@ -133,12 +133,13 @@ def _multiattack(content: str) -> int:
     match = _MULTIATTACK_RE.search(content)
     if match is None:
         return 1
-    # Conditional alternatives ("… if it used Hasten this turn") are not a
-    # flat property of the action, like conditional damage riders.
+    # Conditional attack counts ("… three Slam attacks if it used Hasten") are
+    # not a flat property of the action, like conditional damage riders; a
+    # condition on another rider ("uses Unsettling Visage if available") is.
     counts = [
         sum(_COUNT_WORDS[word] for word in _ATTACK_COUNT_RE.findall(option))
         for option in re.split(r",? or (?:it )?(?=makes|uses)", match.group(1))
-        if not re.search(r"\bif\b", option)
+        if not re.search(r"\battacks? if\b", option)
     ]
     return max([1, *counts])
 

@@ -358,3 +358,99 @@ def test_cue_only_turn_sees_the_party_and_hits_them(table):
     s.expire_all()
     assert s.get(DmTurn, turn.id).status == "succeeded"
     assert _hp(t) == 12
+
+
+def test_hidden_attacker_stays_unnamed_in_the_outcome(table):
+    t, s = table, table["s"]
+    entity = s.get(WorldEntity, t["goblin"].id)
+    entity.visibility = "dm_only"
+    s.commit()
+    _encounter(t)
+    with pinned_dice(15):
+        resolution = resolve_mechanics(s, s.get(Campaign, t["camp_id"]), s.execute(select(DmTurn)).scalars().first(),
+                                       _contract(mechanics=[_attack(t)]))
+    assert resolution.issues == []
+    assert resolution.outcomes[0].text == "An unseen creature attacks Hero with Scimitar: hit. Hero takes 8 slashing damage."
+
+
+def test_cue_never_reaches_narration(table):
+    t, s = table, table["s"]
+    _encounter(t)
+    _, attempt = _cue_attempt(t)
+    packet = assemble_attempt_context(s, attempt.id)
+    (cue_record,) = [r for lane in packet.lanes for r in lane.records
+                     if r.record_id == f"submission:{_cues(t)[0].id}"]
+    assert cue_record.use == "adjudication_only"
+
+
+def test_one_npc_end_turn_per_commit(table):
+    t, s = table, table["s"]
+    encounter = _encounter(t)
+    pc, goblin = _participants(t)
+    from app.dm.effects import apply_staged_effects
+
+    turn = s.execute(select(DmTurn)).scalars().first()
+    effects = [_end_turn_effect(encounter, goblin, "e1"), _end_turn_effect(encounter, pc, "e2")]
+    with pytest.raises(ValueError, match="one npc_end_turn"):
+        apply_staged_effects(s, s.get(Campaign, t["camp_id"]), effects, turn, s.get(DmTurnAttempt, turn.current_attempt_id))
+
+
+def test_twin_npcs_spend_their_own_actions(table):
+    t, s = table, table["s"]
+    turn, attempt = _submit(t)
+    encounter = dm_start_encounter(
+        s, t["camp_id"], turn.id, attempt.id,
+        [{"character_id": str(t["char_id"])}, {"npc_entity_id": str(t["goblin"].id)},
+         {"npc_entity_id": str(t["goblin"].id)}], npc_d20=20,
+    )
+    pc = s.execute(select(EncounterParticipant).where(EncounterParticipant.character_id == t["char_id"])).scalars().one()
+    fulfill_human_initiative(s, encounter.id, pc.id, actor_id=t["owner"], payload={
+        "source": "app", "raw_rolls": [1], "modifier": pc.initiative_modifier, "total": 1 + pc.initiative_modifier})
+    s.commit()
+    s.refresh(encounter)
+    dm_end_npc_turn(s, encounter, encounter.active_participant_id)  # first twin done
+    s.commit()
+    second = encounter.active_participant_id
+    with pinned_dice(15):
+        resolution = resolve_mechanics(s, s.get(Campaign, t["camp_id"]), turn, _contract(mechanics=[_attack(t)]))
+    (spend,) = [e for e in resolution.effects if e["effect_type"] == "consume_turn_resource"]
+    assert spend["arguments"]["participant_id"] == str(second)
+
+
+def test_open_npc_turn_gets_one_reminder_then_code_ends_it(table):
+    t, s = table, table["s"]
+    encounter = _encounter(t)
+    pc, goblin = _participants(t)
+    forgetful = _contract(mechanics=[_attack(t)])  # attacks but never stages npc_end_turn
+    _, attempt = _cue_attempt(t)
+    with pinned_dice(15):
+        execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: forgetful, narrator="deterministic")
+    s.expire_all()
+    assert s.get(Encounter, encounter.id).active_participant_id == goblin.id
+    cues = _cues(t)
+    assert len(cues) == 2 and "still open" in cues[1].raw_content
+
+    _, attempt = _cue_attempt(t)
+    execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _contract(), narrator="deterministic")
+    s.expire_all()
+    encounter = s.get(Encounter, encounter.id)
+    assert (encounter.active_participant_id, encounter.turn_sequence) == (pc.id, 2)
+    assert _hp(t) == 12  # the one attack applied once
+    assert coordinate_npc_turn(s, t["camp_id"], str(t["thread_id"])) is None
+
+
+def test_npc_turn_waits_out_a_capacity_pause(table):
+    t, s = table, table["s"]
+    from app.billing.resolution_guarantee import CapacityPausedError
+    from app.combat.npc_turns import queue_missing_npc_turns
+
+    paused = mock.patch(
+        "app.billing.resolution_guarantee.require_new_ai_work",
+        side_effect=CapacityPausedError("paused", decision={}),
+    )
+    with paused:
+        _encounter(t)
+    assert _cues(t) == []
+    assert queue_missing_npc_turns(s) != []
+    assert len(_cues(t)) == 1
+    assert queue_missing_npc_turns(s) == []

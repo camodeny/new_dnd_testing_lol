@@ -251,6 +251,7 @@ def test_search_stat_blocks_evidence_tool(table):
     ("The pit fiend makes one Bite attack, two Devilish Claw attacks, and one Fiery Mace attack.", 4),
     ("The medusa makes two Claw attacks and one Snake Hair attack, or it makes three Poison Ray attacks.", 3),
     ("The golem makes two Slam attacks, or it makes three Slam attacks if it used Hasten this turn.", 2),
+    ("The doppelganger makes two Slam attacks and uses Unsettling Visage if available.", 2),
     ("The snake makes one Bite attack and uses Constrict.", 1),
     ("The hydra makes as many Bite attacks as it has heads.", 1),
 ])

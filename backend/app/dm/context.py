@@ -29,6 +29,7 @@ from app.adventures.service import get_current_adventure
 from app.dm.turns import DM_TURN_RESOLVED
 from app.characters.service import latest_sheet
 from app.combat.npc_turns import active_encounter_context, encounter_character_ids
+from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
 from app.observability.tracing import structured_log
 from app.rules.mechanics import get_character_mechanics_for_sheet
 from app.schema import StrictModel
@@ -1141,6 +1142,9 @@ def assemble_attempt_context(
                 ],
                 authorization=_scope(campaign.id, thread_ids=[attempt.thread_id]),
                 visibility="private" if attempt.audience == "private" else "campaign",
+                # System cues for the DM alone (#236 NPC turns) carry
+                # internal ids and instructions, never narration material.
+                use="adjudication_only" if submission.source in DM_ONLY_SUBMISSION_SOURCES else "narration_eligible",
             )
         )
     timings[LaneName.PLAYER_INPUTS] = (time.monotonic() - lane_started) * 1000

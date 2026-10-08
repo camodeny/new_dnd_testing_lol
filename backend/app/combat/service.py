@@ -1184,6 +1184,20 @@ def stage_turn_encounter_events(
             actor_id=campaign_after.owner_id, provenance=provenance,
         )
         turn_ids.append(encounter.id)
+    # A DM turn that answered an NPC's cue but left its turn open: remind
+    # once, then code ends the turn so combat never stalls.
+    from app.combat.npc_turns import settle_npc_turn
+
+    current = get_active_encounter(db, turn.campaign_id)
+    if current is not None and str(current.thread_id) == str(turn.thread_id):
+        auto_ended = settle_npc_turn(db, campaign_after, current, attempt)
+        if auto_ended is not None:
+            emit_dm_turn_transitions(
+                db, campaign_after, current, [auto_ended],
+                actor_id=campaign_after.owner_id, provenance=provenance,
+            )
+            if current.id not in turn_ids:
+                turn_ids.append(current.id)
 
     # Only encounters this attempt's own end_encounter effects targeted: the
     # API end path stages its event immediately, and a turn must never claim

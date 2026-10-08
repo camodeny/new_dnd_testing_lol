@@ -218,6 +218,9 @@ def apply_staged_effects(
 
     _reject_duplicate_damage_ids(staged_effects)
     _reject_duplicate_state_mutations(staged_effects)
+    if sum(1 for e in staged_effects if e.get("effect_type") == "npc_end_turn") > 1:
+        # Ending A's turn makes B active, so a second end would skip B's turn.
+        raise ValueError("one npc_end_turn per turn commit: a second would skip the next combatant's turn")
     from app.combat.turns import NPC_TURN_TRANSITIONS_KEY
 
     db.info.setdefault(NPC_TURN_TRANSITIONS_KEY, {}).pop(str(attempt.id), None)
@@ -671,14 +674,17 @@ def _handle_update_map_placement(db: Session, campaign: Campaign, effect: dict[s
     )
 
 
-def lock_turn_economy_encounters(db: Session, staged_effects: list[dict[str, Any]]) -> None:
-    """Row-lock encounters whose turn economy this commit changes, before the campaign.
+def lock_turn_economy_encounters(db: Session, staged_effects: list[dict[str, Any]], *, turn: DmTurn) -> None:
+    """Row-lock encounters whose turn economy this commit may change, before the campaign.
 
     Encounter commands lock the encounter, then the campaign; the turn
     commit takes the campaign lock in ``commit_campaign_mutation``. Locking
-    these encounters first keeps one lock order, so a DM commit and a
+    these encounters (and the thread's active one, whose NPC turn the
+    commit may settle) first keeps one lock order, so a DM commit and a
     player's end-turn never deadlock.
     """
+    from app.combat.service import get_active_encounter
+
     import uuid as _uuid
 
     from sqlalchemy import select as _select
@@ -692,6 +698,9 @@ def lock_turn_economy_encounters(db: Session, staged_effects: list[dict[str, Any
                 ids.add(_uuid.UUID(str((eff.get("arguments") or {}).get("encounter_id"))))
             except ValueError:
                 continue
+    current = get_active_encounter(db, turn.campaign_id)
+    if current is not None and str(current.thread_id) == str(turn.thread_id):
+        ids.add(current.id)
     for encounter_id in sorted(ids, key=str):
         db.execute(_select(_Encounter).where(_Encounter.id == encounter_id).with_for_update()).first()
 

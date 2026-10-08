@@ -359,7 +359,7 @@ def npc_turn_issues(db: Session, campaign: Any, turn: Any, contract: DmTurnContr
         key = (str(participant.id), resource)
         amount = int(args.get("amount") or 1)
         spent[key] = spent.get(key, 0) + amount
-        if resource == "action" and participant.npc_entity_id is not None and str(participant.npc_entity_id) in attackers:
+        if resource == "action" and is_active and str(participant.npc_entity_id) in attackers:
             issues.append(MechanicIssue(effect.id, "action_spent_by_attack", "this NPC's attack already spends its action; drop this effect"))
         elif resource != "reaction" and not is_active:
             issues.append(MechanicIssue(effect.id, "not_npcs_turn", f"it is not {participant.display_name}'s turn"))

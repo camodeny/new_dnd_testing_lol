@@ -572,7 +572,10 @@ def resolve_npc_attack(
             "initiative_pending", "the encounter is still waiting on initiative; attacks start on the first turn",
         )
     participants = list_participants(db, encounter.id)
-    attacker_p = _participant_for(participants, "npc", str(attacker.row.id))
+    # One stat-block entity may field several combatants: the attacker is
+    # the one whose turn it is.
+    twins = [p for p in participants if p.npc_entity_id is not None and str(p.npc_entity_id) == str(attacker.row.id)]
+    attacker_p = next((p for p in twins if p.id == encounter.active_participant_id), twins[0] if twins else None)
     target_id = str(target.row.id) if target.kind == "npc" else str(target.row.character_id)
     target_p = _participant_for(participants, target.kind, target_id)
     if attacker_p is None:
@@ -599,7 +602,14 @@ def resolve_npc_attack(
     except AttackError as exc:
         raise AttackRollError(exc.code, str(exc)) from exc
     outcome = {"critical": "critical hit", "hit": "hit"}.get(roll.outcome, "miss")
-    text = f"{attacker.name} attacks {target.name} with {weapon.offense.attack_name}: {outcome}."
+    # The outcome is table-visible: combatants hidden from players stay unnamed.
+    from app.combat.service import hidden_participant_ids
+
+    hidden = hidden_participant_ids(db, encounter.id)
+    attacker_name = "An unseen creature" if str(attacker_p.id) in hidden else attacker.name
+    target_name = "an unseen creature" if str(target_p.id) in hidden else target.name
+    target_subject = target_name[:1].upper() + target_name[1:]
+    text = f"{attacker_name} attacks {target_name} with {weapon.offense.attack_name}: {outcome}."
     effects: list[dict[str, Any]] = []
     hp = target_hp
     if roll.outcome in ("hit", "critical"):
@@ -630,9 +640,9 @@ def resolve_npc_attack(
                 hp = apply_damage(hp, damage.final_total, change_id=damage.damage_id).after
                 dropped = dropped or (before > 0 and hp.current == 0)
         if parts:
-            text += f" {target.name} takes {' and '.join(parts)} damage."
+            text += f" {target_subject} takes {' and '.join(parts)} damage."
         if dropped:
-            text += f" {target.name} drops to 0 hit points."
+            text += f" {target_subject} drops to 0 hit points."
     return NpcAttack(
         encounter_id=str(encounter.id), participant_id=str(attacker_p.id),
         turn_sequence=int(encounter.turn_sequence or 0), effects=effects, text=text,
