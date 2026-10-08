@@ -166,21 +166,32 @@ def settle_npc_turn(db: Session, campaign: Campaign, encounter: Encounter, attem
 
 
 def queue_missing_npc_turns(db: Session, *, limit: int = 5) -> list[str]:
-    """Sweep: queue cues for NPC turns that have none (e.g. started while AI-paused)."""
+    """Sweep: queue cues an NPC turn is owed but never got (e.g. while AI-paused).
+
+    A turn with no cue gets its first; a turn whose only cue was answered
+    without ending it gets the reminder that a paused commit skipped.
+    """
     rows = db.execute(
         select(Encounter, Campaign)
         .join(Campaign, Campaign.id == Encounter.campaign_id)
-        .where(Encounter.status == "active", Campaign.status != "archived")
+        .join(EncounterParticipant, EncounterParticipant.id == Encounter.active_participant_id)
+        .where(
+            Encounter.status == "active",
+            Campaign.status != "archived",
+            EncounterParticipant.kind.in_(NPC_KINDS),
+        )
         .order_by(Encounter.turn_started_at.asc())
-        .limit(max(1, limit) * 4)
     ).all()
     queued: list[str] = []
     for encounter, campaign in rows:
         participant = _active_npc(db, encounter)
-        if participant is None or _turn_cues(db, encounter, participant):
+        if participant is None:
+            continue
+        cues = _turn_cues(db, encounter, participant)
+        if len(cues) > 1 or any(cue.resolution_status == "accepted" for cue in cues):
             continue
         try:
-            if queue_npc_turn(db, campaign, encounter) is not None:
+            if queue_npc_turn(db, campaign, encounter, reminder=bool(cues)) is not None:
                 db.commit()
                 queued.append(str(encounter.id))
         except Exception:

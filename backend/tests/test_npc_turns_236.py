@@ -454,3 +454,18 @@ def test_npc_turn_waits_out_a_capacity_pause(table):
     assert queue_missing_npc_turns(s) != []
     assert len(_cues(t)) == 1
     assert queue_missing_npc_turns(s) == []
+
+
+def test_sweep_sends_a_reminder_a_paused_commit_skipped(table):
+    t, s = table, table["s"]
+    from app.billing.resolution_guarantee import CapacityPausedError
+    from app.combat.npc_turns import queue_missing_npc_turns
+
+    _encounter(t)
+    _, attempt = _cue_attempt(t)
+    with mock.patch("app.billing.resolution_guarantee.require_new_ai_work",
+                    side_effect=CapacityPausedError("paused", decision={})):
+        execute_dm_attempt(s, attempt.id, adjudicate=lambda p, f=None: _contract(), narrator="deterministic")
+    assert len(_cues(t)) == 1
+    assert queue_missing_npc_turns(s) != []
+    assert "still open" in _cues(t)[1].raw_content
