@@ -202,14 +202,14 @@ def test_confirmed_payment_creates_exactly_one_credit(ctx):
     assert outcome["status"] == "confirmed"
     entries = db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").all()
     assert len(entries) == 1
-    assert entries[0].amount_cents == 500
+    assert entries[0].amount_micros == 5_000_000
     assert entries[0].idempotency_key == f"stripe_funds:{op_id}"
     assert entries[0].entry_metadata["funding_operation_id"] == str(op_id)
     # No Stripe identifiers leak into the ledger (#253 privacy).
     assert "stripe" not in json.dumps(entries[0].entry_metadata).lower()
     assert "cs_test" not in str(entries[0].note) and "pi_test" not in str(entries[0].note)
     summary = get_capacity_summary(db, camp)
-    assert summary["funded_cents"] == 500 and summary["remaining_cents"] == 500
+    assert summary["funded_micros"] == 5_000_000 and summary["remaining_micros"] == 5_000_000
     db.close()
 
 
@@ -231,7 +231,7 @@ def test_payment_failure_leaves_capacity_and_gameplay_untouched(ctx):
     assert outcome["status"] == "failed"
     assert db.get(CampaignFundingOperation, op_id).status == "failed"
     assert db.query(CampaignUsageEntry).count() == 0
-    assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    assert get_capacity_summary(db, camp)["funded_micros"] == 0
     assert db.get(Campaign, camp).name == name_before
     db.close()
 
@@ -251,7 +251,7 @@ def test_duplicate_webhook_delivery_credits_once(ctx):
     db.commit()
     assert first["status"] == "confirmed" and second["status"] == "duplicate"
     assert db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").count() == 1
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     db.close()
 
 
@@ -275,7 +275,7 @@ def test_reordered_webhooks_credit_once(ctx):
                            _session_completed_obj(db, op_id, paid=True)))["status"] == "confirmed"
     db.commit()
     assert db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").count() == 1
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     db.close()
 
 
@@ -355,7 +355,7 @@ def test_unpaid_reconcile_credits_nothing(ctx):
 def test_successful_funding_resumes_paused_play(ctx):
     fac, camp, owner, _member, fake = ctx
     db = _db(fac)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=100,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=1_000_000,
                  idempotency_key="alloc-1")
     run = _run(db, camp, cost_usd=1.00, tag="pause256")
     record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
@@ -381,7 +381,7 @@ def test_successful_funding_resumes_paused_play(ctx):
 def test_failed_counted_run_recredited_once_with_link(ctx):
     fac, camp, owner, _member, _fake = ctx
     db = _db(fac)
-    record_entry(db, campaign_id=camp, entry_type="allocation", amount_cents=1000,
+    record_entry(db, campaign_id=camp, entry_type="allocation", amount_micros=10_000_000,
                  idempotency_key="alloc-1")
     run = _run(db, camp, cost_usd=4.00, tag="doom256")
     spend = record_ai_spend_for_run(db, campaign_id=camp, ai_run=run)
@@ -392,10 +392,10 @@ def test_failed_counted_run_recredited_once_with_link(ctx):
     entry = funding.recredit_failed_run(db, campaign_id=camp, ai_run_id=run.id,
                                         actor_user_id=owner, failure_reason="failed")
     db.commit()
-    assert entry.entry_type == "recredit" and entry.amount_cents == 400
+    assert entry.entry_type == "recredit" and entry.amount_micros == 4_000_000
     assert entry.entry_metadata["recredit_for_ai_run_id"] == str(run.id)
     assert entry.entry_metadata["recredit_for_entry_id"] == str(spend.id)
-    assert get_capacity_summary(db, camp)["funded_cents"] == 1400
+    assert get_capacity_summary(db, camp)["funded_micros"] == 14_000_000
     # Second re-credit for the same run is rejected.
     with pytest.raises(LedgerConflictError):
         funding.recredit_failed_run(db, campaign_id=camp, ai_run_id=run.id,
@@ -448,7 +448,7 @@ def test_stripe_refund_mirrored_idempotently(ctx):
         db, _webhook_event("evt-pay-9", "checkout.session.completed",
                            _session_completed_obj(db, op_id, paid=True)))
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     op = db.get(CampaignFundingOperation, op_id)
     refund_obj = {"id": "re_test_1", "object": "refund", "amount": 500, "currency": "usd",
                   "payment_intent": op.stripe_payment_intent_id,
@@ -457,13 +457,13 @@ def test_stripe_refund_mirrored_idempotently(ctx):
     db.commit()
     assert first["status"] == "refunded"
     # Money returned → funded pool decreases via signed correction, history intact.
-    assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    assert get_capacity_summary(db, camp)["funded_micros"] == 0
     assert db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").count() == 1
     # Redelivery replays without a second correction.
     dup = funding.handle_stripe_event(db, _webhook_event("evt-re-9a", "refund.created", refund_obj))
     db.commit()
     assert dup["status"] == "duplicate"
-    assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    assert get_capacity_summary(db, camp)["funded_micros"] == 0
     db.close()
 
 
@@ -483,7 +483,7 @@ def test_reordered_refund_before_confirm_resolves_once(ctx):
     assert outcome["status"] == "refunded"
     assert db.get(CampaignFundingOperation, op_id).status == "confirmed"
     assert db.query(CampaignUsageEntry).filter_by(entry_type="added_funds").count() == 1
-    assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    assert get_capacity_summary(db, camp)["funded_micros"] == 0
     db.close()
 
 
@@ -509,7 +509,7 @@ def _refund_mirror_count(db, camp):
     return db.query(CampaignUsageEntry).filter(
         CampaignUsageEntry.campaign_id == camp,
         CampaignUsageEntry.entry_type == "admin_adjustment",
-        CampaignUsageEntry.amount_cents < 0,
+        CampaignUsageEntry.amount_micros < 0,
     ).count()
 
 
@@ -523,7 +523,7 @@ def test_two_partial_refunds_mirror_each_idempotently(ctx):
         db, _webhook_event("evt-pay-part", "checkout.session.completed",
                            _session_completed_obj(db, op_id, paid=True)))
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     op = db.get(CampaignFundingOperation, op_id)
 
     def _per_refund_event(event_id, refund_id, amount_cents, status="succeeded"):
@@ -537,7 +537,7 @@ def test_two_partial_refunds_mirror_each_idempotently(ctx):
     assert funding.handle_stripe_event(
         db, _per_refund_event("evt-part-a", "re_part_a", 200))["status"] == "refunded"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 300
+    assert get_capacity_summary(db, camp)["funded_micros"] == 3_000_000
 
     # 2. charge.refunded re-emits the FULL list [A, B]: A replays, B mirrors.
     #    The old first-item-only code returned duplicate here and lost B.
@@ -546,26 +546,26 @@ def test_two_partial_refunds_mirror_each_idempotently(ctx):
     assert funding.handle_stripe_event(
         db, _webhook_event("evt-part-charge", "charge.refunded", both))["status"] == "refunded"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
     assert _refund_mirror_count(db, camp) == 2
 
     # 3. Same event id redelivered → duplicate, no movement.
     assert funding.handle_stripe_event(
         db, _webhook_event("evt-part-charge", "charge.refunded", both))["status"] == "duplicate"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
 
     # 4. New event id, same charge payload (both ids already mirrored) → duplicate.
     assert funding.handle_stripe_event(
         db, _webhook_event("evt-part-charge-2", "charge.refunded", both))["status"] == "duplicate"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
 
     # 5. Reordered per-refund event for B alone → duplicate replay.
     assert funding.handle_stripe_event(
         db, _per_refund_event("evt-part-b-late", "re_part_b", 150))["status"] == "duplicate"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
     assert _refund_mirror_count(db, camp) == 2
 
     # 6. Cumulative cap: 350 already mirrored; a further 400 would exceed the
@@ -573,7 +573,7 @@ def test_two_partial_refunds_mirror_each_idempotently(ctx):
     with pytest.raises(funding.FundingValidationError):
         funding.handle_stripe_event(db, _per_refund_event("evt-part-over", "re_part_c", 400))
     db.rollback()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
     assert _refund_mirror_count(db, camp) == 2
 
     # 7. Non-final (pending) refunds move no money: ignored until final.
@@ -582,12 +582,12 @@ def test_two_partial_refunds_mirror_each_idempotently(ctx):
         db, _webhook_event("evt-part-pending", "charge.refunded", pending_only))
     db.commit()
     assert ignored["status"] == "ignored"
-    assert get_capacity_summary(db, camp)["funded_cents"] == 150
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_500_000
     # ... and its later succeeded delivery mirrors exactly once.
     assert funding.handle_stripe_event(
         db, _per_refund_event("evt-part-d-final", "re_part_d", 50))["status"] == "refunded"
     db.commit()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 100
+    assert get_capacity_summary(db, camp)["funded_micros"] == 1_000_000
     assert _refund_mirror_count(db, camp) == 3
     db.close()
 
@@ -800,7 +800,7 @@ def test_recredit_endpoint_owner_only_and_idempotent(api):
     first = client.post(f"/api/campaigns/{camp_id}/recredits", json=payload,
                         headers={"Idempotency-Key": "recredit-ep-1"})
     assert first.status_code == 200, first.text
-    assert first.json()["entry"]["amount_cents"] == 200
+    assert first.json()["entry"]["amount_micros"] == 2_000_000
     # Same key replays the same entry; conflicting reuse is rejected.
     replay = client.post(f"/api/campaigns/{camp_id}/recredits", json=payload,
                          headers={"Idempotency-Key": "recredit-ep-1"})
@@ -1000,7 +1000,7 @@ def test_refund_currency_mismatch_rejected(ctx):
     with pytest.raises(funding.FundingValidationError):
         funding.handle_stripe_event(db, _webhook_event("evt-fx-1", "refund.created", refund_obj))
     db.rollback()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     db.close()
 
 
@@ -1019,7 +1019,7 @@ def test_refund_exceeding_funding_rejected(ctx):
     with pytest.raises(funding.FundingValidationError):
         funding.handle_stripe_event(db, _webhook_event("evt-big-1", "refund.created", refund_obj))
     db.rollback()
-    assert get_capacity_summary(db, camp)["funded_cents"] == 500
+    assert get_capacity_summary(db, camp)["funded_micros"] == 5_000_000
     db.close()
 
 
@@ -1040,7 +1040,7 @@ def test_refund_for_failed_operation_ignored(ctx):
     db.commit()
     assert outcome["status"] == "ignored"
     assert db.query(CampaignUsageEntry).count() == 0
-    assert get_capacity_summary(db, camp)["funded_cents"] == 0
+    assert get_capacity_summary(db, camp)["funded_micros"] == 0
     db.close()
 
 

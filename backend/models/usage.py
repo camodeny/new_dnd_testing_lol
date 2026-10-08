@@ -3,8 +3,9 @@
 Append-only, auditable usage/capacity accounting for one campaign's shared
 pool. One canonical schema (pre-alpha: no legacy shims).
 
-Money is integer cents. Funding entries are positive, AI-spend entries are
-negative. Corrections never mutate history:
+Money is integer micro-USD (1e-6 USD): a typical AI run costs a fraction of
+a cent, so whole cents would round every spend to zero (#259). Funding
+entries are positive, AI-spend entries are negative. Corrections never mutate history:
 post a compensating entry (refund / re-credit / admin adjustment).
 
 Each primary billable AI run from #192 maps to exactly one ``ai_spend``
@@ -20,11 +21,14 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import BigInteger, CheckConstraint, DateTime, ForeignKey, Index, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
+
+MICROS_PER_USD = 1_000_000
+MICROS_PER_CENT = 10_000
 
 # Canonical entry types — single schema, no aliases.
 ENTRY_TYPE_ALLOCATION = "allocation"  # subscription / plan funded allocation
@@ -80,8 +84,8 @@ class CampaignUsageEntry(Base):
         UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
     )
     entry_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    # Signed cents: funding > 0, ai_spend < 0, admin adjustment != 0.
-    amount_cents: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Signed micro-USD: funding > 0, ai_spend < 0, admin adjustment != 0.
+    amount_micros: Mapped[int] = mapped_column(BigInteger, nullable=False)
     # Exactly one ai_spend entry per primary billable AI run; NULL otherwise.
     ai_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, unique=True)
     # Which human funded this line. Gameplay authority is unchanged — the
@@ -103,7 +107,7 @@ class CampaignUsageEntry(Base):
             "id": str(self.id),
             "campaign_id": str(self.campaign_id),
             "entry_type": self.entry_type,
-            "amount_cents": self.amount_cents,
+            "amount_micros": self.amount_micros,
             "ai_run_id": str(self.ai_run_id) if self.ai_run_id else None,
             "contributor_user_id": str(self.contributor_user_id) if self.contributor_user_id else None,
             "idempotency_key": self.idempotency_key,
@@ -118,6 +122,6 @@ class CampaignUsageEntry(Base):
             "id": str(self.id),
             "campaign_id": str(self.campaign_id),
             "entry_type": self.entry_type,
-            "amount_cents": self.amount_cents,
+            "amount_micros": self.amount_micros,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

@@ -67,7 +67,7 @@ def test_credential_cleanup_preserves_platform_funding_and_ai_runs():
                         "1, 'primary', false, 'succeeded', now(), :credential)"
                     ), {"id": run, "credential": credential})
                     conn.execute(text(
-                        "INSERT INTO campaign_usage_entries (id, campaign_id, entry_type, amount_cents, idempotency_key) "
+                        "INSERT INTO campaign_usage_entries (id, campaign_id, entry_type, amount_micros, idempotency_key) "
                         "VALUES (:id, :campaign, :type, :amount, :key)"
                     ), [
                         {"id": funding, "campaign": campaign, "type": "allocation", "amount": 500, "key": "funding"},
@@ -81,12 +81,12 @@ def test_credential_cleanup_preserves_platform_funding_and_ai_runs():
                 assert "credential_id" not in {c["name"] for c in inspect(conn).get_columns("ai_runs")}
                 assert conn.execute(text("SELECT count(*) FROM ai_runs WHERE id = :id"), {"id": run}).scalar() == 1
                 entries = conn.execute(text(
-                    "SELECT id, amount_cents FROM campaign_usage_entries WHERE campaign_id = :id"
+                    "SELECT id, amount_micros FROM campaign_usage_entries WHERE campaign_id = :id"
                 ), {"id": campaign}).all()
                 assert entries == [(funding, 500)]
                 with pytest.raises(IntegrityError), conn.begin_nested():
                     conn.execute(text(
-                        "INSERT INTO campaign_usage_entries (id, campaign_id, entry_type, amount_cents, idempotency_key) "
+                        "INSERT INTO campaign_usage_entries (id, campaign_id, entry_type, amount_micros, idempotency_key) "
                         "VALUES (:id, :campaign, 'byok_marker', 0, 'rejected-marker')"
                     ), {"id": uuid.uuid4(), "campaign": campaign})
             finally:
