@@ -35,6 +35,16 @@ import {
 } from '@/lib/realtime'
 import { isProjectionError, type TableProjection } from '@/lib/table'
 
+function removeChannelQuietly(channel: ReturnType<typeof supabase.channel>) {
+  try {
+    supabase.removeChannel(channel)
+  } catch {
+    try {
+      channel.unsubscribe()
+    } catch { /* ignore */ }
+  }
+}
+
 /** A whole-table projection failure renders as "no table data", never stale. */
 function snapshotTable(snap: SnapshotForRealtime): TableProjection | null {
   return snap.table && !isProjectionError(snap.table) ? snap.table : null
@@ -439,6 +449,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     })
     let cancelled = false
     let currentChannel: ReturnType<typeof supabase.channel> | null = null
+    let reconnectTimer: number | undefined
 
     const doSubscribe = async () => {
       const channelName = liveTableChannel(campaignId!, threadId!)
@@ -464,11 +475,15 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       }
       if (cancelled) return false
 
-      currentChannel = buildChannel(channelName) as unknown as ReturnType<typeof supabase.channel>
-      channelRef.current = currentChannel
+      const channel = buildChannel(channelName)
+      currentChannel = channel
+      channelRef.current = channel
 
       const onStatusChange = (status: string) => {
-        if (cancelled) return
+        // Statuses from a retired channel are stale — notably the CLOSED that
+        // removeChannel fires on it. Acting on that would schedule another
+        // rebuild that tears down the healthy replacement, forever.
+        if (cancelled || channel !== currentChannel) return
         if (status === 'SUBSCRIBED') {
           if (isMountedRef.current) {
             setState((prev) => ({
@@ -481,6 +496,11 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
           incRealtimeMetric('subscriptionCount')
           reconnectAttemptsRef.current = 0
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          // Retire before removing so the CLOSED this triggers is ignored above.
+          // Explicitly rebuild the channel (supabase-js does not always auto-resubscribe private channels)
+          currentChannel = null
+          channelRef.current = null
+          removeChannelQuietly(channel)
           if (isMountedRef.current) {
             setState((prev) => ({
               ...prev,
@@ -488,38 +508,16 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
               phase: prev.hasSnapshot ? 'reconnecting' : 'loading',
             }))
           }
-          if (!cancelled) {
-            reconnectAttemptsRef.current += 1
-            incRealtimeMetric('reconnectCount')
-            const backoff = Math.min(1000 * 2 ** reconnectAttemptsRef.current, 15000)
-            setTimeout(async () => {
-              if (cancelled || !isMountedRef.current) return
-              // Explicitly rebuild the channel (supabase-js does not always auto-resubscribe private channels)
-              try {
-                if (currentChannel) {
-                  try {
-                    supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])
-                  } catch {
-                    try {
-                      ;(currentChannel as unknown as { unsubscribe: () => void }).unsubscribe()
-                    } catch { /* ignore */ }
-                  }
-                }
-              } catch { /* ignore */ }
-              currentChannel = null
-              channelRef.current = null
-              bufferedRef.current = []
-              const ok = await doSubscribe()
-              if (ok) {
-                const snap = await fetchSnapshotAndAdopt()
-                if (snap && bufferedRef.current.length) {
-                  const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
-                  if (reconciled.length) applyEvents(reconciled)
-                  bufferedRef.current = []
-                }
-              }
-            }, backoff)
-          }
+          reconnectAttemptsRef.current += 1
+          incRealtimeMetric('reconnectCount')
+          const backoff = Math.min(1000 * 2 ** reconnectAttemptsRef.current, 15000)
+          window.clearTimeout(reconnectTimer)
+          reconnectTimer = window.setTimeout(() => {
+            if (cancelled || !isMountedRef.current) return
+            bufferedRef.current = []
+            // doSubscribe re-snapshots and reconciles once resubscribed.
+            void doSubscribe()
+          }, backoff)
         }
       }
 
@@ -562,22 +560,12 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       cancelled = true
       isMountedRef.current = false
       window.clearInterval(pollId)
+      window.clearTimeout(reconnectTimer)
       if (currentChannel) {
-        try {
-          supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])
-        } catch {
-          try {
-            ;(currentChannel as unknown as { unsubscribe: () => void }).unsubscribe()
-          } catch { /* ignore */ }
-        }
+        removeChannelQuietly(currentChannel)
         currentChannel = null
       }
-      if (channelRef.current) {
-        try {
-          supabase.removeChannel(channelRef.current as unknown as Parameters<typeof supabase.removeChannel>[0])
-        } catch { /* ignore */ }
-        channelRef.current = null
-      }
+      channelRef.current = null
     }
   }, [campaignId, threadId, enabled, buildChannel, fetchSnapshotAndAdopt, applyEvents])
 

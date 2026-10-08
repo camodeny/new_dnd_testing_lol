@@ -360,4 +360,55 @@ describe('useLiveTableRealtime snapshot fallback', () => {
     })
     container.remove()
   })
+
+  it('rebuilds once after a channel error instead of cycling reconnects forever', async () => {
+    type FakeChannel = { on: () => FakeChannel; subscribe: (cb: (status: string) => void) => FakeChannel; status?: (status: string) => void }
+    let created = 0
+    mockedChannel.mockImplementation(() => {
+      created += 1
+      // Only the first join fails; every rebuild joins cleanly.
+      const initial = created === 1 ? 'CHANNEL_ERROR' : 'SUBSCRIBED'
+      const fakeChannel: FakeChannel = {
+        on: () => fakeChannel,
+        subscribe: (cb) => {
+          fakeChannel.status = cb
+          cb(initial)
+          return fakeChannel
+        },
+      }
+      return fakeChannel as never
+    })
+    // Like realtime-js, removing a channel fires CLOSED on its subscribe callback.
+    vi.mocked(supabase.removeChannel).mockImplementation(async (channel) => {
+      ;(channel as unknown as FakeChannel).status?.('CLOSED')
+      return 'ok'
+    })
+
+    const seen: { latest: ReturnType<typeof useLiveTableRealtime> | null } = { latest: null }
+    function Harness() {
+      seen.latest = useLiveTableRealtime({ campaignId: 'c1', threadId: 't1' })
+      return null
+    }
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(<Harness />)
+    })
+    expect(seen.latest?.phase).toBe('reconnecting')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    // One rebuild for the one error; the healthy replacement is never torn down.
+    expect(created).toBe(2)
+    expect(supabase.removeChannel).toHaveBeenCalledTimes(1)
+    expect(seen.latest?.phase).toBe('live')
+    expect(seen.latest?.connected).toBe(true)
+
+    await act(async () => {
+      root.unmount()
+    })
+    container.remove()
+  })
 })
