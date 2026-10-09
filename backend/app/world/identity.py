@@ -388,8 +388,16 @@ def create_entity_after_resolution(
     entity_type: str, name: str, idempotency_key: str, details: dict | None = None,
     summary: str | None = None, source_turn_id: uuid.UUID | None = None,
     source_attempt_id: uuid.UUID | None = None, operation_id: str | None = None,
+    baseline_revision: str | None = None,
 ) -> tuple[WorldEntity, bool]:
-    """Revalidate a resolved outcome immediately before its durable write."""
+    """Revalidate a resolved outcome immediately before its durable write.
+
+    ``baseline_revision`` is the identity fingerprint a commit took before
+    its own writes. A commit that creates several entities passes it so
+    creating the first does not stale the second; any change by anyone
+    else before that baseline still fails stale. Exact-name collisions are
+    always checked against fresh state.
+    """
     prior = db.execute(select(WorldEntity).where(
         WorldEntity.campaign_id == campaign.id,
         WorldEntity.idempotency_key == str(idempotency_key).strip(),
@@ -399,9 +407,10 @@ def create_entity_after_resolution(
         if resolution.get("frame_id") != frame.frame_id or resolution.get("outcome") != selected_id:
             raise ValueError("idempotency key belongs to a different identity resolution")
         return prior, False
-    current = db.get(Campaign, campaign.id)
+    if baseline_revision is None:
+        baseline_revision = identity_revision(db, db.get(Campaign, campaign.id))
     candidate = revalidate_for_execution(
-        frame, selected_id, identity_revision(db, current),
+        frame, selected_id, baseline_revision,
         legal_ids={item.id for item in frame.candidates},
     )
     if candidate.id == DEFER:
@@ -531,6 +540,27 @@ def _extract_identity_proposals(source: Any) -> list[dict]:
                 "location_ref": getattr(raw, "location_ref", None),
             })
     return proposals
+
+
+def _reject_duplicate_sibling_names(proposals: list[dict]) -> None:
+    """Refuse two proposals in one turn that share an exact public name.
+
+    Every proposal's frame is enumerated before any sibling exists, so
+    neither sees the other as a candidate. Two same-name introductions in
+    one turn are one person, or two people who need distinct names: either
+    way the contract must change, never the canon.
+    """
+    seen: dict[str, str] = {}
+    for proposal in proposals:
+        key = normalize_alias(proposal.get("public_name") or "")
+        if not key:
+            continue
+        if key in seen:
+            raise ValueError(
+                f"new_entities {seen[key]!r} and {proposal.get('temp_id')!r} have the same name "
+                f"{proposal.get('public_name')!r}; introduce one entity or give each a distinct name"
+            )
+        seen[key] = str(proposal.get("temp_id") or "")
 
 
 def _location_value(location_ref: Any) -> Any:
@@ -678,11 +708,14 @@ def _apply_stored_identity_outcome(
     turn_id: Any,
     attempt_id: Any,
     operation_id: Any,
+    baseline_revision: str,
 ) -> WorldEntity:
     """Apply one pre-narration identity outcome against fresh commit-time state.
 
     Revalidates deterministically in code; never makes a model call. Stale
-    or illegal outcomes fail closed with no insert.
+    or illegal outcomes fail closed with no insert. The frame's revision is
+    checked against the commit's ``baseline_revision``; legality and name
+    collisions are checked against fresh state.
     """
     temp_id = proposal["temp_id"]
     selected_id = str(outcome.get("outcome") or "")
@@ -699,6 +732,7 @@ def _apply_stored_identity_outcome(
         frame = rebuild_identity_frame(outcome["frame"])
         entity, _ = create_entity_after_resolution(
             db, campaign, frame, selected_id,
+            baseline_revision=baseline_revision,
             entity_type=proposal["kind"],
             name=validate_entity_name(proposal["public_name"]),
             idempotency_key=jit_key,
@@ -804,6 +838,7 @@ def resolve_new_entity_identities_pre_narration(
         return []
     if len(proposals) > 8:
         raise ValueError("new_entities proposals exceed bound of 8")
+    _reject_duplicate_sibling_names(proposals)
     turn_id = getattr(turn, "id", None)
     attempt_id = getattr(attempt, "id", None)
     service = identity_decision_service
@@ -902,6 +937,7 @@ def promote_new_entities_from_contract(
     identity_decision_service: Any | None = None,
     identity_session_factory: Any | None = None,
     identity_telemetry_outbox: list | None = None,
+    baseline_identity_revision: str | None = None,
 ) -> list[WorldEntity]:
     """Promote ``new_entities`` proposals to durable canonical identity.
 
@@ -919,6 +955,13 @@ def promote_new_entities_from_contract(
     with no stored outcome (direct commit callers that skipped the
     pre-narration step) fall back to the same inline bounded resolution.
 
+    Every stored frame is revalidated against ONE baseline identity
+    revision: ``baseline_identity_revision`` when the caller took it before
+    its own writes in this commit (the turn commit does, ahead of staged
+    effects), else the state on entry. Entities this promotion creates
+    therefore never stale their siblings' frames, while any other change
+    since pre-narration resolution still fails closed as stale.
+
     Telemetry never opens an independent session while the campaign lock is
     held: pass ``identity_telemetry_outbox`` to collect decision records
     for a post-commit flush. ``identity_session_factory`` remains only for
@@ -929,7 +972,11 @@ def promote_new_entities_from_contract(
         return []
     if len(proposals) > 8:
         raise ValueError("new_entities proposals exceed bound of 8")
+    _reject_duplicate_sibling_names(proposals)
     stored = stored_identity_outcomes(attempt)
+    baseline = baseline_identity_revision
+    if baseline is None:
+        baseline = identity_revision(db, campaign)
 
     promoted: list[WorldEntity] = []
     reused_names: list[tuple[WorldEntity, str]] = []
@@ -949,12 +996,12 @@ def promote_new_entities_from_contract(
             continue
         outcome = stored.get(temp_id)
         if outcome is not None:
-            # Pre-narration decision: revalidate against fresh state and
-            # apply with no second model call.
+            # Pre-narration decision: revalidate against the commit's
+            # baseline and apply with no second model call.
             entity = _apply_stored_identity_outcome(
                 db, campaign, proposal=proposal, outcome=outcome,
                 jit_key=jit_key, turn_id=turn_id, attempt_id=attempt_id,
-                operation_id=operation_id,
+                operation_id=operation_id, baseline_revision=baseline,
             )
             promoted.append(entity)
             reused_names.append((entity, proposal["public_name"]))
