@@ -129,6 +129,26 @@ def _stream(db, cid, tid, turn, attempt):
     return stream
 
 
+# ── 0. never-funded campaigns are unmetered ───────────────────────────────────
+
+def test_never_funded_campaign_stays_open_after_spend():
+    """Recorded spend alone must not pause a campaign that was never funded
+    (regression: #259 started recording real spend; funding is #489)."""
+    Fac, cid, owner, _p2, _char, tid = _setup()
+    db = Fac()
+    _spend(db, cid, 0.004, tag="opening")
+    db = Fac()
+    decision = evaluate_new_work(db, cid, tid)
+    assert decision["allowed"] is True and decision["reason"] == "unfunded_open"
+    assert decision["ai_paused"] is False
+    assert capacity_state_payload(db, cid, tid)["percent_used"] == 0.0
+    # Once funded, the campaign is metered and the normal boundary applies.
+    _fund(db, cid, 1)
+    _spend(db, cid, 0.02, tag="past-funding")
+    db = Fac()
+    assert evaluate_new_work(db, cid, tid)["reason"] == "capacity_exhausted_paused"
+
+
 # ── 1. boundary before a new turn ────────────────────────────────────────────
 
 def test_boundary_before_new_turn():

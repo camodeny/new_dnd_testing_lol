@@ -324,9 +324,9 @@ def evaluate_new_work(
         "grace_overage_pct": grace_overage_pct(),
     }
 
-    # No funded boundary and nothing spent: capacity policy has nothing to
-    # enforce yet (checkout/funding lives elsewhere). Never brick first play.
-    if funded <= 0 and consumed <= 0:
+    # Never funded: capacity policy has nothing to enforce yet (funding and
+    # the free tier live in #489). Recorded spend alone must not pause play.
+    if not summary.get("metered"):
         decision = {**base, "allowed": True, "reason": "unfunded_open",
                     "ai_paused": False, "grace_active": False}
         return decision
