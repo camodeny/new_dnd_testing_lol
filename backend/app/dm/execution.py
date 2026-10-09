@@ -73,6 +73,11 @@ class _Run:
     provider: str | None = None
     model: str | None = None
     path_info: dict = field(default_factory=dict)
+    #: Provider-backed adjudication passes / rules-advisory checks started for
+    #: this attempt (#515). Only the first of each can bill: every later pass
+    #: re-adjudicates the same accepted player intent.
+    adjudication_passes: int = 0
+    advisory_checks: int = 0
 
 
 @dataclass
@@ -326,13 +331,19 @@ def _failover_adjudicator(run: _Run):
         from app.dm.adjudication import adjudicate_with_failover
 
         _ = feedback  # feedback reaches the model via the regeneration packet
+        # Every pass after the attempt's first — validator/malformed-output
+        # regeneration, an evidence-loop round, identity re-adjudication — is
+        # system-driven work on the same already-accepted player intent, so
+        # it is recovery: costed, never billed (#515).
+        regeneration = run.adjudication_passes > 0
+        run.adjudication_passes += 1
         contract, info = adjudicate_with_failover(
             packet, db=run.db, role="forward_dm",
             timeout_seconds=run.timeout_seconds, trace_id=run.trace_id,
             # Explicit-Retry attempts carry retry lineage: even the first
             # provider call is recovery/non-billable so failed work is never
             # double-charged.
-            is_retry=run.is_recovery,
+            is_retry=run.is_recovery or regeneration,
             campaign_id=run.campaign_id,
         )
         run.path_info.update(info)
@@ -411,14 +422,24 @@ def _adjudicate_and_validate(run: _Run, adjudicate, start_packet):
     # and identity readjudication reuse the same bounded rules references.
     if "rules_guidance" not in start_packet.observability.retrieval_dependencies:
         with trace_context(run.trace_id, f"dm_rules:{run.attempt_id}"):
-            start_packet = enrich_rules_context(run.db, start_packet, is_recovery=run.is_recovery)
+            start_packet = enrich_rules_context(
+                run.db, start_packet, is_recovery=run.is_recovery,
+                campaign_id=run.campaign_id,
+            )
 
     def checked(contract, packet):
         # Shadow evaluation only: a semantic judgment never changes the
         # contract or bypasses the deterministic validation/commit pipeline.
         with trace_context(run.trace_id, f"dm_rules:{run.attempt_id}"):
+            # A re-adjudicated contract's advisory re-check is recovery, as
+            # its adjudication pass is (#515).
+            recheck = run.advisory_checks > 0
+            run.advisory_checks += 1
             try:
-                advisory = check_rules_advisory(packet, contract, is_recovery=run.is_recovery)
+                advisory = check_rules_advisory(
+                    packet, contract, is_recovery=run.is_recovery or recheck,
+                    campaign_id=run.campaign_id,
+                )
             except Exception as exc:
                 # Optional evaluation must never interrupt a validated turn.
                 advisory = {"status": "unavailable", "outcome": "INSUFFICIENT_EVIDENCE",

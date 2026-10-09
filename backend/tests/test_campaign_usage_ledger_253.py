@@ -595,3 +595,67 @@ def test_primary_narration_stream_charges_exactly_once(monkeypatch):
     assert "".join(narrate_retry(NarratorRequest(prompt="p", projection={}))) == "hello world"
     assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
     db.close()
+
+
+# ── 17. decision runtime: dm_rules_guidance runs are priced and charged (#516) ─
+
+def test_jev_price_is_pinned():
+    from app.billing import config
+    from app.decisions.config import DEFAULT_MODEL
+    # TypeSafe list price: $0.042 per 1M input tokens, output free.
+    per_mtok = {"input_tokens": 1_000_000, "output_tokens": 1_000_000}
+    assert config.cost_usd_for("jev", DEFAULT_MODEL, per_mtok) == pytest.approx(0.042)
+
+
+def test_dm_rules_guidance_run_is_costed_charged_and_reconciles(monkeypatch):
+    import requests
+
+    from app.decisions.contracts import DecisionRequest, NoulQuestion
+    from app.dm import rules_guidance
+    from app.observability.tracing import trace_context
+
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    trace_id = f"trace-{uuid.uuid4().hex[:12]}"
+    db.add(OperationTrace(trace_id=trace_id, operation_id=f"op-{trace_id}",
+                          campaign_id=camp, submitted_at=datetime.now(timezone.utc)))
+    db.commit()
+    db.close()
+
+    body = {
+        "model": "jev-1.13.0",
+        "answers": {"ok": {"type": "noul", "noul": 0.7}},
+        # The #268 eval's average rules-guidance call.
+        "usage": {"input_tokens": 4_500, "output_tokens": 400},
+    }
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return body
+
+    monkeypatch.setenv("TYPESAFE_API_KEY", "test-key")
+    monkeypatch.delenv("JEV_MODEL", raising=False)
+    monkeypatch.delenv("TYPESAFE_BASE_URL", raising=False)
+    monkeypatch.setattr(requests, "post", lambda *a, **k: _Resp())
+    monkeypatch.setattr("database.SessionLocal", factory)
+
+    service = rules_guidance._provider_service(None, campaign_id=camp)
+    with trace_context(trace_id, f"dm_rules:{uuid.uuid4()}"):
+        service.decide(DecisionRequest(
+            questions=(NoulQuestion(question_id="ok", instructions="yes?"),), state="s"))
+
+    db = factory()
+    run = db.query(AIRun).one()
+    assert (run.logical_operation, run.provider, run.model) == (
+        "dm_rules_guidance", "jev", "jev-latest")
+    assert (run.classification, run.billable, run.status) == ("primary", True, "succeeded")
+    assert run.cost_usd == pytest.approx(4_500 * 0.042 / 1_000_000)
+    entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
+    assert len(entries) == 1
+    assert str(entries[0].ai_run_id) == str(run.id)
+    assert reconcile(db, camp) == []
+    db.close()

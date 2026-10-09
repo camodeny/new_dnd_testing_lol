@@ -32,6 +32,8 @@ from app.decisions.contracts import (
 )
 from app.decisions.errors import DecisionError
 from app.observability import tracing as tracing_module
+from app.billing.config import cost_usd_for, tokens_from_usage
+from app.billing.ledger import charge_finished_run
 from app.observability.service import fail_soft, finish_ai_run, start_ai_run
 
 DECISION_ROLE = "decision"
@@ -180,11 +182,15 @@ class DecisionService:
         session_factory: Any = None,
         logical_operation: str = DECISION_LOGICAL_OPERATION,
         is_recovery: bool = False,
+        campaign_id: Any = None,
     ) -> None:
         self._adapter = adapter or JevAdapter()
         self._session_factory = session_factory
         self._logical_operation = logical_operation
         self._is_recovery = is_recovery
+        # Campaign whose capacity a succeeded primary run is charged to
+        # (#516). Without one, runs are still costed but never charged.
+        self._campaign_id = campaign_id
 
     @property
     def adapter(self) -> DecisionAdapter:
@@ -237,7 +243,10 @@ class DecisionService:
                 data = adapter.execute(request, model=model, timeout=timeout)
                 results, answered_model, usage = adapter.parse_response(data, request)
                 latency_ms = max(0, int((time.monotonic() - started) * 1000))
-                self._finish_run(run_id, status="succeeded", usage=usage)
+                self._finish_run(
+                    run_id, status="succeeded", usage=usage,
+                    provider=adapter.name, model=model,
+                )
                 return DecisionResponse(
                     results=results,
                     provider=adapter.name,
@@ -299,22 +308,33 @@ class DecisionService:
 
     def _finish_run(
         self, run_id: Any, *, status: str, usage: dict | None = None,
-        error_type: str | None = None,
+        error_type: str | None = None, provider: str | None = None,
+        model: str | None = None,
     ) -> None:
         if self._session_factory is None or run_id is None:
             return
         try:
             run = getattr(run_id, "id", run_id)
-            usage = usage or {}
+            input_tokens, output_tokens = tokens_from_usage(usage)
             fail_soft(
                 finish_ai_run,
                 self._session_factory,
                 run,
                 status=status,
-                input_tokens=usage.get("input_tokens"),
-                output_tokens=usage.get("output_tokens"),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                # Priced against the requested pin (the run's recorded
+                # model), like every other provider call (#516).
+                cost_usd=(
+                    cost_usd_for(provider, model, usage)
+                    if status == "succeeded" else None
+                ),
                 result_code="decision" if status == "succeeded" else None,
                 error_type=error_type,
             )
+            if status == "succeeded" and self._campaign_id is not None:
+                charge_finished_run(
+                    self._session_factory, run_id=run, campaign_id=self._campaign_id,
+                )
         except Exception:
             return
