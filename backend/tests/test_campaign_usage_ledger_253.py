@@ -255,10 +255,16 @@ def test_percentage_from_ledger_with_grace_and_added_funds():
     # Empty ledger edge: nothing funded, nothing spent → 0%.
     camp2, _ = _seed(db)
     assert get_capacity_summary(db, camp2)["percent_used"] == 0.0
-    # Spent with no funding → surfaces as 100%, never div-by-zero.
+    # Spent while never funded → unmetered, shown as 0% (not a full meter).
     run2 = _run(db, cost_usd=1.00, campaign_id=camp2)
     record_ai_spend_for_run(db, campaign_id=camp2, ai_run=run2)
-    assert get_capacity_summary(db, camp2)["percent_used"] == 100.0
+    summary2 = get_capacity_summary(db, camp2)
+    assert summary2["metered"] is False and summary2["percent_used"] == 0.0
+    # Metered with nothing left funded → surfaces as 100%, never div-by-zero.
+    record_entry(db, campaign_id=camp2, entry_type="admin_adjustment", amount_micros=-1,
+                 idempotency_key="adj-zero")
+    summary2 = get_capacity_summary(db, camp2)
+    assert summary2["metered"] is True and summary2["percent_used"] == 100.0
     # Public projection is aggregates only.
     public = public_capacity(db, camp)
     assert set(public) == {"campaign_id", "funded_micros", "consumed_micros",

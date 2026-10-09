@@ -428,8 +428,12 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
     - ``funded_micros``: sum of credit types + signed admin adjustments.
     - ``consumed_micros``: abs sum of ``ai_spend`` (billable actuals only).
     - ``remaining_micros``: funded − consumed.
-    - ``percent_used``: consumed/funded·100 clamped to [0, 100]; 0.0 when
-      nothing is funded and nothing spent, 100.0 when spent with no funding.
+    - ``metered``: the campaign has ever had a funding line (credit, refund
+      mirror, or admin adjustment). Until then it plays unmetered: the
+      #254 gate stays open and nothing is shown as used (#489 replaces this
+      with a funded free tier).
+    - ``percent_used``: consumed/funded·100 clamped to [0, 100]; 0.0 while
+      unmetered, 100.0 when metered with nothing funded.
     - ``recovery_cost_usd``: separately tracked non-billable cost (free).
     - ``contributors``: per-user funded totals (aggregates only).
     """
@@ -438,21 +442,26 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
     funded = 0
     consumed = 0
     spend_count = 0
+    metered = False
     contributors: dict[str, int] = {}
     for e in entries:
         if e.entry_type in FUNDED_CREDIT_TYPES:
+            metered = True
             funded += e.amount_micros
             if e.contributor_user_id is not None:
                 key = str(e.contributor_user_id)
                 contributors[key] = contributors.get(key, 0) + e.amount_micros
         elif e.entry_type == ENTRY_TYPE_ADMIN_ADJUSTMENT:
+            metered = True
             funded += e.amount_micros  # signed operator correction
         elif e.entry_type == ENTRY_TYPE_AI_SPEND:
             consumed += abs(e.amount_micros)
             spend_count += 1
 
     remaining = funded - consumed
-    if funded <= 0:
+    if not metered:
+        percent = 0.0
+    elif funded <= 0:
         percent = 0.0 if consumed <= 0 else 100.0
     else:
         percent = round(consumed / funded * 100.0, 1)
@@ -464,6 +473,7 @@ def get_capacity_summary(db: Session, campaign_id) -> dict:
         "consumed_micros": consumed,
         "remaining_micros": remaining,
         "percent_used": percent,
+        "metered": metered,
         "entry_count": len(entries),
         "spend_entry_count": spend_count,
         "recovery_cost_usd": recovery_cost_usd(db, campaign_id),
