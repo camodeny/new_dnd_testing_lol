@@ -112,7 +112,7 @@ def test_search_campaign_memory_finds_records_without_index():
     assert results[0].payload["packets"][0]["source_id"] == str(fact.id)
 
 
-def test_lookup_world_fact_with_description_returns_fact_matches():
+def test_lookup_world_fact_with_description_returns_world_matches():
     Fac, cid, owner, _player, _ = _setup()
     db = Fac()
     fact = _seed_fact(db, cid, content="Osric's brass lantern was left at the ferry dock.")
@@ -122,8 +122,8 @@ def test_lookup_world_fact_with_description_returns_fact_matches():
                    {"id": "f1", "tool": "lookup_world_fact", "query": "evidence_osric_lantern"})
     assert results[0].status == "ok"
     packets = results[0].payload["packets"]
-    assert {p["source_type"] for p in packets} == {"world_fact"}
-    assert packets[0]["source_id"] == str(fact.id)
+    assert {p["source_type"] for p in packets} <= {"world_fact", "world_relation", "world_entity"}
+    assert str(fact.id) in {p["source_id"] for p in packets}
     assert "not one" in results[0].payload["note"]
 
 

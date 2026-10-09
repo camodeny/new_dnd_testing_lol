@@ -989,8 +989,9 @@ def handle_lookup_world_fact(req: Any, audience: Any, db: Any = None) -> dict[st
     if not query:
         raise ValueError("lookup_world_fact requires query (fact id)")
     if not _is_record_id(query):
+        # A described "fact" may be stored as an entity (an item) or relation.
         return _search_instead(session, audience, req, query, "lookup_world_fact",
-                               frozenset({"world_fact"}))
+                               frozenset({"world_fact", "world_relation", "world_entity"}))
     outcome = fact_source_evidence(
         session, getattr(audience, "campaign_id", None), query,
         audience_viewers(audience), dm_internal=dm_internal)
