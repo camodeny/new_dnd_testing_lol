@@ -618,3 +618,25 @@ def test_world_seed_without_brief_uses_curated_setting(api):
     assert response.status_code == 200, response.text
     assert SETTING_CALLS == []
     assert response.json()["seed"]["location"]["name"] != "Saltmere Light"
+
+
+def _deterministic_situation(names: list[str]) -> str:
+    from app.campaigns.world_seed import build_seed_spec
+
+    members = [{"character_id": str(uuid.uuid4()), "character_name": n} for n in names]
+    spec = build_seed_spec(
+        campaign_id=str(uuid.uuid4()), theme=None, brief=None, difficulty="medium",
+        content_boundaries=None, composition={"members": members}, lore_bundle=[],
+    )
+    return spec["situation"]
+
+
+def test_deterministic_situation_grammar():
+    """#517: verb agrees with the party size; faction names keep one article."""
+    solo = _deterministic_situation(["Tamsin Reed"])
+    assert solo.startswith("Tamsin Reed arrives at ")
+    assert "The The" not in solo and " watches every newcomer." in solo
+    duo = _deterministic_situation(["Tamsin Reed", "Oren Vale"])
+    assert duo.startswith("Tamsin Reed and Oren Vale arrive at ")
+    trio = _deterministic_situation(["A", "B", "C"])
+    assert trio.startswith("A, B and C arrive at ")
