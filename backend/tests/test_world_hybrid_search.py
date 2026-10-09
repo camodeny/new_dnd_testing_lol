@@ -157,3 +157,25 @@ def test_lexical_candidates_respect_source_type_filter_and_campaign():
                                        source_types=frozenset({"world_entity"}))
     assert {stype for stype, _, _ in only_entities} == {"world_entity"}
     assert lexical_candidates(db, uuid.uuid4(), "rusty grate") == []
+
+
+def test_committed_narration_is_searchable_and_returned_with_the_turn():
+    from app.threads.service import get_or_create_campaign_thread
+    from tests.test_world_semantic_213 import _commit_knowledge_turn
+
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    turn, _attempt, _event = _commit_knowledge_turn(db, cid, owner, str(thread.id), [])
+
+    # "Narration begins." exists only in the committed stream, not in input.
+    outcome = search_world_memory(db, cid, "narration begins", owner, dm_internal=True)
+    assert outcome.packets[0].source_id == str(turn.id)
+    content = outcome.packets[0].content
+    assert content["narration"] == "Narration begins."
+    assert [s["raw_content"] for s in content["submissions"]] == ["The DM speaks"]
+
+    looked_up = _run(db, cid, [owner],
+                     {"id": "t1", "tool": "lookup_source_turn", "query": str(turn.id)})
+    assert looked_up[0].payload["packets"][0]["content"]["narration"] == "Narration begins."

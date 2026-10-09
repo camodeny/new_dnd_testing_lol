@@ -622,9 +622,12 @@ def lookup_source_turn(
                 continue
             records["fact_ids"].append(str(fact.id))
             outcome.total += 1
+    from app.world.semantic_index import turn_narrations
+
     outcome.packets = [turn_packet(
         turn, 0, revealable=None if dm_internal else True,
-        submissions=submission_dicts, records=records)]
+        submissions=submission_dicts, records=records,
+        narration=turn_narrations(db, campaign.id, [turn]).get(str(turn.id)))]
     outcome.visible = 1
     outcome.source_ids = packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000

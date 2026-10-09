@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.rules_corpus.bm25 import Bm25Index
-from app.world.semantic_index import build_source_text
+from app.world.semantic_index import build_source_text, turn_narrations
 from models.campaigns import CampaignDomainEvent
 from models.dm import DmTurn
 from models.world import (
@@ -135,11 +135,13 @@ def lexical_candidates(
     aliases = _entity_aliases(db, campaign_id) if "world_entity" in types else {}
     turns = [record for stype, record in records if stype == "source_turn"]
     submissions = _submission_texts(db, campaign_id, turns) if turns else {}
+    narrations = turn_narrations(db, campaign_id, turns) if turns else {}
     docs: dict[str, str] = {}
     keys: dict[str, tuple[str, uuid.UUID]] = {}
     for stype, record in records:
         text = build_source_text(
-            db, stype, record, entity_names=names, submission_texts=submissions)
+            db, stype, record, entity_names=names, submission_texts=submissions,
+            narration_texts=narrations)
         if stype == "world_entity":
             text = "\n".join([text, *aliases.get(str(record.id), [])])
         source_id = record.campaign_id if stype == "scene" else record.id

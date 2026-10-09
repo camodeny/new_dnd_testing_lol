@@ -38,6 +38,7 @@ from app.world.evidence_packets import (
     resolve_campaign,
     resolve_viewers,
     scene_gate,
+    submission_gate,
     tool_result,
     turn_gate,
     turn_packet,
@@ -58,6 +59,7 @@ from app.world.semantic_index import (
     resolve_embedding_model,
     source_record_active,
     stub_embed,
+    turn_narrations,
     vector_literal,
 )
 from models.campaigns import Campaign
@@ -272,6 +274,7 @@ class _Candidate:
 def _build_packet(
     db: Session, candidate: _Candidate, record: Any, campaign_id: uuid.UUID, rank: int,
     *, revealable: bool | None, embedding_model: str, embedding_version: str,
+    turn_content: dict[str, Any] | None = None,
 ) -> Any:
     """Authorized packet with retrieval scores as derived provenance metadata."""
     source_type = candidate.source_type
@@ -284,7 +287,7 @@ def _build_packet(
     elif source_type == "domain_event":
         packet = event_packet(db, record, rank, revealable=revealable)
     elif source_type == "source_turn":
-        packet = turn_packet(record, rank, revealable=revealable)
+        packet = turn_packet(record, rank, revealable=revealable, **(turn_content or {}))
     elif source_type == "scene":
         packet = scene_packet(record, rank, revealable=revealable)
     else:  # pragma: no cover — guarded by validate_source_type at index time
@@ -300,6 +303,30 @@ def _build_packet(
     if candidate.lexical_score is not None:
         packet.provenance["lexical_score"] = round(float(candidate.lexical_score), 6)
     return packet
+
+
+def turn_content(
+    db: Session, campaign: Campaign, turn: Any, viewers: list[uuid.UUID], *,
+    dm_internal: bool,
+) -> dict[str, Any]:
+    """What a source turn said: gated player submissions plus the committed
+    narration, so a turn hit is readable without a follow-up lookup."""
+    from models.threads import PlayerSubmission
+
+    submissions: list[dict[str, Any]] = []
+    for raw in list(getattr(turn, "submission_ids", None) or []):
+        try:
+            sid = raw if isinstance(raw, uuid.UUID) else uuid.UUID(str(raw))
+        except (ValueError, AttributeError, TypeError):
+            continue
+        submission = db.get(PlayerSubmission, sid)
+        if submission is None or submission.campaign_id != campaign.id:
+            continue
+        allowed, _ = submission_gate(db, campaign, submission, viewers, dm_internal=dm_internal)
+        if allowed:
+            submissions.append(submission.to_dict())
+    narration = turn_narrations(db, campaign.id, [turn]).get(str(turn.id))
+    return {"submissions": submissions, "narration": narration}
 
 
 def _mark_row(db: Session, row: WorldEmbedding, status: str, error: str | None = None) -> None:
@@ -367,6 +394,8 @@ def _resolve_candidates(
             db, candidate, record, campaign.id, len(out.packets),
             revealable=None if dm_internal else True,
             embedding_model=embedding_model, embedding_version=embedding_version,
+            turn_content=turn_content(db, campaign, record, viewers, dm_internal=dm_internal)
+            if candidate.source_type == "source_turn" else None,
         ))
     return out
 

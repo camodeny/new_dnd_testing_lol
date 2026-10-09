@@ -186,15 +186,56 @@ def _entity_display(db: Session, entity_id: Any, names: dict[str, str] | None = 
     return str(getattr(entity, "name", entity_id))
 
 
+def turn_narrations(
+    db: Session, campaign_id: uuid.UUID, turns: list[Any],
+) -> dict[str, str]:
+    """Committed narration per turn id: the completed stream of the turn's
+    current attempt (else its latest completed stream). Narration is the
+    public projection already shown to the turn's audience."""
+    from models.dm import DMStream, DMStreamChunk
+
+    current = {str(t.id): str(t.current_attempt_id or "") for t in turns}
+    if not current:
+        return {}
+    rows = db.execute(
+        select(DMStream.id, DMStream.turn_id, DMStream.attempt_id, DMStream.final_text,
+               DMStream.completed_at)
+        .where(DMStream.campaign_id == campaign_id, DMStream.status == "completed",
+               DMStream.turn_id.in_(list(current)))
+    ).all()
+    rows = sorted(rows, key=lambda r: (
+        r.attempt_id == current.get(r.turn_id),
+        r.completed_at.timestamp() if r.completed_at else 0.0))
+    # Same fallback as snapshots: a completed stream without final_text is
+    # the concatenation of its chunks.
+    unjoined = [r.id for r in rows if r.final_text is None]
+    joined: dict[Any, list[str]] = {}
+    if unjoined:
+        for stream_id, chunk_text in db.execute(
+            select(DMStreamChunk.stream_id, DMStreamChunk.text)
+            .where(DMStreamChunk.stream_id.in_(unjoined))
+            .order_by(DMStreamChunk.stream_id, DMStreamChunk.sequence)
+        ).all():
+            joined.setdefault(stream_id, []).append(chunk_text or "")
+    out: dict[str, str] = {}
+    for r in rows:
+        text_value = r.final_text if r.final_text is not None else "".join(joined.get(r.id, []))
+        if text_value:
+            out[r.turn_id] = str(text_value)
+    return out
+
+
 def build_source_text(
     db: Session, source_type: str, record: Any, *,
     entity_names: dict[str, str] | None = None,
     submission_texts: dict[str, str] | None = None,
+    narration_texts: dict[str, str] | None = None,
 ) -> str:
     """Deterministic index text for one authoritative record.
 
-    Batch callers (lexical search) pass preloaded ``entity_names`` and
-    ``submission_texts`` maps so one record costs no extra queries.
+    Batch callers (lexical search) pass preloaded ``entity_names``,
+    ``submission_texts``, and ``narration_texts`` maps so one record costs
+    no extra queries.
     """
     parts: list[str] = []
     if source_type == "world_entity":
@@ -247,7 +288,13 @@ def build_source_text(
                         chunk.append(str(getattr(submission, "raw_content", "") or ""))
             except Exception:
                 pass
-        parts = [f"turn audience={getattr(record, 'audience', '')}", *chunk]
+        if narration_texts is None:
+            try:
+                narration_texts = turn_narrations(db, record.campaign_id, [record])
+            except Exception:
+                narration_texts = {}
+        parts = [f"turn audience={getattr(record, 'audience', '')}", *chunk,
+                 narration_texts.get(str(record.id), "")]
     elif source_type == "scene":
         actors = getattr(record, "present_actors", None) or []
         names = [
