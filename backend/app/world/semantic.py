@@ -570,7 +570,8 @@ def search_world_memory(
     pool = limit_applied * 2
 
     lexical = lexical_candidates(
-        db, campaign.id, query, source_types=source_types, limit=pool)
+        db, campaign.id, query, source_types=source_types, limit=pool,
+        dm_internal=dm_internal)
 
     vector: list[tuple[WorldEmbedding, float]] = []
     backend = "unavailable"
@@ -600,6 +601,7 @@ def search_world_memory(
         candidate.score += 1 / (RRF_K + rank + 1)
         candidate.lexical_score = score
     candidates = sorted(fused.values(), key=lambda c: c.score, reverse=True)
+    vector_count = sum(1 for c in candidates if c.vector_similarity is not None)
 
     resolved = _resolve_candidates(
         db, campaign, candidates, viewers, dm_internal=dm_internal,
@@ -611,7 +613,7 @@ def search_world_memory(
         packets=resolved.packets,
         total_candidates=len(candidates),
         lexical_candidates=len(lexical),
-        vector_candidates=sum(1 for c in candidates if c.vector_similarity is not None),
+        vector_candidates=vector_count,
         visible=len(resolved.packets),
         denied=resolved.denied,
         denied_reasons=resolved.denied_reasons,
@@ -707,6 +709,15 @@ def world_memory_result(
         "vector_backend": outcome.vector_backend,
         "latency_ms": outcome.latency_ms,
     }
+    if not dm_internal:
+        # Counts that include hidden records would confirm a hidden match
+        # (e.g. a guessed secret name); they stay in the structured log.
+        for key in ("total_candidates", "lexical_candidates", "vector_candidates",
+                    "denied", "denied_reasons", "stale_dropped", "top_similarity"):
+            payload.pop(key)
+    if outcome.error:
+        # Keyword results still stand; the DM learns meaning-level recall was down.
+        payload["vector_error"] = outcome.error[:300]
     if note:
         payload["note"] = note
     return tool_result(audience, status="ok" if packets else "missing", packets=packets,

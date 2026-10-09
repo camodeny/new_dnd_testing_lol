@@ -179,3 +179,36 @@ def test_committed_narration_is_searchable_and_returned_with_the_turn():
     looked_up = _run(db, cid, [owner],
                      {"id": "t1", "tool": "lookup_source_turn", "query": str(turn.id)})
     assert looked_up[0].payload["packets"][0]["content"]["narration"] == "Narration begins."
+
+
+def test_player_guessing_a_hidden_entity_name_learns_nothing():
+    Fac, cid, _owner, player, _ = _setup()
+    db = Fac()
+    commit_world_write(db, cid, 0, create_entity, entity_type="npc", name="The Pale Patron",
+                       visibility="dm_only", operation_id="op-hyb-hidden")
+    guessed = _run(db, cid, [player],
+                   {"id": "g1", "tool": "lookup_world_entity", "query": "The Pale Patron"},
+                   audience="private")
+    unknown = _run(db, cid, [player],
+                   {"id": "g2", "tool": "lookup_world_entity", "query": "The Green Hermit"},
+                   audience="private")
+    assert guessed[0].status == unknown[0].status == "missing"
+    assert guessed[0].result_count == unknown[0].result_count == 0
+    shape = lambda r: {k: v for k, v in r.payload.items()
+                       if k not in ("note", "latency_ms")}  # note echoes the query
+    assert shape(guessed[0]) == shape(unknown[0])
+
+
+def test_restricted_aliases_rank_only_dm_internal_searches():
+    from app.world.identity import add_alias
+
+    Fac, cid, _owner, _player, _ = _setup()
+    db = Fac()
+    entity, _ = commit_world_write(db, cid, 0, create_entity, entity_type="npc",
+                                   name="Brother Aldo", operation_id="op-hyb-alias")
+    add_alias(db, entity, "Vharos Unbound", visibility="dm_only")
+    db.commit()
+    dm = lexical_candidates(db, cid, "Vharos Unbound", dm_internal=True)
+    player = lexical_candidates(db, cid, "Vharos Unbound", dm_internal=False)
+    assert [sid for _, sid, _ in dm] == [entity.id]
+    assert player == []

@@ -919,7 +919,9 @@ def _is_record_id(query: str) -> bool:
 def _entity_ref(session: Session, audience: Any, query: str) -> str | None:
     """Stable id for ``query``: as given when already an id, else the one
     live entity whose canonical name or alias matches exactly. None when no
-    exact match — never the nearest candidate."""
+    exact match — never the nearest candidate. Player-facing callers only
+    resolve names they may see, so a guessed hidden name looks the same as
+    an unknown one."""
     if _is_record_id(query):
         return query
     from app.world.identity import exact_identity
@@ -928,7 +930,16 @@ def _entity_ref(session: Session, audience: Any, query: str) -> str | None:
     if campaign_id is None:
         return None
     entity = exact_identity(session, campaign_id, query)
-    return str(entity.id) if entity is not None else None
+    if entity is None:
+        return None
+    dm_internal = getattr(audience, "audience", "campaign") != "private"
+    if not dm_internal:
+        allowed, _ = authorize_world_record(
+            session, resolve_campaign(session, campaign_id), "entity", entity.id,
+            resolve_viewers(audience_viewers(audience)), dm_internal=False)
+        if not allowed:
+            return None
+    return str(entity.id)
 
 
 def _search_instead(

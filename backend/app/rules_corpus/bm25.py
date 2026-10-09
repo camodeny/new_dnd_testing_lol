@@ -56,7 +56,9 @@ class Bm25Index:
     def rank_ids(self, query: str, limit: int = 8) -> list[str]:
         return [doc_id for doc_id, _ in self.rank_scored(query, limit)]
 
-    def rank_scored(self, query: str, limit: int = 8) -> list[tuple[str, float]]:
+    def rank_scored(
+        self, query: str, limit: int = 8, *, max_limit: int = 20,
+    ) -> list[tuple[str, float]]:
         scores = defaultdict(float)
         n = len(self.rule_ids)
         for term in set(terms(query)):
@@ -72,5 +74,5 @@ class Bm25Index:
         )
         return [
             (self.rule_ids[index], scores[index])
-            for index in ranked[: max(0, min(limit, 20))]
+            for index in ranked[: max(0, min(limit, max_limit))]
         ]

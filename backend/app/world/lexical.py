@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.rules_corpus.bm25 import Bm25Index
+from app.visibility.policy import RESTRICTED_VISIBILITIES
 from app.world.semantic_index import build_source_text, turn_narrations
 from models.campaigns import CampaignDomainEvent
 from models.dm import DmTurn
@@ -82,12 +83,16 @@ def _entity_names(db: Session, campaign_id: uuid.UUID) -> dict[str, str]:
     return {str(entity_id): str(name) for entity_id, name in rows}
 
 
-def _entity_aliases(db: Session, campaign_id: uuid.UUID) -> dict[str, list[str]]:
+def _entity_aliases(
+    db: Session, campaign_id: uuid.UUID, *, include_restricted: bool,
+) -> dict[str, list[str]]:
     aliases: dict[str, list[str]] = {}
-    for entity_id, alias in db.execute(
-        select(WorldEntityAlias.entity_id, WorldEntityAlias.alias)
+    for entity_id, alias, visibility in db.execute(
+        select(WorldEntityAlias.entity_id, WorldEntityAlias.alias, WorldEntityAlias.visibility)
         .where(WorldEntityAlias.campaign_id == campaign_id)
     ).all():
+        if not include_restricted and visibility in RESTRICTED_VISIBILITIES:
+            continue
         aliases.setdefault(str(entity_id), []).append(str(alias))
     return aliases
 
@@ -122,17 +127,21 @@ def lexical_candidates(
     *,
     source_types: frozenset[str] | None = None,
     limit: int = 20,
+    dm_internal: bool = False,
 ) -> list[tuple[str, uuid.UUID, float]]:
     """BM25-ranked ``(source_type, source_id, score)`` over live records.
 
     Unauthorized: the caller must resolve and gate every candidate.
+    Restricted entity aliases (secret true names) only rank DM-internal
+    searches, so a player query can't surface an entity through them.
     """
     types = frozenset(source_types or SEMANTIC_SOURCE_TYPES) & SEMANTIC_SOURCE_TYPES
     records = _load_records(db, campaign_id, types)
     if not records:
         return []
     names = _entity_names(db, campaign_id) if types & {"world_fact", "world_relation"} else {}
-    aliases = _entity_aliases(db, campaign_id) if "world_entity" in types else {}
+    aliases = (_entity_aliases(db, campaign_id, include_restricted=dm_internal)
+               if "world_entity" in types else {})
     turns = [record for stype, record in records if stype == "source_turn"]
     submissions = _submission_texts(db, campaign_id, turns) if turns else {}
     narrations = turn_narrations(db, campaign_id, turns) if turns else {}
@@ -148,5 +157,5 @@ def lexical_candidates(
         key = f"{stype}:{source_id}"
         docs[key] = text
         keys[key] = (stype, source_id)
-    ranked = Bm25Index.from_texts(docs).rank_scored(query_text, limit)
+    ranked = Bm25Index.from_texts(docs).rank_scored(query_text, limit, max_limit=limit)
     return [(*keys[key], score) for key, score in ranked if score > 0]
