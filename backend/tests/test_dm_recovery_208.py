@@ -481,6 +481,73 @@ def test_explicit_retry_executes_as_non_billable_recovery(db, monkeypatch):
     assert all(r.status == "succeeded" for r in runs)
 
 
+def test_validation_regeneration_is_costed_recovery_not_billed(db, monkeypatch):
+    """#515: only the first adjudication pass of an attempt bills.
+
+    A validator rejection's regeneration pass is system-driven recovery of
+    the same accepted player intent: recovery/non-billable, still costed.
+    """
+    import json
+
+    from app.billing import config as billing_config
+    from app.billing.ledger import reconcile, recovery_cost_usd
+    from models.reliability import AIRun
+    from models.usage import CampaignUsageEntry
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    rejected = _contract().model_dump(mode="json")
+    # An invented canonical NPC id: the contract parses (the first run
+    # succeeds and bills), then the entity validator rejects it and forces
+    # exactly one regeneration pass.
+    rejected["beats"][0]["claims"][0]["actor_ref"] = {"type": "npc", "id": "npc:invented"}
+    responses = [json.dumps(rejected), json.dumps(_contract().model_dump(mode="json"))]
+    usage = {"prompt_tokens": 1_000_000, "completion_tokens": 500_000}
+
+    def _fake_execute(adapter, request):
+        from app.providers.contracts import NormalizedChatResponse
+
+        return NormalizedChatResponse(
+            provider="primary", model="model-x", content=responses.pop(0), tool_calls=[],
+            finish_reason="stop", usage=usage, reasoning=None,
+            reasoning_details=None, raw={},
+        )
+
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+    monkeypatch.setattr(billing_config, "MODEL_PRICES_PER_MTOK_USD",
+                        {("primary", "model-x"): (2.0, 2.0, 8.0)})
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    monkeypatch.setattr("app.dm.adjudication.execute_chat", _fake_execute)
+
+    result = execute_dm_attempt(s, attempt.id, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert responses == [], "the rejection must cost exactly one regeneration pass"
+
+    runs = sorted(
+        s.execute(select(AIRun).where(AIRun.logical_operation == "forward_dm_adjudicate"))
+        .scalars().all(),
+        key=lambda r: r.started_at,
+    )
+    assert [(r.classification, r.billable, r.status) for r in runs] == [
+        ("primary", True, "succeeded"),
+        ("recovery", False, "succeeded"),
+    ]
+    # 2.0 * 1M input + 8.0 * 0.5M output = $6.00 per pass, both recorded.
+    assert [r.cost_usd for r in runs] == [pytest.approx(6.0), pytest.approx(6.0)]
+    entries = s.execute(
+        select(CampaignUsageEntry).where(CampaignUsageEntry.entry_type == "ai_spend")
+    ).scalars().all()
+    assert [str(e.ai_run_id) for e in entries] == [str(runs[0].id)]
+    assert entries[0].amount_micros == -6_000_000
+    assert recovery_cost_usd(s, camp_id) == pytest.approx(6.0)
+    assert reconcile(s, camp_id) == []
+
+
 def test_recover_partial_stream_rejects_cross_campaign_stream(db):
     from app.dm.recovery import recover_partial_stream
 

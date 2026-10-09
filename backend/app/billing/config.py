@@ -24,9 +24,17 @@ PERCENT_DECIMALS = 1
 #
 # (input, cached input, output) list prices as of 2026-10-08. Meta publishes
 # no Contributor-tier cache rate, so its cache hits bill at the input rate.
+#
+# TypeSafe Jev (the ``app.decisions`` bounded-decision runtime; model pin
+# ``app.decisions.config.DEFAULT_MODEL``), as of 2026-10-08: "Input tokens:
+# $0.042 / MTok ... Output tokens: FREE" per TypeSafe's launch post
+# https://typesafe.ai/blog/introducing-system-one-models-and-jev and the
+# typesafe.ai homepage ("$42 per billion input tokens"). TypeSafe publishes
+# no cache rate, so cache hits bill at the input rate.
 MODEL_PRICES_PER_MTOK_USD: dict[tuple[str, str], tuple[float, float, float]] = {
     ("openai", "gpt-6-luna"): (0.10, 0.01, 0.50),
     ("meta", "muse-spark-1.3-contributor"): (0.10, 0.10, 0.20),
+    ("jev", "jev-latest"): (0.042, 0.042, 0.0),
 }
 
 

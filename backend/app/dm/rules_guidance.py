@@ -124,7 +124,7 @@ def _no_relevant_record(
     )
 
 
-def _provider_service(decision_service, *, is_recovery: bool = False):
+def _provider_service(decision_service, *, is_recovery: bool = False, campaign_id=None):
     if decision_service is not None:
         return decision_service
     try:
@@ -139,6 +139,9 @@ def _provider_service(decision_service, *, is_recovery: bool = False):
                 session_factory=SessionLocal,
                 logical_operation="dm_rules_guidance",
                 is_recovery=is_recovery,
+                # A turn's rules-guidance calls are priced provider work
+                # charged to the campaign like the DM's own calls (#516).
+                campaign_id=campaign_id,
             )
     except Exception:
         return None
@@ -336,6 +339,7 @@ def enrich_rules_context(
     *,
     decision_service=None,
     is_recovery: bool = False,
+    campaign_id=None,
 ) -> ForwardDmContextPacket:
     """Retrieve once per attempt; optional retrieval failures stay explicit."""
     if GUIDANCE_DEPENDENCY in packet.observability.retrieval_dependencies:
@@ -360,7 +364,9 @@ def enrich_rules_context(
             request_status = "tool_failure"
     retained = candidates[:MAX_RETAINED]
     ranking = "unranked"
-    service = _provider_service(decision_service, is_recovery=is_recovery)
+    service = _provider_service(
+        decision_service, is_recovery=is_recovery, campaign_id=campaign_id
+    )
     if candidates and service is not None:
         try:
             retained, ranking = _rerank_relevant(candidates, query, service)
@@ -492,6 +498,7 @@ def check_rules_advisory(
     *,
     decision_service=None,
     is_recovery: bool = False,
+    campaign_id=None,
 ) -> dict[str, Any]:
     """Advisory-only judgment of a mechanical proposal. Never mutates input."""
     view = _contract_view(contract)
@@ -524,7 +531,9 @@ def check_rules_advisory(
             "reason": "no_retained_rules_evidence",
             "provider_error": None,
         }
-    service = _provider_service(decision_service, is_recovery=is_recovery)
+    service = _provider_service(
+        decision_service, is_recovery=is_recovery, campaign_id=campaign_id
+    )
     if service is None:
         logger.info(
             "rules_advisory_insufficient rules=%d provider=unavailable", len(rules)
