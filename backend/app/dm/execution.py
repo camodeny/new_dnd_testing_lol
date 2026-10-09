@@ -863,9 +863,11 @@ def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
 def _record_failure(run: _Run, exc: BaseException, *, retryable: bool = True) -> None:
     """The one pre-commit failure path for every spine step.
 
-    Only acts while the attempt is still this worker's pre-stream claim
-    (post-visibility remediation happens inside narration, and superseded
-    work is never resurrected). A retriable failure before anything became
+    Acts while the attempt is still this worker's claim: pre-stream, or
+    streaming when a failure after visible narration (e.g. the final
+    commit) escaped remediation, which then becomes a visible failure. One
+    the commit already marked failed-visible gets the public retry marker;
+    superseded work is never resurrected. A retriable failure before anything became
     visible requeues the claim BEHIND ready work (prepared, error kept,
     future ``next_retry_at``) so the next sweep retries it without starving
     newer attempts. Anything else — and every non-``retryable`` failure such
@@ -874,7 +876,13 @@ def _record_failure(run: _Run, exc: BaseException, *, retryable: bool = True) ->
     """
     from datetime import datetime, timedelta, timezone
 
-    from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING, mark_attempt_failed
+    from app.dm.turns import (
+        ATTEMPT_FAILED_VISIBLE,
+        ATTEMPT_PREPARED,
+        ATTEMPT_RUNNING,
+        ATTEMPT_STREAMING,
+        mark_attempt_failed,
+    )
     from models.dm import DmTurn, DmTurnAttempt
 
     db = run.db
@@ -886,7 +894,16 @@ def _record_failure(run: _Run, exc: BaseException, *, retryable: bool = True) ->
     error = f"{type(exc).__name__}: {exc}"[:2000]
     try:
         current = db.get(DmTurnAttempt, run.attempt_id)
-        if current is None or current.status not in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+        if current is None:
+            return
+        if current.status == ATTEMPT_FAILED_VISIBLE:
+            # The commit path already failed it visibly (e.g. a commit
+            # error after narration); only the player-facing marker is missing.
+            if not (current.result or {}).get("public_error"):
+                _attach_public_retry_marker(db, run.attempt_id)
+                db.commit()
+            return
+        if current.status not in (ATTEMPT_PREPARED, ATTEMPT_RUNNING, ATTEMPT_STREAMING):
             return
         turn = db.get(DmTurn, run.turn_id)
         crossed = turn is not None and turn.status in ("streaming", "failed_visible")

@@ -51,7 +51,11 @@ from app.campaigns.service import require_playable_campaign
 from app.clock import utcnow
 from app.combat.service import publish_turn_encounter_events, stage_turn_encounter_events
 from app.decisions import record_fail_soft
-from app.world.identity import promote_new_entities_from_contract, register_promoted_npcs_in_scene
+from app.world.identity import (
+    identity_revision,
+    promote_new_entities_from_contract,
+    register_promoted_npcs_in_scene,
+)
 from app.world.semantic_index import note_turn_committed
 from models.campaigns import Campaign
 from models.dm import DmTurn
@@ -1365,6 +1369,14 @@ def commit_turn(
             # serialize the dormancy decision with the campaign row lock the
             # revision guard already holds.
             require_playable_campaign(locked_campaign)
+        # Identity baseline for new-entity promotion, taken under the lock
+        # before this commit writes anything: staged effects (aliases,
+        # renames) and the entities promotion itself creates must not stale
+        # the pre-narration identity frames, but anyone else's change must.
+        identity_baseline = (
+            identity_revision(db, locked_campaign)
+            if (attempt.contract_snapshot or {}).get("new_entities") else None
+        )
         # Apply staged effects via registry (fail-closed)
         if staged_list:
             from app.dm.effects import apply_staged_effects
@@ -1384,7 +1396,8 @@ def commit_turn(
         # Idempotency key per (attempt, temp_id) makes retries safe.
         promoted = promote_new_entities_from_contract(
             db, locked_campaign, turn, attempt,
-            identity_telemetry_outbox=identity_telemetry_outbox)
+            identity_telemetry_outbox=identity_telemetry_outbox,
+            baseline_identity_revision=identity_baseline)
         if promoted:
             base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
             base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
@@ -1440,6 +1453,22 @@ def commit_turn(
                 db, turn, attempt, error=str(exc), error_class="revision_conflict", commit=commit,
             )
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
+    except Exception as exc:
+        # The mutation rolled back. Narration of a streaming attempt is
+        # already visible, so the turn must land in failed_visible (which
+        # auto-retry and Retry recover), never stay "streaming" forever.
+        logger.warning(
+            "dm_turn commit_failed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s error=%s",
+            turn.campaign_id, turn.thread_id, turn.id, attempt.id, exc,
+        )
+        db.rollback()
+        turn, attempt = lock_turn_and_attempt(db, turn_id, attempt_id)
+        if attempt and turn and attempt.status == ATTEMPT_STREAMING:
+            _fail_commit_visible(
+                db, turn, attempt, error=f"{type(exc).__name__}: {exc}"[:2000],
+                error_class="commit_failed", commit=commit,
+            )
+        raise
 
     now = utcnow()
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
@@ -1560,11 +1589,68 @@ def mark_attempt_failed(
     return attempt
 
 
+def _reclaim_stranded_streaming(db: Session, *, cutoff: datetime, campaign_id: uuid.UUID | None) -> int:
+    """Fail visibly a streaming attempt whose narration ended but never committed.
+
+    A terminal stream (completed/failed) whose attempt is still
+    ``streaming`` past the lease, with no executor holding it, can only
+    advance through failed_visible: auto-retry or Retry take it from there.
+    Caller owns flush/commit; the conditional updates keep it idempotent.
+    """
+    from models.dm import DMStream
+
+    q = (
+        select(DmTurnAttempt)
+        .join(DMStream, DMStream.id == DmTurnAttempt.stream_id)
+        .where(
+            DmTurnAttempt.status == ATTEMPT_STREAMING,
+            DmTurnAttempt.updated_at < cutoff,
+            DMStream.status.in_(("completed", "failed")),
+            DMStream.updated_at < cutoff,
+        )
+    )
+    if campaign_id is not None:
+        q = q.where(DmTurnAttempt.campaign_id == campaign_id)
+    count = 0
+    for attempt in db.execute(q).scalars().all():
+        if db.get_bind().dialect.name == "postgresql":
+            from app.dm.ownership import try_execution_lock
+            if not try_execution_lock(db, attempt.id):
+                continue
+        turn = db.get(DmTurn, attempt.turn_id)
+        if turn is None or turn.status != TURN_STREAMING or turn.current_attempt_id != attempt.id:
+            continue
+        reclaimed = db.execute(
+            update(DmTurnAttempt)
+            .where(DmTurnAttempt.id == attempt.id, DmTurnAttempt.status == ATTEMPT_STREAMING)
+            .values(status=ATTEMPT_FAILED_VISIBLE, error_class="stranded_streaming",
+                    last_error="Narration finished but the turn never committed; reclaimed after lease expiry",
+                    completed_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if not reclaimed.rowcount:
+            continue
+        db.execute(
+            update(DmTurn)
+            .where(DmTurn.id == turn.id, DmTurn.status == TURN_STREAMING)
+            .values(status=TURN_FAILED_VISIBLE)
+            .execution_options(synchronize_session=False)
+        )
+        db.expire(attempt)
+        db.expire(turn)
+        count += 1
+        logger.warning("dm_turn reclaimed_stranded_streaming attempt_id=%s turn_id=%s", attempt.id, turn.id)
+    return count
+
+
 def recover_stuck_attempts(
     db: Session, *, campaign_id: uuid.UUID | None = None, lease_seconds: int = 300, commit: bool = True
 ) -> int:
     """Recover attempts left in running without completion (worker crash).
 
+    Also reclaims attempts stranded in ``streaming`` after their narration
+    stream ended (see :func:`_reclaim_stranded_streaming`), so a commit that
+    died after visible narration still reaches failed_visible and auto-retry.
     When ``campaign_id`` is given, only attempts for that campaign are recovered.
     """
     cutoff = utcnow() - timedelta(seconds=lease_seconds)
@@ -1598,6 +1684,7 @@ def recover_stuck_attempts(
             db.expire(attempt)
             count += 1
             logger.info("dm_turn recovered_stuck attempt_id=%s turn_id=%s", attempt.id, attempt.turn_id)
+    count += _reclaim_stranded_streaming(db, cutoff=cutoff, campaign_id=campaign_id)
     if commit:
         try:
             db.commit()
