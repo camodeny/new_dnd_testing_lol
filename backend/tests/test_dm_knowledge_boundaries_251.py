@@ -504,3 +504,50 @@ def test_validator_checks_location_ref():
     assert not result.passed
     assert result.violations[0].code == "npc_utterance_without_knowledge"
     assert result.violations[0].details["unknown"] == [target]
+
+
+def _new_npc_utterance(*topic_ids):
+    """A brand-new NPC speaking on its introduction turn (speaker_temp_id)."""
+    return normalize_contract(
+        {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+         "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc",
+                           "public_name": "Masked Rider"}],
+         "beats": [{"id": "beat_1", "type": "npc_dialogue",
+                    "speaker_temp_id": "tmp_npc_rider",
+                    "speaker_public_name": "Masked Rider",
+                    "truth_status": "truthful",
+                    "claims": [{"text": "This town owes us.", "claim_kind": "npc_utterance",
+                                "origin": "dm_adjudication", "visibility": "public",
+                                "topic_refs": [{"type": "location", "id": tid}
+                                               for tid in topic_ids]}]}]})
+
+
+def _scene_packet(location_id):
+    pkt = _knowledge_packet(subject_id="npc:vera")
+    scene = ContextRecord(
+        record_id="scene:1", required=False, priority=90,
+        value={"location_entity_id": location_id},
+        sources=[SourceRef(source_type="campaign_scene", source_id="scene:1",
+                           source_version="1")],
+        authorization=AuthorizationScope(campaign_id=pkt.audience.campaign_id),
+        visibility="dm_only", use="adjudication_only",
+    )
+    records = {lane: [] for lane in LaneName}
+    records[LaneName.CURRENT_SCENE] = [scene]
+    status = {LaneName.RELEVANT_CANON: "not_applicable",
+              LaneName.REPAIR_DIRECTIVES: "not_applicable",
+              LaneName.KNOWLEDGE_VISIBILITY: "not_applicable"}
+    return assemble_context_packet(audience=pkt.audience, records=records, lane_status=status)
+
+
+def test_new_npc_speaker_knows_its_scene_only():
+    """An NPC introduced this turn gets the co-presence baseline, nothing more."""
+    here, elsewhere = str(uuid.uuid4()), str(uuid.uuid4())
+    pkt = _scene_packet(here)
+    assert KnowledgeValidator().validate(_new_npc_utterance(here), pkt).passed
+    result = KnowledgeValidator().validate(_new_npc_utterance(here, elsewhere), pkt)
+    assert not result.passed
+    violation = result.violations[0]
+    assert violation.code == "npc_utterance_without_knowledge"
+    assert violation.details["actor"] == "tmp_npc_rider"
+    assert violation.details["unknown"] == [elsewhere]

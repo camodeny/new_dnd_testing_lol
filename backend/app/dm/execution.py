@@ -665,7 +665,8 @@ def _identity_repair_record(packet, conflict):
                 "Identity resolution found an existing canonical entity for the "
                 "proposed new NPC. Re-adjudicate the same player intent. If this "
                 "is that person, remove the new_entities proposal, use the exact "
-                "canonical EntityRef, and rewrite any new-person introduction. "
+                "canonical EntityRef (its dialogue uses speaker_ref, not "
+                "speaker_temp_id), and rewrite any new-person introduction. "
                 "If a genuinely distinct person is needed, give the proposal a "
                 "distinct name and distinguishing details."
             ),

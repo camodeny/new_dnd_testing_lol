@@ -200,6 +200,61 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
             "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
             "new_entities": [{"temp_id": "bad-id", "kind": "npc", "public_name": "Foo"}],
         })
+    # New entity location_ref must be a location
+    with pytest.raises(ContractValidationError):
+        normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
+            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Foo",
+                              "location_ref": {"type": "npc", "id": "npc:keeper"}}],
+        })
+
+
+def _new_npc_dialogue(beat_over=None, claim_over=None, **contract_over):
+    claim = {"text": "This town owes us a debt.", "claim_kind": "npc_utterance", "origin": "dm_adjudication"}
+    claim.update(claim_over or {})
+    beat = {
+        "id": "beat_1", "type": "npc_dialogue", "speaker_temp_id": "tmp_npc_rider",
+        "speaker_public_name": "Masked Rider", "truth_status": "truthful", "claims": [claim],
+    }
+    beat.update(beat_over or {})
+    payload = {
+        "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "new npc speaks",
+        "beats": [beat],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+    }
+    payload.update(contract_over)
+    return payload
+
+
+def test_new_npc_speaks_on_its_introduction_turn():
+    c = normalize_contract(_new_npc_dialogue())
+    assert c.beats[0].speaker_temp_id == "tmp_npc_rider"
+    assert c.beats[0].speaker_ref is None
+    proj = public_projection(c)
+    assert proj["beats"][0]["speaker_public_name"] == "Masked Rider"
+    assert "tmp_npc_rider" not in json.dumps(proj)
+    assert "speaker_temp_id" in contract_json_schema()["$defs"]["Beat"]["properties"]
+
+
+@pytest.mark.parametrize("payload", [
+    # The temp handle must name an NPC this contract introduces.
+    _new_npc_dialogue(new_entities=[]),
+    _new_npc_dialogue(new_entities=[{"temp_id": "tmp_npc_other", "kind": "npc", "public_name": "Other"}]),
+    # Exactly one speaker: not both, not neither.
+    _new_npc_dialogue(beat_over={"speaker_ref": {"type": "npc", "id": "npc:keeper"}}),
+    _new_npc_dialogue(beat_over={"speaker_temp_id": None}),
+    # Utterances of a not-yet-canonical speaker carry no actor_ref.
+    _new_npc_dialogue(claim_over={"actor_ref": {"type": "npc", "id": "npc:keeper"}}),
+    # Narration beats never carry a speaker.
+    _new_npc_dialogue(beat_over={
+        "type": "narration", "speaker_public_name": None, "truth_status": None,
+        "claims": [_base_beat_claim()],
+    }),
+])
+def test_new_npc_speaker_invariants(payload):
+    with pytest.raises(ContractValidationError):
+        normalize_contract(payload)
 
 
 def test_no_generic_sql_mutation_capability():
