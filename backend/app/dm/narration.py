@@ -86,8 +86,10 @@ HARD RULES — violating any rule invalidates your output:
 2. NEVER re-adjudicate: no new DCs, checks, saves, or success/failure calls.
 3. NEVER invent voluntary player-character speech, thought, or action. Reproduce
    player-authored declarations with attribution; do not extend them.
-4. NPC dialogue: render the given utterance text only. Never reveal whether the
-   NPC is truthful, mistaken, or deceptive, and never state hidden motives.
+4. NPC dialogue: render the given utterance text only. Give each line one speech
+   tag; when the utterance already contains one, do not add another. Never
+   reveal whether the NPC is truthful, mistaken, or deceptive, and never state
+   hidden motives.
  5. No numbers, names, places, or quoted speech beyond the structured beats.
  6. You have no game-state authority: your words change nothing by themselves.
 

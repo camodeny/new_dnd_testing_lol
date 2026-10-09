@@ -86,6 +86,12 @@ impossible, moot, or uninformed in a way the player would reconsider, do NOT
 emit beats for an action that never happens: use clarify mode with the answer
 and let the player redeclare.
 
+SEQUENCE:
+Beats run in the order events happen. If someone answers what a PC said, that
+answer comes before the PC leaves. When a PC goes somewhere or to someone,
+resolve the trip: end on what they find when they arrive, and stop before
+their next words or choices.
+
 CONVERSATION:
 The recent_conversation lane is the table chat as the players saw it, oldest
 first: your earlier narration and their messages, ending with this turn's
