@@ -144,7 +144,7 @@ def test_projection_excludes_effects_evidence_provenance_and_temp_ids():
             "arguments": {"event_type": "torch_lit", "summary": "Torch lit", "visibility": "public"},
         }],
         new_entities=[{
-            "temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Hooded Stranger",
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "Hooded Stranger",
             "public_summary": "A watcher",
         }],
         open_player_choice="What do you do?",

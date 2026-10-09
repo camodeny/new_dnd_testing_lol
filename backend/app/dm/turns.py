@@ -1401,7 +1401,7 @@ def commit_turn(
         if promoted:
             base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
             base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
-            # Introduced NPCs are present by construction (#459).
+            # Introduced NPCs the DM marked present join the scene (#459).
             register_promoted_npcs_in_scene(
                 db, locked_campaign, promoted, attempt=attempt, turn=turn)
 

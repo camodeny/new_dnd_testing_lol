@@ -231,7 +231,7 @@ def test_jit_promotion_from_committed_turn_exactly_once():
     attempt.contract_snapshot = {
         "contract_version": "dm_turn_contract_v1",
         "new_entities": [{
-            "temp_id": "tmp_npc_1", "kind": "npc",
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": True,
             "public_name": "Mira the Guide", "role": "guide",
             "public_summary": "A hooded guide.",
         }],
@@ -270,7 +270,7 @@ def test_committed_turn_introducing_npc_registers_it_in_scene_once():
     attempt.contract_snapshot = {
         "contract_version": "dm_turn_contract_v1",
         "new_entities": [{
-            "temp_id": "tmp_npc_1", "kind": "npc",
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": True,
             "public_name": "Mira the Guide", "role": "guide",
         }],
         "staged_effects": [],
@@ -293,6 +293,42 @@ def test_committed_turn_introducing_npc_registers_it_in_scene_once():
     commit_turn(db, turn.id, attempt.id)
     db.expire_all()
     assert len(db.get(CampaignCurrentScene, cid).present_actors) == 1
+
+
+def test_committed_turn_mentioning_npc_creates_it_outside_the_scene():
+    """An NPC introduced by mention becomes canon without joining the scene."""
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="Who runs this town?",
+        segments=[{"type": "ooc", "text": "Who runs this town?"}], thread_id=tid,
+    )
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, tid)
+    attempt.contract_snapshot = {
+        "contract_version": "dm_turn_contract_v1",
+        "new_entities": [{
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": False,
+            "public_name": "Elira Voss", "role": "reeve",
+        }],
+        "staged_effects": [],
+    }
+    attempt.staged_effects = [{
+        "id": "e1", "effect_type": "update_scene",
+        "arguments": {"scene_patch": {"location_name": "Gate", "present_actors": []}},
+    }]
+    db.flush()
+    db.commit()
+    stream = _stream(db, turn, attempt)
+    db.commit()
+    mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+    commit_turn(db, turn.id, attempt.id)
+    (elira,) = list_entities(db, cid, entity_type="npc")
+    assert elira.name == "Elira Voss"
+    assert db.get(CampaignCurrentScene, cid).present_actors == []
 
 
 def test_failed_entity_commit_leaves_no_half_created_authority():

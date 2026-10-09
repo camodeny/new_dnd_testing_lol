@@ -193,7 +193,7 @@ def test_invented_entity_rejected_and_new_entity_allowed():
     assert any(v.code in ("unknown_canonical_id", "missing_identity_authority") for v in r2.violations)
 
     # new entity proposal passes
-    c3 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state"}]} ], new_entities=[{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "New Dragon"}])
+    c3 = _base([{"id": "beat_1", "type": "narration", "claims": [{"text": "See", "claim_kind": "observation", "origin": "established_state"}]} ], new_entities=[{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "New Dragon"}])
     r3 = validate_contract(c3, _known(pkt, {"npc:known"}))
     assert r3.passed
 
