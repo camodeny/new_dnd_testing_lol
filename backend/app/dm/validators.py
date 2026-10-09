@@ -24,7 +24,9 @@ from typing import Any, Callable, Protocol
 from pydantic import Field
 
 from app.dm.context import ForwardDmContextPacket, LaneName
-from app.dm.contract import Claim, ContractValidationError, DmTurnContractV1
+from app.dm.contract import (
+    NON_NARRATED_MODES, Claim, ContractValidationError, DmTurnContractV1, has_audience_visible_content,
+)
 from app.observability.tracing import structured_log
 from app.schema import StrictModel
 
@@ -683,6 +685,39 @@ class VisibilityValidator:
         return ValidatorResult(validator=self.name, category=self.category, passed=len(violations) == 0, violations=violations, latency_ms=latency)
 
 
+class AudienceContentValidator:
+    """A narrated contract must leave its audience something to read (issue #514).
+
+    ``public_projection`` strips every ``dm_private`` claim. A shared thread
+    already refuses those claims (:class:`VisibilityValidator`), but a private
+    thread allows them, so a respond turn whose every claim is DM-private
+    validated, streamed zero chunks, and could never commit. Refuse it before
+    narration so bounded regeneration fixes it in-process with feedback.
+    """
+
+    name = "audience_content_validator"
+    category = "visibility"
+
+    def validate(self, contract, packet) -> ValidatorResult:
+        violations: list[ValidationViolation] = []
+        if contract.mode not in NON_NARRATED_MODES and not has_audience_visible_content(contract):
+            audience = packet.audience.audience if packet is not None else "campaign"
+            violations.append(ValidationViolation(
+                validator=self.name, category=self.category, code="no_audience_visible_content",
+                message=(
+                    "Nothing in this contract is visible to the players reading this thread: "
+                    "every claim is dm_private, so they would get no reply. Claim visibility is "
+                    "relative to the thread's audience: public means the players reading this "
+                    "thread see it (in a private thread, only that player). A player acting "
+                    "privately or secretly is what the private thread is for, not a reason for "
+                    "dm_private, which is hidden truth no player sees. Mark what the player "
+                    "should read as public, or use silent mode if there is genuinely nothing to say."
+                ),
+                details={"mode": contract.mode, "audience": audience},
+            ))
+        return ValidatorResult(validator=self.name, category=self.category, passed=not violations, violations=violations, latency_ms=0.0)
+
+
 class KnowledgeValidator:
     """Deterministic unavailable-knowledge checks against the #251 lane (issue #251).
 
@@ -1234,6 +1269,7 @@ DEFAULT_VALIDATORS: list[Validator] = [
     ProvenanceValidator(),
     EpistemicValidator(),
     VisibilityValidator(),
+    AudienceContentValidator(),
     KnowledgeValidator(),
     CanonValidator(),
     RulesValidator(),

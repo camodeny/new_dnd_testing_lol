@@ -68,7 +68,7 @@ from sqlalchemy.orm import Session
 
 from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
-from app.dm.contract import DmTurnContractV1, public_projection
+from app.dm.contract import DmTurnContractV1, projection_has_visible_content, public_projection
 from app.dm.mechanics import MechanicsResolution, issue_summary, resolve_attack_damage, resolve_mechanics, with_outcome_beat
 from app.observability.tracing import structured_log
 from app.realtime.service import publish_dm_chunk_created, publish_dm_status
@@ -792,14 +792,32 @@ def _iter_provider_deltas(
         return
     result = narrator(request)
     if isinstance(result, str):
-        yield result
-        return
-    if isinstance(result, Iterable):
-        yield from result
-        return
-    raise NarratorGenerationError(
-        f"Narrator must return str or an iterable of str deltas, got {type(result).__name__}"
-    )
+        deltas: Iterable[Any] = (result,)
+    elif isinstance(result, Iterable):
+        deltas = result
+    else:
+        raise NarratorGenerationError(
+            f"Narrator must return str or an iterable of str deltas, got {type(result).__name__}"
+        )
+    emitted = False
+    for delta in deltas:
+        if isinstance(delta, NarratorFailoverMarker):
+            # The consumer drops the failed provider's unpersisted text.
+            emitted = False
+        elif isinstance(delta, str) and delta.strip():
+            emitted = True
+        yield delta
+    if not emitted:
+        # Issue #514 — a provider that finishes without any text for a
+        # projection that has some would leave a zero-chunk stream that can
+        # never cross the stream-start boundary. Render the same projection
+        # with the deterministic template instead (claim text only, so it
+        # passes the same fidelity gates) and resolve the turn in-process.
+        structured_log(
+            logger, logging.WARNING, "narration_empty_provider_output",
+            mode=projection.get("mode"), fallback=PROVIDER_DETERMINISTIC,
+        )
+        yield render_deterministic_narration(projection, contract)
 
 
 # ── 4. Streaming orchestration ────────────────────────────────────────────────
@@ -933,6 +951,14 @@ def stream_narration(
 
     projection = build_narration_projection(contract)
     proj_bytes = projection_size_bytes(projection)
+    if not projection_has_visible_content(projection):
+        # Issue #514 — nothing audience-visible means zero chunks, and a
+        # zero-chunk stream can never reach the stream-start boundary the
+        # commit requires. Refuse before any stream header exists; the
+        # validator pipeline normally regenerates such contracts upstream.
+        raise NarrationProjectionError(
+            f"Narration projection for mode {contract.mode!r} has no audience-visible content"
+        )
 
     # Recent visible conversation for narrator coherence (fail-soft: a
     # history-query failure must never break narration — the beats alone
@@ -1166,6 +1192,10 @@ def stream_narration(
             )
 
         narration_text = "".join(full_parts)
+        if persisted == 0 and not narration_text.strip():
+            # Never complete a zero-chunk stream: it can never commit, and
+            # a completed header would refuse every retry's appends (#514).
+            raise NarratorGenerationError("Narrator produced no visible text")
 
         # — Authoritative full-output validation at completion —
         violations = validate_narration_fidelity(

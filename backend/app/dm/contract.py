@@ -1596,6 +1596,39 @@ def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:
     return result
 
 
+#: Modes the executor resolves without a narration stream: ``await_roll``
+#: and ``silent`` commit through their own non-narrated paths, and
+#: ``need_evidence`` never commits (the evidence loop resumes it). Every
+#: other mode streams narration and must give its audience something to read.
+NON_NARRATED_MODES = frozenset({"await_roll", "silent", "need_evidence"})
+
+
+def projection_has_visible_content(projection: dict[str, Any]) -> bool:
+    """True when a :func:`public_projection` carries text the audience can read.
+
+    ``public_projection`` already drops ``dm_private`` claims and beats left
+    empty, so a narrated contract whose every claim is DM-private projects to
+    nothing: the narrator has nothing to render and zero chunks can never
+    cross the stream-start boundary the commit requires (issue #514).
+    """
+    def _text(value: Any) -> bool:
+        return bool(str(value or "").strip())
+
+    for beat in projection.get("beats") or []:
+        if any(_text(claim.get("text")) for claim in beat.get("claims") or []):
+            return True
+    for lane in ("safe_prelude", "clarify_question", "table_chat_intent", "open_player_choice"):
+        if _text(projection.get(lane)):
+            return True
+    roll = projection.get("roll_request")
+    return isinstance(roll, dict) and _text(roll.get("reason_public"))
+
+
+def has_audience_visible_content(contract: DmTurnContractV1) -> bool:
+    """True when ``contract`` projects to narratable audience-visible text."""
+    return projection_has_visible_content(public_projection(contract))
+
+
 def contract_json_schema() -> dict[str, Any]:
     """Return the JSON Schema for dm_turn_contract_v1 (strict, no additionalProperties)."""
     return DmTurnContractV1.model_json_schema()
