@@ -27,7 +27,7 @@ cycles are listed at the end.
 - `rules_corpus/`: SRD rules-text ingest, embeddings, hybrid search, `/api/rules/*`.
 - `threads/`: shared/private campaign threads, membership, read/write authorization.
 - `campaigns/`: the campaign aggregate. `events.commit_campaign_mutation` is the single revision-ordered write path. Also members, invites, lobby, lore, party, lifecycle/start, world seed, and HTTP `routes/`.
-- `world/`: entities, scene, facts/relations, knowledge, clocks, NPC state, identity, retrieval, semantic index.
+- `world/`: entities, scene, facts/relations, knowledge, clocks, NPC state, identity, retrieval, semantic index, and hybrid keyword + vector memory search (`lexical.py`, `semantic.search_world_memory`). After an embedding-model change, `scripts/reindex_world_memory.py` re-queues existing records.
 
 **Gameplay**
 - `combat/`: encounter lifecycle, initiative, turn economy, maps/geometry, ending.

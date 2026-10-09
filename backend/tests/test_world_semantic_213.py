@@ -496,7 +496,7 @@ def test_mediation_hides_unauthorized_semantic_hits():
         {"id": "sem9", "tool": "search_campaign_memory", "query": query},
     ])
     results, _trace = execute_evidence_round(requests, audience, db=db, timeout_s=None)
-    assert results[0].status == "unknown"
+    assert results[0].status == "missing"
     assert results[0].result_count == 0
     assert "Asha hides" not in str(results[0].model_dump(mode="json"))
 

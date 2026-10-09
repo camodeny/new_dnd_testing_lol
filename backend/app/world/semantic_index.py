@@ -174,7 +174,9 @@ def resolve_embedder(
 
 # ── Source text + version (code-owned, from persisted records only) ──────────
 
-def _entity_display(db: Session, entity_id: Any) -> str:
+def _entity_display(db: Session, entity_id: Any, names: dict[str, str] | None = None) -> str:
+    if names is not None:
+        return names.get(str(entity_id), str(entity_id))
     try:
         entity = db.get(WorldEntity, entity_id)
     except Exception:
@@ -184,8 +186,16 @@ def _entity_display(db: Session, entity_id: Any) -> str:
     return str(getattr(entity, "name", entity_id))
 
 
-def build_source_text(db: Session, source_type: str, record: Any) -> str:
-    """Deterministic index text for one authoritative record."""
+def build_source_text(
+    db: Session, source_type: str, record: Any, *,
+    entity_names: dict[str, str] | None = None,
+    submission_texts: dict[str, str] | None = None,
+) -> str:
+    """Deterministic index text for one authoritative record.
+
+    Batch callers (lexical search) pass preloaded ``entity_names`` and
+    ``submission_texts`` maps so one record costs no extra queries.
+    """
     parts: list[str] = []
     if source_type == "world_entity":
         parts = [f"{record.name} ({record.entity_type})", str(record.summary or "")]
@@ -195,9 +205,9 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
             if role:
                 parts.append(str(role)[:500])
     elif source_type == "world_relation":
-        subject = _entity_display(db, getattr(record, "subject_entity_id", None))
+        subject = _entity_display(db, getattr(record, "subject_entity_id", None), entity_names)
         obj_id = getattr(record, "object_entity_id", None)
-        obj = _entity_display(db, obj_id) if obj_id else str(getattr(record, "object_label", "") or "")
+        obj = _entity_display(db, obj_id, entity_names) if obj_id else str(getattr(record, "object_label", "") or "")
         parts = [
             f"{subject} {getattr(record, 'relation_type', '')} {obj}",
             f"epistemic={getattr(record, 'epistemic_state', '')}",
@@ -206,7 +216,7 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
         parts = [str(getattr(record, "content", "") or "")]
         for ref in list(getattr(record, "entity_refs", None) or [])[:8]:
             try:
-                parts.append(_entity_display(db, ref))
+                parts.append(_entity_display(db, ref, entity_names))
             except Exception:
                 continue
         parts.append(f"epistemic={getattr(record, 'epistemic_state', '')}")
@@ -219,19 +229,24 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
         parts = [str(getattr(record, "event_type", "")), payload_text]
     elif source_type == "source_turn":
         chunk: list[str] = []
-        try:
-            from models.threads import PlayerSubmission
+        if submission_texts is not None:
+            chunk = [submission_texts[str(raw_sid)]
+                     for raw_sid in list(getattr(record, "submission_ids", None) or [])
+                     if str(raw_sid) in submission_texts]
+        else:
+            try:
+                from models.threads import PlayerSubmission
 
-            for raw_sid in list(getattr(record, "submission_ids", None) or []):
-                try:
-                    sid = raw_sid if isinstance(raw_sid, uuid.UUID) else uuid.UUID(str(raw_sid))
-                except (ValueError, AttributeError, TypeError):
-                    continue
-                submission = db.get(PlayerSubmission, sid)
-                if submission is not None and submission.campaign_id == record.campaign_id:
-                    chunk.append(str(getattr(submission, "raw_content", "") or ""))
-        except Exception:
-            pass
+                for raw_sid in list(getattr(record, "submission_ids", None) or []):
+                    try:
+                        sid = raw_sid if isinstance(raw_sid, uuid.UUID) else uuid.UUID(str(raw_sid))
+                    except (ValueError, AttributeError, TypeError):
+                        continue
+                    submission = db.get(PlayerSubmission, sid)
+                    if submission is not None and submission.campaign_id == record.campaign_id:
+                        chunk.append(str(getattr(submission, "raw_content", "") or ""))
+            except Exception:
+                pass
         parts = [f"turn audience={getattr(record, 'audience', '')}", *chunk]
     elif source_type == "scene":
         actors = getattr(record, "present_actors", None) or []

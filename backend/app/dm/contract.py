@@ -1210,7 +1210,7 @@ class EvidenceRequest(StrictModel):
                 raise ValueError("search_stat_blocks requires query (the creature's nature, e.g. 'silt water ooze')")
         elif self.tool in ("lookup_world_entity", "traverse_world_relations", "lookup_world_fact", "lookup_source_turn"):
             if not (self.query and self.query.strip()):
-                raise ValueError(f"{self.tool} requires query (stable record id)")
+                raise ValueError(f"{self.tool} requires query (record id, exact name, or description)")
         elif self.tool == "query_character_knowledge":
             if not (self.query and self.query.strip()) and self.character_id is None:
                 raise ValueError("query_character_knowledge requires query (subject entity id) or character_id")
