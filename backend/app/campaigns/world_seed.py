@@ -297,7 +297,6 @@ def build_seed_spec(
     theme_text = str(theme or "").strip()
     brief_text = str(brief or "").strip()
     grounding = theme_text or brief_text or "A frontier on the edge of strange events"
-    pc_names = ", ".join(str(p["character_name"]) for p in pcs)
     if setting is not None:
         loc_name = str(setting["location"]["name"]).strip()
         loc_summary = str(setting["location"]["summary"]).strip()
@@ -316,9 +315,12 @@ def build_seed_spec(
         pressure_name, pressure_desc = _SEED_PRESSURES[pick("pressure", len(_SEED_PRESSURES))]
         # Multiplayer seeds get a second NPC so hooks can distribute; solo stays lean.
         npc_specs = [npc_pick] if len(pcs) < 2 else [npc_pick, npc2_pick]
+        names = [str(p["character_name"]) for p in pcs]
+        party = names[0] if len(names) == 1 else f"{', '.join(names[:-1])} and {names[-1]}"
+        verb = "arrives" if len(names) == 1 else "arrive"
         situation = (
-            f"{pc_names} arrive at {loc_name} as {pressure_desc.lower()} "
-            f"The {faction_name} watches every newcomer."
+            f"{party} {verb} at {loc_name} as {pressure_desc[0].lower()}{pressure_desc[1:]} "
+            f"{faction_name} watches every newcomer."
         )
     premise = f"{grounding}. {situation}"
 
