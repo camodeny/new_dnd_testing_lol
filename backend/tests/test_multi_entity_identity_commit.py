@@ -34,8 +34,8 @@ from tests.test_world_identity_214 import (
 
 def _two_proposals(first="Foremost Rider", second="Grey Ferryman"):
     return {"new_entities": [
-        {"temp_id": "tmp_npc_1", "kind": "npc", "public_name": first},
-        {"temp_id": "tmp_npc_2", "kind": "npc", "public_name": second},
+        {"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": first},
+        {"temp_id": "tmp_npc_2", "kind": "npc", "present": True, "public_name": second},
     ]}
 
 
@@ -51,8 +51,8 @@ def _two_entity_contract(first="Foremost Rider", second="Grey Ferryman"):
                         "visibility": "public"}],
         }],
         "new_entities": [
-            {"temp_id": "tmp_npc_1", "kind": "npc", "public_name": first},
-            {"temp_id": "tmp_npc_2", "kind": "npc", "public_name": second},
+            {"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": first},
+            {"temp_id": "tmp_npc_2", "kind": "npc", "present": True, "public_name": second},
         ],
         "open_player_choice": "What do you do?",
     })
@@ -149,7 +149,7 @@ def test_new_npc_speaking_on_its_introduction_turn_commits():
             "claims": [{"text": "This town owes us a debt.", "claim_kind": "npc_utterance",
                         "origin": "dm_adjudication", "visibility": "public"}],
         }],
-        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "present": True, "public_name": "Masked Rider"}],
     })
     out = execute_validated_turn(
         db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,

@@ -30,7 +30,7 @@ from tests.test_world_identity_214 import make_entity, setup_db
 
 def _promote(db, campaign, public_name, service):
     attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op", "contract_snapshot": {
-        "new_entities": [{"temp_id": "tmp", "kind": "npc", "public_name": public_name}]}})()
+        "new_entities": [{"temp_id": "tmp", "kind": "npc", "present": True, "public_name": public_name}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     return promote_new_entities_from_contract(db, campaign, turn, attempt, identity_decision_service=service)
 

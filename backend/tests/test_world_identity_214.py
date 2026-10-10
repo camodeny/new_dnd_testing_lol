@@ -75,7 +75,7 @@ def test_obvious_duplicate_jit_proposal_rejected_and_retry_stays_idempotent():
     db, campaign = setup_db()
     original = make_entity(db, campaign, "Mara Venn", idempotency_key="first")
     attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op", "contract_snapshot": {
-        "new_entities": [{"temp_id": "tmp", "kind": "npc", "public_name": "mara venn"}]}})()
+        "new_entities": [{"temp_id": "tmp", "kind": "npc", "present": True, "public_name": "mara venn"}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     # Exact hit now enters the bounded frame instead of raising upfront.
     # DEFER fails closed with no insert.
@@ -106,7 +106,7 @@ def test_exact_same_name_distinct_context_keep_distinct_via_promotion():
     north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
     south_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-south",
         "contract_snapshot": {"new_entities": [{
-            "temp_id": "tmp-south", "kind": "npc", "public_name": "The Guard",
+            "temp_id": "tmp-south", "kind": "npc", "present": True, "public_name": "The Guard",
             "location_ref": "south gate"}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     # DEFER on the exact same name creates nothing.
@@ -137,7 +137,7 @@ def test_real_promotion_path_near_name_requires_bounded_outcome():
     db, campaign = setup_db()
     original = make_entity(db, campaign, "Mara Venn")
     attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op", "contract_snapshot": {
-        "new_entities": [{"temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}})()
+        "new_entities": [{"temp_id": "tmp", "kind": "npc", "present": True, "public_name": "Mara"}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(
         answers={"resolve_world_entity_identity": DEFER}))
@@ -244,7 +244,7 @@ def test_retry_with_memo_resolves_instead_of_looping():
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     snapshot = {"new_entities": [{
-        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}
+        "temp_id": "tmp", "kind": "npc", "present": True, "public_name": "Mara"}]}
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     parent = DmTurnAttempt(
         id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign.id,
@@ -334,13 +334,13 @@ def test_exact_alias_and_uuid_proposals_reuse_owner_without_model_call():
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     alias_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-alias",
         "contract_snapshot": {"new_entities": [{
-            "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}})()
+            "temp_id": "tmp-alias", "kind": "npc", "present": True, "public_name": "Mara"}]}})()
     reused = promote_new_entities_from_contract(
         db, campaign, turn, alias_attempt, identity_decision_service=service)
     assert reused[0].id == mara_venn.id
     uuid_attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-uuid",
         "contract_snapshot": {"new_entities": [{
-            "temp_id": "tmp-uuid", "kind": "npc", "public_name": str(mara_venn.id)}]}})()
+            "temp_id": "tmp-uuid", "kind": "npc", "present": True, "public_name": str(mara_venn.id)}]}})()
     reused_uuid = promote_new_entities_from_contract(
         db, campaign, turn, uuid_attempt, identity_decision_service=service)
     assert reused_uuid[0].id == mara_venn.id
@@ -371,7 +371,7 @@ def test_locked_promotion_collects_telemetry_outbox_without_independent_write():
     make_entity(db, campaign, "The Guard", location_ref="north gate")
     attempt = type("Attempt", (), {"id": uuid.uuid4(), "commit_operation_id": "op-lock",
         "contract_snapshot": {"new_entities": [{
-            "temp_id": "tmp-lock", "kind": "npc", "public_name": "The Guard",
+            "temp_id": "tmp-lock", "kind": "npc", "present": True, "public_name": "The Guard",
             "location_ref": "south gate"}]}})()
     turn = type("Turn", (), {"id": uuid.uuid4()})()
 
@@ -409,7 +409,7 @@ def test_pre_narration_resolution_persists_attempt_local_outcome():
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
-        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]})
+        "temp_id": "tmp", "kind": "npc", "present": True, "public_name": "Mara"}]})
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(
         answers={"resolve_world_entity_identity": KEEP_DISTINCT}))
@@ -432,7 +432,7 @@ def test_commit_revalidation_applies_stored_outcome_without_new_decision():
     db, campaign = setup_db()
     north_guard = make_entity(db, campaign, "The Guard", location_ref="north gate")
     snapshot = {"new_entities": [{
-        "temp_id": "tmp-south", "kind": "npc", "public_name": "The Guard",
+        "temp_id": "tmp-south", "kind": "npc", "present": True, "public_name": "The Guard",
         "location_ref": "south gate"}]}
     attempt = _attempt_fake(snapshot)
     turn = type("Turn", (), {"id": uuid.uuid4()})()
@@ -462,7 +462,7 @@ def test_pre_narration_defer_aborts_before_anything_durable():
     db, campaign = setup_db()
     original = make_entity(db, campaign, "Mara Venn")
     attempt = _attempt_fake({"new_entities": [{
-        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]})
+        "temp_id": "tmp", "kind": "npc", "present": True, "public_name": "Mara"}]})
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(
         answers={"resolve_world_entity_identity": DEFER}))
@@ -488,7 +488,7 @@ def test_stored_outcome_stale_revision_fails_closed_at_commit():
     db, campaign = setup_db()
     make_entity(db, campaign, "Mara Venn")
     snapshot = {"new_entities": [{
-        "temp_id": "tmp", "kind": "npc", "public_name": "Mara"}]}
+        "temp_id": "tmp", "kind": "npc", "present": True, "public_name": "Mara"}]}
     attempt = _attempt_fake(snapshot)
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     pre_service = DecisionService(FakeDecisionAdapter(
@@ -514,7 +514,7 @@ def test_pre_narration_exact_alias_requires_readjudication_with_zero_model_calls
     mara_venn = make_entity(db, campaign, "Mara Venn")
     add_alias(db, mara_venn, "Mara", provenance={"turn": "t1"})
     snapshot = {"new_entities": [{
-        "temp_id": "tmp-alias", "kind": "npc", "public_name": "Mara"}]}
+        "temp_id": "tmp-alias", "kind": "npc", "present": True, "public_name": "Mara"}]}
     attempt = _attempt_fake(snapshot)
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(answers={}))
@@ -534,7 +534,7 @@ def test_pre_narration_bounded_reuse_requires_readjudication():
     db, campaign = setup_db()
     mara_venn = make_entity(db, campaign, "Mara Venn")
     snapshot = {"new_entities": [{
-        "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+        "temp_id": "tmp_npc_mara", "kind": "npc", "present": True, "public_name": "Mara",
     }]}
     attempt = _attempt_fake(snapshot)
     turn = type("Turn", (), {"id": uuid.uuid4()})()
@@ -594,7 +594,7 @@ def _respond_with_new_entity(public_name, temp_id="tmp_npc_1"):
                         "visibility": "public"}],
         }],
         "new_entities": [{
-            "temp_id": temp_id, "kind": "npc", "public_name": public_name,
+            "temp_id": temp_id, "kind": "npc", "present": True, "public_name": public_name,
         }],
         "open_player_choice": "What do you do?",
     })
@@ -669,10 +669,10 @@ def _scene_with_pc(db, campaign):
     return place, pc
 
 
-def _promote_hooded(db, campaign):
+def _promote_hooded(db, campaign, *, present=True):
     attempt = _attempt_fake({"new_entities": [{
-        "temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Hooded Traveler",
-        "role": "stranger"}]})
+        "temp_id": "tmp_npc_1", "kind": "npc", "present": present,
+        "public_name": "Hooded Traveler", "role": "stranger"}]})
     turn = type("Turn", (), {"id": uuid.uuid4()})()
     service = DecisionService(FakeDecisionAdapter(
         answers={"resolve_world_entity_identity": NEW_ENTITY}))
@@ -732,6 +732,44 @@ def test_promoted_npc_gets_baseline_knowledge_and_lane_covers_it():
     # Retry must not duplicate rows (idempotency per attempt/temp_id/target).
     assert {e["target_id"] for e in value["entries"]} == {str(place.id), str(pc.id)}
     assert len(value["entries"]) == 2
+
+
+def test_npc_introduced_by_mention_stays_out_of_scene():
+    """Naming someone who is elsewhere does not put them in the scene."""
+    from app.world.identity import register_promoted_npcs_in_scene
+    from app.world.knowledge import build_knowledge_visibility_values
+    from models.world import CampaignCurrentScene
+    db, campaign = setup_db()
+    _scene_with_pc(db, campaign)
+    promoted, attempt, turn = _promote_hooded(db, campaign, present=False)
+    assert register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn) == 0
+    assert db.get(CampaignCurrentScene, campaign.id).present_actors == [
+        {"kind": "pc", "name": "Oneshot Hero"}]
+    (value,) = build_knowledge_visibility_values(
+        db, campaign, [], npc_entity_ids=[promoted[0].id])
+    assert value["entries"] == []
+
+
+def test_only_present_proposals_join_scene():
+    from app.world.identity import register_promoted_npcs_in_scene
+    from models.world import CampaignCurrentScene
+    db, campaign = setup_db()
+    _scene_with_pc(db, campaign)
+    attempt = _attempt_fake({"new_entities": [
+        {"temp_id": "tmp_npc_1", "kind": "npc", "present": False,
+         "public_name": "Elira Voss", "role": "reeve"},
+        {"temp_id": "tmp_npc_2", "kind": "npc", "present": True,
+         "public_name": "Hooded Traveler", "role": "stranger"},
+    ]})
+    turn = type("Turn", (), {"id": uuid.uuid4()})()
+    service = DecisionService(FakeDecisionAdapter(
+        answers={"resolve_world_entity_identity": NEW_ENTITY}))
+    promoted = promote_new_entities_from_contract(
+        db, campaign, turn, attempt, identity_decision_service=service)
+    assert register_promoted_npcs_in_scene(db, campaign, promoted, attempt=attempt, turn=turn) == 1
+    actors = db.get(CampaignCurrentScene, campaign.id).present_actors
+    assert [a["name"] for a in actors] == ["Oneshot Hero", "Hooded Traveler"]
+    assert actors[1]["entity_id"] == str(promoted[1].id)
 
 
 def test_identity_frame_carries_the_proposal_description_and_hidden_identity_rule():

@@ -132,6 +132,9 @@ class NewEntityProposal(StrictModel):
     role: str | None = Field(default=None, max_length=160)
     public_summary: str | None = Field(default=None, max_length=500)
     location_ref: EntityRef | None = None
+    present: bool = Field(description=(
+        "True if this NPC is physically in the current scene now; false if they "
+        "are only mentioned, remembered, or somewhere else"))
 
     @field_validator("temp_id")
     @classmethod
@@ -1426,13 +1429,15 @@ class DmTurnContractV1(StrictModel):
         # Global cross-field: new_entities only in respond
         if self.new_entities and m != "respond":
             raise ValueError("new_entities only valid in respond mode")
-        introduced = {e.temp_id for e in self.new_entities}
+        introduced = {e.temp_id: e for e in self.new_entities}
         for beat in beats:
             if beat.speaker_temp_id is not None and beat.speaker_temp_id not in introduced:
                 raise ValueError(
                     f"speaker_temp_id {beat.speaker_temp_id!r} must be the temp_id of an "
                     "NPC this contract introduces in new_entities; a known NPC speaks via speaker_ref"
                 )
+            if beat.speaker_temp_id is not None and not introduced[beat.speaker_temp_id].present:
+                raise ValueError("speaker_temp_id must refer to a present NPC")
         # staged_effects only in respond (and arguably silent? no — strictly respond)
         if self.staged_effects and m not in ("respond",):
             # await_roll / need_evidence etc. already block above, but keep global guard

@@ -170,14 +170,14 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
     c = normalize_contract({
         "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "new npc",
         "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-        "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "a dock clerk"}],
+        "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "a dock clerk"}],
     })
     assert c.new_entities[0].temp_id == "tmp_npc_1"
     # New entity also accepts generic tmp_<kind> form
     c2 = normalize_contract({
         "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
         "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-        "new_entities": [{"temp_id": "tmp_guard_2", "kind": "npc", "public_name": "a guard"}],
+        "new_entities": [{"temp_id": "tmp_guard_2", "kind": "npc", "present": True, "public_name": "a guard"}],
     })
     assert c2.new_entities[0].temp_id == "tmp_guard_2"
     # Legacy new_npc_ prefix is no longer accepted
@@ -185,7 +185,7 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
         normalize_contract({
             "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
             "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-            "new_entities": [{"temp_id": "new_npc_1", "kind": "npc", "public_name": "keeper"}],
+            "new_entities": [{"temp_id": "new_npc_1", "kind": "npc", "present": True, "public_name": "keeper"}],
         })
     # Existing EntityRef must not use temp prefix
     with pytest.raises(ContractValidationError):
@@ -198,14 +198,14 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
         normalize_contract({
             "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
             "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-            "new_entities": [{"temp_id": "bad-id", "kind": "npc", "public_name": "Foo"}],
+            "new_entities": [{"temp_id": "bad-id", "kind": "npc", "present": True, "public_name": "Foo"}],
         })
     # New entity location_ref must be a location
     with pytest.raises(ContractValidationError):
         normalize_contract({
             "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
             "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Foo",
+            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "Foo",
                               "location_ref": {"type": "npc", "id": "npc:keeper"}}],
         })
 
@@ -221,7 +221,7 @@ def _new_npc_dialogue(beat_over=None, claim_over=None, **contract_over):
     payload = {
         "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "new npc speaks",
         "beats": [beat],
-        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "present": True, "public_name": "Masked Rider"}],
     }
     payload.update(contract_over)
     return payload
@@ -240,7 +240,7 @@ def test_new_npc_speaks_on_its_introduction_turn():
 @pytest.mark.parametrize("payload", [
     # The temp handle must name an NPC this contract introduces.
     _new_npc_dialogue(new_entities=[]),
-    _new_npc_dialogue(new_entities=[{"temp_id": "tmp_npc_other", "kind": "npc", "public_name": "Other"}]),
+    _new_npc_dialogue(new_entities=[{"temp_id": "tmp_npc_other", "kind": "npc", "present": True, "public_name": "Other"}]),
     # Exactly one speaker: not both, not neither.
     _new_npc_dialogue(beat_over={"speaker_ref": {"type": "npc", "id": "npc:keeper"}}),
     _new_npc_dialogue(beat_over={"speaker_temp_id": None}),
@@ -254,6 +254,13 @@ def test_new_npc_speaks_on_its_introduction_turn():
 ])
 def test_new_npc_speaker_invariants(payload):
     with pytest.raises(ContractValidationError):
+        normalize_contract(payload)
+
+
+def test_new_npc_speaker_must_be_present():
+    payload = _new_npc_dialogue()
+    payload["new_entities"][0]["present"] = False
+    with pytest.raises(ContractValidationError, match="present NPC"):
         normalize_contract(payload)
 
 
@@ -386,7 +393,7 @@ def test_malformed_output_rejected_before_mutation():
     with pytest.raises(ContractValidationError):
         normalize_contract({
             "contract_version": CONTRACT_VERSION, "mode": "table_chat", "reason": "x", "beats": [], "table_chat_intent": "hi",
-            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Foo"}],
+            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "Foo"}],
         })
 
 
@@ -429,7 +436,7 @@ def test_public_projection_is_allowlisted_sentinel_secret_recursive():
         "staged_effects": [
             {"id": "effect_1", "effect_type": "record_world_event", "arguments": {"event_type": "secret_event", "summary": sentinel_effect, "visibility": "dm_private", "payload": {"secret": sentinel_effect}}},
         ],
-        "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "a stranger"}],
+        "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "a stranger"}],
         "adjudication_input": {"submission_ids": ["sub_1"], "segments": [{"position": 0, "segment_type": "ic", "text": sentinel_input}]},
         "open_player_choice": "What do you do?",
         "narration_hints": {"max_words": 90},
