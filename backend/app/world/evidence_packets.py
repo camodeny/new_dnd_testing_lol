@@ -246,12 +246,15 @@ def event_packet(db: Session, event: CampaignDomainEvent, rank: int,
 def turn_packet(turn: DmTurn, rank: int, *,
                  revealable: bool | None,
                  submissions: list[dict[str, Any]] | None = None,
-                 records: dict[str, list[str]] | None = None) -> EvidencePacket:
+                 records: dict[str, list[str]] | None = None,
+                 narration: str | None = None) -> EvidencePacket:
     audience = str(getattr(turn, "audience", "campaign") or "campaign")
     visibility = audience if audience in RECORD_VISIBILITIES else "campaign"
     content = turn.to_dict()
     if submissions is not None:
         content = {**content, "submissions": submissions}
+    if narration is not None:
+        content = {**content, "narration": narration}
     if records is not None:
         content = {**content, "established_records": records}
     return EvidencePacket(

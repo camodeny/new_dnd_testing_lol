@@ -152,12 +152,12 @@ def _log_query(
 
 
 def _not_found(query_type: str, campaign: Campaign, *, depth: int, limit: int,
-               detail: str) -> RetrievalOutcome:
+               detail: str, dm_internal: bool) -> RetrievalOutcome:
     outcome = RetrievalOutcome(
         status=STATUS_NOT_FOUND, depth_applied=depth, limit_applied=limit, error=detail,
     )
     _log_query(query_type, campaign, depth=depth, limit=limit,
-               outcome=outcome, dm_internal=False)
+               outcome=outcome, dm_internal=dm_internal)
     return outcome
 
 
@@ -182,7 +182,7 @@ def retrieve_entity(
         entity = get_entity_strict(db, campaign.id, eid)
     except ValueError as exc:
         return _not_found("lookup_world_entity", campaign, depth=0,
-                          limit=1, detail=str(exc))
+                          limit=1, detail=str(exc), dm_internal=dm_internal)
     allowed, reason = authorize_world_record(
         db, campaign, "entity", entity.id, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
@@ -238,7 +238,7 @@ def traverse_relations(
         root = get_entity_strict(db, campaign.id, root_id)
     except ValueError as exc:
         return _not_found("traverse_world_relations", campaign, depth=depth_applied,
-                          limit=limit_applied, detail=str(exc))
+                          limit=limit_applied, detail=str(exc), dm_internal=dm_internal)
 
     outcome = RetrievalOutcome(depth_applied=depth_applied, limit_applied=limit_applied)
     allowed, reason = authorize_world_record(
@@ -362,7 +362,7 @@ def lookup_fact(
         fact = get_fact_strict(db, campaign.id, fid)
     except ValueError as exc:
         return _not_found("lookup_world_fact", campaign, depth=0,
-                          limit=1, detail=str(exc))
+                          limit=1, detail=str(exc), dm_internal=dm_internal)
     allowed, reason = authorize_world_record(
         db, campaign, "fact", fact.id, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=0, limit_applied=1)
@@ -568,7 +568,7 @@ def lookup_source_turn(
             raise ValueError(f"Source turn {tid} not found in campaign {campaign.id}")
     except ValueError as exc:
         return _not_found("lookup_source_turn", campaign, depth=0,
-                          limit=1, detail=str(exc))
+                          limit=1, detail=str(exc), dm_internal=dm_internal)
     allowed, reason = turn_gate(db, campaign, turn, viewers, dm_internal=dm_internal)
     outcome = RetrievalOutcome(depth_applied=1, limit_applied=1)
     outcome.total = 1
@@ -622,9 +622,12 @@ def lookup_source_turn(
                 continue
             records["fact_ids"].append(str(fact.id))
             outcome.total += 1
+    from app.world.semantic_index import turn_narrations
+
     outcome.packets = [turn_packet(
         turn, 0, revealable=None if dm_internal else True,
-        submissions=submission_dicts, records=records)]
+        submissions=submission_dicts, records=records,
+        narration=turn_narrations(db, campaign.id, [turn]).get(str(turn.id)))]
     outcome.visible = 1
     outcome.source_ids = packet_source_ids(outcome.packets)
     outcome.latency_ms = (time.monotonic() - started) * 1000
@@ -744,7 +747,7 @@ def query_character_knowledge(
         subject_id = coerce_uuid(subject_entity_id, field="subject_entity_id")
     except ValueError as exc:
         return _not_found("query_character_knowledge", campaign, depth=0,
-                          limit=limit_applied, detail=str(exc))
+                          limit=limit_applied, detail=str(exc), dm_internal=dm_internal)
     if dm_internal:
         from app.world.knowledge import list_knowledge_for_subject
         from models.world import WorldEntity
@@ -753,7 +756,7 @@ def query_character_knowledge(
         if subject is None or subject.campaign_id != campaign.id:
             return _not_found("query_character_knowledge", campaign, depth=0,
                               limit=limit_applied,
-                              detail=f"Subject entity {subject_id} not found")
+                              detail=f"Subject entity {subject_id} not found", dm_internal=dm_internal)
         rows = list_knowledge_for_subject(
             db, campaign.id, subject_id,
             knowledge_state=knowledge_state, limit=limit_applied + 1)
@@ -905,6 +908,55 @@ def _bundle_result(audience: Any, outcome: RetrievalOutcome, *, dm_internal: boo
                        dm_internal=dm_internal)
 
 
+def _is_record_id(query: str) -> bool:
+    try:
+        uuid.UUID(query)
+    except ValueError:
+        return False
+    return True
+
+
+def _entity_ref(session: Session, audience: Any, query: str) -> str | None:
+    """Stable id for ``query``: as given when already an id, else the one
+    live entity whose canonical name or alias matches exactly. None when no
+    exact match — never the nearest candidate. Player-facing callers only
+    resolve names they may see, so a guessed hidden name looks the same as
+    an unknown one."""
+    if _is_record_id(query):
+        return query
+    from app.world.identity import exact_identity
+
+    campaign_id = coerce_optional_uuid(getattr(audience, "campaign_id", None), field="campaign_id")
+    if campaign_id is None:
+        return None
+    entity = exact_identity(session, campaign_id, query)
+    if entity is None:
+        return None
+    dm_internal = getattr(audience, "audience", "campaign") != "private"
+    if not dm_internal:
+        allowed, _ = authorize_world_record(
+            session, resolve_campaign(session, campaign_id), "entity", entity.id,
+            resolve_viewers(audience_viewers(audience)), dm_internal=False)
+        if not allowed:
+            return None
+    return str(entity.id)
+
+
+def _search_instead(
+    session: Session, audience: Any, req: Any, query: str, tool: str,
+    source_types: frozenset[str],
+) -> dict[str, Any]:
+    """By-id tool given a description: answer with hybrid search matches."""
+    from app.world.semantic import world_memory_result
+
+    return world_memory_result(
+        session, audience, query, limit=getattr(req, "limit", None),
+        source_types=source_types,
+        note=(f"{tool} takes a record id and {query[:80]!r} is not one, so these are "
+              f"search matches. Pass a packet source_id to {tool} for the exact record."),
+    )
+
+
 def handle_lookup_world_entity(req: Any, audience: Any, db: Any = None) -> dict[str, Any]:
     session = _require_db(db)
     if isinstance(session, dict):
@@ -913,8 +965,12 @@ def handle_lookup_world_entity(req: Any, audience: Any, db: Any = None) -> dict[
     query = (getattr(req, "query", None) or "").strip()
     if not query:
         raise ValueError("lookup_world_entity requires query (entity id)")
+    entity_id = _entity_ref(session, audience, query)
+    if entity_id is None:
+        return _search_instead(session, audience, req, query, "lookup_world_entity",
+                               frozenset({"world_entity"}))
     outcome = retrieve_entity(
-        session, getattr(audience, "campaign_id", None), query,
+        session, getattr(audience, "campaign_id", None), entity_id,
         audience_viewers(audience), dm_internal=dm_internal)
     return _bundle_result(audience, outcome, dm_internal=dm_internal)
 
@@ -927,8 +983,12 @@ def handle_traverse_world_relations(req: Any, audience: Any, db: Any = None) -> 
     query = (getattr(req, "query", None) or "").strip()
     if not query:
         raise ValueError("traverse_world_relations requires query (entity id)")
+    entity_id = _entity_ref(session, audience, query)
+    if entity_id is None:
+        return _search_instead(session, audience, req, query, "traverse_world_relations",
+                               frozenset({"world_entity"}))
     outcome = traverse_relations(
-        session, getattr(audience, "campaign_id", None), query,
+        session, getattr(audience, "campaign_id", None), entity_id,
         audience_viewers(audience), limit=getattr(req, "limit", None),
         dm_internal=dm_internal)
     return _bundle_result(audience, outcome, dm_internal=dm_internal)
@@ -942,6 +1002,10 @@ def handle_lookup_world_fact(req: Any, audience: Any, db: Any = None) -> dict[st
     query = (getattr(req, "query", None) or "").strip()
     if not query:
         raise ValueError("lookup_world_fact requires query (fact id)")
+    if not _is_record_id(query):
+        # A described "fact" may be stored as an entity (an item) or relation.
+        return _search_instead(session, audience, req, query, "lookup_world_fact",
+                               frozenset({"world_fact", "world_relation", "world_entity"}))
     outcome = fact_source_evidence(
         session, getattr(audience, "campaign_id", None), query,
         audience_viewers(audience), dm_internal=dm_internal)
@@ -969,6 +1033,9 @@ def handle_lookup_source_turn(req: Any, audience: Any, db: Any = None) -> dict[s
     query = (getattr(req, "query", None) or "").strip()
     if not query:
         raise ValueError("lookup_source_turn requires query (turn id)")
+    if not _is_record_id(query):
+        return _search_instead(session, audience, req, query, "lookup_source_turn",
+                               frozenset({"source_turn"}))
     outcome = lookup_source_turn(
         session, getattr(audience, "campaign_id", None), query,
         audience_viewers(audience), dm_internal=dm_internal)
@@ -985,6 +1052,12 @@ def handle_query_character_knowledge(req: Any, audience: Any, db: Any = None) ->
     subject = query or (str(character_id).strip() if character_id else "")
     if not subject:
         raise ValueError("query_character_knowledge requires query (subject entity id)")
+    if query:
+        entity_id = _entity_ref(session, audience, query)
+        if entity_id is None:
+            return _search_instead(session, audience, req, query, "query_character_knowledge",
+                                   frozenset({"world_entity"}))
+        subject = entity_id
     outcome = query_character_knowledge(
         session, getattr(audience, "campaign_id", None), subject,
         audience_viewers(audience), limit=getattr(req, "limit", None),
