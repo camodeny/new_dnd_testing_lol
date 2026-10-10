@@ -529,6 +529,7 @@ def _extract_identity_proposals(source: Any) -> list[dict]:
                 "public_summary": raw.get("public_summary"),
                 "role": raw.get("role"),
                 "location_ref": raw.get("location_ref"),
+                "present": raw.get("present"),
             })
         else:
             proposals.append({
@@ -538,6 +539,7 @@ def _extract_identity_proposals(source: Any) -> list[dict]:
                 "public_summary": getattr(raw, "public_summary", None),
                 "role": getattr(raw, "role", None),
                 "location_ref": getattr(raw, "location_ref", None),
+                "present": getattr(raw, "present", None),
             })
     return proposals
 
@@ -945,7 +947,7 @@ def promote_new_entities_from_contract(
     promotion is transactional with its source turn: failed commit leaves no
     half-created authority. Each proposal gets a stable idempotency key per
     (attempt, temp_id) → committed exactly once; duplicate retry returns the
-    existing row.
+    existing row. Returns one entity per proposal, in proposal order.
 
     Identity itself is decided pre-narration by
     :func:`resolve_new_entity_identities_pre_narration` (after contract
@@ -1210,9 +1212,12 @@ def register_promoted_npcs_in_scene(
     attempt: Any,
     turn: Any = None,
 ) -> int:
-    """Make freshly introduced NPCs present in the scene with baseline knowledge (#459).
+    """Make introduced NPCs the DM marked present join the scene with baseline knowledge (#459).
 
-    Introduction means present by construction: each promoted NPC gains an
+    ``promoted`` pairs one-to-one, in order, with the attempt's
+    ``new_entities`` proposals. Only proposals with ``present`` set join the
+    scene: an NPC introduced by mention ("the reeve keeps an office by the
+    lanterns") is not standing there. Each present NPC gains an
     ``entity_id``-bearing ``present_actors`` entry (deduped by entity id; a
     name-only or ``temp_id`` entry the model wrote for the same NPC in a
     same-turn ``update_scene`` is replaced, not duplicated), and receives
@@ -1222,7 +1227,13 @@ def register_promoted_npcs_in_scene(
     row yet means no scene is established, so nothing is registered. Returns
     the number of NPCs newly added to ``present_actors``.
     """
-    npcs = [e for e in promoted if getattr(e, "entity_type", None) == "npc"]
+    proposals = _extract_identity_proposals(getattr(attempt, "contract_snapshot", None))
+    if len(proposals) != len(promoted):
+        raise ValueError("promoted entities must pair one-to-one with new_entities proposals")
+    npcs = [
+        e for e, proposal in zip(promoted, proposals)
+        if proposal["present"] and getattr(e, "entity_type", None) == "npc"
+    ]
     scene = db.get(CampaignCurrentScene, campaign.id) if npcs else None
     if scene is None:
         return 0

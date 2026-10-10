@@ -288,7 +288,7 @@ def test_existing_npc_proposal_is_readjudicated_before_narration(db):
                     "claim_kind": "observation", "origin": "dm_adjudication",
                 }]}],
                 "new_entities": [{
-                    "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+                    "temp_id": "tmp_npc_mara", "kind": "npc", "present": True, "public_name": "Mara",
                 }],
             })
         repairs = next(
@@ -342,7 +342,7 @@ def test_repeated_existing_npc_proposal_never_streams(db):
                 "claim_kind": "observation", "origin": "dm_adjudication",
             }]}],
             "new_entities": [{
-                "temp_id": "tmp_npc_mara", "kind": "npc", "public_name": "Mara",
+                "temp_id": "tmp_npc_mara", "kind": "npc", "present": True, "public_name": "Mara",
             }],
         })
 
@@ -366,7 +366,7 @@ def _new_npc_contract():
             "claim_kind": "observation", "origin": "dm_adjudication",
         }]}],
         "new_entities": [{
-            "temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Orsa Pell",
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "Orsa Pell",
         }],
     })
 

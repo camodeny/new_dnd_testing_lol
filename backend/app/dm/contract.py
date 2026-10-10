@@ -132,6 +132,9 @@ class NewEntityProposal(StrictModel):
     role: str | None = Field(default=None, max_length=160)
     public_summary: str | None = Field(default=None, max_length=500)
     location_ref: EntityRef | None = None
+    present: bool = Field(description=(
+        "True if this NPC is physically in the current scene now; false if they "
+        "are only mentioned, remembered, or somewhere else"))
 
     @field_validator("temp_id")
     @classmethod

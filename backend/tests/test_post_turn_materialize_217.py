@@ -677,7 +677,7 @@ def test_compiler_entity_links_back_to_committed_turn():
                          source_revision=rev, input_set_revision=0,
                          status="succeeded", staged_effects=[],
                          contract_snapshot={"new_entities": [{
-                             "temp_id": "tmp_npc_1", "kind": "npc",
+                             "temp_id": "tmp_npc_1", "kind": "npc", "present": True,
                              "public_name": "Unpromoted Nina",
                              "public_summary": "Missed by promotion."}]}))
     db.flush()
@@ -934,7 +934,7 @@ def test_promoted_keep_distinct_proposal_is_recognized():
                          source_revision=rev, input_set_revision=0,
                          status="succeeded", staged_effects=[],
                          contract_snapshot={"new_entities": [{
-                             "temp_id": "tmp_npc_1", "kind": "npc",
+                             "temp_id": "tmp_npc_1", "kind": "npc", "present": True,
                              "public_name": "Mira",
                              "public_summary": "A second Mira."}]}))
     db.flush()
@@ -1023,7 +1023,7 @@ def test_reuse_first_later_keep_distinct_stays_two():
         source_revision=rev, input_set_revision=0,
         status="succeeded", staged_effects=[],
         contract_snapshot={"new_entities": [{
-            "temp_id": "tmp_npc_1", "kind": "npc",
+            "temp_id": "tmp_npc_1", "kind": "npc", "present": True,
             "public_name": "Mira", "public_summary": "Same Mira."}]},
         identity_resolutions=[{
             "temp_id": "tmp_npc_1", "outcome": str(first.id)}]))
