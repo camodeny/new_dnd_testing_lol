@@ -174,7 +174,9 @@ def resolve_embedder(
 
 # ── Source text + version (code-owned, from persisted records only) ──────────
 
-def _entity_display(db: Session, entity_id: Any) -> str:
+def _entity_display(db: Session, entity_id: Any, names: dict[str, str] | None = None) -> str:
+    if names is not None:
+        return names.get(str(entity_id), str(entity_id))
     try:
         entity = db.get(WorldEntity, entity_id)
     except Exception:
@@ -184,8 +186,57 @@ def _entity_display(db: Session, entity_id: Any) -> str:
     return str(getattr(entity, "name", entity_id))
 
 
-def build_source_text(db: Session, source_type: str, record: Any) -> str:
-    """Deterministic index text for one authoritative record."""
+def turn_narrations(
+    db: Session, campaign_id: uuid.UUID, turns: list[Any],
+) -> dict[str, str]:
+    """Committed narration per turn id: the completed stream of the turn's
+    current attempt (else its latest completed stream). Narration is the
+    public projection already shown to the turn's audience."""
+    from models.dm import DMStream, DMStreamChunk
+
+    current = {str(t.id): str(t.current_attempt_id or "") for t in turns}
+    if not current:
+        return {}
+    rows = db.execute(
+        select(DMStream.id, DMStream.turn_id, DMStream.attempt_id, DMStream.final_text,
+               DMStream.completed_at)
+        .where(DMStream.campaign_id == campaign_id, DMStream.status == "completed",
+               DMStream.turn_id.in_(list(current)))
+    ).all()
+    rows = sorted(rows, key=lambda r: (
+        r.attempt_id == current.get(r.turn_id),
+        r.completed_at.timestamp() if r.completed_at else 0.0))
+    # Same fallback as snapshots: a completed stream without final_text is
+    # the concatenation of its chunks.
+    unjoined = [r.id for r in rows if r.final_text is None]
+    joined: dict[Any, list[str]] = {}
+    if unjoined:
+        for stream_id, chunk_text in db.execute(
+            select(DMStreamChunk.stream_id, DMStreamChunk.text)
+            .where(DMStreamChunk.stream_id.in_(unjoined))
+            .order_by(DMStreamChunk.stream_id, DMStreamChunk.sequence)
+        ).all():
+            joined.setdefault(stream_id, []).append(chunk_text or "")
+    out: dict[str, str] = {}
+    for r in rows:
+        text_value = r.final_text if r.final_text is not None else "".join(joined.get(r.id, []))
+        if text_value:
+            out[r.turn_id] = str(text_value)
+    return out
+
+
+def build_source_text(
+    db: Session, source_type: str, record: Any, *,
+    entity_names: dict[str, str] | None = None,
+    submission_texts: dict[str, str] | None = None,
+    narration_texts: dict[str, str] | None = None,
+) -> str:
+    """Deterministic index text for one authoritative record.
+
+    Batch callers (lexical search) pass preloaded ``entity_names``,
+    ``submission_texts``, and ``narration_texts`` maps so one record costs
+    no extra queries.
+    """
     parts: list[str] = []
     if source_type == "world_entity":
         parts = [f"{record.name} ({record.entity_type})", str(record.summary or "")]
@@ -195,9 +246,9 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
             if role:
                 parts.append(str(role)[:500])
     elif source_type == "world_relation":
-        subject = _entity_display(db, getattr(record, "subject_entity_id", None))
+        subject = _entity_display(db, getattr(record, "subject_entity_id", None), entity_names)
         obj_id = getattr(record, "object_entity_id", None)
-        obj = _entity_display(db, obj_id) if obj_id else str(getattr(record, "object_label", "") or "")
+        obj = _entity_display(db, obj_id, entity_names) if obj_id else str(getattr(record, "object_label", "") or "")
         parts = [
             f"{subject} {getattr(record, 'relation_type', '')} {obj}",
             f"epistemic={getattr(record, 'epistemic_state', '')}",
@@ -206,7 +257,7 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
         parts = [str(getattr(record, "content", "") or "")]
         for ref in list(getattr(record, "entity_refs", None) or [])[:8]:
             try:
-                parts.append(_entity_display(db, ref))
+                parts.append(_entity_display(db, ref, entity_names))
             except Exception:
                 continue
         parts.append(f"epistemic={getattr(record, 'epistemic_state', '')}")
@@ -219,20 +270,31 @@ def build_source_text(db: Session, source_type: str, record: Any) -> str:
         parts = [str(getattr(record, "event_type", "")), payload_text]
     elif source_type == "source_turn":
         chunk: list[str] = []
-        try:
-            from models.threads import PlayerSubmission
+        if submission_texts is not None:
+            chunk = [submission_texts[str(raw_sid)]
+                     for raw_sid in list(getattr(record, "submission_ids", None) or [])
+                     if str(raw_sid) in submission_texts]
+        else:
+            try:
+                from models.threads import PlayerSubmission
 
-            for raw_sid in list(getattr(record, "submission_ids", None) or []):
-                try:
-                    sid = raw_sid if isinstance(raw_sid, uuid.UUID) else uuid.UUID(str(raw_sid))
-                except (ValueError, AttributeError, TypeError):
-                    continue
-                submission = db.get(PlayerSubmission, sid)
-                if submission is not None and submission.campaign_id == record.campaign_id:
-                    chunk.append(str(getattr(submission, "raw_content", "") or ""))
-        except Exception:
-            pass
-        parts = [f"turn audience={getattr(record, 'audience', '')}", *chunk]
+                for raw_sid in list(getattr(record, "submission_ids", None) or []):
+                    try:
+                        sid = raw_sid if isinstance(raw_sid, uuid.UUID) else uuid.UUID(str(raw_sid))
+                    except (ValueError, AttributeError, TypeError):
+                        continue
+                    submission = db.get(PlayerSubmission, sid)
+                    if submission is not None and submission.campaign_id == record.campaign_id:
+                        chunk.append(str(getattr(submission, "raw_content", "") or ""))
+            except Exception:
+                pass
+        if narration_texts is None:
+            try:
+                narration_texts = turn_narrations(db, record.campaign_id, [record])
+            except Exception:
+                narration_texts = {}
+        parts = [f"turn audience={getattr(record, 'audience', '')}", *chunk,
+                 narration_texts.get(str(record.id), "")]
     elif source_type == "scene":
         actors = getattr(record, "present_actors", None) or []
         names = [

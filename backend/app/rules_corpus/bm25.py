@@ -45,7 +45,20 @@ class Bm25Index:
                 self.postings[term].append((index, count))
         self.avg_length = sum(self.lengths) / max(1, len(rows))
 
+    @classmethod
+    def from_texts(cls, docs: dict[str, str]) -> "Bm25Index":
+        """Index arbitrary keyed documents (keys play the rule-ID role)."""
+        return cls([
+            {"rule_id": key, "title": "", "heading_path": [], "body": text}
+            for key, text in docs.items()
+        ])
+
     def rank_ids(self, query: str, limit: int = 8) -> list[str]:
+        return [doc_id for doc_id, _ in self.rank_scored(query, limit)]
+
+    def rank_scored(
+        self, query: str, limit: int = 8, *, max_limit: int = 20,
+    ) -> list[tuple[str, float]]:
         scores = defaultdict(float)
         n = len(self.rule_ids)
         for term in set(terms(query)):
@@ -59,4 +72,7 @@ class Bm25Index:
         ranked = sorted(
             scores, key=lambda index: (-scores[index], self.rule_ids[index])
         )
-        return [self.rule_ids[index] for index in ranked[: max(0, min(limit, 20))]]
+        return [
+            (self.rule_ids[index], scores[index])
+            for index in ranked[: max(0, min(limit, max_limit))]
+        ]

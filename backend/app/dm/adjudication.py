@@ -68,6 +68,12 @@ no relevant rules as permission to invent a rule. Creative rulings beyond
 SRD coverage remain explicit DM adjudication. Code owns dice arithmetic,
 resource availability, ownership, and all supported deterministic checks.
 
+WORLD MEMORY: search_campaign_memory finds established people, places, items,
+facts, and past turns by keyword and meaning. The by-id tools
+(lookup_world_entity, traverse_world_relations, lookup_world_fact,
+lookup_source_turn, query_character_knowledge) take a packet source_id or an
+exact entity name; given a description they return search matches instead.
+
 PLAY:
 Resolve the player's intent with a concrete response, discovery, consequence,
 or necessary roll. Do not merely repeat their action and ask what they do.
