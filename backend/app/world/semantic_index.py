@@ -456,7 +456,7 @@ def _store_native_vector(db: Session, row_id: uuid.UUID, vec: list[float]) -> No
     """Write the native vector column via cast (pgvector branch only)."""
     literal = vector_literal(vec)
     db.execute(
-        sql_text("UPDATE world_embeddings SET embedding = :vec::vector WHERE id = :rid"),
+        sql_text("UPDATE world_embeddings SET embedding = CAST(:vec AS vector) WHERE id = :rid"),
         {"vec": literal, "rid": str(row_id)},
     )
 

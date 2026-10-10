@@ -188,12 +188,12 @@ def _pgvector_candidates(
             params["types"] = sorted(source_types)
         rows = db.execute(
             sql_text(f"""
-                SELECT id, (1 - (embedding <=> :vec::vector)) AS score
+                SELECT id, (1 - (embedding <=> CAST(:vec AS vector))) AS score
                 FROM world_embeddings
                 WHERE campaign_id = :cid AND status = 'active'
                   AND embedding_model = :model AND embedding_version = :ver
                   AND embedding IS NOT NULL {type_filter}
-                ORDER BY embedding <=> :vec::vector
+                ORDER BY embedding <=> CAST(:vec AS vector)
                 LIMIT :lim
             """),
             params,

@@ -118,10 +118,10 @@ def search_vector(db: Session, query_embedding: list[float] | None, *, corpus_id
         params["cid"] = corpus_id
     try:
         rows = db.execute(text(f"""
-            SELECT e.rule_id, (1 - (e.embedding <=> :vec::vector)) as score
+            SELECT e.rule_id, (1 - (e.embedding <=> CAST(:vec AS vector))) as score
             FROM rules_embeddings e
             WHERE e.embedding IS NOT NULL {model_filter} {corpus_filter}
-            ORDER BY e.embedding <=> :vec::vector
+            ORDER BY e.embedding <=> CAST(:vec AS vector)
             LIMIT :lim
         """), params).fetchall()
     except Exception as e:
