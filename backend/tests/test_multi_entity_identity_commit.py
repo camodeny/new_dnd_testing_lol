@@ -149,7 +149,7 @@ def test_new_npc_speaking_on_its_introduction_turn_commits():
             "claims": [{"text": "This town owes us a debt.", "claim_kind": "npc_utterance",
                         "origin": "dm_adjudication", "visibility": "public"}],
         }],
-        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "present": True, "public_name": "Masked Rider"}],
     })
     out = execute_validated_turn(
         db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,

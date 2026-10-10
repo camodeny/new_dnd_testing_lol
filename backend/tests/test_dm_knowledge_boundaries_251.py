@@ -510,7 +510,7 @@ def _new_npc_utterance(*topic_ids):
     """A brand-new NPC speaking on its introduction turn (speaker_temp_id)."""
     return normalize_contract(
         {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
-         "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc",
+         "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "present": True,
                            "public_name": "Masked Rider"}],
          "beats": [{"id": "beat_1", "type": "npc_dialogue",
                     "speaker_temp_id": "tmp_npc_rider",

@@ -205,7 +205,7 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
         normalize_contract({
             "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
             "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "Foo",
+            "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "present": True, "public_name": "Foo",
                               "location_ref": {"type": "npc", "id": "npc:keeper"}}],
         })
 
@@ -221,7 +221,7 @@ def _new_npc_dialogue(beat_over=None, claim_over=None, **contract_over):
     payload = {
         "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "new npc speaks",
         "beats": [beat],
-        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "present": True, "public_name": "Masked Rider"}],
     }
     payload.update(contract_over)
     return payload
@@ -240,7 +240,7 @@ def test_new_npc_speaks_on_its_introduction_turn():
 @pytest.mark.parametrize("payload", [
     # The temp handle must name an NPC this contract introduces.
     _new_npc_dialogue(new_entities=[]),
-    _new_npc_dialogue(new_entities=[{"temp_id": "tmp_npc_other", "kind": "npc", "public_name": "Other"}]),
+    _new_npc_dialogue(new_entities=[{"temp_id": "tmp_npc_other", "kind": "npc", "present": True, "public_name": "Other"}]),
     # Exactly one speaker: not both, not neither.
     _new_npc_dialogue(beat_over={"speaker_ref": {"type": "npc", "id": "npc:keeper"}}),
     _new_npc_dialogue(beat_over={"speaker_temp_id": None}),
@@ -254,6 +254,13 @@ def test_new_npc_speaks_on_its_introduction_turn():
 ])
 def test_new_npc_speaker_invariants(payload):
     with pytest.raises(ContractValidationError):
+        normalize_contract(payload)
+
+
+def test_new_npc_speaker_must_be_present():
+    payload = _new_npc_dialogue()
+    payload["new_entities"][0]["present"] = False
+    with pytest.raises(ContractValidationError, match="present NPC"):
         normalize_contract(payload)
 
 
