@@ -111,6 +111,13 @@ class EntityRef(StrictModel):
         return v
 
 
+def _valid_temp_handle(v: str) -> str:
+    s = v.strip()
+    if not re.fullmatch(r"(tmp_npc_[A-Za-z0-9_-]+|tmp_[a-z]+_[A-Za-z0-9_-]+)", s):
+        raise ValueError("temp_id must be like tmp_npc_1 or tmp_<kind>_<id>")
+    return s
+
+
 class NewEntityProposal(StrictModel):
     """Proposal to introduce a previously unknown entity within this turn.
 
@@ -129,10 +136,7 @@ class NewEntityProposal(StrictModel):
     @field_validator("temp_id")
     @classmethod
     def _valid_temp_id(cls, v: str) -> str:
-        s = v.strip()
-        if not re.fullmatch(r"(tmp_npc_[A-Za-z0-9_-]+|tmp_[a-z]+_[A-Za-z0-9_-]+)", s):
-            raise ValueError("temp_id must be like tmp_npc_1 or tmp_<kind>_<id>")
-        return s
+        return _valid_temp_handle(v)
 
     @field_validator("location_ref")
     @classmethod
@@ -199,9 +203,11 @@ class Claim(StrictModel):
 
     @model_validator(mode="after")
     def _claim_invariants(self) -> "Claim":
+        # The speaker itself is the beat's to require: an NPC introduced
+        # this turn speaks through speaker_temp_id with actor_ref null.
         if self.claim_kind == "npc_utterance":
-            if self.actor_ref is None or self.actor_ref.type != "npc":
-                raise ValueError("npc_utterance requires actor_ref type=npc")
+            if self.actor_ref is not None and self.actor_ref.type != "npc":
+                raise ValueError("npc_utterance actor_ref must be type=npc")
         if self.claim_kind == "player_declaration":
             if self.actor_ref is None or self.actor_ref.type != "character":
                 raise ValueError("player_declaration requires actor_ref type=character")
@@ -227,6 +233,7 @@ class Beat(StrictModel):
     id: str = Field(min_length=1, max_length=48, description="Stable beat id, e.g. beat_1")
     type: BeatType
     speaker_ref: EntityRef | None = Field(default=None, description="Canonical speaker for npc_dialogue; null for narration")
+    speaker_temp_id: str | None = Field(default=None, description="temp_id of an NPC this contract introduces in new_entities, speaking on its introduction turn; null otherwise")
     speaker_public_name: str | None = Field(default=None, max_length=160)
     claims: list[Claim] = Field(min_length=1, max_length=5, description="Ordered atomic claims for this beat")
     delivery: str | None = Field(default=None, max_length=400, description="Style/narration hint; contains no world facts")
@@ -240,20 +247,32 @@ class Beat(StrictModel):
             raise ValueError("beat id must match [A-Za-z0-9_-]+")
         return v
 
+    @field_validator("speaker_temp_id")
+    @classmethod
+    def _valid_speaker_temp_id(cls, v: str | None) -> str | None:
+        return None if v is None else _valid_temp_handle(v)
+
     @model_validator(mode="after")
     def _beat_invariants(self) -> "Beat":
         if self.type == "npc_dialogue":
-            if self.speaker_ref is None:
-                raise ValueError("npc_dialogue requires speaker_ref")
-            if self.speaker_ref.type != "npc":
+            if (self.speaker_ref is None) == (self.speaker_temp_id is None):
+                raise ValueError(
+                    "npc_dialogue requires exactly one of speaker_ref (a known NPC) "
+                    "or speaker_temp_id (an NPC introduced this turn)"
+                )
+            if self.speaker_ref is not None and self.speaker_ref.type != "npc":
                 raise ValueError("npc_dialogue speaker_ref must be type=npc")
             if not self.speaker_public_name or not self.speaker_public_name.strip():
                 raise ValueError("npc_dialogue requires speaker_public_name")
             for c in self.claims:
                 if c.claim_kind != "npc_utterance":
                     raise ValueError("npc_dialogue beats may only contain npc_utterance claims")
-                # actor must match speaker
-                if c.actor_ref is None or str(c.actor_ref.id) != str(self.speaker_ref.id):
+                # actor must match speaker; a speaker introduced this turn
+                # has no canonical id yet, so its utterances carry none.
+                if self.speaker_temp_id is not None:
+                    if c.actor_ref is not None:
+                        raise ValueError("npc_dialogue claims of a speaker_temp_id speaker must have actor_ref null")
+                elif c.actor_ref is None or str(c.actor_ref.id) != str(self.speaker_ref.id):
                     raise ValueError("npc_dialogue claim actor_ref must equal beat speaker_ref")
             # truth_status + private context lane for deception
             if self.truth_status is None:
@@ -264,8 +283,8 @@ class Beat(StrictModel):
                 # unknown gets safe default; allow validator to fill below
                 pass
         else:  # narration
-            if self.speaker_ref is not None or self.speaker_public_name is not None:
-                raise ValueError("narration beats must not have speaker_ref / speaker_public_name")
+            if self.speaker_ref is not None or self.speaker_temp_id is not None or self.speaker_public_name is not None:
+                raise ValueError("narration beats must not have speaker_ref / speaker_temp_id / speaker_public_name")
             if self.truth_status is not None or self.dm_private_context is not None:
                 raise ValueError("truth_status / dm_private_context only valid on npc_dialogue beats")
             for c in self.claims:
@@ -1407,6 +1426,13 @@ class DmTurnContractV1(StrictModel):
         # Global cross-field: new_entities only in respond
         if self.new_entities and m != "respond":
             raise ValueError("new_entities only valid in respond mode")
+        introduced = {e.temp_id for e in self.new_entities}
+        for beat in beats:
+            if beat.speaker_temp_id is not None and beat.speaker_temp_id not in introduced:
+                raise ValueError(
+                    f"speaker_temp_id {beat.speaker_temp_id!r} must be the temp_id of an "
+                    "NPC this contract introduces in new_entities; a known NPC speaks via speaker_ref"
+                )
         # staged_effects only in respond (and arguably silent? no — strictly respond)
         if self.staged_effects and m not in ("respond",):
             # await_roll / need_evidence etc. already block above, but keep global guard

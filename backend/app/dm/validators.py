@@ -843,9 +843,15 @@ class KnowledgeValidator:
         for bi, ci, claim in _all_claims(contract):
             if claim.claim_kind not in self._NPC_KNOWLEDGE_KINDS:
                 continue
-            if claim.actor_ref is None or getattr(claim.actor_ref, "type", None) != "npc":
+            speaker_temp_id = contract.beats[bi].speaker_temp_id
+            if speaker_temp_id is not None:
+                # Introduced this turn: it knows only what being here shows
+                # it (the co-presence baseline commit grants), nothing more.
+                actor_id = speaker_temp_id
+            elif claim.actor_ref is None or getattr(claim.actor_ref, "type", None) != "npc":
                 continue
-            actor_id = _norm_id(claim.actor_ref.id)
+            else:
+                actor_id = _norm_id(claim.actor_ref.id)
             refs = [
                 _norm_id(ref.id)
                 for ref in (list(claim.target_refs or []) + list(claim.topic_refs or []))
@@ -854,6 +860,22 @@ class KnowledgeValidator:
             if claim.location_ref is not None and _norm_id(claim.location_ref.id):
                 refs.append(_norm_id(claim.location_ref.id))
             if not refs:
+                continue
+            if speaker_temp_id is not None:
+                unknown = [ref for ref in refs if ref not in co_present]
+                if unknown:
+                    violations.append(
+                        ValidationViolation(
+                            validator=self.name, category=self.category,
+                            code="npc_utterance_without_knowledge",
+                            message=(
+                                "An NPC introduced this turn knows only the current scene and the "
+                                "characters acting in it; it cannot speak to anything else yet"
+                            ),
+                            details={"beat": bi, "claim": ci, "actor": actor_id, "targets": refs, "unknown": unknown},
+                            claim_index=(bi, ci),
+                        )
+                    )
                 continue
             perspective = perspectives.get(actor_id)
             if perspective is None or not perspective["resolved"]:

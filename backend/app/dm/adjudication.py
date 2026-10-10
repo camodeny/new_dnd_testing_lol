@@ -125,12 +125,15 @@ record_id or source_id from the relevant context record. Player declarations
 must cite their originating submission in evidence_refs or trigger_refs.
 Do not retell player declarations unless necessary; focus on the world's reply.
 Introduce new NPCs through new_entities and a narrated introduction, without
-using their temp_id as an EntityRef. When a known NPC reveals a true name
+using their temp_id as an EntityRef. A new NPC can speak on the turn it
+appears: its npc_dialogue beat sets speaker_temp_id to its temp_id instead of
+speaker_ref. When a known NPC reveals a true name
 ("they call me Pell"), stage reveal_entity_name so the registry carries it from
 then on. Each entity id is one person: never voice a different person (a new
 Ledger agent, a second guard) through an existing NPC's id; introduce them as
-new_entities. They can speak as canonical NPCs on later
-turns once their durable identity is in context.
+new_entities.
+NPC SPEECH: when an NPC speaks, put their own words in an npc_dialogue beat;
+narration beats describe, they do not summarize what an NPC said.
 REGISTRY FIRST: the packet carries a complete entity registry (id, name, kind,
 one-line summary for every known NPC/location). Before proposing a new entity,
 check the registry: if the figure is already there under any name or guise,
@@ -248,13 +251,16 @@ def build_forward_dm_messages(packet) -> list[dict]:
         "player_transcript, or do not assert a PC action. NPC actor_ref, "
         "speaker_ref, and target/topic refs use the exact entity id from the "
         "packet (subject_entity_id / registry id), never a name or alias. "
-        "npc_dialogue beats are one NPC speaking: speaker_ref is that NPC, "
+        "npc_dialogue beats are one NPC speaking: speaker_ref is that NPC "
+        "(or, for an NPC introduced in this contract's new_entities, "
+        "speaker_ref is null and speaker_temp_id is its temp_id), "
         "speaker_public_name is set, truth_status is REQUIRED (truthful, "
         "mistaken, deceptive, incomplete, or unknown), every claim is an "
-        "npc_utterance whose actor_ref equals speaker_ref, and any "
+        "npc_utterance whose actor_ref equals speaker_ref (null with "
+        "speaker_temp_id), and any "
         "truth_status other than truthful needs dm_private_context stating "
         "what is actually true. Narration beats hold no NPC speech: "
-        "speaker_ref, speaker_public_name, truth_status, and "
+        "speaker_ref, speaker_temp_id, speaker_public_name, truth_status, and "
         "dm_private_context are null and no claim is an npc_utterance. "
         "roll_request_id is null except on roll_outcome claims."
     )

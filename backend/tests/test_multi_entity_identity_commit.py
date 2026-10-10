@@ -134,6 +134,31 @@ def test_narrated_turn_with_two_new_entities_commits_and_resolves_submissions():
     assert subs and all(s.resolution_status == "resolved" for s in subs)
 
 
+def test_new_npc_speaking_on_its_introduction_turn_commits():
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+    from app.dm.narration import execute_validated_turn
+    db, campaign, thread_id = _streaming_setup()
+    turn, attempt = _coordinated_attempt(db, campaign, thread_id)
+    contract = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "respond",
+        "reason": "the rider leader answers",
+        "beats": [{
+            "id": "beat_1", "type": "npc_dialogue",
+            "speaker_temp_id": "tmp_npc_rider", "speaker_public_name": "Masked Rider",
+            "truth_status": "truthful",
+            "claims": [{"text": "This town owes us a debt.", "claim_kind": "npc_utterance",
+                        "origin": "dm_adjudication", "visibility": "public"}],
+        }],
+        "new_entities": [{"temp_id": "tmp_npc_rider", "kind": "npc", "public_name": "Masked Rider"}],
+    })
+    out = execute_validated_turn(
+        db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
+        publish_realtime=False, identity_decision_service=_no_calls_service())
+    assert out.turn.status == "succeeded"
+    assert 'Masked Rider says: "This town owes us a debt."' in out.narration.visible_text
+    assert [e.name for e in db.query(WorldEntity).all()] == ["Masked Rider"]
+
+
 def test_post_narration_commit_failure_ends_failed_visible(monkeypatch):
     from app.dm import turns as turns_mod
     from app.dm.narration import execute_validated_turn
