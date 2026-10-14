@@ -155,7 +155,7 @@ def test_new_npc_speaking_on_its_introduction_turn_commits():
         db, turn_id=turn.id, attempt_id=attempt.id, contract=contract,
         publish_realtime=False, identity_decision_service=_no_calls_service())
     assert out.turn.status == "succeeded"
-    assert 'Masked Rider says: "This town owes us a debt."' in out.narration.visible_text
+    assert '<npc speaker="Masked Rider">"This town owes us a debt."</npc>' in out.narration.visible_text
     assert [e.name for e in db.query(WorldEntity).all()] == ["Masked Rider"]
 
 

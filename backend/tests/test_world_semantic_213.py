@@ -651,6 +651,29 @@ def _commit_knowledge_turn(db, cid, owner, tid, staged_effects):
     return commit_turn(db, turn.id, attempt.id)
 
 
+def test_turn_narrations_flatten_npc_dialogue_markup():
+    from types import SimpleNamespace
+
+    from app.threads.service import get_or_create_campaign_thread
+    from models.dm import DMStream
+
+    Fac, cid, owner, _player, _ = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    turn = SimpleNamespace(id=uuid.uuid4(), current_attempt_id=uuid.uuid4())
+    db.add(DMStream(
+        id=uuid.uuid4(), campaign_id=cid, thread_id=uuid.UUID(str(thread.id)),
+        turn_id=str(turn.id), attempt_id=str(turn.current_attempt_id),
+        status="completed", completed_at=datetime.now(timezone.utc),
+        final_text='The rider leans in. <npc speaker="Rust-cloaked rider">"The debt is due."</npc>',
+    ))
+    db.commit()
+    assert semantic_index.turn_narrations(db, cid, [turn]) == {
+        str(turn.id): 'The rider leans in. Rust-cloaked rider: "The debt is due."',
+    }
+
+
 def test_committed_turn_staged_effects_become_searchable():
     from app.threads.service import get_or_create_campaign_thread
 

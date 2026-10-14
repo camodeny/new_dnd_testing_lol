@@ -2663,6 +2663,21 @@ a.automation-list-item:focus-visible {
 }
 /* <q> renders the quotation marks itself; no extra quotes needed. */
 
+/* NPC dialogue in DM narration (DmNarration): the speaker's name over the
+   line, set off from the surrounding prose by a rule. */
+.npc-line { margin: 0; padding: 1px 0 1px 16px; border-left: 2px solid var(--ember-soft); }
+.dm-narration > * + * { margin-top: 12px; }
+.npc-line-speaker {
+  margin: 0 0 2px;
+  color: var(--ember-hover);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+.npc-line-text { margin: 0; }
+
 .session-send-btn {
   min-width: 36px;
   min-height: 32px;
@@ -3388,6 +3403,8 @@ a.automation-list-item:focus-visible {
 .tv-dm { margin: 0 0 24px; }
 .tv-dm p { margin: 0 0 12px; }
 .tv-dm p:last-child { margin: 0; }
+.tv-dm .npc-line { border-left: 2px solid #e3d5c8; }
+.tv-dm .npc-line-speaker { color: #a3502f; font-family: var(--tv-ui); }
 .tv-thinking { margin: 4px 0 0; color: var(--tv-muted); font: italic 15px/1.5 var(--tv-story); }
 .tv-you { display: flex; justify-content: flex-end; margin: 0 0 24px; }
 .tv-other { margin: 0 0 24px; }

@@ -70,6 +70,7 @@ from app.campaigns.campaign_start import OPENING_SOURCE as _OPENING_SOURCE
 from app.submissions.service import DM_ONLY_SUBMISSION_SOURCES
 from app.dm.contract import DmTurnContractV1, projection_has_visible_content, public_projection
 from app.dm.mechanics import MechanicsResolution, issue_summary, resolve_attack_damage, resolve_mechanics, with_outcome_beat
+from app.dm.npc_markup import iter_npc_lines, render_npc_line
 from app.observability.tracing import structured_log
 from app.realtime.service import publish_dm_chunk_created, publish_dm_status
 from app.world.identity import resolve_new_entity_identities_pre_narration
@@ -86,10 +87,13 @@ HARD RULES — violating any rule invalidates your output:
 2. NEVER re-adjudicate: no new DCs, checks, saves, or success/failure calls.
 3. NEVER invent voluntary player-character speech, thought, or action. Reproduce
    player-authored declarations with attribution; do not extend them.
-4. NPC dialogue: render the given utterance text only. Give each line one speech
-   tag; when the utterance already contains one, do not add another. Never
-   reveal whether the NPC is truthful, mistaken, or deceptive, and never state
-   hidden motives.
+4. NPC dialogue: render the given utterance text only, wrapped in an npc tag
+   on its own paragraph, with speaker set to the beat's speaker_public_name:
+     <npc speaker="Mara the Innkeeper">"Rooms are two silver a night."</npc>
+   Gestures and speech tags ("she says, wiping the bar") belong in the
+   surrounding prose, never inside the tag. Use the tag only for NPC speech.
+   Never reveal whether the NPC is truthful, mistaken, or deceptive, and
+   never state hidden motives.
  5. No numbers, names, places, or quoted speech beyond the structured beats.
  6. You have no game-state authority: your words change nothing by themselves.
 
@@ -418,9 +422,10 @@ def render_deterministic_narration(
     """Expand a narration projection to prose without a model provider.
 
     Pure projection: narration beats join claim texts; NPC dialogue beats
-    render as ``Name says: "utterance"`` (utterance text only — never the
-    private truth status); roll prompts append the public reason; open
-    player choice closes the narration. No new facts are introduced.
+    render as ``<npc speaker="Name">"utterance"</npc>`` (utterance text
+    only — never the private truth status); roll prompts append the public
+    reason; open player choice closes the narration. No new facts are
+    introduced.
     Discussion leads action: clarify answers and table-chat intents render
     before beats so a mixed question + action reads answer-first.
     """
@@ -447,7 +452,7 @@ def render_deterministic_narration(
         if beat.get("type") == "npc_dialogue":
             name = (beat.get("speaker_public_name") or "A voice").strip()
             for t in texts:
-                parts.append(f'{name} says: "{t.strip()}"')
+                parts.append(render_npc_line(name, t))
         else:
             parts.append(" ".join(t.strip() for t in texts))
     roll = projection.get("roll_request")
@@ -595,6 +600,26 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
 
+_TYPOGRAPHIC_FOLD = str.maketrans({
+    "\u2018": "'", "\u2019": "'", "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-", "\u2026": "...",
+})
+
+
+def _speech_norm(s: str) -> str:
+    """Spoken-text key: typographic quotes/dashes folded, outer quotes dropped."""
+    return _norm((s or "").translate(_TYPOGRAPHIC_FOLD)).strip("\"' ")
+
+
+def _speaker_norm(s: str) -> str:
+    """Speaker-name key: 'The rust-cloaked rider' matches 'Rust-cloaked rider'."""
+    return re.sub(r"^(?:the|a|an)\s+", "", _norm(s))
+
+
+def _speech_grounded(spoken: str, sources: list[str]) -> bool:
+    return any(spoken in src or src in spoken for src in sources if src)
+
+
 def _contains_phrase(text: str, phrase: str) -> bool:
     """Word-boundary match so 'studies' is not the consequence 'dies'."""
     needle = (phrase or "").strip().lower()
@@ -708,6 +733,34 @@ def validate_narration_fidelity(
             violations.append({
                 "category": "unsupported_addition", "code": "invented_dialogue",
                 "message": f"Narration invents dialogue not in structured beats: {match.group(3)[:60]!r}",
+            })
+            break
+    # Tagged NPC lines (contract rule 4): the line must be a supplied
+    # utterance — or verbatim recent history — and an utterance from an
+    # npc_dialogue beat must carry that beat's speaker.
+    npc_speakers = [
+        (_speaker_norm(b.speaker_public_name or ""), [_speech_norm(c.text) for c in b.claims if c.visibility == "public"])
+        for b in contract.beats if b.type == "npc_dialogue"
+    ]
+    spoken_claims = [_speech_norm(c.text) for b in contract.beats for c in b.claims if c.visibility == "public"]
+    spoken_history = [_speech_norm(entry.get("text") or "") for entry in history or []]
+    for line in iter_npc_lines(text):
+        spoken = _speech_norm(line.text)
+        if not spoken:
+            continue
+        speakers = [name for name, utterances in npc_speakers if _speech_grounded(spoken, utterances)]
+        if speakers:
+            said_by = _speaker_norm(line.speaker)
+            if not said_by or not any(name and (said_by in name or name in said_by) for name in speakers):
+                violations.append({
+                    "category": "unsupported_addition", "code": "misattributed_dialogue",
+                    "message": f"Narration attributes an NPC line to {line.speaker[:60]!r}, not its speaker",
+                })
+                break
+        elif not _speech_grounded(spoken, spoken_claims) and not _speech_grounded(spoken, spoken_history):
+            violations.append({
+                "category": "unsupported_addition", "code": "invented_dialogue",
+                "message": f"Narration invents dialogue not in structured beats: {line.text[:60]!r}",
             })
             break
 

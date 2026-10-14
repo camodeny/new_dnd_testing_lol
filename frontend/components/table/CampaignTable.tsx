@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState, type ReactNode } from 'react'
-import MarkdownContent from '@/components/common/MarkdownContent'
+import DmNarration from '@/components/common/DmNarration'
 import IcOocText from '@/components/dashboard/IcOocText'
 import PrivateThreadConversation from '@/components/dashboard/PrivateThreadConversation'
 import CombatArena from '@/components/table/CombatArena'
@@ -220,7 +220,7 @@ export default function CampaignTable({
             }
             const msg = item.message
             if (msg.role === 'dm') {
-              return <div className="tv-dm" key={item.key}><MarkdownContent content={msg.content} /></div>
+              return <div className="tv-dm" key={item.key}><DmNarration content={msg.content} /></div>
             }
             return (
               <div className={msg.is_own ? 'tv-you' : 'tv-other'} key={item.key}>
@@ -231,7 +231,7 @@ export default function CampaignTable({
           })}
           {(aiThinking || activeDmText) && (
             <div className="tv-dm streaming" aria-live="polite">
-              {activeDmText && <MarkdownContent content={activeDmText} />}
+              {activeDmText && <DmNarration content={activeDmText} />}
               {aiThinking && <p className="tv-thinking">{aiThinkingStatus || (activeDmText ? 'Writing…' : 'The DM is thinking…')}</p>}
             </div>
           )}

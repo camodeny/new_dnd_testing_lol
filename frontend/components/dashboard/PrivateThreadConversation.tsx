@@ -3,7 +3,7 @@
 import { useMemo, useState } from 'react'
 import DmTurnControls from '@/components/dashboard/DmTurnControls'
 import IcOocText from '@/components/dashboard/IcOocText'
-import MarkdownContent from '@/components/common/MarkdownContent'
+import DmNarration from '@/components/common/DmNarration'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
 import { gameplayThreads } from '@/lib/api'
 import { parseQuotedSegments } from '@/lib/icOoc'
@@ -142,7 +142,7 @@ export default function PrivateThreadConversation({
                 <strong>{entry.author}</strong>
                 {entry.timestamp && <time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>}
               </div>
-              {entry.role === 'dm' ? <MarkdownContent content={entry.content} /> : <IcOocText message={{ id: entry.id, session_id: '', role: 'player', content: entry.content, created_at: entry.timestamp ?? '', segments: entry.segments }} />}
+              {entry.role === 'dm' ? <DmNarration content={entry.content} /> : <IcOocText message={{ id: entry.id, session_id: '', role: 'player', content: entry.content, created_at: entry.timestamp ?? '', segments: entry.segments }} />}
             </div>
           </article>
         ))}
@@ -151,7 +151,7 @@ export default function PrivateThreadConversation({
             <div className="session-msg-avatar dm-avatar" aria-hidden="true">AI</div>
             <div>
               <div className="private-thread-message-meta"><strong>AI DM</strong><span>responding…</span></div>
-              <MarkdownContent content={aiVisibleText} />
+              <DmNarration content={aiVisibleText} />
             </div>
           </article>
         )}
