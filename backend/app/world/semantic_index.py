@@ -30,6 +30,7 @@ from typing import Any, Callable
 from sqlalchemy import select, text as sql_text
 from sqlalchemy.orm import Session
 
+from app.dm.npc_markup import strip_npc_markup
 from app.rules_corpus.gemini import make_gemini_provider
 from app.schema import coerce_uuid
 from app.observability.tracing import structured_log
@@ -191,7 +192,8 @@ def turn_narrations(
 ) -> dict[str, str]:
     """Committed narration per turn id: the completed stream of the turn's
     current attempt (else its latest completed stream). Narration is the
-    public projection already shown to the turn's audience."""
+    public projection already shown to the turn's audience, with NPC
+    dialogue markup flattened to ``Speaker: "line"`` for indexing."""
     from models.dm import DMStream, DMStreamChunk
 
     current = {str(t.id): str(t.current_attempt_id or "") for t in turns}
@@ -221,7 +223,7 @@ def turn_narrations(
     for r in rows:
         text_value = r.final_text if r.final_text is not None else "".join(joined.get(r.id, []))
         if text_value:
-            out[r.turn_id] = str(text_value)
+            out[r.turn_id] = strip_npc_markup(str(text_value))
     return out
 
 

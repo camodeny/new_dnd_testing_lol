@@ -182,7 +182,7 @@ def test_truthful_npc_renders_utterance_without_truth_commentary():
         }],
     })
     text = render_deterministic_narration(build_narration_projection(c), c)
-    assert 'Odin says: "Welcome to the hall."' in text
+    assert '<npc speaker="Odin">"Welcome to the hall."</npc>' in text
     assert "truthful" not in text.lower()
     assert validate_narration_fidelity(text, c) == []
 
@@ -192,7 +192,7 @@ def test_deceptive_npc_private_truth_never_narrated():
     text = render_deterministic_narration(build_narration_projection(c), c)
     assert "Red Mask" not in text
     assert "deceptive" not in text.lower()
-    assert 'Vera says: "The north road is perfectly safe, travelers."' in text
+    assert '<npc speaker="Vera">"The north road is perfectly safe, travelers."</npc>' in text
     assert validate_narration_fidelity(text, c) == []
 
 
@@ -1180,6 +1180,43 @@ def test_fidelity_still_rejects_novel_numbers_and_quotes():
         v["code"] == "invented_dialogue"
         for v in validate_narration_fidelity(bad_quote, c, history=history)
     )
+
+
+def test_fidelity_accepts_tagged_npc_line_with_typographic_quotes():
+    c = _deceptive_npc()
+    text = (
+        "Vera smiles a little too quickly.\n\n"
+        "<npc speaker=\"Vera\">“The north road is perfectly safe, travelers.”</npc>"
+    )
+    assert validate_narration_fidelity(text, c) == []
+    # A leading article on the speaker still names the same NPC.
+    assert validate_narration_fidelity(text.replace('speaker="Vera"', 'speaker="the Vera"'), c) == []
+
+
+def test_fidelity_rejects_tagged_npc_line_not_in_beats():
+    c = _deceptive_npc()
+    text = '<npc speaker="Vera">"The east road is crawling with bandits."</npc>'
+    assert [v["code"] for v in validate_narration_fidelity(text, c)] == ["invented_dialogue"]
+
+
+def test_fidelity_rejects_tagged_npc_line_given_to_another_speaker():
+    c = _deceptive_npc()
+    for speaker in ("Odin", ""):
+        text = f'<npc speaker="{speaker}">"The north road is perfectly safe, travelers."</npc>'
+        assert [v["code"] for v in validate_narration_fidelity(text, c)] == ["misattributed_dialogue"]
+
+
+def test_fidelity_grounds_tagged_npc_line_recalled_from_history():
+    c = _respond([_narr_beat("The vault door stands shut.")])
+    history = [{
+        "speaker": "Dungeon Master", "role": "dm",
+        "text": '<npc speaker="Vera">"The north road is perfectly safe, travelers."</npc>',
+    }]
+    text = (
+        "The vault door stands shut. You remember Vera's promise: "
+        '<npc speaker="Vera">"The north road is perfectly safe, travelers."</npc>'
+    )
+    assert validate_narration_fidelity(text, c, history=history) == []
 
 
 def test_stream_narration_builds_history_on_template_path(db):
