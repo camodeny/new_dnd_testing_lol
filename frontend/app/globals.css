@@ -2723,11 +2723,13 @@ a.automation-list-item:focus-visible {
 }
 
 .private-thread-conversation { display: flex; height: 100%; flex-direction: column; }
-.private-thread-header { flex: 0 0 auto; }
+.private-thread-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; gap: 12px; }
+.private-thread-header .btn { flex: 0 0 auto; white-space: nowrap; }
 .private-thread-eyebrow { margin-bottom: 4px; color: var(--ember); font: 700 .58rem/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
 .private-thread-subtitle { margin-top: 3px; color: var(--text-dim); font-size: .69rem; }
-.private-thread-messages { flex: 1; overflow-y: auto; padding: 22px clamp(18px, 4.5vw, 72px) 34px; }
-.private-thread-empty { display: grid; min-height: 100%; place-content: center; place-items: center; color: var(--text-dim); text-align: center; }
+.private-thread-messages { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 22px clamp(18px, 4.5vw, 72px) 34px; }
+.private-thread-log { display: flex; min-height: 100%; flex-direction: column; }
+.private-thread-empty { display: grid; flex: 1; place-content: center; place-items: center; color: var(--text-dim); text-align: center; }
 .private-thread-empty i { margin-bottom: 10px; color: var(--ember); font-size: 1.5rem; }
 .private-thread-empty p { max-width: 320px; margin: 0; font-size: .82rem; }
 .private-thread-reconnect { margin: 0 auto 14px; padding: 8px 12px; border: 1px solid rgba(200, 95, 61, .25); border-radius: 7px; color: var(--ember-hover); font-size: .7rem; }
@@ -3332,14 +3334,23 @@ a.automation-list-item:focus-visible {
   --tv-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", Arial, sans-serif;
   --tv-story: Charter, "Iowan Old Style", Georgia, serif;
 
+  /* The table is the whole screen and tracks the visible viewport: when
+     the phone keyboard opens, the header stays on top and the composer
+     sits right above the keys (see useVisualViewportVars). */
+  position: fixed;
+  top: var(--vv-top, 0px);
+  right: 0;
+  left: 0;
   display: flex;
   flex-direction: column;
-  height: 100svh;
+  height: var(--vv-height, 100dvh);
   overflow: hidden;
   background: var(--tv-bg);
   color: var(--tv-text);
   font: 14px/1.5 var(--tv-ui);
 }
+/* Nothing behind the table scrolls, rubber-bands, or pulls to refresh. */
+html:has(.tv) { overscroll-behavior: none; }
 .tv button { font: inherit; }
 .tv-muted { color: var(--tv-muted); }
 .tv .cap { text-transform: capitalize; }
@@ -3366,7 +3377,7 @@ a.automation-list-item:focus-visible {
 }
 .tv-header-right { display: flex; align-items: center; gap: 4px; margin-left: auto; }
 .tv-icon-btn {
-  display: grid; place-items: center; width: 30px; height: 30px;
+  display: grid; flex: 0 0 auto; place-items: center; width: 30px; height: 30px;
   border: 0; border-radius: 7px; background: none; color: var(--tv-muted); cursor: pointer;
 }
 .tv-icon-btn:hover, .tv-icon-btn.on { background: var(--tv-hover); color: var(--tv-text); }
@@ -3375,13 +3386,13 @@ a.automation-list-item:focus-visible {
 /* Conversation switcher */
 .tv-switcher { position: relative; }
 .tv-switch-btn {
-  display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px;
+  display: flex; align-items: center; gap: 7px; height: 30px; padding: 0 10px; white-space: nowrap;
   border: 0; border-radius: 7px; background: none; color: var(--tv-text); font-size: 13px; cursor: pointer;
 }
 .tv-switch-btn:hover, .tv-switch-btn.open { background: var(--tv-hover); }
 .tv-chev { color: var(--tv-muted); font-size: 11px; }
 .tv-menu {
-  position: absolute; top: 36px; right: 0; width: 270px; padding: 6px;
+  position: absolute; top: calc(100% + 6px); right: 0; width: min(270px, calc(100vw - 16px)); padding: 6px;
   border: 1px solid var(--tv-line); border-radius: 12px; background: #fff;
   box-shadow: 0 12px 32px rgba(0, 0, 0, .10);
 }
@@ -3412,13 +3423,15 @@ a.automation-list-item:focus-visible {
 
 /* Body */
 .tv-body { position: relative; display: flex; flex: 1; min-height: 0; }
-.tv-private { display: flex; flex: 1; min-width: 0; flex-direction: column; }
+.tv-private { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
 .tv-private > * { flex: 1; min-height: 0; }
 
 /* Story */
-.tv-chat { display: flex; flex: 1; min-width: 0; flex-direction: column; }
-.tv-thread { flex: 1; min-height: 0; overflow-y: auto; }
-.tv-thread-inner { max-width: 700px; margin: 0 auto; padding: 36px 28px 24px; }
+/* min-height: 0 lets the story shrink to the screen and scroll inside it
+   when the body stacks vertically (phones). */
+.tv-chat { display: flex; flex: 1; min-width: 0; min-height: 0; flex-direction: column; }
+.tv-thread { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.tv-thread-inner { max-width: 700px; margin: 0 auto; padding: 36px 28px 24px; overflow-wrap: anywhere; }
 .tv-dm, .tv-dm .markdown-content { color: var(--tv-text); font: 17px/1.7 var(--tv-story); }
 .tv-dm { margin: 0 0 24px; }
 .tv-dm p { margin: 0 0 12px; }
@@ -3447,6 +3460,23 @@ a.automation-list-item:focus-visible {
 .tv-turn-controls { margin: 0 0 24px; color: var(--tv-muted); font-size: 13.5px; }
 .tv-turn-controls p { margin: 0 0 6px; }
 .tv-capacity { max-width: 700px; width: 100%; margin: 0 auto; padding: 0 28px; }
+/* "Latest" sits at the bottom of the story while you've scrolled up. */
+.tv-jump-wrap { position: sticky; bottom: 12px; display: flex; justify-content: center; height: 0; pointer-events: none; }
+.tv-jump {
+  display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 14px; transform: translateY(-100%);
+  border: 1px solid var(--tv-line); border-radius: 999px; background: #fff; color: var(--tv-text);
+  font-size: 13px; font-weight: 500; box-shadow: 0 4px 16px rgba(0, 0, 0, .1); cursor: pointer; pointer-events: auto;
+}
+/* Continue into the next adventure (owner), inside the turn controls. */
+.tv .continue-campaign p { color: var(--tv-muted); }
+.tv .continue-campaign p strong { color: var(--tv-text); font-weight: 600; }
+.tv .continue-campaign form { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 10px; }
+.tv .continue-campaign label { width: 100%; font-size: 12.5px; }
+.tv .continue-campaign input {
+  flex: 1 1 180px; min-width: 0; height: 36px; padding: 0 10px;
+  border: 1px solid var(--tv-line); border-radius: 8px; background: #fff; color: var(--tv-text);
+}
+.tv .continue-campaign form p { width: 100%; margin: 0; font-size: 12.5px; }
 
 /* Buttons */
 .tv-btn {
@@ -3522,7 +3552,7 @@ a.automation-list-item:focus-visible {
 .tv-tab.on { background: var(--tv-hover); color: var(--tv-text); font-weight: 500; }
 .tv-tab .tv-dot { position: absolute; top: 6px; right: 3px; }
 .tv-tabs-close { margin-left: auto; }
-.tv-view { flex: 1; overflow-y: auto; padding: 22px 24px 28px; }
+.tv-view { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 22px 24px 28px; }
 .tv-who { display: flex; align-items: center; gap: 12px; }
 .tv-who h3 { margin: 0; font-size: 17px; font-weight: 600; }
 .tv-who p { margin: 1px 0 0; color: var(--tv-muted); font-size: 13px; text-transform: capitalize; }
@@ -3557,7 +3587,13 @@ a.automation-list-item:focus-visible {
 .tv-arena { display: flex; flex: 1; min-width: 0; flex-direction: column; background: #fafaf8; }
 .tv-turns { display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--tv-line); background: #fff; }
 .tv-round { color: var(--tv-muted); font-size: 12.5px; white-space: nowrap; }
-.tv-turns ol { display: flex; gap: 6px; margin: 0; padding: 0; overflow-x: auto; list-style: none; scrollbar-width: none; }
+.tv-turns ol { position: relative; display: flex; flex: 1; min-width: 0; gap: 6px; margin: 0; padding: 0; overflow-x: auto; list-style: none; scrollbar-width: none; }
+/* Phones only: fold the map away to give the story the screen. */
+.tv-map-toggle {
+  display: none; flex: 0 0 auto; align-items: center; gap: 6px; height: 32px; padding: 0 11px;
+  border: 1px solid var(--tv-line); border-radius: 999px; background: #fff; color: var(--tv-muted); font-size: 13px; cursor: pointer;
+}
+.tv-map-toggle.on { border-color: var(--tv-text); color: var(--tv-text); }
 .tv-turn {
   display: flex; flex: 0 0 auto; align-items: center; gap: 7px; height: 32px; padding: 0 11px 0 4px;
   border: 1px solid var(--tv-line); border-radius: 999px; background: #fff; color: var(--tv-muted); font-size: 13px;
@@ -3570,6 +3606,7 @@ a.automation-list-item:focus-visible {
 .tv-map-wrap { display: grid; flex: 1; min-height: 0; place-items: center; padding: 20px; }
 .tv-no-map { max-width: 320px; text-align: center; }
 .tv-map {
+  container-type: inline-size;
   display: grid;
   grid-template-columns: repeat(var(--cols), minmax(0, 1fr));
   grid-template-rows: repeat(var(--rows), minmax(0, 1fr));
@@ -3593,6 +3630,8 @@ a.automation-list-item:focus-visible {
 .tv-token.foe { border: 2px solid #b8452b; background: #f6dfd7; color: #a8401f; }
 .tv-token.me { background: var(--tv-text); color: #fff; }
 .tv-token.active { box-shadow: 0 0 0 4px rgba(27, 27, 26, .15); }
+/* Cells too small for initials: tokens read as coloured dots. */
+@container (max-width: 260px) { .tv-token span { display: none; } }
 .tv-yourturn { padding: 14px 20px 16px; border-top: 1px solid var(--tv-line); background: #fff; }
 .tv-yt-top { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
 .tv-yt-top h3 { margin: 0; font-size: 15px; font-weight: 600; }
@@ -3613,18 +3652,6 @@ a.automation-list-item:focus-visible {
 .tv.combat .tv-panel {
   position: absolute; top: 0; right: 0; bottom: 0; z-index: 5;
   box-shadow: -12px 0 32px rgba(0, 0, 0, .08);
-}
-
-@media (max-width: 900px) {
-  .tv-thread-inner { padding: 24px 18px 16px; }
-  .tv-composer-wrap { padding: 8px 12px 12px; }
-  .tv-panel { position: absolute; inset: 0; z-index: 5; flex-basis: auto; border-left: 0; }
-  .tv-body { flex-direction: column; }
-  .tv.combat .tv-body { overflow-y: auto; }
-  .tv.combat .tv-arena { flex: 0 0 auto; }
-  .tv-map { width: 100%; }
-  .tv-side-chat { flex: 1 0 60svh; border-top: 1px solid var(--tv-line); border-left: 0; }
-  .tv-place span { display: none; }
 }
 
 /* Placeholders for features that don't exist yet: visible, clearly
@@ -3681,3 +3708,113 @@ a.automation-list-item:focus-visible {
 .tv-rarity-tag.legendary { color: #a77a25; }
 @keyframes tv-loot-reveal { from { opacity: 0; transform: translateY(6px) scale(.97); } }
 @media (prefers-reduced-motion: reduce) { .tv-loot.fresh .tv-loot-haul li { animation: none; } }
+
+/* ── Live table on phones and touch screens ─────────────────────────────
+   Last in the file so these override the table's base rules above. */
+
+@media (max-width: 900px) {
+  .tv-header { gap: 4px; padding: 0 4px; }
+  .tv-place { flex: 1 1 auto; padding-left: 2px; }
+  .tv-place span { display: none; }
+  .tv-thread-inner { padding: 20px 16px 16px; }
+  .tv-bubble { max-width: 86%; font-size: 15px; }
+  .tv-composer-wrap { padding: 6px 10px calc(10px + env(safe-area-inset-bottom)); }
+  .tv-composer { padding: 10px 10px 8px 14px; border-radius: 18px; }
+  /* The keyboard already takes half the screen: grow less before scrolling. */
+  .tv-composer-input { max-height: min(216px, calc(var(--vv-height, 100dvh) * .28)); }
+  .tv-capacity { padding: 0 10px; }
+  .tv-place-card { flex-wrap: wrap; }
+  .tv-place-card > div { flex: 1 1 0; min-width: 0; }
+  .tv-place-card .tv-btn { width: 100%; margin-left: 0; }
+
+  /* Character, Journal and Party open as a full-screen sheet over the story. */
+  .tv-panel {
+    position: absolute; inset: 0; z-index: 5; flex-basis: auto; border-left: 0;
+    animation: tv-sheet-in 180ms ease-out;
+  }
+  .tv-tabs { overflow-x: auto; scrollbar-width: none; padding: 0 4px 0 8px; }
+  .tv-tabs::-webkit-scrollbar { display: none; }
+  .tv-tab { flex: 0 0 auto; }
+  .tv-tabs-close { position: sticky; right: 0; background: #fff; }
+  .tv-view { padding: 18px 18px calc(28px + env(safe-area-inset-bottom)); }
+  .tv-body { flex-direction: column; }
+  /* Private conversations match the table: white, edge to edge, and a
+     rounded composer above the keyboard. */
+  .tv .private-thread-header { min-height: 0; padding: 10px 10px 10px 16px; background: #fff; }
+  .tv .private-thread-messages { padding: 18px 16px; background: #fff; }
+  .tv .private-thread-input-area { padding: 6px 10px calc(10px + env(safe-area-inset-bottom)) !important; background: #fff; }
+  .tv .private-thread-input-area .session-input-shell {
+    align-items: center; padding: 4px 4px 4px 12px;
+    border: 1px solid var(--tv-line) !important; border-radius: 18px !important; background: #fff !important;
+  }
+  .tv .private-thread-input-area .session-send-btn { width: 40px; height: 40px; border: 0; border-radius: 50% !important; background: var(--tv-text) !important; }
+  .tv.combat .tv-turns { gap: 8px; padding: 6px 10px; }
+  .tv.combat .tv-yourturn { padding: 10px 12px; }
+
+  /* The tray keeps to two rows: whose turn and your health, then what's
+     left this turn beside the quick moves. The budget chips say what the
+     longer sentence does. */
+  .tv-yt-top { flex-wrap: nowrap; align-items: center; }
+  .tv-yt-top p { display: none; }
+  .tv-hp-mini .bar { width: 56px; }
+  .tv-yt-bottom { flex-wrap: nowrap; gap: 8px; margin: 10px -12px 0; padding: 0 12px; overflow-x: auto; scrollbar-width: none; }
+  .tv-yt-bottom::-webkit-scrollbar { display: none; }
+  .tv-budget, .tv-moves { flex: 0 0 auto; flex-wrap: nowrap; margin-left: 0; }
+  /* Typing gets the half of the screen the keyboard leaves: the map and
+     turn tray step aside until the composer lets go of focus. */
+}
+@media (max-width: 900px) and (orientation: portrait) {
+  /* Combat on a phone: turn order, the (foldable) map, the story, what
+     you can do this turn, then the composer, all on one screen. The arena
+     and story wrappers dissolve so their parts can interleave. */
+  .tv.combat .tv-arena,
+  .tv.combat .tv-side-chat,
+  .tv.combat .tv-side-chat > .tv-chat { display: contents; }
+  .tv.combat .tv-turns { order: 1; flex: 0 0 auto; }
+  .tv.combat .tv-map-wrap { order: 2; flex: 0 0 auto; padding: 8px 12px; border-bottom: 1px solid var(--tv-line); background: #fafaf8; }
+  .tv.combat .tv-thread { order: 3; flex: 1 1 0; min-height: 64px; }
+  .tv.combat .tv-capacity { order: 4; }
+  .tv.combat .tv-yourturn { order: 5; flex: 0 0 auto; }
+  .tv.combat .tv-composer-wrap { order: 6; }
+  .tv.combat .tv-arena.map-closed .tv-map-wrap { display: none; }
+  .tv-map-toggle { display: inline-flex; }
+  .tv-map { width: min(100%, calc(var(--vv-height, 100dvh) * .27 * var(--cols) / var(--rows))); }
+  /* Typing gets the half of the screen the keyboard leaves: the map and
+     turn tray step aside until the composer lets go of focus. */
+  .tv.combat:has(.tv-composer-input:focus) .tv-map-wrap,
+  .tv.combat:has(.tv-composer-input:focus) .tv-yourturn { display: none; }
+}
+@media (max-width: 900px) and (orientation: landscape) {
+  /* Landscape phones are too short to stack: the fight and the story sit
+     side by side as on a desktop. */
+  .tv.combat .tv-body { flex-direction: row; }
+  .tv.combat .tv-side-chat { flex: 0 0 min(360px, 48%); }
+  .tv.combat .tv-map-wrap { padding: 8px; }
+  .tv-map { width: min(100%, calc((var(--vv-height, 100dvh) - 220px) * var(--cols) / var(--rows))); }
+}
+@keyframes tv-sheet-in { from { opacity: 0; transform: translateY(12px); } }
+@media (prefers-reduced-motion: reduce) { .tv-panel { animation: none; } }
+@media (max-width: 480px) {
+  /* Icon-only conversation switcher; the menu names every conversation. */
+  .tv-switch-label { display: none; }
+  .tv-mode-soon { display: none; }
+}
+/* Fingers, not cursors: every control on the table is at least 40-44px. */
+@media (pointer: coarse) {
+  .tv-icon-btn { width: 44px; height: 44px; }
+  .tv-switch-btn { height: 44px; }
+  .tv-menu-item { min-height: 48px; }
+  .tv-menu-direct select { height: 40px; }
+  .tv-btn { height: 40px; padding: 0 16px; font-size: 14px; }
+  .tv-btn.small { height: 36px; padding: 0 13px; font-size: 13.5px; }
+  .tv-link { padding: 6px 0; font-size: 14px; }
+  .tv-tabs { height: 52px; }
+  .tv-tab { height: 40px; padding: 0 12px; font-size: 14px; }
+  .tv-mode button { height: 36px; padding: 0 13px; font-size: 13.5px; }
+  .tv-mode-soon { height: 36px; }
+  .tv-send { width: 38px; height: 38px; }
+  .tv-jump { height: 40px; }
+  .tv-map-toggle { height: 36px; }
+  .tv-roll-manual input { width: 110px; height: 40px; }
+  .tv .continue-campaign input { height: 40px; }
+}

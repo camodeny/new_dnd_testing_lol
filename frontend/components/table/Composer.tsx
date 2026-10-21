@@ -41,13 +41,14 @@ export default function Composer({
   // backdrop glyphs.
   const [caret, setCaret] = useState<number | null>(null)
 
-  // Auto-grow with newlines up to ~10 rows, then scroll; the backdrop
-  // mirrors the textarea scroll position.
+  // Auto-grow with newlines up to the CSS max-height (shorter on phones,
+  // where the keyboard already takes half the screen), then scroll; the
+  // backdrop mirrors the textarea scroll position.
   useEffect(() => {
     const ta = inputRef.current
     if (!ta) return
     ta.style.height = 'auto'
-    const max = Math.round(10 * 0.9 * 16 * 1.5)
+    const max = parseFloat(getComputedStyle(ta).maxHeight) || 216
     ta.style.height = `${Math.min(ta.scrollHeight, max)}px`
     ta.style.overflowY = ta.scrollHeight > max ? 'auto' : 'hidden'
     syncScroll()
@@ -91,7 +92,8 @@ export default function Composer({
   }
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
+    // Enter while an IME is composing confirms the composition, not the message.
+    if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
       e.preventDefault()
       onSubmit()
     }
@@ -125,6 +127,7 @@ export default function Composer({
           onKeyDown={handleKeyDown}
           rows={1}
           disabled={disabled}
+          enterKeyHint="send"
           aria-label={aiPaused ? 'Message draft (AI narration paused)' : 'Message'}
           spellCheck={false}
         />

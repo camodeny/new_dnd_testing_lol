@@ -16,7 +16,8 @@ vi.mock('@/lib/api', () => ({
   gameplayThreads: { list: vi.fn(), getOrCreateDm: vi.fn(), getOrCreateDirect: vi.fn() },
   playerNotes: { list: vi.fn(), create: vi.fn(), update: vi.fn(), remove: vi.fn() },
 }))
-if (typeof Element !== 'undefined' && !Element.prototype.scrollIntoView) Element.prototype.scrollIntoView = function () {}
+// jsdom has no layout or scrolling; the story and turn order scroll themselves.
+if (typeof Element !== 'undefined' && !Element.prototype.scrollTo) Element.prototype.scrollTo = function () {}
 
 let container: HTMLDivElement
 let root: Root
@@ -118,6 +119,27 @@ it('sends Say drafts as speech', async () => {
   expect(onSendMessage).toHaveBeenCalledWith('"Who rang the bell?"')
 })
 
+it('leaves Enter alone while an IME is still composing', async () => {
+  const onSendMessage = vi.fn(async () => {})
+  await render({ onSendMessage })
+  const ta = container.querySelector('textarea')!
+  await act(async () => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(ta, 'こんにちは')
+    ta.dispatchEvent(new Event('input', { bubbles: true }))
+  })
+  await act(async () => { ta.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', isComposing: true, bubbles: true, cancelable: true })) })
+  expect(onSendMessage).not.toHaveBeenCalled()
+  expect(ta.getAttribute('enterkeyhint')).toBe('send')
+})
+
+it('closes the conversation menu on a tap outside it', async () => {
+  await render({ campaign: { ...solo, required_players: 3 } })
+  await act(async () => (container.querySelector('.tv-switch-btn') as HTMLButtonElement).click())
+  expect(container.querySelector('.tv-menu')).not.toBeNull()
+  await act(async () => { container.querySelector('.tv-thread')!.dispatchEvent(new Event('pointerdown', { bubbles: true })) })
+  expect(container.querySelector('.tv-menu')).toBeNull()
+})
+
 it('lets the fight take over the screen, with the story alongside', async () => {
   const encounter: TableEncounter = {
     id: 'e', status: 'active', round: 2, active_participant_id: 'p1',
@@ -148,6 +170,12 @@ it('lets the fight take over the screen, with the story alongside', async () => 
   const attack = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Attack with longsword')!
   await act(async () => attack.click())
   expect(container.querySelector('textarea')!.value).toBe('I attack with my longsword ')
+  // Phones can fold the map away to give the story the screen.
+  const mapToggle = container.querySelector('.tv-map-toggle') as HTMLButtonElement
+  expect(mapToggle.getAttribute('aria-expanded')).toBe('true')
+  await act(async () => mapToggle.click())
+  expect(mapToggle.getAttribute('aria-expanded')).toBe('false')
+  expect(container.querySelector('.tv-arena')?.classList.contains('map-closed')).toBe(true)
 })
 
 it('announces a shop in the story and opens its contextual tab as a placeholder', async () => {

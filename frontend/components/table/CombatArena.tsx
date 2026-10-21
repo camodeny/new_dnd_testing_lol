@@ -1,6 +1,6 @@
 'use client'
 
-import type { CSSProperties } from 'react'
+import { useEffect, useRef, useState, type CSSProperties } from 'react'
 import { orderedParticipants, type TableCharacter, type TableEncounter } from '@/lib/table'
 
 interface CombatArenaProps {
@@ -30,12 +30,24 @@ export default function CombatArena({ encounter, userId, character, onSuggest }:
   const resources = myParticipant ? encounter.turn?.resources?.[myParticipant.id] : undefined
   const rollingInitiative = (encounter.my_pending_initiative?.length ?? 0) > 0
   const round = encounter.turn?.round ?? encounter.round
+  // Phones stack the map above the story; folding it away gives the story
+  // the screen. Wider screens always show it (the toggle is hidden there).
+  const [mapOpen, setMapOpen] = useState(true)
+  // Keep whoever is acting in view in the (horizontally scrolling) turn
+  // order — on a phone only two or three fit.
+  const turnsRef = useRef<HTMLOListElement>(null)
+  useEffect(() => {
+    const list = turnsRef.current
+    const current = list?.querySelector<HTMLElement>('[aria-current="true"]')
+    if (!list || !current) return
+    list.scrollTo({ left: current.offsetLeft - (list.clientWidth - current.offsetWidth) / 2, behavior: 'smooth' })
+  }, [activeId])
 
   return (
-    <div className="tv-arena">
+    <div className={`tv-arena${mapOpen ? '' : ' map-closed'}`}>
       <div className="tv-turns" aria-label="Turn order">
         <span className="tv-round">{round ? `Round ${round}` : 'Rolling initiative'}</span>
-        <ol>
+        <ol ref={turnsRef}>
           {ordered.map((p) => {
             const isActive = p.id === activeId
             const label = mine(p) ? 'You' : p.display_name
@@ -52,6 +64,12 @@ export default function CombatArena({ encounter, userId, character, onSuggest }:
             )
           })}
         </ol>
+        {encounter.map && (
+          <button type="button" className={`tv-map-toggle${mapOpen ? ' on' : ''}`} aria-expanded={mapOpen}
+            onClick={() => setMapOpen((open) => !open)}>
+            <i className="bi bi-map" aria-hidden="true" /> Map
+          </button>
+        )}
       </div>
 
       <div className="tv-map-wrap">
