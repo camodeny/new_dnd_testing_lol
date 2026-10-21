@@ -800,6 +800,11 @@ select.input:focus,
     url('/images/character-creator-hero.png') 62% center / cover no-repeat;
 }
 
+.character-library-hero {
+  min-height: calc(100svh - 64px);
+  margin-bottom: 0;
+}
+
 .campaign-hero-copy {
   z-index: 2;
   width: min(900px, 74%);
@@ -1193,7 +1198,8 @@ select.input:focus,
 }
 
 .character-card:hover { border-color: transparent; box-shadow: none; transform: none; }
-.character-card h3 { margin: 0 0 5px; color: var(--ink-strong); font: 650 1rem/1.2 var(--sans); letter-spacing: -0.02em; }
+.character-card .card-identity { min-width: 0; }
+.character-card h3 { margin: 0 0 5px; color: var(--ink-strong); font: 650 1rem/1.2 var(--sans); letter-spacing: -0.02em; overflow-wrap: anywhere; }
 
 .character-card .card-subtitle {
   grid-column: 1;
@@ -1257,6 +1263,15 @@ select.input:focus,
   color: var(--danger);
 }
 
+@media (pointer: coarse) {
+  .character-card-edit-link,
+  .character-card-delete-button { width: 44px; min-height: 44px; }
+  .characters-list-page .btn.small,
+  .character-create-page .btn.small,
+  .character-edit-page .btn.small,
+  .character-view-page .btn.small { min-height: 40px; }
+}
+
 .character-library-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
 
 .character-drafts {
@@ -1302,7 +1317,10 @@ select.input:focus,
   margin: 0 0 5px;
   color: var(--ink-strong);
   font: 650 0.98rem/1.25 var(--sans);
+  overflow-wrap: anywhere;
 }
+
+.character-draft-row__copy { min-width: 0; }
 
 .character-draft-row__copy p {
   margin: 0;
@@ -1660,11 +1678,18 @@ select.input:focus,
   .character-spotlight { grid-template-columns: 1fr; }
   .character-drafts__heading { align-items: start; flex-direction: column; gap: 8px; }
   .character-draft-row { align-items: start; }
+  /* The grid/spotlight/sheet/bars/feature variants are desktop-only, so the
+     switcher stays hidden and the list always renders the compact layout. */
+  .character-library-header .layout-switcher { display: none; }
 }
 
 @media (max-width: 560px) {
   .character-draft-row { flex-direction: column; }
   .character-draft-row__actions { width: 100%; justify-content: space-between; }
+  /* One column: actions sit in a row under the content instead of crushing it. */
+  .character-roster .card-wrapper { grid-template-columns: minmax(0, 1fr); gap: 0; }
+  .character-roster .character-card-link { padding: 0; }
+  .character-roster .card-actions { justify-content: flex-start; padding: 12px; }
 }
 
 .character-empty-state { max-width: 620px; padding: 74px 0; }
@@ -1735,6 +1760,48 @@ select.input:focus,
 
 .character-view-page .character-back-btn {
   margin-bottom: 16px;
+}
+
+/* ── Character detail sheet ──────────────────────────────────────────── */
+
+.character-sheet-view { padding: clamp(24px, 4vw, 40px); }
+
+.character-sheet-view__header { border-bottom: 1px solid var(--line); padding-bottom: 20px; margin-bottom: 24px; }
+
+.character-sheet-view__title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+
+.character-sheet-view__title-copy { min-width: 0; }
+
+.character-sheet-view__name { margin: 0 0 6px; min-width: 0; overflow-wrap: anywhere; font-size: clamp(2.2rem, 4vw, 3rem); }
+
+.character-sheet-view__subtitle { margin: 0; color: var(--ink-muted); font-size: 0.88rem; }
+
+.character-sheet-view__class { margin: 6px 0 0; color: var(--ink-muted); font-size: 0.84rem; }
+
+.character-sheet-view__quick-stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px; }
+
+.sheet-field { padding: 10px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-paper); }
+
+.sheet-field__label { margin-bottom: 2px; color: var(--ink-faint); font-size: 0.6rem; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+
+.sheet-field__value { color: var(--ink-strong); font-size: 1.4rem; font-weight: 600; }
+
+.character-sheet-view__abilities { border-top: 1px solid var(--line); padding-top: 20px; }
+
+.character-sheet-view__abilities-title { margin: 0 0 16px; color: var(--ink-faint); font-size: 0.78rem; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+
+.character-sheet-view__ability-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+
+.ability-box { padding: 12px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface-paper); text-align: center; }
+
+.ability-box__label { margin-bottom: 4px; color: var(--ink-faint); font-size: 0.58rem; font-weight: 700; letter-spacing: 0.09em; text-transform: uppercase; }
+
+.ability-box__score { color: var(--ink-strong); font-size: 1.4rem; font-weight: 600; line-height: 1; }
+
+.ability-box__mod { margin-top: 2px; color: var(--ink-muted); font-size: 0.75rem; font-weight: 600; }
+
+@media (max-width: 560px) {
+  .character-sheet-view__ability-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 }
 
 .character-form-wizard { container-type: inline-size; }
@@ -1916,6 +1983,9 @@ select.input:focus,
   align-items: center;
   gap: 8px;
 }
+
+/* Phones only: Cancel / AI Help move above the step nav. */
+.character-form-wizard__secondary-actions { display: none; }
 
 /* ── Join page ───────────────────────────────────────────────────────── */
 
@@ -2961,6 +3031,8 @@ a.automation-list-item:focus-visible {
   .account-menu-trigger { min-height: 44px; padding: 4px 6px; }
   .app-main { padding: 34px 20px 60px; }
   .campaign-hero { display: flex; flex-direction: column; min-height: 0; margin: -34px calc(50% - 50vw) 44px; background: var(--surface-paper); }
+  /* Phone header is a single 56px row. */
+  .character-library-hero { min-height: calc(100svh - 56px); }
   .campaign-hero-copy {
     width: 100%;
     padding-right: 20px;
@@ -2983,9 +3055,18 @@ a.automation-list-item:focus-visible {
   .campaign-card-restore-btn { right: 60px; width: 44px; height: 44px; }
   .campaign-card-inner { min-height: 142px; grid-template-columns: 1fr; gap: 10px; padding: 20px 56px 20px 4px; }
   .character-card, .character-card-link { grid-template-columns: 1fr; gap: 10px; padding: 18px 12px; }
+  /* The desktop placements would otherwise spawn implicit columns. */
+  .character-card .card-subtitle,
+  .character-card .card-stats,
+  .character-card .card-abilities { grid-column: auto; grid-row: auto; }
   .lobby-party-section, .lobby-invite-section, .lobby-footer { padding-right: 22px; padding-left: 22px; }
   .character-form-header { min-height: 0; align-items: flex-start; flex-direction: column; }
-  .character-form-wizard__step-nav { overflow-x: auto; scrollbar-width: thin; }
+  /* Title above, full-width Create button below. */
+  .character-library-header { flex-direction: column; align-items: stretch; gap: 16px; }
+  .character-library-tools { width: 100%; }
+  .character-library-tools .btn { width: 100%; justify-content: center; }
+  .character-form-wizard__step-nav { overflow-x: auto; scrollbar-width: thin; scroll-snap-type: x proximity; }
+  .character-form-wizard__step-item { scroll-snap-align: center; }
   .character-form-wizard__step-list {
     width: max-content;
     min-width: 100%;
@@ -3000,13 +3081,16 @@ a.automation-list-item:focus-visible {
   }
   .character-form-wizard__actions {
     bottom: 8px;
-    align-items: stretch;
-    flex-direction: column-reverse;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding-bottom: calc(12px + env(safe-area-inset-bottom));
   }
-  .character-form-wizard__actions-start,
+  .character-form-wizard__secondary-actions { display: flex; gap: 8px; margin-bottom: 12px; }
+  .character-form-wizard__secondary-actions .btn { flex: 1; min-height: 44px; }
+  .character-form-wizard__actions-start { display: none; }
   .character-form-wizard__actions-end { width: 100%; }
-  .character-form-wizard__actions-start .btn,
-  .character-form-wizard__actions-end .btn { flex: 1; }
+  .character-form-wizard__actions-end .btn { flex: 1; min-height: 44px; }
 }
 
 @media (max-width: 480px) {
@@ -3191,12 +3275,17 @@ a.automation-list-item:focus-visible {
 
 @container (max-width: 420px) {
   .character-form-wizard .form-grid.two-col,
-  .character-form-wizard .form-grid.three-col,
-  .character-form-wizard .form-grid.five-col,
-  .character-form-wizard .form-grid.six-col { grid-template-columns: 1fr; }
+  .character-form-wizard .form-grid.three-col:not(.numbers),
+  .character-form-wizard .form-grid.five-col:not(.numbers),
+  .character-form-wizard .form-grid.six-col:not(.numbers) { grid-template-columns: 1fr; }
   .character-form-wizard .item-display { align-items: stretch; flex-direction: column; }
   .character-form-wizard .item-actions .btn { flex: 1; }
   .character-form-wizard .item-form { grid-template-columns: 1fr; padding: 12px; }
+}
+
+/* Number-only grids stay readable at 2 columns down to ~280px viewports. */
+@container (max-width: 240px) {
+  .character-form-wizard .form-grid.numbers { grid-template-columns: 1fr; }
 }
 
 /* ── Character AI assist ─────────────────────────────────────────────── */
@@ -3228,12 +3317,14 @@ a.automation-list-item:focus-visible {
 
 .character-ai-chat__bubble {
   max-width: 92%;
+  min-width: 0;
   padding: 10px 12px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface-raised);
   font-size: 0.86rem;
   line-height: 1.5;
+  overflow-wrap: anywhere;
 }
 
 .character-ai-chat__bubble.is-ai {
@@ -3257,6 +3348,9 @@ a.automation-list-item:focus-visible {
 }
 
 .character-ai-chat__bubble p { margin: 0; }
+
+.character-ai-chat__bubble pre,
+.character-ai-chat__bubble table { max-width: 100%; overflow-x: auto; }
 
 .character-ai-chat__bubble.is-typing { opacity: 0.7; font-style: italic; }
 
@@ -3328,6 +3422,10 @@ a.automation-list-item:focus-visible {
 
 .character-ai-chat__send:hover:not(:disabled) { background: var(--ember-hover); }
 
+@media (pointer: coarse) {
+  .character-ai-chat__send { width: 44px; height: 44px; }
+}
+
 .character-ai-banner {
   display: flex;
   align-items: center;
@@ -3394,6 +3492,9 @@ a.automation-list-item:focus-visible {
   box-shadow: var(--shadow-sm);
 }
 
+/* Stays mounted while collapsed so draft text and chat history survive. */
+.character-ai-sidebar[hidden] { display: none; }
+
 .character-ai-sidebar__head {
   display: flex;
   align-items: center;
@@ -3420,6 +3521,13 @@ a.automation-list-item:focus-visible {
   cursor: pointer;
 }
 .character-ai-sidebar__close:hover { background: var(--surface-paper); color: var(--ink-strong); }
+
+.character-ai-sidebar__actions { display: flex; gap: 4px; }
+
+@media (pointer: coarse) {
+  .character-ai-sidebar__close { width: 44px; height: 44px; }
+  .character-ai-sidebar__actions { gap: 12px; }
+}
 
 .character-ai-sidebar__content {
   flex: 1;
@@ -3449,9 +3557,24 @@ a.automation-list-item:focus-visible {
   .character-create-layout.is-collapsed {
     grid-template-columns: 1fr;
   }
-  .character-ai-sidebar { position: static; }
+  /* The page-enter animation's retained transform would become the
+     containing block for the fixed sheet and trap its z-index below the
+     header; the wizard panels keep their own enter animation. */
+  .character-create-page.has-sidebar { animation: none; }
+  /* Full-screen sheet over the page, above the sticky app header (z-index
+     1000) and clear of the iOS keyboard via the visual-viewport vars. */
+  .character-ai-sidebar {
+    position: fixed;
+    left: 0;
+    right: 0;
+    top: var(--vv-top, 0px);
+    z-index: 1100;
+    height: var(--vv-height, 100dvh);
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+  }
   .character-ai-sidebar__collapsed-hint { display: none !important; }
-  .character-create-layout.is-collapsed .character-ai-sidebar__content { display: block; }
 }
 
 

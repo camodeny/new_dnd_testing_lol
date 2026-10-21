@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type KeyboardEvent } from 'react'
 import Button from '@/components/common/Button'
 import Input from '@/components/common/Input'
 import NumberInput from '@/components/common/NumberInput'
@@ -58,6 +58,16 @@ export default function ItemListEditor({ title, items, fields, emptyItem, onChan
     cancel()
   }
 
+  // The editor lives inside the wizard form: Return in an item input must
+  // save the item, not submit the whole step. Textareas keep their newline.
+  const guardEnter = (event: KeyboardEvent) => {
+    if (event.key !== 'Enter' || event.nativeEvent.isComposing) return
+    const target = event.target as HTMLElement | null
+    if (!target || target.tagName !== 'INPUT') return
+    event.preventDefault()
+    save()
+  }
+
   const remove = (index: number) => onChange(items.filter((_, itemIndex) => itemIndex !== index))
 
   const renderField = (field: ItemFieldConfig) => {
@@ -82,7 +92,7 @@ export default function ItemListEditor({ title, items, fields, emptyItem, onChan
   }
 
   const editor = (
-    <div className="item-form">
+    <div className="item-form" onKeyDown={guardEnter}>
       {fields.map((field) => (
         <div key={field.key} className={`item-field${field.type === 'textarea' ? ' full-width' : ''}`}>
           {field.type !== 'checkbox' && <label>{field.label}</label>}

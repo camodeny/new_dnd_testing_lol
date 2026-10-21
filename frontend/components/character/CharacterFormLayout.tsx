@@ -8,6 +8,7 @@ import type { Character } from '@/types'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import Button from '@/components/common/Button'
+import { matchesMedia } from '@/hooks/useMediaQuery'
 import { characters as charactersApi } from '@/lib/api'
 import { newId } from '@/lib/ids'
 
@@ -70,6 +71,11 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
 
   const [aiPatch, setAiPatch] = useState<Partial<CharacterDraft> | null>(null)
   const [aiCollapsed, setAiCollapsed] = useState(false)
+  // On phones the helper opens as a full-screen sheet over the form, so it
+  // starts collapsed. Decided once on mount to stay SSR-safe.
+  useEffect(() => {
+    if (matchesMedia('(max-width: 900px)')) setAiCollapsed(true)
+  }, [])
   const [draftSnapshot, setDraftSnapshot] = useState<CharacterDraft | null>(null)
   const [activePage, setActivePage] = useState<string>('identity')
   const [clearTrigger, setClearTrigger] = useState(0)
@@ -196,6 +202,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   }
 
   const handleClearChat = async () => {
+    if (!window.confirm('Clear this chat?')) return
     await clearChat()
     setClearTrigger((n) => n + 1)
   }
@@ -230,31 +237,30 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
   return (
     <div className="page character-create-page has-sidebar">
       <div className={`character-create-layout ${aiCollapsed ? 'is-collapsed' : ''}`}>
-        {!aiCollapsed && (
-          <aside className="character-ai-sidebar">
-            <div className="character-ai-sidebar__head">
-              <span><i className="bi bi-stars" aria-hidden="true" /> AI Helper</span>
-              <div style={{ display: 'flex', gap: 4 }}>
-                <button type="button" className="character-ai-sidebar__close" onClick={handleClearChat} aria-label="Clear chat" title="Clear chat">
-                  <i className="bi bi-trash" aria-hidden="true" />
-                </button>
-                <button type="button" className="character-ai-sidebar__close" onClick={() => setAiCollapsed(true)} aria-label="Close AI helper">
-                  <i className="bi bi-x-lg" aria-hidden="true" />
-                </button>
-              </div>
+        {/* Stays mounted while hidden so draft text and chat history survive toggling. */}
+        <aside className="character-ai-sidebar" hidden={aiCollapsed} aria-hidden={aiCollapsed}>
+          <div className="character-ai-sidebar__head">
+            <span><i className="bi bi-stars" aria-hidden="true" /> AI Helper</span>
+            <div className="character-ai-sidebar__actions">
+              <button type="button" className="character-ai-sidebar__close" onClick={handleClearChat} aria-label="Clear chat" title="Clear chat">
+                <i className="bi bi-trash" aria-hidden="true" />
+              </button>
+              <button type="button" className="character-ai-sidebar__close" onClick={() => setAiCollapsed(true)} aria-label="Close AI helper">
+                <i className="bi bi-x-lg" aria-hidden="true" />
+              </button>
             </div>
-            <div className="character-ai-sidebar__content">
-              <CharacterAIAssist
-                characterId={activeCharacterId}
-                draftCharacter={draftSnapshot as unknown as Record<string, unknown>}
-                activePage={activePage}
-                clearTrigger={clearTrigger}
-                campaignId={campaignId ?? null}
-                onGenerated={handleGenerated}
-              />
-            </div>
-          </aside>
-        )}
+          </div>
+          <div className="character-ai-sidebar__content">
+            <CharacterAIAssist
+              characterId={activeCharacterId}
+              draftCharacter={draftSnapshot as unknown as Record<string, unknown>}
+              activePage={activePage}
+              clearTrigger={clearTrigger}
+              campaignId={campaignId ?? null}
+              onGenerated={handleGenerated}
+            />
+          </div>
+        </aside>
 
         <div className="character-create-main">
           <CharacterFormPage

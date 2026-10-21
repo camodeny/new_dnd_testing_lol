@@ -158,6 +158,7 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const formRef = useRef<HTMLFormElement>(null)
+  const stepNavRef = useRef<HTMLElement>(null)
   const createCommandKeyRef = useRef<string | null>(null)
   const isEdit = Boolean(initial?.id)
   const activePage = CHARACTER_FORM_PAGES[activePageIndex]
@@ -165,6 +166,18 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
   useEffect(() => {
     onActivePageChange?.(activePage.key)
   }, [activePage.key, onActivePageChange])
+
+  // Phones scroll the step nav horizontally; keep the active step centered
+  // by scrolling the nav element itself, never the page.
+  useEffect(() => {
+    const nav = stepNavRef.current
+    const active = nav?.querySelector<HTMLElement>('.character-form-wizard__step-button.is-active')
+    if (!nav || !active) return
+    nav.scrollTo({
+      left: Math.max(0, active.offsetLeft - (nav.clientWidth - active.clientWidth) / 2),
+      behavior: 'smooth',
+    })
+  }, [activePageIndex])
   const isFirstPage = activePageIndex === 0
   const isLastPage = activePageIndex === CHARACTER_FORM_PAGES.length - 1
 
@@ -302,7 +315,16 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
           )}
         </div>
       )}
-      <nav className="character-form-wizard__step-nav" aria-label="Character form steps">
+      {/* Phones only: Cancel / AI Help sit here so the sticky bar below stays one row. */}
+      <div className="character-form-wizard__secondary-actions">
+        <Button type="button" variant="secondary" onClick={onCancel} disabled={saving}>Cancel</Button>
+        {onToggleAI && (
+          <Button type="button" variant={aiCollapsed ? 'primary' : 'secondary'} onClick={onToggleAI} disabled={saving}>
+            <i className="bi bi-stars" aria-hidden="true" /> {aiCollapsed ? 'AI Help' : 'Hide AI'}
+          </Button>
+        )}
+      </div>
+      <nav className="character-form-wizard__step-nav" ref={stepNavRef} aria-label="Character form steps">
         <ol className="character-form-wizard__step-list">
           {CHARACTER_FORM_PAGES.map((page, pageIndex) => {
             const isActive = pageIndex === activePageIndex
