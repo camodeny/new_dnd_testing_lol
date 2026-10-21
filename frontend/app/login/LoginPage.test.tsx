@@ -54,30 +54,57 @@ function setValue(element: HTMLInputElement, value: string) {
   element.dispatchEvent(new Event('input', { bubbles: true }))
 }
 
+async function submit() {
+  await act(async () => {
+    container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
+    await Promise.resolve()
+  })
+  // Flush the async submit handler.
+  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+}
+
 describe('signed-out /invite/:code registration', () => {
+  it('starts in Create Account mode on an invite continuation', async () => {
+    const onLogin = vi.fn()
+    await act(async () => root.render(<LoginPage onLogin={onLogin} />))
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+
+    expect(container.querySelector('button[type="submit"]')?.textContent).toBe('Create Account')
+    // The way back to sign-in stays visible.
+    expect([...container.querySelectorAll('button')].some((b) => b.textContent === 'Sign In')).toBe(true)
+  })
+
+  it('registers with Email first, then Username, then Password', async () => {
+    const onLogin = vi.fn()
+    await act(async () => root.render(<LoginPage onLogin={onLogin} />))
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+
+    const ids = [...container.querySelectorAll('.form-group input')].map((el) => el.id)
+    expect(ids).toEqual(['email', 'username', 'password'])
+    const email = field('email')
+    expect(email.type).toBe('email')
+    expect(email.required).toBe(true)
+    expect(email.getAttribute('autocomplete')).toBe('email')
+    // No username-as-email juggling: the username field is plain text.
+    expect(field('username').type).toBe('text')
+  })
+
   it('keeps the same invite across an email-confirmation signup', async () => {
     signUp.mockResolvedValue({
       data: { user: { id: 'new-user', email: 'new@example.com' }, session: null },
       error: null,
     })
     const onLogin = vi.fn()
+    // Already in Create Account mode from the invite continuation.
     await act(async () => root.render(<LoginPage onLogin={onLogin} />))
 
-    // AppShell renders LoginPage directly at /invite/:code (no ?next=).
-    await act(async () => {
-      [...container.querySelectorAll('button')].find((b) => b.textContent === 'Create Account')!.click()
-    })
-    setValue(field('username'), 'newbie')
     setValue(field('email'), 'new@example.com')
+    setValue(field('username'), 'newbie')
     setValue(field('password'), 'correct horse battery staple')
-    await act(async () => {
-      container.querySelector('form')!.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
-      await Promise.resolve()
-    })
-    // Flush the async submit handler.
-    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+    await submit()
 
     expect(signUp).toHaveBeenCalledOnce()
+    expect(signUp.mock.calls[0][0]).toMatchObject({ email: 'new@example.com' })
     const options = signUp.mock.calls[0][0].options as { emailRedirectTo?: string }
     // Confirmation returns to the invite itself — never the bare site URL.
     expect(options.emailRedirectTo).toBe(`${window.location.origin}/invite/TESTCODE8`)
@@ -87,5 +114,52 @@ describe('signed-out /invite/:code registration', () => {
     expect(container.textContent).toContain('Confirmation email sent')
     expect(onLogin).not.toHaveBeenCalled()
     expect(push).not.toHaveBeenCalled()
+  })
+
+  it('shows a submit error right above the submit button', async () => {
+    signInWithPassword.mockResolvedValue({ data: {}, error: new Error('Invalid login credentials') })
+    window.history.replaceState({}, '', '/login')
+    const onLogin = vi.fn()
+    await act(async () => root.render(<LoginPage onLogin={onLogin} />))
+
+    setValue(field('email'), 'someone@example.com')
+    setValue(field('password'), 'wrong password')
+    await submit()
+
+    const error = container.querySelector('.error-message')
+    expect(error?.textContent).toContain('Invalid login credentials')
+    // The error renders directly before the submit button (above the fold anchor).
+    expect(error?.nextElementSibling?.getAttribute('type')).toBe('submit')
+  })
+})
+
+describe('sign-in mode', () => {
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/login')
+  })
+
+  it('asks for Email (not Username) and signs in with it', async () => {
+    signInWithPassword.mockResolvedValue({
+      data: {
+        user: { id: 'user-1', email: 'sam@example.com', user_metadata: {} },
+        session: { access_token: 'tok' },
+      },
+      error: null,
+    })
+    const onLogin = vi.fn()
+    await act(async () => root.render(<LoginPage onLogin={onLogin} />))
+
+    const email = field('email')
+    expect(email.type).toBe('email')
+    expect(email.getAttribute('autocomplete')).toBe('email')
+    expect(container.querySelector('#username')).toBeNull()
+
+    setValue(email, 'sam@example.com')
+    setValue(field('password'), 'correct horse battery staple')
+    await submit()
+
+    expect(signInWithPassword).toHaveBeenCalledOnce()
+    expect(signInWithPassword.mock.calls[0][0]).toMatchObject({ email: 'sam@example.com' })
+    expect(onLogin).toHaveBeenCalledOnce()
   })
 })
