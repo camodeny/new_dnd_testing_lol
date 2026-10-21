@@ -316,6 +316,7 @@ export default function CampaignViewPage() {
           currentUser={user}
           isOwner={isOwner}
           onBegin={() => setMode(isSolo ? 'world-building' : 'planning')}
+          onTableOpen={loadData}
         />
       </>
     )

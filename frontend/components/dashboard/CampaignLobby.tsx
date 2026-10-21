@@ -14,6 +14,8 @@ interface CampaignLobbyProps {
   currentUser: User | null
   isOwner: boolean
   onBegin: () => void
+  /** The host opened the live table: everyone still in the lobby follows. */
+  onTableOpen?: () => void
 }
 
 async function tryCopyText(text: string): Promise<boolean> {
@@ -35,7 +37,7 @@ function newestUsableInvite(list: CampaignInvite[]): CampaignInvite | undefined 
   return usable.reduce((latest, inv) => ((inv.created_at ?? '') >= (latest.created_at ?? '') ? inv : latest))
 }
 
-export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin }: CampaignLobbyProps) {
+export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin, onTableOpen }: CampaignLobbyProps) {
   const router = useRouter()
   const [members, setMembers] = useState<CampaignMember[]>([])
   const [eligibility, setEligibility] = useState<LobbyEligibility | null>(null)
@@ -80,9 +82,16 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [dmChatOpen, setDmChatOpen] = useState(false)
   const [applyingProposal, setApplyingProposal] = useState(false)
 
+  // Players other than the host only ever see the table open through
+  // this poll, so it hands off once.
+  const tableOpened = useRef(false)
   const refreshLobby = useCallback(async () => {
     try {
       const data = await membersApi.getLobby(campaign.id)
+      if (data.campaign?.status === 'active' && !tableOpened.current) {
+        tableOpened.current = true
+        onTableOpen?.()
+      }
       setMembers(data.members ?? [])
       setEligibility(data.eligibility ?? null)
       setRevision((current) => data.campaign?.revision ?? current)
@@ -101,7 +110,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
         setMembers((data as { members?: CampaignMember[] }).members ?? [])
       } catch { /* no-op */ }
     }
-  }, [campaign.id])
+  }, [campaign.id, onTableOpen])
 
   useEffect(() => {
     void refreshLobby()
