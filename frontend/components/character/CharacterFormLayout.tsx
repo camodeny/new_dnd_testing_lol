@@ -9,6 +9,7 @@ import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import Button from '@/components/common/Button'
 import { characters as charactersApi } from '@/lib/api'
+import { newId } from '@/lib/ids'
 
 interface Props {
   characterId: string
@@ -47,7 +48,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
     try {
       const operationKey = createOperationKeyRef.current ||
         window.sessionStorage.getItem(NEW_DRAFT_OPERATION_KEY) ||
-        window.crypto.randomUUID()
+        newId()
       createOperationKeyRef.current = operationKey
       window.sessionStorage.setItem(NEW_DRAFT_OPERATION_KEY, operationKey)
       const response = await charactersApi.createDraft(operationKey)

@@ -5,17 +5,13 @@ import Modal from '@/components/common/Modal'
 import LoreDmChat from '@/components/campaign/LoreDmChat'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
 import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyComposition, User } from '@/types'
+import { newId } from '@/lib/ids'
 
 interface CampaignLobbyProps {
   campaign: Campaign
   currentUser: User | null
   isOwner: boolean
   onBegin: () => void
-}
-
-function newKey(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
 async function tryCopyText(text: string): Promise<boolean> {
@@ -126,7 +122,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       try {
         const lobby = await membersApi.getLobby(campaign.id)
         const rev = lobby.campaign?.revision ?? campaign.revision
-        await membersApi.selectCharacter(campaign.id, rev, charId, newKey())
+        await membersApi.selectCharacter(campaign.id, rev, charId, newId())
         await refreshLobby()
       } catch (err) {
         await refreshLobby()
@@ -206,7 +202,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setInviteNotice('')
     setManualLink(null)
     try {
-      await membersApi.revokeInvite(campaign.id, code, revision, newKey())
+      await membersApi.revokeInvite(campaign.id, code, revision, newId())
       await Promise.all([refreshInvites(), refreshLobby()])
       setInviteNotice(`Invite ${code} revoked.`)
     } catch (err) {
@@ -263,7 +259,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      await membersApi.selectCharacter(campaign.id, revision, selectedId, newKey())
+      await membersApi.selectCharacter(campaign.id, revision, selectedId, newId())
       await refreshLobby()
     } catch (err) {
       await refreshLobby()
@@ -278,7 +274,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      await membersApi.setReadiness(campaign.id, revision, ready, newKey())
+      await membersApi.setReadiness(campaign.id, revision, ready, newId())
       await refreshLobby()
     } catch (err) {
       await refreshLobby()
@@ -306,7 +302,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, lore, newKey())
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, lore, newId())
       setLoreSaved(true)
       await refreshLobby()
     } catch (err) {
@@ -322,7 +318,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.deleteCharacterLore(campaign.id, loreCharId, revision, newKey())
+      await membersApi.deleteCharacterLore(campaign.id, loreCharId, revision, newId())
       setLore('')
       setLoreSaved(false)
       await refreshLobby()
@@ -341,7 +337,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setApplyingProposal(true)
     setLoreError('')
     try {
-      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, proposal, newKey())
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, proposal, newId())
       setLore(proposal)
       setLoreSaved(true)
       setDmChatOpen(false)
@@ -359,7 +355,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newKey())
+      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newId())
       setRevision(result.campaign.revision)
       setLaunchLocked(true)
       onBegin()

@@ -95,10 +95,13 @@
 html {
   min-width: 320px;
   background: var(--surface-canvas);
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
   min-height: 100vh;
+  min-height: 100svh;
   margin: 0;
   overflow-x: hidden;
   background:
@@ -140,25 +143,29 @@ summary:focus-visible,
   color: var(--ink-strong);
 }
 
-::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
+/* Mouse-driven screens only: styling ::-webkit-scrollbar makes Android
+   Chrome draw permanent, layout-eating bars instead of overlay ones. */
+@media (hover: hover) and (pointer: fine) {
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
 
-::-webkit-scrollbar-track {
-  background: transparent;
-}
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
 
-::-webkit-scrollbar-thumb {
-  border: 3px solid transparent;
-  border-radius: 999px;
-  background: #b5aea1;
-  background-clip: padding-box;
-}
+  ::-webkit-scrollbar-thumb {
+    border: 3px solid transparent;
+    border-radius: 999px;
+    background: #b5aea1;
+    background-clip: padding-box;
+  }
 
-::-webkit-scrollbar-thumb:hover {
-  background: #8f897e;
-  background-clip: padding-box;
+  ::-webkit-scrollbar-thumb:hover {
+    background: #8f897e;
+    background-clip: padding-box;
+  }
 }
 
 h1, h2, h3, h4, h5, h6 {
@@ -199,6 +206,28 @@ code {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── Touch screens ───────────────────────────────────────────────────── */
+
+@media (hover: none) and (pointer: coarse) {
+  /* iOS Safari zooms the page when a field under 16px takes focus and never
+     zooms back out. The composer's highlight mirror must stay metrically
+     identical to its textarea, so it moves with it. */
+  input:not([type='checkbox'], [type='radio'], [type='range'], [type='file']),
+  textarea,
+  select,
+  .composer-backdrop {
+    font-size: 16px !important;
+  }
+
+  /* A tap leaves :hover applied until the next tap elsewhere, so hover
+     lifts would stay stuck in the air. Keep the colour change only. */
+  .btn:hover,
+  .card:hover {
+    box-shadow: none !important;
+    transform: none !important;
   }
 }
 
@@ -2806,23 +2835,12 @@ a.automation-list-item:focus-visible {
 }
 
 @media (max-width: 720px) {
-  .app-header {
-    min-height: 112px;
-    grid-template-columns: 1fr auto;
-    grid-template-rows: 60px 51px;
-    align-items: center;
-  }
-  .app-brand { grid-column: 1; grid-row: 1; }
-  .header-actions { grid-column: 2; grid-row: 1; }
-  .app-nav {
-    width: calc(100% + 40px);
-    grid-column: 1 / -1;
-    grid-row: 2;
-    align-self: stretch;
-    justify-self: center;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-  }
-  .nav-link { display: grid; min-height: 51px; flex: 1; place-items: center; padding: 0 12px; }
+  /* One 56px row on phones: brand, the two sections, account. */
+  .app-header { min-height: 56px; gap: 4px; padding: 0 8px 0 16px; }
+  .app-nav { gap: 0; }
+  .nav-link { display: grid; min-height: 56px; place-items: center; padding: 0 12px; font-size: 0.8rem; }
+  .nav-link::after { right: 12px; left: 12px; }
+  .account-menu-trigger { min-height: 44px; padding: 4px 6px; }
   .app-main { padding: 34px 20px 60px; }
   .campaign-hero { display: flex; flex-direction: column; min-height: 0; margin: -34px calc(50% - 50vw) 44px; background: var(--surface-paper); }
   .campaign-hero-copy {
@@ -2859,7 +2877,9 @@ a.automation-list-item:focus-visible {
 }
 
 @media (max-width: 480px) {
-  .header-wordmark { font-size: 1.25rem; }
+  .header-wordmark { display: none; }
+  .header-link { min-width: 44px; min-height: 44px; justify-content: center; }
+  .header-mark { font-size: 1.05rem; }
   .campaign-hero-actions, .empty-state-actions, .campaigns-header-actions {
     display: grid;
     width: 100%;

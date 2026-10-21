@@ -21,6 +21,7 @@ import {
   type FundingOperationStatus,
 } from '@/lib/funding'
 import type { CapacityUiEvent } from '@/lib/capacity'
+import { newId } from '@/lib/ids'
 
 interface UseCampaignFundingOptions {
   campaignId: string | null
@@ -38,18 +39,11 @@ export interface CampaignFunding {
   syncAfterReturn: () => Promise<FundingOperationStatus | null>
 }
 
-function defaultKey(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID()
-  }
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
-}
-
 export function useCampaignFunding({
   campaignId,
   onEvent,
   navigate,
-  newKey = defaultKey,
+  newKey = newId,
 }: UseCampaignFundingOptions): CampaignFunding {
   const [starting, setStarting] = useState(false)
   const [error, setError] = useState<string | null>(null)

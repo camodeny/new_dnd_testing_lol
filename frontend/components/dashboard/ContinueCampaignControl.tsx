@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { apiFetch } from '@/lib/api'
+import { newId } from '@/lib/ids'
 
 type AdventureSummary = {
   id: string
@@ -66,7 +67,7 @@ export default function ContinueCampaignControl({ campaignId, isOwner, refreshKe
     if (pending) return
     const nextTitle = (title.trim() || defaultTitle).slice(0, 160)
     if (command.current?.title !== nextTitle) {
-      command.current = { title: nextTitle, key: crypto.randomUUID() }
+      command.current = { title: nextTitle, key: newId() }
     }
     setPending(true)
     setError('')

@@ -27,6 +27,7 @@ import {
   type CharacterSectionKey,
   type FormValue,
 } from './characterFormConfig'
+import { newId } from '@/lib/ids'
 
 interface CharacterFormPageProps {
   initial?: Partial<Character>
@@ -266,7 +267,7 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
         ? await charactersApi.update(initial.id, payload)
         : await charactersApi.create(
             payload,
-            createCommandKeyRef.current ??= crypto.randomUUID(),
+            createCommandKeyRef.current ??= newId(),
           )
       createCommandKeyRef.current = null
       onSaved(response.character)

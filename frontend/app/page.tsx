@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import { campaigns as campaignsApi, campaignMembers } from '@/lib/api'
+import { newId } from '@/lib/ids'
 import { recoverPendingInviteTarget } from '@/lib/pendingInvite'
 import LandingPage from '@/components/landing/LandingPage'
 import CampaignCard from '@/components/campaign/CampaignCard'
@@ -112,7 +113,7 @@ export default function HomePage() {
     setActionError('')
     try {
       const data = await campaignsApi.transitionLifecycle(
-        campaign.id, campaign.revision, 'archived', crypto.randomUUID(),
+        campaign.id, campaign.revision, 'archived', newId(),
       )
       const updated = (data as { campaign: Campaign }).campaign
       setCampaignList((prev) => prev.filter((c) => c.id !== campaign.id))
@@ -130,7 +131,7 @@ export default function HomePage() {
     try {
       const target = await campaignsApi.restoreTarget(campaign.id)
       const data = await campaignsApi.transitionLifecycle(
-        campaign.id, campaign.revision, target, crypto.randomUUID(),
+        campaign.id, campaign.revision, target, newId(),
       )
       const updated = (data as { campaign: Campaign }).campaign
       setArchivedList((prev) => prev.filter((c) => c.id !== campaign.id))

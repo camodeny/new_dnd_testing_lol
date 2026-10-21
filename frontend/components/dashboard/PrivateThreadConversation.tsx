@@ -9,6 +9,7 @@ import { gameplayThreads } from '@/lib/api'
 import { parseQuotedSegments } from '@/lib/icOoc'
 import { privateThreadLabel } from '@/lib/privateThreads'
 import type { CampaignMember, CampaignThread, User } from '@/types'
+import { newId } from '@/lib/ids'
 
 interface PrivateThreadConversationProps {
   campaignId: string
@@ -87,7 +88,7 @@ export default function PrivateThreadConversation({
     setSending(true)
     setInput('')
     try {
-      const operationId = crypto.randomUUID()
+      const operationId = newId()
       await gameplayThreads.submit(campaignId, thread.id, content, operationId, parseQuotedSegments(content))
       await realtime.refresh()
     } catch (error) {
