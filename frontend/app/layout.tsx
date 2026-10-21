@@ -24,6 +24,8 @@ const fraunces = Fraunces({
 export const metadata: Metadata = {
   title: 'Fireside',
   description: 'Gather your party. The table is open.',
+  // iOS home-screen launch: full screen under a standard status bar.
+  appleWebApp: { capable: true, title: 'Fireside', statusBarStyle: 'default' },
 }
 
 export const viewport: Viewport = {
