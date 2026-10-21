@@ -29,7 +29,7 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [chatError, setChatError] = useState('')
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -50,8 +50,11 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
     return () => { cancelled = true }
   }, [campaignId, characterId])
 
+  // Keep the latest message visible by scrolling the log container itself —
+  // scrollIntoView would also pan the whole page on every streamed token.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: 'nearest' })
+    const log = logRef.current
+    if (log) log.scrollTop = log.scrollHeight
   }, [messages])
 
   const patchAiMessage = useCallback((aiIndex: number, update: (m: ChatMsg) => ChatMsg) => {
@@ -134,7 +137,7 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
 
   return (
     <div className="lobby-lore-chat" aria-label="Work out lore with the DM">
-      <div className="lobby-lore-chat-log" role="log" aria-live="polite">
+      <div className="lobby-lore-chat-log" role="log" aria-live="polite" ref={logRef}>
         {messages.map((m, i) => (
           <div key={i} className={`lobby-lore-chat-msg is-${m.role}`}>
             <div className="lobby-lore-chat-bubble">{m.content}</div>
@@ -154,7 +157,6 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
             )}
           </div>
         ))}
-        <div ref={bottomRef} />
       </div>
       {chatError && <div className="lobby-lore-chat-error" role="alert">{chatError}</div>}
       <div className="lobby-lore-chat-composer">
@@ -164,7 +166,8 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
           placeholder="Tell the DM about your character…"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter') void handleSend() }}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.nativeEvent.isComposing) void handleSend() }}
+          enterKeyHint="send"
           disabled={loading}
         />
         <button type="button" className="lobby-generate-btn" onClick={() => void handleSend()} disabled={loading || !input.trim()}>

@@ -18,6 +18,11 @@ vi.mock('@/lib/api', () => ({
   characters: { list: vi.fn() },
 }))
 
+const push = vi.fn()
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push }),
+}))
+
 let container: HTMLDivElement
 let root: Root
 let serverRevision: number

@@ -842,6 +842,13 @@ select.input:focus,
   margin-top: 30px;
 }
 
+/* Zero-campaign welcome: fills the viewport below the header. The phone
+   header is 56px (desktop 64px) — see the ≤720px override below. */
+.campaign-hero--welcome {
+  min-height: calc(100svh - 64px);
+  margin-bottom: 0;
+}
+
 .campaigns-header,
 .character-library-header {
   display: flex;
@@ -1919,8 +1926,15 @@ select.input:focus,
   color: var(--ink);
 }
 
-.join-title { color: var(--ink-strong); letter-spacing: -0.035em; }
-.join-desc, .join-input-label, .join-back-btn { color: var(--ink-muted); }
+.join-title { color: var(--ink-strong); letter-spacing: -0.035em; overflow-wrap: anywhere; }
+.join-desc, .join-input-label { color: var(--ink-muted); }
+.join-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 44px;
+  color: var(--ink-muted);
+}
 .join-owner { color: var(--ink); }
 
 .join-code-input {
@@ -1947,6 +1961,56 @@ select.input:focus,
   background: var(--ember-hover);
   box-shadow: 0 10px 24px rgba(150, 57, 31, 0.2);
 }
+
+/* ── Adventure recap (opened from the live table) ───────────────────── */
+
+.recap-page {
+  max-width: 42rem;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+  color: var(--ink);
+}
+
+.recap-kicker {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.8rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.recap-title {
+  margin: 4px 0 0;
+  color: var(--ink-strong);
+  font-size: 1.5rem;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+  overflow-wrap: anywhere;
+}
+
+.recap-meta { margin: 4px 0 0; color: var(--ink-muted); font-size: 0.85rem; }
+
+.recap-alert {
+  margin-top: 1rem;
+  padding: 12px 14px;
+  border: 1px solid rgba(210, 164, 87, 0.5);
+  border-radius: 8px;
+  background: rgba(253, 240, 213, 0.5);
+  font-size: 0.85rem;
+}
+
+.recap-body {
+  margin-top: 1rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
+.recap-foot { margin: 12px 0 0; color: var(--ink-faint); font-size: 0.75rem; }
 
 /* ── Not found ───────────────────────────────────────────────────────── */
 
@@ -2261,6 +2325,7 @@ a.automation-list-item:focus-visible {
   gap: 8px;
   max-height: 260px;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 12px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -2315,13 +2380,14 @@ a.automation-list-item:focus-visible {
 
 .lobby-section-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
-  gap: 18px;
+  gap: 10px 18px;
   margin-bottom: 16px;
 }
 
-.lobby-section-label { display: flex; align-items: center; gap: 9px; color: var(--ink-strong); font-size: 0.82rem; font-weight: 700; }
+.lobby-section-label { display: flex; align-items: center; gap: 9px; color: var(--ink-strong); font-size: 0.82rem; font-weight: 700; white-space: nowrap; }
 .lobby-section-label i { color: var(--ember); }
 
 .lobby-players-grid {
@@ -2392,6 +2458,39 @@ a.automation-list-item:focus-visible {
   font: 700 1rem/1 var(--mono);
 }
 
+/* Back to the campaign list: the global header is hidden on lobby routes. */
+.lobby-back-row {
+  width: 100%;
+  max-width: 1120px;
+  margin: 0 auto 12px;
+}
+
+/* Owner invite row: email input + Send button side by side on desktop. */
+.lobby-invite-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.lobby-invite-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 10px;
+  border-radius: 8px;
+}
+
+/* The share-link label only fits once the row wraps (see ≤900px). */
+.lobby-share-label { display: none; }
+
+/* Explicit call to action on your own empty seat. */
+.lobby-slot-cta {
+  margin-top: 4px;
+  color: var(--ember-hover);
+  font-size: 0.74rem;
+  font-weight: 800;
+}
+
 .lobby-copy-btn, .lobby-generate-btn {
   display: inline-flex;
   align-items: center;
@@ -2401,6 +2500,7 @@ a.automation-list-item:focus-visible {
   padding: 0 15px;
   border: 1px solid var(--line);
   border-radius: 7px;
+  white-space: nowrap;
   cursor: pointer;
   background: var(--surface-raised);
   color: var(--ink);
@@ -2437,9 +2537,11 @@ a.automation-list-item:focus-visible {
 
 .planning-page {
   display: flex;
-  height: 100svh;
-  overflow: hidden;
+  min-height: 100svh;
+  height: auto;
+  overflow-y: auto;
   flex-direction: column;
+  justify-content: safe center;
   background: var(--surface-canvas);
   color: var(--ink);
 }
@@ -2482,8 +2584,8 @@ a.automation-list-item:focus-visible {
 
 .planning-header .dashboard-back {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   flex: 0 0 auto;
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.13);
@@ -2503,8 +2605,8 @@ a.automation-list-item:focus-visible {
 
 .dashboard-back {
   display: grid;
-  width: 42px;
-  height: 42px;
+  width: 44px;
+  height: 44px;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 50%;
@@ -2813,7 +2915,21 @@ a.automation-list-item:focus-visible {
   .lobby-page { display: block; min-height: auto; max-height: none; height: auto; overflow: visible; place-items: initial; padding: clamp(16px, 3vw, 24px); }
   .lobby-container { max-height: none; overflow: visible; }
   .lobby-card { grid-template-columns: 1fr; padding: 24px; max-height: none; overflow: visible; }
-  .lobby-hero { min-height: 410px; grid-row: auto; border-radius: 10px; }
+  .lobby-hero { min-height: clamp(140px, 24svh, 220px); grid-row: auto; border-radius: 10px; }
+  .lobby-page { place-items: start center; }
+  /* A long URL or name must never widen the page: single column with
+     nowhere to grow, and hard wrapping on user-controlled strings. */
+  .lobby-card > * { min-width: 0; }
+  .lobby-title,
+  .lobby-slot-name,
+  .lobby-invite-hint,
+  .lobby-invite-code-row span,
+  .lobby-lore-chat-bubble { overflow-wrap: anywhere; }
+  /* Owner invite row: input full width, button below. */
+  .lobby-invite-row { flex-wrap: wrap; }
+  .lobby-invite-row input { flex: 1 1 100%; min-height: 44px; }
+  .lobby-invite-row .lobby-generate-btn { width: 100%; }
+  .lobby-share-label { display: inline; }
   .lobby-party-section,
   .lobby-invite-section,
   .lobby-lore-section,
@@ -2824,7 +2940,7 @@ a.automation-list-item:focus-visible {
   .modal-body { padding: 14px 16px; }
   .modal-body .form-field { margin-bottom: 10px; }
   .modal-body label { font-size: 0.65rem; }
-  .modal-body .input, .modal-body textarea, .modal-body select { font-size: 0.88rem; padding: 8px 10px; min-height: 36px; }
+  .modal-body .input, .modal-body textarea, .modal-body select { font-size: 0.88rem; padding: 8px 10px; min-height: 44px; }
   .campaign-form-intro {
     grid-template-columns: 1fr !important;
   }
@@ -2850,6 +2966,21 @@ a.automation-list-item:focus-visible {
     padding-right: 20px;
     padding-left: 20px;
   }
+  .campaign-hero--welcome { min-height: calc(100svh - 56px); }
+  /* Stack the library header: title, then the two buttons side by side,
+     full width. (≤480px collapses to one column — see below.) */
+  .campaigns-header { flex-direction: column; align-items: stretch; }
+  .campaigns-header-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .campaigns-header-actions .btn { width: 100%; justify-content: center; }
+  /* Owner cards: room for two 44px buttons with ≥12px between them
+     (delete spans 4–48px from the right, archive 60–104px). */
+  .campaign-card-v2.has-actions .campaign-card-inner { padding-right: 112px; }
+  .campaign-card-delete-btn { right: 4px; width: 44px; height: 44px; }
+  .campaign-card-archive-btn,
+  .campaign-card-restore-btn { right: 60px; width: 44px; height: 44px; }
   .campaign-card-inner { min-height: 142px; grid-template-columns: 1fr; gap: 10px; padding: 20px 56px 20px 4px; }
   .character-card, .character-card-link { grid-template-columns: 1fr; gap: 10px; padding: 18px 12px; }
   .lobby-party-section, .lobby-invite-section, .lobby-footer { padding-right: 22px; padding-left: 22px; }
@@ -2882,12 +3013,21 @@ a.automation-list-item:focus-visible {
   .header-wordmark { display: none; }
   .header-link { min-width: 44px; min-height: 44px; justify-content: center; }
   .header-mark { font-size: 1.05rem; }
-  .campaign-hero-actions, .empty-state-actions, .campaigns-header-actions {
+  .campaign-hero-actions, .empty-state-actions {
     display: grid;
     width: 100%;
     grid-template-columns: 1fr;
   }
   .empty-state-v2 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  /* Party seats pair up instead of one tall column; tighter card chrome. */
+  .lobby-page { padding: 12px; }
+  .lobby-card { padding: 16px; }
+  .lobby-players-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lobby-player-slot { min-height: 110px; padding: 12px 8px; }
+  .lobby-party-section, .lobby-invite-section, .lobby-footer { padding-right: 16px; padding-left: 16px; }
 }
 
 @media (min-width: 901px) {

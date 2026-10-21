@@ -323,7 +323,7 @@ export default function CampaignViewPage() {
 
   if (mode === 'planning' && !session) {
     return (
-      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+      <div className="planning-page" style={{ position: 'relative' }}>
         <button
           type="button"
           className="dashboard-back"
@@ -363,7 +363,7 @@ export default function CampaignViewPage() {
   if (mode === 'world-building' && !session) {
     const canGoBack = !isSolo
     return (
-      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+      <div className="planning-page" style={{ position: 'relative' }}>
         {canGoBack ? (
           <button
             type="button"
