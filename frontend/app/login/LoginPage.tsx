@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase, isSupabaseConfigured } from '@/lib/supabase'
 import { inviteContinuation, storePendingInvite } from '@/lib/pendingInvite'
@@ -9,13 +9,6 @@ import './login.css'
 
 interface LoginPageProps {
   onLogin: (user: User) => void
-}
-
-function safeNextPath(raw: string | null): string | null {
-  if (!raw) return null
-  // Only same-origin absolute paths continue — never open-redirect.
-  if (!raw.startsWith('/') || raw.startsWith('//')) return null
-  return raw
 }
 
 export default function LoginPage({ onLogin }: LoginPageProps) {
@@ -28,11 +21,15 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
   const [inviteNext, setInviteNext] = useState<string | null>(null)
+  const errorRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
     const authError = params.get('auth_error')
     const continuation = inviteContinuation()
     setInviteNext(continuation?.next ?? null)
+    // Invite recipients are almost certainly new: start on Create Account
+    // (the toggle back to Sign in stays visible).
+    if (continuation?.next?.startsWith('/invite/')) setIsRegistering(true)
     // Persist the pending invite so a later auth-confirmation landing can
     // resume it even if the redirect chain drops the path.
     if (continuation?.code) storePendingInvite(continuation.code)
@@ -44,6 +41,12 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
       window.history.replaceState({}, '', nextUrl)
     }
   }, [])
+
+  // Bring a fresh submit error into view (it renders right above the
+  // submit button, which may be below the fold on a phone).
+  useEffect(() => {
+    if (error) errorRef.current?.scrollIntoView?.({ block: 'nearest' })
+  }, [error])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -62,8 +65,9 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
 
     try {
       if (isSupabaseConfigured()) {
-        // Supabase Auth path — email is required for Supabase; username is stored in user_metadata
-        const emailVal = email.trim() || (username.includes('@') ? username.trim() : '')
+        // Supabase Auth path — email identifies the account in both modes;
+        // username is register-only display metadata.
+        const emailVal = email.trim()
         if (!emailVal) {
           throw new Error('Email is required for Supabase auth.')
         }
@@ -95,10 +99,9 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             : { id: 0 as unknown as number, username: username.trim(), email: emailVal }
           continueAfterLogin(u as unknown as User)
         } else {
-          const emailLogin = username.includes('@') ? username.trim() : email.trim() || username.trim()
           // Try email login; Supabase requires email
           const { data, error } = await supabase.auth.signInWithPassword({
-            email: emailLogin.includes('@') ? emailLogin : emailVal,
+            email: emailVal,
             password,
           })
           if (error) throw error
@@ -106,7 +109,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             localStorage.setItem('token', data.session.access_token)
           }
           const u = data.user!
-          continueAfterLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? u.email?.split('@')[0] ?? username, email: u.email ?? undefined } as unknown as User)
+          continueAfterLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? emailVal.split('@')[0], email: u.email ?? undefined } as unknown as User)
         }
       } else {
         throw new Error('Authentication is not configured. Set the public Supabase URL and key.')
@@ -154,7 +157,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           </p>
           {inviteNext?.startsWith('/invite/') && !success && (
             <p className="login-subtitle" role="note" style={{ marginTop: 8 }}>
-              You&apos;re accepting a campaign invite — after signing in you&apos;ll continue straight to the lobby.
+              You&apos;re accepting a campaign invite — once you&apos;re in, you&apos;ll go straight to the lobby.
             </p>
           )}
 
@@ -181,31 +184,38 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             </div>
           ) : (
             <form onSubmit={handleSubmit}>
-              {error && <div className="error-message" role="alert">{error}</div>}
-
             <div className="form-group">
-              <label htmlFor="username">Username</label>
+              <label htmlFor="email">Email</label>
               <input
-                type="text"
-                id="username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                type="email"
+                id="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
                 required
-                placeholder="Enter your username"
-                autoComplete="username"
+                placeholder="Enter your email"
+                autoComplete="email"
+                inputMode="email"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                enterKeyHint="next"
               />
             </div>
 
             {isRegistering && (
               <div className="form-group">
-                <label htmlFor="email">Email</label>
+                <label htmlFor="username">Username</label>
                 <input
-                  type="email"
-                  id="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="Enter your email"
-                  autoComplete="email"
+                  type="text"
+                  id="username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="Choose a username"
+                  autoComplete="username"
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  enterKeyHint="next"
                 />
               </div>
             )}
@@ -220,9 +230,14 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 required
                 placeholder="Enter your password"
                 autoComplete={isRegistering ? 'new-password' : 'current-password'}
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+                enterKeyHint="go"
               />
             </div>
 
+              {error && <div className="error-message" role="alert" ref={errorRef}>{error}</div>}
               <button type="submit" className="login-button" disabled={loading}>
                 {loading ? 'Loading…' : isRegistering ? 'Create Account' : 'Sign In'}
               </button>

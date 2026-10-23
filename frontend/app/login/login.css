@@ -302,7 +302,11 @@
 }
 
 .toggle-button {
-  padding: 0;
+  display: inline-flex;
+  min-height: 44px;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 12px;
   border: 0;
   cursor: pointer;
   background: none;
@@ -345,8 +349,8 @@
   }
 
   .login-illustration {
-    min-height: 290px;
-    padding: 24px;
+    min-height: 120px;
+    padding: 20px 24px;
     background:
       linear-gradient(90deg, rgba(255, 248, 232, 0.82), rgba(255, 248, 232, 0.08)),
       url('/images/fireside-hero.jpg') 72% 45% / cover no-repeat;
@@ -356,17 +360,24 @@
   .login-visual-note { display: none; }
 
   .login-panel {
-    min-height: calc(100svh - 290px);
+    min-height: calc(100svh - 120px);
     align-items: flex-start;
-    padding: 52px 24px 64px;
+    padding: 32px 24px 64px;
   }
 
   .login-card { width: 100%; max-width: 480px; }
   .login-footer { display: none; }
 }
 
+@media (max-height: 520px) {
+  /* Short landscape: the banner costs a whole screen — drop it so the
+     form (including submit) fits without scrolling. */
+  .login-illustration { display: none; }
+  .login-panel { min-height: 100svh; }
+}
+
 @media (max-width: 430px) {
-  .login-illustration { min-height: 260px; }
-  .login-panel { min-height: calc(100svh - 260px); padding-top: 48px; }
+  .login-illustration { min-height: 120px; }
+  .login-panel { min-height: calc(100svh - 120px); padding-top: 32px; }
   .login-card h1 { font-size: 2.65rem; }
 }

@@ -8,6 +8,7 @@ import CombatArena from '@/components/table/CombatArena'
 import Composer, { composeForMode, type ComposerMode } from '@/components/table/Composer'
 import RollCard from '@/components/table/RollCard'
 import SidePanel from '@/components/table/SidePanel'
+import { useStickToBottom } from '@/hooks/useStickToBottom'
 import { campaignMembers, gameplayThreads } from '@/lib/api'
 import type { CapacityUiEvent } from '@/lib/capacity'
 import { privateThreadLabel, upsertVisibleThread } from '@/lib/privateThreads'
@@ -80,9 +81,8 @@ export default function CampaignTable({
   const [threadActionPending, setThreadActionPending] = useState(false)
   const [threadError, setThreadError] = useState('')
   const inputRef = useRef<HTMLTextAreaElement>(null)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  const messagesContainerRef = useRef<HTMLDivElement>(null)
-  const lastItemRef = useRef<string | null>(null)
+  const switcherRef = useRef<HTMLDivElement>(null)
+  const story = useStickToBottom()
 
   const userId = currentUser?.id ?? null
   const multiplayer = (campaign.required_players ?? 1) > 1
@@ -113,13 +113,30 @@ export default function CampaignTable({
     return () => { cancelled = true }
   }, [campaign.id])
 
+  // The story follows new lines on its own while the reader is at the
+  // bottom. Your own message and a roll the DM asks you for always bring
+  // you back down, even if you'd scrolled up to re-read.
+  const last = timeline.at(-1)
+  const lastOwnKey = last?.kind === 'message' && last.message.is_own ? last.key : null
+  const { scrollToBottom } = story
   useEffect(() => {
-    const last = timeline.length ? timeline[timeline.length - 1].key : null
-    if (last !== lastItemRef.current || activeDmText || myRoll) {
-      messagesEndRef.current?.scrollIntoView({ behavior: lastItemRef.current ? 'smooth' : 'auto' })
+    if (lastOwnKey || myRoll?.id) scrollToBottom('smooth')
+  }, [lastOwnKey, myRoll?.id, scrollToBottom])
+
+  useEffect(() => {
+    if (!switcherOpen) return
+    const close = (event: Event) => {
+      if (event instanceof KeyboardEvent ? event.key === 'Escape' : !switcherRef.current?.contains(event.target as Node)) {
+        setSwitcherOpen(false)
+      }
     }
-    lastItemRef.current = last
-  }, [timeline.length, aiThinking, activeDmText, myRoll?.id])
+    document.addEventListener('pointerdown', close)
+    document.addEventListener('keydown', close)
+    return () => {
+      document.removeEventListener('pointerdown', close)
+      document.removeEventListener('keydown', close)
+    }
+  }, [switcherOpen])
 
   const openPrivateThread = (thread: CampaignThread) => {
     setActivePrivateThread(thread)
@@ -142,11 +159,14 @@ export default function CampaignTable({
   }
 
   const handleLoadOlder = async () => {
-    const container = messagesContainerRef.current
+    const container = story.scrollEl
     const previousHeight = container?.scrollHeight ?? 0
+    story.unpin()
     await onLoadOlderMessages()
     requestAnimationFrame(() => {
-      if (container) container.scrollTop += container.scrollHeight - previousHeight
+      if (!container) return
+      container.scrollTop += container.scrollHeight - previousHeight
+      story.sync()
     })
   }
 
@@ -184,8 +204,8 @@ export default function CampaignTable({
 
   const thread = (
     <div className="tv-chat">
-      <div ref={messagesContainerRef} className="tv-thread">
-        <div className="tv-thread-inner">
+      <div ref={story.scrollRef} className="tv-thread">
+        <div ref={story.contentRef} className="tv-thread-inner">
           {(liveStatus === 'reconnecting' || liveStatus === 'reconciling') && (
             <p role="status" className="tv-note">
               {liveStatus === 'reconciling' ? 'Catching up with the table…' : 'Reconnecting to the table…'}
@@ -250,8 +270,14 @@ export default function CampaignTable({
           {myRoll && onRefresh && (
             <RollCard campaignId={campaign.id} roll={myRoll} modifier={character?.roll_modifiers?.[myRoll.id]} refresh={onRefresh} />
           )}
-          <div ref={messagesEndRef} />
         </div>
+        {story.away && (
+          <div className="tv-jump-wrap">
+            <button type="button" className="tv-jump" onClick={() => story.scrollToBottom('smooth')}>
+              <i className="bi bi-arrow-down" aria-hidden="true" /> Latest
+            </button>
+          </div>
+        )}
       </div>
       {capacitySlot && <div className="tv-capacity">{capacitySlot}</div>}
       {session && (
@@ -273,6 +299,7 @@ export default function CampaignTable({
     </div>
   )
 
+  const conversationLabel = activePrivateThread && userId ? privateThreadLabel(activePrivateThread, members, userId) : 'The table'
   const showPanel = inCombat ? combatPanelOpen : panelOpen && !activePrivateThread
   const panel = (
     <SidePanel
@@ -300,13 +327,14 @@ export default function CampaignTable({
             <button type="button" className="tv-btn primary small" onClick={onStartSession}>Start session</button>
           )}
           {multiplayer && (
-            <div className="tv-switcher">
+            <div className="tv-switcher" ref={switcherRef}>
               <button
                 type="button" className={`tv-switch-btn${switcherOpen ? ' open' : ''}`}
+                aria-label={`Conversation: ${conversationLabel}`}
                 aria-expanded={switcherOpen} aria-haspopup="menu" onClick={() => setSwitcherOpen((open) => !open)}
               >
                 <i className={activePrivateThread ? 'bi bi-lock' : 'bi bi-people'} aria-hidden="true" />
-                {activePrivateThread && userId ? privateThreadLabel(activePrivateThread, members, userId) : 'The table'}
+                <span className="tv-switch-label">{conversationLabel}</span>
                 <i className="bi bi-chevron-down tv-chev" aria-hidden="true" />
               </button>
               {switcherOpen && (
@@ -377,7 +405,7 @@ export default function CampaignTable({
           </div>
         ) : inCombat && encounter ? (
           <>
-            <CombatArena encounter={encounter} userId={userId} character={character} onSuggest={suggest} />
+            <CombatArena key={encounter.id} encounter={encounter} userId={userId} character={character} onSuggest={suggest} />
             <div className="tv-side-chat">{thread}</div>
           </>
         ) : thread}

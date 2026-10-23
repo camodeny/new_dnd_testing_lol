@@ -18,6 +18,11 @@ vi.mock('@/lib/api', () => ({
   characters: { list: vi.fn() },
 }))
 
+const push = vi.fn()
+vi.mock('next/navigation', () => ({
+  useRouter: () => ({ push }),
+}))
+
 let container: HTMLDivElement
 let root: Root
 let serverRevision: number
@@ -68,6 +73,23 @@ function button(label: string) {
 }
 
 describe('authoritative lobby synchronization', () => {
+  it('hands players off to the live table once the host opens it', async () => {
+    const onTableOpen = vi.fn()
+    await act(async () => root.render(<CampaignLobby
+      campaign={{ id: 'campaign', name: 'Table', revision: 0 } as Campaign}
+      currentUser={{ id: 'friend' } as User} isOwner={false} onBegin={onBegin} onTableOpen={onTableOpen}
+    />))
+    expect(onTableOpen).not.toHaveBeenCalled()
+    vi.mocked(campaignMembers.getLobby).mockResolvedValue({
+      campaign: { id: 'campaign', revision: 5, status: 'active' } as Campaign,
+      members: [], eligibility: { eligible: false, blockers: [] }, launch_locked: true,
+    })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000) })
+    expect(onTableOpen).toHaveBeenCalledTimes(1)
+  })
+
+
   it('observes another client becoming ready and starts with the refreshed revision', async () => {
     await renderLobby()
     expect(button('Not ready to begin').disabled).toBe(true)

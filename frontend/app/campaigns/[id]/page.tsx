@@ -24,6 +24,7 @@ import ErrorMessage from '@/components/common/ErrorMessage'
 import CampaignLobby from '@/components/dashboard/CampaignLobby'
 import CampaignTable from '@/components/table/CampaignTable'
 import type { Campaign, Character, Message, Session } from '@/types'
+import { newId } from '@/lib/ids'
 
 type CampaignMode = 'lobby' | 'planning' | 'world-building' | 'session'
 
@@ -206,17 +207,13 @@ export default function CampaignViewPage() {
     setError('')
     setStartPending(true)
     try {
-      const newKey = () =>
-        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
       // Production start (#245 → #246): seed the world (lobby -> starting),
       // then open the live table (starting -> active + opening DM turn).
       const status = campaign?.status
       if (status !== 'starting' && status !== 'active' && !worldPrepared) {
         const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
         if (solo || status === 'lobby' || !status) {
-          const data = await campaignsApi.worldSeed(String(id), newKey()) as {
+          const data = await campaignsApi.worldSeed(String(id), newId()) as {
             campaign: Campaign
             seed: unknown
           }
@@ -226,7 +223,7 @@ export default function CampaignViewPage() {
         }
       }
       // Seeded (starting): open the live table through the production path.
-      const data = await campaignsApi.campaignStart(String(id), newKey()) as {
+      const data = await campaignsApi.campaignStart(String(id), newId()) as {
         campaign: Campaign
       }
       setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
@@ -246,9 +243,7 @@ export default function CampaignViewPage() {
 
   const handleSendMessage = useCallback(async (content: string) => {
     if (!id || !session?.id || !activeThreadId) return
-    const pendingId = `pending:${typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-      ? crypto.randomUUID()
-      : `${Date.now()}-${Math.random().toString(36).slice(2)}`}`
+    const pendingId = `pending:${newId()}`
     const optimistic: Message = {
       id: pendingId,
       session_id: session.id,
@@ -263,10 +258,7 @@ export default function CampaignViewPage() {
     // Show instantly; the server echo replaces this via the merge above.
     setPendingMessages((current) => [...current, optimistic])
     try {
-      const idempotencyKey =
-        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      const idempotencyKey = newId()
       await apiFetch(`/campaigns/${id}/submissions`, {
         method: 'POST',
         headers: { 'Idempotency-Key': idempotencyKey },
@@ -324,6 +316,7 @@ export default function CampaignViewPage() {
           currentUser={user}
           isOwner={isOwner}
           onBegin={() => setMode(isSolo ? 'world-building' : 'planning')}
+          onTableOpen={loadData}
         />
       </>
     )
@@ -331,7 +324,7 @@ export default function CampaignViewPage() {
 
   if (mode === 'planning' && !session) {
     return (
-      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+      <div className="planning-page" style={{ position: 'relative' }}>
         <button
           type="button"
           className="dashboard-back"
@@ -371,7 +364,7 @@ export default function CampaignViewPage() {
   if (mode === 'world-building' && !session) {
     const canGoBack = !isSolo
     return (
-      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+      <div className="planning-page" style={{ position: 'relative' }}>
         {canGoBack ? (
           <button
             type="button"

@@ -12,7 +12,7 @@ export default function AbilityScoresSection({ data, onChange }: Props) {
   return (
     <div className="form-section">
       <h3>Ability Scores</h3>
-      <div className="form-grid six-col">
+      <div className="form-grid six-col numbers">
         {ABILITIES.map((ability) => (
           <FormGroup key={ability} label={`${ability[0].toUpperCase()}${ability.slice(1)}`} htmlFor={`abl-${ability}`}>
             <NumberInput

@@ -50,16 +50,16 @@ export default function CharacterViewPage() {
         <i className="bi bi-arrow-left" aria-hidden="true" /> Characters
       </Link>
 
-      <div className="character-sheet-view card" style={{ padding: 'clamp(24px, 4vw, 40px)' }}>
-        <div className="sheet-header" style={{ borderBottom: '1px solid var(--line)', paddingBottom: 20, marginBottom: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 16 }}>
-            <div>
-              <h2 style={{ margin: '0 0 6px', fontSize: 'clamp(2.2rem, 4vw, 3rem)' }}>{character.name}</h2>
-              <p className="sheet-subtitle" style={{ margin: 0, color: 'var(--ink-muted)', fontSize: '0.88rem' }}>
+      <div className="character-sheet-view card">
+        <div className="sheet-header character-sheet-view__header">
+          <div className="character-sheet-view__title-row">
+            <div className="character-sheet-view__title-copy">
+              <h2 className="character-sheet-view__name">{character.name}</h2>
+              <p className="sheet-subtitle character-sheet-view__subtitle">
                 {[character.race, character.alignment, character.background].filter(Boolean).join(' · ')}
               </p>
               {classLabel && (
-                <p style={{ margin: '6px 0 0', color: 'var(--ink-muted)', fontSize: '0.84rem' }}>{classLabel}</p>
+                <p className="character-sheet-view__class">{classLabel}</p>
               )}
             </div>
             <Link href={`/characters/${id}/edit`} className="btn btn-secondary small">
@@ -69,48 +69,41 @@ export default function CharacterViewPage() {
         </div>
 
         {/* Core stats */}
-        <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 24 }}>
+        <div className="character-sheet-view__quick-stats">
           {character.hit_points != null && (
-            <div className="sheet-field" style={{ padding: '10px 14px', border: '1px solid var(--line)', borderRadius: 8, background: 'var(--surface-paper)' }}>
-              <div style={{ fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.1em', color: 'var(--ink-faint)', textTransform: 'uppercase', marginBottom: 2 }}>HP</div>
-              <div style={{ fontSize: '1.4rem', fontWeight: 600, color: 'var(--ink-strong)' }}>{character.hit_points}</div>
+            <div className="sheet-field">
+              <div className="sheet-field__label">HP</div>
+              <div className="sheet-field__value">{character.hit_points}</div>
             </div>
           )}
           {character.armor_class != null && (
-            <div className="sheet-field" style={{ padding: '10px 14px', border: '1px solid var(--line)', borderRadius: 8, background: 'var(--surface-paper)' }}>
-              <div style={{ fontSize: '0.6rem', fontWeight: 700, letterSpacing: '0.1em', color: 'var(--ink-faint)', textTransform: 'uppercase', marginBottom: 2 }}>AC</div>
-              <div style={{ fontSize: '1.4rem', fontWeight: 600, color: 'var(--ink-strong)' }}>{character.armor_class}</div>
+            <div className="sheet-field">
+              <div className="sheet-field__label">AC</div>
+              <div className="sheet-field__value">{character.armor_class}</div>
             </div>
           )}
         </div>
 
         {/* Ability scores */}
-        <div className="sheet-section" style={{ borderTop: '1px solid var(--line)', paddingTop: 20 }}>
-          <h3 className="sheet-section-title" style={{ margin: '0 0 16px', fontSize: '0.78rem', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--ink-faint)' }}>
+        <div className="sheet-section character-sheet-view__abilities">
+          <h3 className="sheet-section-title character-sheet-view__abilities-title">
             Ability Scores
           </h3>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 10 }}>
+          <div className="character-sheet-view__ability-grid">
             {ABILITY_LABELS.map(([key, label]) => {
               const score = character[key] as number | undefined
               return (
                 <div
                   key={key}
                   className="ability-box"
-                  style={{
-                    padding: '12px 8px',
-                    border: '1px solid var(--line)',
-                    borderRadius: 8,
-                    background: 'var(--surface-paper)',
-                    textAlign: 'center',
-                  }}
                 >
-                  <div style={{ fontSize: '0.58rem', fontWeight: 700, letterSpacing: '0.09em', color: 'var(--ink-faint)', textTransform: 'uppercase', marginBottom: 4 }}>
+                  <div className="ability-box__label">
                     {label.slice(0, 3)}
                   </div>
-                  <div style={{ fontSize: '1.4rem', fontWeight: 600, color: 'var(--ink-strong)', lineHeight: 1 }}>
+                  <div className="ability-box__score">
                     {score ?? '—'}
                   </div>
-                  <div className="ability-mod" style={{ fontSize: '0.75rem', fontWeight: 600, color: 'var(--ink-muted)', marginTop: 2 }}>
+                  <div className="ability-mod ability-box__mod">
                     {abilityMod(score)}
                   </div>
                 </div>

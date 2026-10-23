@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { usePathname, useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
+import { useVisualViewportVars } from '@/hooks/useVisualViewportVars'
 import Header from './Header'
 import PublicHeader from './PublicHeader'
 import LoginPage from '@/app/login/LoginPage'
@@ -21,6 +22,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   const isCampaignView = /^\/campaigns\/[^/]+$/.test(pathname)
   const isLanding = pathname === '/'
   const isLogin = pathname === '/login'
+  useVisualViewportVars()
 
   useEffect(() => {
     if (!loading && !user) {

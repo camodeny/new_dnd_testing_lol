@@ -4,6 +4,7 @@ import { useRef, useState } from 'react'
 import { apiFetch } from '@/lib/api'
 import type { PlayerRollForRealtime } from '@/lib/realtime'
 import { keptDie, rollDice, rollDiceCount, rollInstructions, signed, type TableRollModifier } from '@/lib/table'
+import { newId } from '@/lib/ids'
 
 interface RollCardProps {
   campaignId: string
@@ -54,7 +55,7 @@ export default function RollCard({ campaignId, roll, modifier, refresh }: RollCa
       const rawRolls = dice ? rollDice(dice.count, dice.sides) : rollDice(rollDiceCount(roll.advantage_state), 20)
       const rolled = dice ? rawRolls.reduce((sum, n) => sum + n, 0) : keptDie(rawRolls, roll.advantage_state)
       appCommand.current = {
-        key: crypto.randomUUID(),
+        key: newId(),
         body: { source: 'app', raw_rolls: rawRolls, modifier: modifier.modifier, total: rolled + modifier.modifier },
       }
     }
@@ -66,7 +67,7 @@ export default function RollCard({ campaignId, roll, modifier, refresh }: RollCa
     const value = Number(total)
     if (pending || !total.trim() || !Number.isInteger(value)) return
     if (!manualCommand.current || manualCommand.current.total !== value) {
-      manualCommand.current = { total: value, command: { key: crypto.randomUUID(), body: { source: 'physical', total: value } } }
+      manualCommand.current = { total: value, command: { key: newId(), body: { source: 'physical', total: value } } }
     }
     void send(manualCommand.current.command)
   }

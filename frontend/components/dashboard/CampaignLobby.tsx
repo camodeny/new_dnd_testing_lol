@@ -1,21 +1,21 @@
 'use client'
 
 import { useState, useCallback, useEffect, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import Modal from '@/components/common/Modal'
 import LoreDmChat from '@/components/campaign/LoreDmChat'
+import { matchesMedia } from '@/hooks/useMediaQuery'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
 import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, PartyComposition, User } from '@/types'
+import { newId } from '@/lib/ids'
 
 interface CampaignLobbyProps {
   campaign: Campaign
   currentUser: User | null
   isOwner: boolean
   onBegin: () => void
-}
-
-function newKey(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
-  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+  /** The host opened the live table: everyone still in the lobby follows. */
+  onTableOpen?: () => void
 }
 
 async function tryCopyText(text: string): Promise<boolean> {
@@ -37,7 +37,8 @@ function newestUsableInvite(list: CampaignInvite[]): CampaignInvite | undefined 
   return usable.reduce((latest, inv) => ((inv.created_at ?? '') >= (latest.created_at ?? '') ? inv : latest))
 }
 
-export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin }: CampaignLobbyProps) {
+export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin, onTableOpen }: CampaignLobbyProps) {
+  const router = useRouter()
   const [members, setMembers] = useState<CampaignMember[]>([])
   const [eligibility, setEligibility] = useState<LobbyEligibility | null>(null)
   const [revision, setRevision] = useState<number>(campaign.revision)
@@ -54,8 +55,12 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   // Render-safe origin for shareable links (#242 review): populated after
   // mount so server rendering/prerendering never touches `window`.
   const [origin, setOrigin] = useState('')
+  // Phones hand the invite link to the OS share sheet (Messages etc.);
+  // desktops keep copy-to-clipboard.
+  const [canShare, setCanShare] = useState(false)
   useEffect(() => {
     setOrigin(window.location.origin)
+    setCanShare(typeof navigator.share === 'function' && matchesMedia('(pointer: coarse)'))
   }, [])
   const [owned, setOwned] = useState<Character[]>([])
   const [ownedDraftCount, setOwnedDraftCount] = useState(0)
@@ -77,9 +82,16 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [dmChatOpen, setDmChatOpen] = useState(false)
   const [applyingProposal, setApplyingProposal] = useState(false)
 
+  // Players other than the host only ever see the table open through
+  // this poll, so it hands off once.
+  const tableOpened = useRef(false)
   const refreshLobby = useCallback(async () => {
     try {
       const data = await membersApi.getLobby(campaign.id)
+      if (data.campaign?.status === 'active' && !tableOpened.current) {
+        tableOpened.current = true
+        onTableOpen?.()
+      }
       setMembers(data.members ?? [])
       setEligibility(data.eligibility ?? null)
       setRevision((current) => data.campaign?.revision ?? current)
@@ -98,7 +110,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
         setMembers((data as { members?: CampaignMember[] }).members ?? [])
       } catch { /* no-op */ }
     }
-  }, [campaign.id])
+  }, [campaign.id, onTableOpen])
 
   useEffect(() => {
     void refreshLobby()
@@ -126,7 +138,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       try {
         const lobby = await membersApi.getLobby(campaign.id)
         const rev = lobby.campaign?.revision ?? campaign.revision
-        await membersApi.selectCharacter(campaign.id, rev, charId, newKey())
+        await membersApi.selectCharacter(campaign.id, rev, charId, newId())
         await refreshLobby()
       } catch (err) {
         await refreshLobby()
@@ -206,7 +218,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setInviteNotice('')
     setManualLink(null)
     try {
-      await membersApi.revokeInvite(campaign.id, code, revision, newKey())
+      await membersApi.revokeInvite(campaign.id, code, revision, newId())
       await Promise.all([refreshInvites(), refreshLobby()])
       setInviteNotice(`Invite ${code} revoked.`)
     } catch (err) {
@@ -228,8 +240,22 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       const usable = newestUsableInvite(invites)
       const code = usable?.code ?? (await membersApi.createInvite(campaign.id)).code
       const link = origin ? `${origin}/invite/${code}` : `/invite/${code}`
-      const copied = await tryCopyText(link)
       if (!usable) await Promise.all([refreshInvites(), refreshLobby()])
+      // A cancelled share is a no-op; any other share failure falls back
+      // to the clipboard.
+      if (canShare) {
+        try {
+          await navigator.share({
+            title: `${campaign.name} — Fireside invite`,
+            text: `Join ${campaign.name} on Fireside`,
+            url: link,
+          })
+          return
+        } catch (err) {
+          if ((err as Error)?.name === 'AbortError') return
+        }
+      }
+      const copied = await tryCopyText(link)
       if (copied) {
         setLinkCopied(true)
         setTimeout(() => setLinkCopied(false), 2000)
@@ -244,7 +270,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     } finally {
       setInviteBusy(false)
     }
-  }, [campaign.id, invites, inviteBusy, origin, refreshInvites, refreshLobby])
+  }, [campaign.id, campaign.name, canShare, invites, inviteBusy, origin, refreshInvites, refreshLobby])
 
   const me = members.find((m) => m.user_id === currentUser?.id) ?? null
   const myCharId = me?.selected_character_id ?? me?.character_id ?? null
@@ -263,8 +289,9 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      await membersApi.selectCharacter(campaign.id, revision, selectedId, newKey())
+      await membersApi.selectCharacter(campaign.id, revision, selectedId, newId())
       await refreshLobby()
+      setCharModalOpen(false)
     } catch (err) {
       await refreshLobby()
       setLobbyError((err as Error).message)
@@ -278,7 +305,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      await membersApi.setReadiness(campaign.id, revision, ready, newKey())
+      await membersApi.setReadiness(campaign.id, revision, ready, newId())
       await refreshLobby()
     } catch (err) {
       await refreshLobby()
@@ -306,7 +333,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, lore, newKey())
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, lore, newId())
       setLoreSaved(true)
       await refreshLobby()
     } catch (err) {
@@ -322,7 +349,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setLoreBusy(true)
     setLoreError('')
     try {
-      await membersApi.deleteCharacterLore(campaign.id, loreCharId, revision, newKey())
+      await membersApi.deleteCharacterLore(campaign.id, loreCharId, revision, newId())
       setLore('')
       setLoreSaved(false)
       await refreshLobby()
@@ -341,7 +368,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setApplyingProposal(true)
     setLoreError('')
     try {
-      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, proposal, newKey())
+      await membersApi.putCharacterLore(campaign.id, loreCharId, revision, proposal, newId())
       setLore(proposal)
       setLoreSaved(true)
       setDmChatOpen(false)
@@ -359,7 +386,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setBusy(true)
     setLobbyError('')
     try {
-      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newKey())
+      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newId())
       setRevision(result.campaign.revision)
       setLaunchLocked(true)
       onBegin()
@@ -386,6 +413,16 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
 
   return (
     <div className="lobby-page">
+      <div className="lobby-back-row">
+        <button
+          type="button"
+          className="dashboard-back"
+          onClick={() => router.push('/')}
+          aria-label="Back to campaigns"
+        >
+          <i className="bi bi-arrow-left" aria-hidden="true" />
+        </button>
+      </div>
       <div className="lobby-container">
         <div className={`lobby-card${isSolo ? ' lobby-solo' : ''}${!isSolo && loreCharId && !launchLocked ? ' has-lore' : ''}`}>
           {/* Left: hero panel */}
@@ -437,9 +474,15 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                     {member.character_name && (
                       <div className="lobby-slot-role">{member.character_name}</div>
                     )}
-                    <div style={{ fontSize: '0.7rem', color: member.is_ready ? 'var(--ember-hover)' : 'var(--ink-faint)' }}>
-                      {member.is_ready ? 'Ready' : charId ? 'Not ready' : (isSolo ? 'Choose your character' : 'No character')}
-                    </div>
+                    {member.is_ready ? (
+                      <div style={{ fontSize: '0.7rem', color: 'var(--ember-hover)' }}>Ready</div>
+                    ) : charId ? (
+                      <div style={{ fontSize: '0.7rem', color: 'var(--ink-faint)' }}>Not ready</div>
+                    ) : isMine && !launchLocked ? (
+                      <span className="lobby-slot-cta">Choose your character</span>
+                    ) : (
+                      <div style={{ fontSize: '0.7rem', color: 'var(--ink-faint)' }}>{isSolo ? 'Choose your character' : 'No character'}</div>
+                    )}
                     {member.role === 'owner' && (
                       <span style={{ position: 'absolute', top: 6, right: 6, fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '3px 6px', borderRadius: 4, background: 'var(--ember-soft)', color: 'var(--ember-hover)' }}>Host</span>
                     )}
@@ -532,7 +575,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                       onClick={() => setInvitesModalOpen(true)}
                       title="See who's been invited"
                       aria-label="See who's been invited"
-                      style={{ minHeight: 32, padding: '0 10px' }}
+                      style={{ minHeight: 44, padding: '0 12px' }}
                     >
                       <i className="bi bi-people" aria-hidden="true" />
                     </button>
@@ -543,13 +586,13 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                       className="lobby-generate-btn"
                       onClick={() => void handleShareLink()}
                       disabled={inviteBusy}
-                      title={linkCopied ? 'Copied!' : 'Copy a shareable invite link'}
-                      aria-label="Copy a shareable invite link"
-                      style={{ minHeight: 32, padding: '0 10px' }}
+                      title={linkCopied ? 'Copied!' : canShare ? 'Share an invite link' : 'Copy a shareable invite link'}
+                      aria-label={canShare ? 'Share an invite link' : 'Copy a shareable invite link'}
+                      style={{ minHeight: 44, padding: '0 12px' }}
                     >
                       {linkCopied
-                        ? <><i className="bi bi-check" aria-hidden="true" /> Copied</>
-                        : <i className="bi bi-link-45deg" aria-hidden="true" />}
+                        ? <><i className="bi bi-check" aria-hidden="true" /> <span className="lobby-share-label">Copied</span></>
+                        : <><i className={canShare ? 'bi bi-share' : 'bi bi-link-45deg'} aria-hidden="true" /> <span className="lobby-share-label">{canShare ? 'Share link' : 'Copy link'}</span></>}
                     </button>
                   )}
                 </div>
@@ -557,7 +600,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
               {isOwner ? (
                 <>
                   <p className="lobby-invite-desc">Enter their email — we&apos;ll send an invite to join this lobby.</p>
-                  <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                  <div className="lobby-invite-row">
                     <input
                       type="email"
                       aria-label="Invitee email"
@@ -566,7 +609,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                       onChange={(e) => setInviteEmail(e.target.value)}
                       onKeyDown={(e) => { if (e.key === 'Enter') void handleSendInvite() }}
                       disabled={inviteBusy}
-                      style={{ flex: '1 1 auto', minWidth: 0, padding: '8px 10px', borderRadius: 8 }}
                     />
                     <button
                       type="button"

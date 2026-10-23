@@ -21,7 +21,7 @@ export default function CombatStatsSection({ data, onChange }: Props) {
   return (
     <div className="form-section">
       <h3>Combat Stats</h3>
-      <div className="form-grid three-col">
+      <div className="form-grid three-col numbers">
         {FIELDS.map(([key, label, min, max]) => (
           <FormGroup key={key} label={label} htmlFor={`cmb-${key}`}>
             <NumberInput

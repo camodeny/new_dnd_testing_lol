@@ -116,7 +116,7 @@ export default function InviteAcceptPage() {
             type="button"
             onClick={() => setError('')}
             aria-label="Dismiss"
-            style={{ position: 'absolute', top: 10, right: 10, background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: '1rem' }}
+            style={{ position: 'absolute', top: 4, right: 4, width: 44, height: 44, display: 'grid', placeItems: 'center', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: '1rem' }}
           >
             ×
           </button>

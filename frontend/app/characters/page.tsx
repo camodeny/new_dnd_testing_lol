@@ -7,6 +7,7 @@ import CharacterCard from '@/components/character/CharacterCard'
 import Modal from '@/components/common/Modal'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
+import { useMediaQuery } from '@/hooks/useMediaQuery'
 import type { Character } from '@/types'
 
 const LAYOUT_STORAGE_KEY = 'fireside:character-layout'
@@ -22,14 +23,6 @@ const LAYOUTS = [
 
 type CharacterLayout = (typeof LAYOUTS)[number]['id']
 
-function CharacterHeroLock() {
-  useEffect(() => {
-    document.body.style.overflow = 'hidden'
-    return () => { document.body.style.overflow = '' }
-  }, [])
-  return null
-}
-
 export default function CharactersListPage() {
   const [characterList, setCharacterList] = useState<Character[]>([])
   const [loading, setLoading] = useState(true)
@@ -42,6 +35,9 @@ export default function CharactersListPage() {
     return LAYOUTS.some((l) => l.id === saved) ? (saved as CharacterLayout) : 'strip'
   })
   const [selectedId, setSelectedId] = useState<string | null>(null)
+  // The grid/spotlight/sheet/bars/feature variants are only styled for wide
+  // screens, so on phones always render the default compact strip layout.
+  const isNarrowViewport = useMediaQuery('(max-width: 900px)')
 
   useEffect(() => {
     window.localStorage.setItem(LAYOUT_STORAGE_KEY, layout)
@@ -138,31 +134,29 @@ export default function CharactersListPage() {
   const draftCharacters = characterList.filter((c) => c.status === 'draft')
   const completedCharacters = characterList.filter((c) => c.status !== 'draft')
   const featuredCharacter = completedCharacters[0] ?? null
+  const effectiveLayout = isNarrowViewport ? 'strip' : layout
   const rosterLayout: 'strip' | 'grid' | 'sheet' | 'bars' =
-    layout === 'grid' || layout === 'sheet' || layout === 'bars' ? layout : 'strip'
+    effectiveLayout === 'grid' || effectiveLayout === 'sheet' || effectiveLayout === 'bars' ? effectiveLayout : 'strip'
 
   if (loading) return <Loading />
 
   if (characterList.length === 0) {
     return (
-      <>
-        <CharacterHeroLock />
-        <section className="campaign-hero character-library-hero" style={{ minHeight: 'calc(100svh - 64px)', marginBottom: 0 }}>
-          <div className="campaign-hero-copy">
-            <span className="section-kicker">YOUR COMPANIONS</span>
-            <h1>Every party needs a first name.</h1>
-            <p>Create a character here, then bring them into any campaign you join.</p>
-            <div className="campaign-hero-actions">
-              <Link href="/characters/new" className="btn btn-primary">
-                <i className="bi bi-plus-lg" aria-hidden="true" /> Create your first character
-              </Link>
-            </div>
+      <section className="campaign-hero character-library-hero">
+        <div className="campaign-hero-copy">
+          <span className="section-kicker">YOUR COMPANIONS</span>
+          <h1>Every party needs a first name.</h1>
+          <p>Create a character here, then bring them into any campaign you join.</p>
+          <div className="campaign-hero-actions">
+            <Link href="/characters/new" className="btn btn-primary">
+              <i className="bi bi-plus-lg" aria-hidden="true" /> Create your first character
+            </Link>
           </div>
-          <div className="campaign-hero-art" aria-hidden="true">
-            <span className="campaign-hero-grain" />
-          </div>
-        </section>
-      </>
+        </div>
+        <div className="campaign-hero-art" aria-hidden="true">
+          <span className="campaign-hero-grain" />
+        </div>
+      </section>
     )
   }
 
@@ -237,7 +231,7 @@ export default function CharactersListPage() {
         </section>
       )}
 
-      {completedCharacters.length > 0 && (layout === 'feature' && featuredCharacter ? (
+      {completedCharacters.length > 0 && (effectiveLayout === 'feature' && featuredCharacter ? (
         <div className="character-feature">
           <div className="feature-stage">
             <CharacterCard character={featuredCharacter} layout="feature" />
@@ -249,7 +243,7 @@ export default function CharactersListPage() {
             </div>
           )}
         </div>
-      ) : layout === 'spotlight' && selectedCharacter ? (
+      ) : effectiveLayout === 'spotlight' && selectedCharacter ? (
         <div className="character-spotlight">
           <div className="spotlight-list" role="listbox" aria-label="Characters">
             {completedCharacters.map((c) => {

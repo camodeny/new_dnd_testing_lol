@@ -34,7 +34,8 @@ export default function CampaignJoinPage() {
       .finally(() => setLoadingCampaign(false))
   }, [id, searchParams])
 
-  const handleJoin = async () => {
+  const handleJoin = async (e?: React.FormEvent) => {
+    e?.preventDefault()
     if (!code.trim()) { setError('No invite code provided.'); return }
     setJoining(true)
     setError('')
@@ -91,7 +92,7 @@ export default function CampaignJoinPage() {
             type="button"
             onClick={() => setError('')}
             aria-label="Dismiss"
-            style={{ position: 'absolute', top: 10, right: 10, background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: '1rem' }}
+            style={{ position: 'absolute', top: 4, right: 4, width: 44, height: 44, display: 'grid', placeItems: 'center', background: 'none', border: 'none', cursor: 'pointer', color: 'inherit', fontSize: '1rem' }}
           >
             ×
           </button>
@@ -131,7 +132,7 @@ export default function CampaignJoinPage() {
                 <p style={{ margin: 0, color: 'var(--ink-muted)' }}>You&apos;ve joined this campaign. Redirecting…</p>
               </div>
             ) : (
-              <div style={{ display: 'grid', gap: 16 }}>
+              <form onSubmit={(e) => void handleJoin(e)} style={{ display: 'grid', gap: 16 }}>
                 <div>
                   <label className="join-input-label" htmlFor="campaign-invite-code" style={{ display: 'block', marginBottom: 8, fontSize: '0.69rem', fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase' }}>
                     Invite Code
@@ -145,11 +146,16 @@ export default function CampaignJoinPage() {
                     placeholder="Enter invite code…"
                     disabled={joining}
                     autoFocus={!code}
+                    autoCapitalize="characters"
+                    autoCorrect="off"
+                    autoComplete="off"
+                    spellCheck={false}
+                    enterKeyHint="go"
                   />
                 </div>
                 <button
+                  type="submit"
                   className="join-btn btn btn-primary"
-                  onClick={handleJoin}
                   disabled={joining || !code.trim()}
                   style={{ width: '100%', minHeight: 50, justifyContent: 'center' }}
                 >
@@ -157,7 +163,7 @@ export default function CampaignJoinPage() {
                     <><i className="bi bi-box-arrow-in-right" aria-hidden="true" /> Join campaign</>
                   )}
                 </button>
-              </div>
+              </form>
             )}
           </div>
 

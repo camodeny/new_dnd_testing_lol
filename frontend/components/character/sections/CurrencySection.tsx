@@ -18,7 +18,7 @@ export default function CurrencySection({ data, onChange }: Props) {
   return (
     <div className="form-section">
       <h3>Currency</h3>
-      <div className="form-grid five-col">
+      <div className="form-grid five-col numbers">
         {COINS.map(([key, label]) => (
           <FormGroup key={key} label={label} htmlFor={`cur-${key}`}>
             <NumberInput

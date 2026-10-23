@@ -42,7 +42,7 @@ export default function SpellcastingSection({ data, onChange }: Props) {
         </FormGroup>
       </div>
       <h4 className="spell-slots-heading">Spell Slots</h4>
-      <div className="form-grid five-col spell-slots-grid">
+      <div className="form-grid five-col spell-slots-grid numbers">
         {Array.from({ length: 9 }, (_, index) => index + 1).map((level) => (
           <div key={level} className="slot-box">
             <span className="slot-box__label">Lvl {level}</span>

@@ -5,10 +5,12 @@ import DmTurnControls from '@/components/dashboard/DmTurnControls'
 import IcOocText from '@/components/dashboard/IcOocText'
 import DmNarration from '@/components/common/DmNarration'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
+import { useStickToBottom } from '@/hooks/useStickToBottom'
 import { gameplayThreads } from '@/lib/api'
 import { parseQuotedSegments } from '@/lib/icOoc'
 import { privateThreadLabel } from '@/lib/privateThreads'
 import type { CampaignMember, CampaignThread, User } from '@/types'
+import { newId } from '@/lib/ids'
 
 interface PrivateThreadConversationProps {
   campaignId: string
@@ -41,6 +43,7 @@ export default function PrivateThreadConversation({
   const [sending, setSending] = useState(false)
   const realtime = useLiveTableRealtime({ campaignId, threadId: thread.id })
   const title = privateThreadLabel(thread, members, currentUser.id)
+  const conversation = useStickToBottom()
 
   const entries = useMemo<ConversationEntry[]>(() => {
     const playerEntries = realtime.messages.map((message) => {
@@ -87,7 +90,7 @@ export default function PrivateThreadConversation({
     setSending(true)
     setInput('')
     try {
-      const operationId = crypto.randomUUID()
+      const operationId = newId()
       await gameplayThreads.submit(campaignId, thread.id, content, operationId, parseQuotedSegments(content))
       await realtime.refresh()
     } catch (error) {
@@ -118,43 +121,45 @@ export default function PrivateThreadConversation({
         </button>
       </header>
 
-      <div className="session-messages private-thread-messages">
-        {isAiDmThread && <DmTurnControls key={thread.id} campaignId={campaignId} dmState={realtime.dmState}
-          rolls={realtime.rollRequests} userId={currentUser.id} refresh={realtime.refresh} />}
-        {realtime.error && (
-          <div className="private-thread-reconnect" role="status">
-            Reconnecting from the private snapshot. {realtime.error}
-          </div>
-        )}
-        {entries.length === 0 && !aiVisibleText && (
-          <div className="private-thread-empty">
-            <i className={isAiDmThread ? 'bi bi-stars' : 'bi bi-chat-heart'} aria-hidden="true" />
-            <p>{isAiDmThread ? 'Ask the AI DM something away from the table.' : 'Start a conversation visible only to its players.'}</p>
-          </div>
-        )}
-        {entries.map((entry) => (
-          <article className="session-msg private-thread-message" key={entry.id}>
-            <div className={`session-msg-avatar${entry.role === 'dm' ? ' dm-avatar' : ''}`} aria-hidden="true">
-              {entry.role === 'dm' ? 'AI' : entry.author.slice(0, 2).toUpperCase()}
+      <div ref={conversation.scrollRef} className="session-messages private-thread-messages">
+        <div ref={conversation.contentRef} className="private-thread-log">
+          {isAiDmThread && <DmTurnControls key={thread.id} campaignId={campaignId} dmState={realtime.dmState}
+            rolls={realtime.rollRequests} userId={currentUser.id} refresh={realtime.refresh} />}
+          {realtime.error && (
+            <div className="private-thread-reconnect" role="status">
+              Reconnecting from the private snapshot. {realtime.error}
             </div>
-            <div>
-              <div className="private-thread-message-meta">
-                <strong>{entry.author}</strong>
-                {entry.timestamp && <time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>}
+          )}
+          {entries.length === 0 && !aiVisibleText && (
+            <div className="private-thread-empty">
+              <i className={isAiDmThread ? 'bi bi-stars' : 'bi bi-chat-heart'} aria-hidden="true" />
+              <p>{isAiDmThread ? 'Ask the AI DM something away from the table.' : 'Start a conversation visible only to its players.'}</p>
+            </div>
+          )}
+          {entries.map((entry) => (
+            <article className="session-msg private-thread-message" key={entry.id}>
+              <div className={`session-msg-avatar${entry.role === 'dm' ? ' dm-avatar' : ''}`} aria-hidden="true">
+                {entry.role === 'dm' ? 'AI' : entry.author.slice(0, 2).toUpperCase()}
               </div>
-              {entry.role === 'dm' ? <DmNarration content={entry.content} /> : <IcOocText message={{ id: entry.id, session_id: '', role: 'player', content: entry.content, created_at: entry.timestamp ?? '', segments: entry.segments }} />}
-            </div>
-          </article>
-        ))}
-        {aiVisibleText && (
-          <article className="session-msg private-thread-message is-streaming">
-            <div className="session-msg-avatar dm-avatar" aria-hidden="true">AI</div>
-            <div>
-              <div className="private-thread-message-meta"><strong>AI DM</strong><span>responding…</span></div>
-              <DmNarration content={aiVisibleText} />
-            </div>
-          </article>
-        )}
+              <div>
+                <div className="private-thread-message-meta">
+                  <strong>{entry.author}</strong>
+                  {entry.timestamp && <time>{new Date(entry.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>}
+                </div>
+                {entry.role === 'dm' ? <DmNarration content={entry.content} /> : <IcOocText message={{ id: entry.id, session_id: '', role: 'player', content: entry.content, created_at: entry.timestamp ?? '', segments: entry.segments }} />}
+              </div>
+            </article>
+          ))}
+          {aiVisibleText && (
+            <article className="session-msg private-thread-message is-streaming">
+              <div className="session-msg-avatar dm-avatar" aria-hidden="true">AI</div>
+              <div>
+                <div className="private-thread-message-meta"><strong>AI DM</strong><span>responding…</span></div>
+                <DmNarration content={aiVisibleText} />
+              </div>
+            </article>
+          )}
+        </div>
       </div>
 
       <div className="session-input-area private-thread-input-area">
@@ -166,13 +171,14 @@ export default function PrivateThreadConversation({
             value={input}
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey) {
+              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) {
                 event.preventDefault()
                 void submit()
               }
             }}
             rows={1}
             disabled={sending}
+            enterKeyHint="send"
           />
           <button type="button" className="session-send-btn" aria-label="Send private message" onClick={() => void submit()} disabled={!input.trim() || sending}>
             <i className="bi bi-send-fill" aria-hidden="true" />

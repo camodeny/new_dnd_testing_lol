@@ -3,6 +3,7 @@
 import { useRef, useState } from 'react'
 import { apiFetch } from '@/lib/api'
 import type { DmStateForRealtime, PlayerRollForRealtime } from '@/lib/realtime'
+import { newId } from '@/lib/ids'
 
 interface Props {
   campaignId: string
@@ -19,7 +20,7 @@ export default function DmTurnControls({ campaignId, dmState, rolls, userId, ref
   const retry = async () => {
     if (pending || !dmState?.turn_id || !dmState.attempt_id) return
     if (retryCommand.current?.attemptId !== dmState.attempt_id) {
-      retryCommand.current = { attemptId: dmState.attempt_id, key: crypto.randomUUID() }
+      retryCommand.current = { attemptId: dmState.attempt_id, key: newId() }
     }
     setPending(true)
     setError('')

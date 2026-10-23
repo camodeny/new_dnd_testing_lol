@@ -4,6 +4,8 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import { campaigns as campaignsApi, campaignMembers } from '@/lib/api'
+import { newId } from '@/lib/ids'
+import { useMediaQuery, matchesMedia } from '@/hooks/useMediaQuery'
 import { recoverPendingInviteTarget } from '@/lib/pendingInvite'
 import LandingPage from '@/components/landing/LandingPage'
 import CampaignCard from '@/components/campaign/CampaignCard'
@@ -15,6 +17,9 @@ import type { Campaign } from '@/types'
 
 function HeroLock() {
   useEffect(() => {
+    // Phones stay scrollable: on a short viewport the hero CTAs would
+    // otherwise sit below the fold with no way to reach them.
+    if (matchesMedia('(hover: none) and (pointer: coarse)')) return
     document.body.style.overflow = 'hidden'
     return () => { document.body.style.overflow = '' }
   }, [])
@@ -60,6 +65,12 @@ export default function HomePage() {
     const saved = window.localStorage.getItem(CAMPAIGN_LAYOUT_STORAGE_KEY)
     return CAMPAIGN_LAYOUTS.some((l) => l.id === saved) ? (saved as CampaignLayout) : 'rows'
   })
+
+  // The Rows/Compact/Grid/Feature variants are only styled for wide
+  // screens — on a phone the switcher would push the header actions
+  // off-screen, so hide it and render the default rows layout instead.
+  const isNarrow = useMediaQuery('(max-width: 900px)')
+  const effectiveLayout: CampaignLayout = isNarrow ? 'rows' : layout
 
   useEffect(() => {
     window.localStorage.setItem(CAMPAIGN_LAYOUT_STORAGE_KEY, layout)
@@ -112,7 +123,7 @@ export default function HomePage() {
     setActionError('')
     try {
       const data = await campaignsApi.transitionLifecycle(
-        campaign.id, campaign.revision, 'archived', crypto.randomUUID(),
+        campaign.id, campaign.revision, 'archived', newId(),
       )
       const updated = (data as { campaign: Campaign }).campaign
       setCampaignList((prev) => prev.filter((c) => c.id !== campaign.id))
@@ -130,7 +141,7 @@ export default function HomePage() {
     try {
       const target = await campaignsApi.restoreTarget(campaign.id)
       const data = await campaignsApi.transitionLifecycle(
-        campaign.id, campaign.revision, target, crypto.randomUUID(),
+        campaign.id, campaign.revision, target, newId(),
       )
       const updated = (data as { campaign: Campaign }).campaign
       setArchivedList((prev) => prev.filter((c) => c.id !== campaign.id))
@@ -178,8 +189,8 @@ export default function HomePage() {
   }
 
   const rosterLayout: 'rows' | 'compact' | 'grid' =
-    layout === 'feature' ? 'compact' : layout
-  const featuredCampaign = layout === 'feature' ? (campaignList[0] ?? null) : null
+    effectiveLayout === 'feature' ? 'compact' : effectiveLayout
+  const featuredCampaign = !isNarrow && effectiveLayout === 'feature' ? (campaignList[0] ?? null) : null
 
   const renderCampaign = (campaign: Campaign, rl: 'rows' | 'compact' | 'grid' | 'feature') => {
     const owned = String(user?.id) === String(campaign.owner_id)
@@ -217,7 +228,7 @@ export default function HomePage() {
         <form onSubmit={handleJoinSubmit} style={{ display: 'grid', gap: 16 }}>
           <div className="form-field">
             <label htmlFor="invite-code-input">Invite Code</label>
-            <input id="invite-code-input" type="text" className="input" placeholder="e.g., ABCDEFGH" value={inviteCode} onChange={(e) => setInviteCode(e.target.value.toUpperCase())} maxLength={20} required autoFocus disabled={joinLoading} />
+            <input id="invite-code-input" type="text" className="input" placeholder="e.g., ABCDEFGH" value={inviteCode} onChange={(e) => setInviteCode(e.target.value.toUpperCase())} maxLength={20} required autoFocus disabled={joinLoading} autoCapitalize="characters" autoCorrect="off" autoComplete="off" spellCheck={false} enterKeyHint="go" />
             <p style={{ margin: '6px 0 0', fontSize: '0.8rem', color: 'var(--ink-muted)' }}>Ask the campaign owner for the invite code.</p>
           </div>
           {joinError && <ErrorMessage message={joinError} />}
@@ -245,7 +256,7 @@ export default function HomePage() {
     return (
       <>
         <HeroLock />
-        <section className="campaign-hero" style={{ minHeight: 'calc(100svh - 64px)', marginBottom: 0 }}>
+        <section className="campaign-hero campaign-hero--welcome">
           <div className="campaign-hero-copy">
             <span className="section-kicker">WELCOME TO FIRESIDE</span>
             <h1>
@@ -284,18 +295,20 @@ export default function HomePage() {
               <h2 className="campaigns-title">Return to the table</h2>
             </div>
             <div className="campaigns-header-actions">
-              <div className="layout-switcher" role="group" aria-label="Campaign list layout">
-                {CAMPAIGN_LAYOUTS.map((l) => (
-                  <button
-                    key={l.id}
-                    type="button"
-                    aria-pressed={layout === l.id}
-                    onClick={() => setLayout(l.id)}
-                  >
-                    {l.label}
-                  </button>
-                ))}
-              </div>
+              {!isNarrow && (
+                <div className="layout-switcher" role="group" aria-label="Campaign list layout">
+                  {CAMPAIGN_LAYOUTS.map((l) => (
+                    <button
+                      key={l.id}
+                      type="button"
+                      aria-pressed={layout === l.id}
+                      onClick={() => setLayout(l.id)}
+                    >
+                      {l.label}
+                    </button>
+                  ))}
+                </div>
+              )}
               <button className="btn btn-secondary small" onClick={() => { setInviteCode(''); setJoinError(''); setActiveModal('join') }}>
                 <i className="bi bi-key" aria-hidden="true" /> Join with code
               </button>

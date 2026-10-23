@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Button from '@/components/common/Button'
 import MarkdownContent from '@/components/common/MarkdownContent'
 import type { CharacterDraft } from './characterFormConfig'
@@ -175,6 +175,13 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
   const [messages, setMessages] = useState<ChatMsg[]>([WELCOME])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const listRef = useRef<HTMLDivElement>(null)
+
+  // Follow the newest message by scrolling the list itself, never the page.
+  useEffect(() => {
+    const list = listRef.current
+    if (list) list.scrollTop = list.scrollHeight
+  }, [messages])
 
   useEffect(() => {
     if (clearTrigger) setMessages([WELCOME])
@@ -369,7 +376,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
 
   return (
     <div className="character-ai-chat">
-      <div className="character-ai-chat__messages">
+      <div className="character-ai-chat__messages" ref={listRef}>
         {messages.map((msg, i) => (
           <div key={i} className={`character-ai-chat__bubble is-${msg.role}`}>
             <span className="character-ai-chat__bubble-role">{msg.role === 'ai' ? 'AI' : 'You'}</span>
@@ -391,9 +398,14 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
             rows={1}
             placeholder="Describe your character…"
             value={input}
+            enterKeyHint="send"
             onChange={(e) => setInput(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
-            disabled={loading}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return
+              e.preventDefault()
+              handleSend()
+            }}
+            readOnly={loading}
           />
           <button
             type="button"
