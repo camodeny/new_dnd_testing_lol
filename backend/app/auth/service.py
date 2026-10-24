@@ -11,7 +11,7 @@ raises ``AuthError`` directly; there is a single profile upsert path
 (``upsert_profile``) used by the token resolution flow.
 
 There is no mock/dev auth bypass: every request must bear a real Supabase
-JWT, including local development (see docs/local-dev-auth.md).
+JWT, including local development (see docs/local-dev.md).
 """
 
 import uuid as uuid_lib

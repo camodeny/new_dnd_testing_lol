@@ -85,10 +85,11 @@ Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) sho
 `app/auth/jwt.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`, RS256/ES256). Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
 
 There is no mock/dev auth bypass: every request must bear a real Supabase
-JWT, including local development. Sign in through the app with a dev user
-(see `docs/local-dev-auth.md`); the backend verifies the token and upserts
-the profile. Unauthenticated requests are rejected (401) and invalid tokens
-are rejected (401).
+JWT, including local development. Locally that is the Supabase stack from
+`scripts/local-supabase.sh` with its seeded test players (see
+`docs/local-dev.md`); the backend verifies the token and upserts the
+profile. Unauthenticated requests are rejected (401) and invalid tokens are
+rejected (401).
 
 Supported local/test setup:
 
