@@ -3,6 +3,8 @@
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase, isSupabaseConfigured } from '@/lib/supabase'
+import { setAuthToken } from '@/lib/authToken'
+import { isLocalSupabase, LOCAL_TEST_PLAYERS, LOCAL_TEST_PLAYER_PASSWORD } from '@/lib/localSupabase'
 import { inviteContinuation, storePendingInvite } from '@/lib/pendingInvite'
 import type { User } from '@/types'
 import './login.css'
@@ -48,20 +50,48 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     if (error) errorRef.current?.scrollIntoView?.({ block: 'nearest' })
   }, [error])
 
+  // Invite-aware onboarding (#242): recipients parked here by
+  // /invite/:code — or rendered here directly by AppShell — continue to
+  // the same invite after signing in/up.
+  const afterLogin = (continuation: ReturnType<typeof inviteContinuation>) => (user: User) => {
+    onLogin(user)
+    if (continuation?.next) router.push(continuation.next)
+  }
+
+  const signIn = async (emailVal: string, pw: string, continueAfterLogin: (user: User) => void) => {
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: emailVal,
+      password: pw,
+    })
+    if (error) throw error
+    if (data.session?.access_token) {
+      setAuthToken(data.session.access_token)
+    }
+    const u = data.user!
+    continueAfterLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? emailVal.split('@')[0], email: u.email ?? undefined } as unknown as User)
+  }
+
+  const signInAsTestPlayer = async (testEmail: string) => {
+    setError('')
+    setLoading(true)
+    const continueAfterLogin = afterLogin(inviteContinuation())
+    try {
+      await signIn(testEmail, LOCAL_TEST_PLAYER_PASSWORD, continueAfterLogin)
+    } catch (err) {
+      setError(`${(err as Error).message} — seed test players with scripts/local-supabase.sh up`)
+    } finally {
+      setLoading(false)
+    }
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
     setSuccess('')
     setLoading(true)
 
-    // Invite-aware onboarding (#242): recipients parked here by
-    // /invite/:code — or rendered here directly by AppShell — continue to
-    // the same invite after signing in/up.
     const continuation = inviteContinuation()
-    const continueAfterLogin = (user: User) => {
-      onLogin(user)
-      if (continuation?.next) router.push(continuation.next)
-    }
+    const continueAfterLogin = afterLogin(continuation)
 
     try {
       if (isSupabaseConfigured()) {
@@ -91,7 +121,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             return
           }
           if (data.session?.access_token) {
-            localStorage.setItem('token', data.session.access_token)
+            setAuthToken(data.session.access_token)
           }
           const supaUser = data.user
           const u = supaUser
@@ -100,16 +130,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           continueAfterLogin(u as unknown as User)
         } else {
           // Try email login; Supabase requires email
-          const { data, error } = await supabase.auth.signInWithPassword({
-            email: emailVal,
-            password,
-          })
-          if (error) throw error
-          if (data.session?.access_token) {
-            localStorage.setItem('token', data.session.access_token)
-          }
-          const u = data.user!
-          continueAfterLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? emailVal.split('@')[0], email: u.email ?? undefined } as unknown as User)
+          await signIn(emailVal, password, continueAfterLogin)
         }
       } else {
         throw new Error('Authentication is not configured. Set the public Supabase URL and key.')
@@ -242,6 +263,26 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
                 {loading ? 'Loading…' : isRegistering ? 'Create Account' : 'Sign In'}
               </button>
             </form>
+          )}
+
+          {isLocalSupabase && !success && (
+            <div className="local-test-players" role="group" aria-label="Local test players">
+              <span className="login-kicker">LOCAL TEST PLAYERS</span>
+              <div className="local-test-players-row">
+                {LOCAL_TEST_PLAYERS.map((player) => (
+                  <button
+                    key={player.email}
+                    type="button"
+                    className="toggle-button"
+                    disabled={loading}
+                    onClick={() => signInAsTestPlayer(player.email)}
+                  >
+                    {player.label}
+                  </button>
+                ))}
+              </div>
+              <p>Each tab keeps its own sign-in, so open one tab per player.</p>
+            </div>
           )}
 
           {!success && (

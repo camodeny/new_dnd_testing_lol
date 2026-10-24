@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { localTabAuthOptions } from '@/lib/authToken'
 
 const resolvedUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? ''
 const rawPublishableKey = process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY ?? ''
@@ -19,6 +20,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey, {
     persistSession: true,
     autoRefreshToken: true,
     detectSessionInUrl: true,
+    ...localTabAuthOptions(),
   },
 })
 

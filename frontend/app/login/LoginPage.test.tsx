@@ -3,11 +3,12 @@ import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { push, replace, signUp, signInWithPassword } = vi.hoisted(() => ({
+const { push, replace, signUp, signInWithPassword, localStack } = vi.hoisted(() => ({
   push: vi.fn(),
   replace: vi.fn(),
   signUp: vi.fn(),
   signInWithPassword: vi.fn(),
+  localStack: { on: false },
 }))
 
 vi.mock('next/navigation', () => ({
@@ -17,6 +18,13 @@ vi.mock('next/navigation', () => ({
 vi.mock('@/lib/supabase', () => ({
   supabase: { auth: { signUp, signInWithPassword } },
   isSupabaseConfigured: () => true,
+}))
+
+vi.mock('@/lib/localSupabase', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/localSupabase')>()),
+  get isLocalSupabase() {
+    return localStack.on
+  },
 }))
 
 import LoginPage from './LoginPage'
@@ -29,6 +37,8 @@ beforeEach(() => {
   vi.resetAllMocks()
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
   localStorage.clear()
+  sessionStorage.clear()
+  localStack.on = false
   window.history.replaceState({}, '', '/invite/TESTCODE8')
   container = document.createElement('div')
   document.body.appendChild(container)
@@ -161,5 +171,40 @@ describe('sign-in mode', () => {
     expect(signInWithPassword).toHaveBeenCalledOnce()
     expect(signInWithPassword.mock.calls[0][0]).toMatchObject({ email: 'sam@example.com' })
     expect(onLogin).toHaveBeenCalledOnce()
+  })
+})
+
+describe('local test players', () => {
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/login')
+  })
+
+  it('signs this tab in as a seeded player on the local stack', async () => {
+    localStack.on = true
+    signInWithPassword.mockResolvedValue({
+      data: {
+        user: { id: 'player-2', email: 'player2@local.test', user_metadata: { username: 'player2' } },
+        session: { access_token: 'tok-2' },
+      },
+      error: null,
+    })
+    const onLogin = vi.fn()
+    await act(async () => root.render(<LoginPage onLogin={onLogin} />))
+
+    const player2 = [...container.querySelectorAll('button')].find((b) => b.textContent === 'Player 2')!
+    await act(async () => player2.click())
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)) })
+
+    expect(signInWithPassword).toHaveBeenCalledWith({ email: 'player2@local.test', password: 'password' })
+    // Per-tab: the token mirror lands in sessionStorage, not shared localStorage.
+    expect(sessionStorage.getItem('token')).toBe('tok-2')
+    expect(localStorage.getItem('token')).toBeNull()
+    expect(onLogin).toHaveBeenCalledOnce()
+  })
+
+  it('offers no test players against a hosted project', async () => {
+    await act(async () => root.render(<LoginPage onLogin={vi.fn()} />))
+
+    expect(container.querySelector('[aria-label="Local test players"]')).toBeNull()
   })
 })

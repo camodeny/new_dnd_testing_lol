@@ -1,0 +1,46 @@
+# Local Supabase stack for development and gameplay testing — see
+# docs/local-dev.md. Run `scripts/local-supabase.sh up` instead of calling the
+# CLI directly: it also applies the Alembic schema, schedules the cron sweeps
+# against the local backend, seeds test players, and points the env files here.
+# Alembic owns the schema, so there are no Supabase migrations in this folder.
+project_id = "fireside-local"
+
+[api]
+port = 54321
+
+[db]
+port = 54322
+major_version = 17
+
+[db.seed]
+enabled = false
+
+[studio]
+port = 54323
+
+# Mailpit: every email the local stack sends lands here instead of an inbox.
+[local_smtp]
+port = 54324
+
+# Unused by the app; off so the stack starts faster.
+[storage]
+enabled = false
+
+[edge_runtime]
+enabled = false
+
+[analytics]
+enabled = false
+
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://127.0.0.1:3000"]
+# Asymmetric (ES256) signing so the backend verifies local tokens through
+# JWKS exactly as it does hosted ones. The key is committed on purpose: only
+# this local stack trusts it, the same as the CLI's built-in development
+# secrets, and sharing it keeps every checkout and worktree minting the same
+# tokens. Never import it into a hosted project.
+signing_keys_path = "./signing_keys.json"
+
+[auth.email]
+enable_confirmations = false
