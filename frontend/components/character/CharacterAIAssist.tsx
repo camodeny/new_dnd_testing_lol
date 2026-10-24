@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import Button from '@/components/common/Button'
 import MarkdownContent from '@/components/common/MarkdownContent'
+import { getAuthToken } from '@/lib/authToken'
 import type { CharacterDraft } from './characterFormConfig'
 
 interface Props {
@@ -190,7 +191,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
   useEffect(() => {
     let cancelled = false
     async function loadHistory() {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+      const token = getAuthToken()
       const backendBase =
         (typeof process !== 'undefined' && process.env.BACKEND_URL) ||
         (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
@@ -234,7 +235,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
     // ai will be appended on first token; no empty placeholder to avoid duplicate bubbles
     const aiIndex = history.length + 1
 
-    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+    const token = getAuthToken()
     // bypass Next rewrites for SSE to avoid buffering; hit backend directly when local
     const backendBase =
       (typeof process !== 'undefined' && process.env.BACKEND_URL) ||

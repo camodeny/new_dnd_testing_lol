@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { campaignMembers as membersApi } from '@/lib/api'
+import { getAuthToken } from '@/lib/authToken'
 
 interface LoreDmChatProps {
   campaignId: string
@@ -80,7 +81,7 @@ export default function LoreDmChat({ campaignId, characterId, onUseLore, applyin
     setLoading(true)
     let fullText = ''
     try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+      const token = getAuthToken()
       const res = await fetch(chatUrl(campaignId, characterId), {
         method: 'POST',
         headers: {

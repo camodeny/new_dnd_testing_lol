@@ -2,17 +2,9 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { auth } from '@/lib/api'
+import { clearAuthToken, setAuthToken } from '@/lib/authToken'
 import { supabase } from '@/lib/supabase'
 import type { User } from '@/types'
-
-// Local-dev auto-login: signs in with the dev user from env so dogfooding
-// skips the login form. Gated to non-production builds — in a production
-// build these vars are ignored even if present. Never set them in a
-// deployed environment (values bake into the client bundle).
-const DEV_USER_EMAIL = process.env.NEXT_PUBLIC_DEV_USER_EMAIL ?? ''
-const DEV_USER_PASSWORD = process.env.NEXT_PUBLIC_DEV_USER_PASSWORD ?? ''
-const DEV_AUTO_LOGIN =
-  process.env.NODE_ENV !== 'production' && DEV_USER_EMAIL !== '' && DEV_USER_PASSWORD !== ''
 
 function supabaseUserToAppUser(su: { id: string; email?: string | null; user_metadata?: Record<string, unknown> }): User {
   const email = (su.email ?? null) as string | null
@@ -33,24 +25,11 @@ export function useAuth() {
     let cancelled = false
 
     const init = async () => {
-      // Dev auto-login first (skipped without env creds or with a session).
-      if (DEV_AUTO_LOGIN) {
-        const { data } = await supabase.auth.getSession()
-        if (!data.session && !cancelled) {
-          const { error } = await supabase.auth.signInWithPassword({
-            email: DEV_USER_EMAIL,
-            password: DEV_USER_PASSWORD,
-          })
-          if (error && !cancelled) {
-            console.error('[auth] dev auto-login failed:', error.message)
-          }
-        }
-      }
-      // Check Supabase session; sync token to localStorage for apiFetch (backend JWT)
+      // Check Supabase session; mirror its token for apiFetch (backend JWT)
       await supabase.auth.getSession().then(async ({ data }) => {
       const session = data.session
       if (session?.access_token) {
-        localStorage.setItem('token', session.access_token)
+        setAuthToken(session.access_token)
         if (!cancelled) {
           // Prefer backend /api/me (verifies JWT + upserts profiles) but fallback to Supabase user
           try {
@@ -68,7 +47,7 @@ export function useAuth() {
           return
         }
       }
-      localStorage.removeItem('token')
+      clearAuthToken()
       if (!cancelled) {
         setUser(null)
         setLoading(false)
@@ -83,9 +62,9 @@ export function useAuth() {
       data: { subscription },
     } = supabase.auth.onAuthStateChange((_event, session) => {
       if (session?.access_token) {
-        localStorage.setItem('token', session.access_token)
+        setAuthToken(session.access_token)
       } else {
-        localStorage.removeItem('token')
+        clearAuthToken()
         setUser(null)
       }
     })
@@ -102,7 +81,7 @@ export function useAuth() {
     } catch {
       // fall through
     }
-    localStorage.removeItem('token')
+    clearAuthToken()
     setUser(null)
   }, [])
 

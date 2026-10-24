@@ -381,3 +381,26 @@
   .login-panel { min-height: calc(100svh - 120px); padding-top: 32px; }
   .login-card h1 { font-size: 2.65rem; }
 }
+
+.local-test-players {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px dashed var(--ink-faint);
+  text-align: center;
+}
+
+.local-test-players-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.local-test-players p {
+  margin: 0;
+  color: var(--ink-muted);
+  font-size: 0.78rem;
+}
+
+.local-test-players .login-kicker {
+  margin-bottom: 4px;
+}

@@ -10,6 +10,7 @@ import ErrorMessage from '@/components/common/ErrorMessage'
 import Button from '@/components/common/Button'
 import { matchesMedia } from '@/hooks/useMediaQuery'
 import { characters as charactersApi } from '@/lib/api'
+import { getAuthToken } from '@/lib/authToken'
 import { newId } from '@/lib/ids'
 
 interface Props {
@@ -188,7 +189,7 @@ export default function CharacterFormLayout({ characterId, initial, onSaved, onC
 
   const clearChat = async () => {
     try {
-      const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+      const token = getAuthToken()
       const backendBase =
         (typeof process !== 'undefined' && process.env.BACKEND_URL) ||
         (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')

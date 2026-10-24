@@ -4,6 +4,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { campaignMembers } from '@/lib/api'
+import { getAuthToken } from '@/lib/authToken'
 import { clearPendingInvite, storePendingInvite } from '@/lib/pendingInvite'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
@@ -37,7 +38,7 @@ export default function InviteAcceptPage() {
     }
     let token: string | null = null
     try {
-      token = localStorage.getItem('token')
+      token = getAuthToken()
     } catch { /* no-op */ }
     if (!token) {
       parkAndLogin()

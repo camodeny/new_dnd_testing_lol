@@ -1,11 +1,7 @@
+import { getAuthToken } from '@/lib/authToken'
 import type { ApiError } from '@/types'
 
 const API_BASE = '/api'
-
-function getToken(): string | null {
-  if (typeof window === 'undefined') return null
-  return localStorage.getItem('token')
-}
 
 function errorMessageFrom(value: unknown): string | null {
   if (typeof value === 'string') return value.trim() || null
@@ -58,7 +54,7 @@ export async function apiFetch<T = unknown>(
     'Content-Type': 'application/json',
     ...(options.headers ?? {}),
   }
-  const token = getToken()
+  const token = getAuthToken()
   if (token) headers['Authorization'] = `Bearer ${token}`
 
   const res = await fetch(url, { ...options, headers, credentials: 'include' })
@@ -187,9 +183,7 @@ export const characters = {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        ...(typeof window !== 'undefined' && localStorage.getItem('token')
-          ? { Authorization: `Bearer ${localStorage.getItem('token')}` }
-          : {}),
+        ...(getAuthToken() ? { Authorization: `Bearer ${getAuthToken()}` } : {}),
       },
       body: JSON.stringify(payload),
     }),
