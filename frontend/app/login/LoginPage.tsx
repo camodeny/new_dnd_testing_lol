@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import { supabase, isSupabaseConfigured } from '@/lib/supabase'
 import { setAuthToken } from '@/lib/authToken'
 import { isLocalSupabase, LOCAL_TEST_PLAYERS, LOCAL_TEST_PLAYER_PASSWORD } from '@/lib/localSupabase'
-import { inviteContinuation, storePendingInvite } from '@/lib/pendingInvite'
+import { inviteContinuation, readPendingInvite, storePendingInvite } from '@/lib/pendingInvite'
 import type { User } from '@/types'
 import './login.css'
 
@@ -102,11 +102,18 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           throw new Error('Email is required for Supabase auth.')
         }
         if (isRegistering) {
+          // Sign-up is invite-only: the Supabase before-user-created hook
+          // admits a new account only with a usable invite code (or an email
+          // someone invited), so carry the invite this visit came from.
+          const inviteCode = continuation?.code || readPendingInvite()
           const { data, error } = await supabase.auth.signUp({
             email: emailVal,
             password,
             options: {
-              data: { username: username.trim() || emailVal.split('@')[0] },
+              data: {
+                username: username.trim() || emailVal.split('@')[0],
+                ...(inviteCode ? { invite_code: inviteCode } : {}),
+              },
               // Confirmation emails return to the invite itself so a
               // new-account signup never loses its table.
               ...(continuation?.next

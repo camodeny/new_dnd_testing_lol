@@ -115,7 +115,12 @@ describe('signed-out /invite/:code registration', () => {
 
     expect(signUp).toHaveBeenCalledOnce()
     expect(signUp.mock.calls[0][0]).toMatchObject({ email: 'new@example.com' })
-    const options = signUp.mock.calls[0][0].options as { emailRedirectTo?: string }
+    const options = signUp.mock.calls[0][0].options as {
+      emailRedirectTo?: string
+      data?: Record<string, string>
+    }
+    // The invite code rides along so the invite-only sign-up gate admits it.
+    expect(options.data).toEqual({ username: 'newbie', invite_code: 'TESTCODE8' })
     // Confirmation returns to the invite itself — never the bare site URL.
     expect(options.emailRedirectTo).toBe(`${window.location.origin}/invite/TESTCODE8`)
     // Pending code survives even if the redirect chain drops the path.
@@ -124,6 +129,42 @@ describe('signed-out /invite/:code registration', () => {
     expect(container.textContent).toContain('Confirmation email sent')
     expect(onLogin).not.toHaveBeenCalled()
     expect(push).not.toHaveBeenCalled()
+  })
+
+  it('carries a pending invite when signing up from the bare login page', async () => {
+    signUp.mockResolvedValue({ data: { user: null, session: null }, error: null })
+    localStorage.setItem(PENDING_INVITE_KEY, 'PARKED42')
+    window.history.replaceState({}, '', '/login')
+    await act(async () => root.render(<LoginPage onLogin={vi.fn()} />))
+
+    await act(async () => {
+      [...container.querySelectorAll('button')].find((b) => b.textContent === 'Create Account')!.click()
+    })
+    setValue(field('email'), 'later@example.com')
+    setValue(field('password'), 'correct horse battery staple')
+    await submit()
+
+    expect(signUp.mock.calls[0][0].options.data).toMatchObject({ invite_code: 'PARKED42' })
+  })
+
+  it('sends no invite code when there is no invite to carry', async () => {
+    signUp.mockResolvedValue({
+      data: { user: null, session: null },
+      error: new Error('Fireside is invite-only for now. Open your invite link to create an account.'),
+    })
+    window.history.replaceState({}, '', '/login')
+    await act(async () => root.render(<LoginPage onLogin={vi.fn()} />))
+
+    await act(async () => {
+      [...container.querySelectorAll('button')].find((b) => b.textContent === 'Create Account')!.click()
+    })
+    setValue(field('email'), 'stranger@example.com')
+    setValue(field('password'), 'correct horse battery staple')
+    await submit()
+
+    expect(signUp.mock.calls[0][0].options.data).not.toHaveProperty('invite_code')
+    // The gate's rejection reads as an invite-only notice, not a crash.
+    expect(container.querySelector('.error-message')?.textContent).toContain('invite-only')
   })
 
   it('shows a submit error right above the submit button', async () => {

@@ -42,5 +42,12 @@ additional_redirect_urls = ["http://127.0.0.1:3000"]
 # tokens. Never import it into a hosted project.
 signing_keys_path = "./signing_keys.json"
 
+# Invite-only sign-up, same as production: the function comes from the
+# i001invitesignup01 Alembic migration and admits a new account only with a
+# usable campaign invite. Admin-API users (the seeded test players) skip it.
+[auth.hook.before_user_created]
+enabled = true
+uri = "pg-functions://postgres/public/hook_before_user_created"
+
 [auth.email]
 enable_confirmations = false
