@@ -59,8 +59,9 @@ and click a different player in each. Typical loop:
 2. Tabs 2–4: open the invite link and pick Players 2–4.
 3. Everyone makes or picks a character and readies up; Player 1 starts.
 
-You can still create other accounts with the normal sign-up form.
-Confirmation is off locally, so they sign in immediately.
+You can still create other accounts with the normal sign-up form, but only
+from an invite link (see "Invite-only sign-up" below). Confirmation is off
+locally, so they sign in immediately.
 
 Against a hosted project, or in a production build, none of this applies:
 sessions are shared across tabs and the test-player buttons are hidden.
@@ -80,6 +81,26 @@ request bears a real Supabase JWT, including locally:
   stack trusts that key. Never import it into a hosted project.
 - Realtime private channels need a real session. If the socket is down,
   `useLiveTableRealtime` falls back to 5s snapshot polling.
+
+### Invite-only sign-up
+
+Unfunded campaigns have no AI spend cap until the free tier (#489), so
+sign-up is invite-only. Supabase Auth calls the Postgres function
+`public.hook_before_user_created` (Alembic migration `i001invitesignup01`)
+before creating any account. It admits the new account only when:
+
+- the sign-up carries `invite_code` in its user metadata (the login page
+  sends the code from the `/invite/:code` link it was opened from), or
+- the sign-up email matches an invite's intended email.
+
+The invite must be active, unexpired, and on a campaign that isn't deleted.
+Everything else gets a 403 "invite-only" error. To let someone in, invite
+them to a campaign. Accounts created through the Admin API, like the seeded
+test players, skip the hook.
+
+The hook is enabled in `supabase/config.toml` locally. On the hosted project
+it is enabled under Authentication → Hooks → Before User Created, pointing at
+the same function; sign-ups themselves must also be enabled there.
 
 Mock auth was removed because it was a second auth universe: a fixed profile
 UUID with no Supabase session behind it. Anything keyed on real auth silently
